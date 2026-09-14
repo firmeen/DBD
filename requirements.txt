@@ -1,6 +1,2 @@
-curl_cffi>=0.7,<1
-cryptography>=43,<45
-truststore>=0.10,<1
-browser-cookie3>=0.19,<1
-PyMySQL>=1.1,<2
-python-dotenv>=1.1,<2
+-c requirements.lock
+-e .

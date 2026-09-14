@@ -1,39 +1,40 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from pathlib import Path
 
-from dotenv import load_dotenv
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
-load_dotenv()
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+ENV_FILE = Path(os.environ.get("DBD_ENV_FILE", PROJECT_ROOT / ".env"))
 
 
-@dataclass(frozen=True)
-class Settings:
-    db_host: str = os.getenv("DB_HOST", "127.0.0.1")
-    db_port: int = int(os.getenv("DB_PORT", "3306"))
-    db_name: str = os.getenv("DB_NAME", "dbd")
-    db_user: str = os.getenv("DB_USER", "dbd_app")
-    db_password: str = os.getenv("DB_PASSWORD", "")
-    request_timeout: int = int(os.getenv("REQUEST_TIMEOUT", "30"))
-    user_agent: str = os.getenv(
-        "USER_AGENT",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36",
+class Settings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore", frozen=True
     )
-
-    dbd_base_url: str = os.getenv("DBD_BASE_URL", "https://datawarehouse.dbd.go.th")
-    dbd_max_auth_attempts: int = int(os.getenv("DBD_MAX_AUTH_ATTEMPTS", "4"))
-    dbd_request_delay_seconds: float = float(os.getenv("DBD_REQUEST_DELAY_SECONDS", "0.5"))
-
-    # Bulk/async settings. These hit a public government service, so the
-    # defaults are deliberately moderate rather than as fast as possible.
-    dbd_concurrency: int = int(os.getenv("DBD_CONCURRENCY", "15"))
-    dbd_rate_per_second: float = float(os.getenv("DBD_RATE_PER_SECOND", "15"))
-    # Counting a large bucket is slow server-side: keyword "010" matches
-    # ~963k rows and a filtered count on it exceeded 40 s.
-    dbd_count_timeout_seconds: int = int(os.getenv("DBD_COUNT_TIMEOUT_SECONDS", "120"))
-    dbd_write_batch_size: int = int(os.getenv("DBD_WRITE_BATCH_SIZE", "500"))
+    db_host: str = "127.0.0.1"
+    db_port: int = Field(3307, ge=1, le=65535)
+    db_name: str = Field("dbd", pattern=r"^[A-Za-z0-9_]+$")
+    db_user: str = "dbd_app"
+    db_password: str = Field("", repr=False)
+    db_pool_size: int = Field(8, ge=1, le=100)
+    db_timeout: int = Field(30, ge=1)
+    request_timeout: int = Field(30, ge=1)
+    user_agent: str = "Mozilla/5.0"
+    dbd_base_url: str = "https://datawarehouse.dbd.go.th"
+    dbd_max_auth_attempts: int = Field(4, ge=1, le=10)
+    dbd_request_delay_seconds: float = Field(0.5, ge=0)
+    dbd_concurrency: int = Field(16, ge=1, le=256)
+    dbd_rate_per_second: float = Field(10, gt=0, le=1000)
+    dbd_count_timeout_seconds: int = Field(120, ge=1)
+    dbd_write_batch_size: int = Field(100, ge=1, le=1000)
+    dbd_queue_size: int = Field(64, ge=1, le=10000)
+    dbd_lease_seconds: int = Field(300, ge=30)
+    dbd_max_task_attempts: int = Field(3, ge=1, le=20)
+    dbd_http_retries: int = Field(3, ge=0, le=10)
+    dbd_metrics_port: int = Field(0, ge=0, le=65535)
 
 
 settings = Settings()

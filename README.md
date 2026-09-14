@@ -1,332 +1,140 @@
 # dbd-data
 
-Python ingestion project for fetching DBD DataWarehouse (`datawarehouse.dbd.go.th`)
-company profile data and storing it in MySQL, via plain HTTP requests (no
-Selenium).
+MySQL-backed DBD DataWarehouse ingestion with a company master, resumable
+endpoint tasks, concurrent Python workers, and durable search-page checkpoints.
+No Redis, Supabase, or external message broker is required.
 
-See `docs/ARCHITECTURE.md` for the data flow and folder ownership, and
-`docs/ROADMAP.md` for the fuller architecture this can grow into once there's
-more than one endpoint and real bulk-ingestion volume to justify it.
+## Install and use from any folder
 
-## Why this isn't a normal HTTP scraper
-
-DBD's DataWarehouse issues an anonymous JWT and encrypts every JSON response
-with AES-GCM (key derived via HKDF from a claim inside that JWT). Plain
-`requests` also gets a 403 from the WAF because its TLS fingerprint doesn't
-look like a real browser. `src/dbd/client/` handles all of this so the rest
-of the codebase only ever sees a plain decoded dict.
-
-## Repository structure
-
-```text
-dbd-data/
-├── .env.example
-├── .gitignore
-├── pyproject.toml
-├── requirements.txt
-├── README.md
-├── docs/
-│   ├── ARCHITECTURE.md
-│   └── ROADMAP.md
-├── scripts/
-│   ├── bootstrap.ps1
-│   ├── apply_migrations.py  run sql/NNN_*.sql in order (re-runnable)
-│   └── dbd_test.py          manual smoke-test, not part of the production package
-├── sql/
-│   ├── 001_schema.sql              raw_responses, companies, company_facts
-│   ├── 002_company_details.sql     committees, signs, nations, name/capital history
-│   ├── 003_financials.sql          submissions, statements, statement items
-│   ├── 004_enrichment.sql          decoded labels, transformations, nation history, benchmarks
-│   ├── 005_bulk_ingestion.sql      resumable bulk run/task state
-│   ├── reports/data_inventory.sql  read-only report for DBeaver
-│   └── admin/
-│       └── 001_create_app_user.sql.example
-└── src/
-    └── dbd/
-        ├── core/          settings, exceptions
-        ├── client/        session, auth, crypto, client, endpoints/
-        ├── contracts/     validate + normalize raw JSON -> typed dataclass
-        ├── pipelines/     fetch -> validate -> normalize -> persist
-        ├── storage/mysql/ connection + repositories
-        └── cli/           argparse entrypoint
-```
-
-## 1. Clone and bootstrap
+Python 3.11+ and MySQL 8+ are required. The local configuration uses port **3307**.
 
 ```powershell
-git clone https://github.com/firmeen/DBD.git
-cd DBD
-powershell -ExecutionPolicy Bypass -File .\scripts\bootstrap.ps1
-.\.venv\Scripts\Activate.ps1
+.\scripts\bootstrap.ps1 -Dev -InstallCommand
 ```
 
-Or install manually:
+The installer adds this checkout's `.venv\Scripts` to your **user PATH**.
+Restart your terminal application after the first installation. The checkout and
+its virtual environment must stay at that location. No activation is required.
+
+Configuration is loaded from the checkout's `.env`, independently of the current
+folder. Set `DBD_ENV_FILE` to an absolute filename to select another configuration.
+Shell environment variables override that file. Never commit credentials.
 
 ```powershell
-py -m venv .venv
-.\.venv\Scripts\Activate.ps1
-python -m pip install --upgrade pip
-pip install -e .
-Copy-Item .env.example .env
-```
-
-Edit `.env` and set the real MySQL password.
-
-## 2. MySQL app user
-
-Run as MySQL administrator/root:
-
-```sql
-CREATE USER IF NOT EXISTS 'dbd_app'@'localhost'
-  IDENTIFIED BY 'CHANGE_TO_A_STRONG_PASSWORD';
-
-GRANT SELECT, INSERT, UPDATE, DELETE
-  ON dbd.*
-  TO 'dbd_app'@'localhost';
-```
-
-The application user intentionally has no global/admin privileges.
-
-## 3. Create tables
-
-```powershell
-python scripts\apply_migrations.py
-```
-
-Applies every `sql/NNN_*.sql` in order and is safe to re-run — statements that
-are already applied are reported as "already present" rather than failing.
-
-Note for PowerShell users: `mysql -u root -p < sql\001_schema.sql` does **not**
-work, because `<` input redirection is bash syntax. If you prefer the mysql
-client, pipe instead:
-
-```powershell
-Get-Content sql\001_schema.sql | mysql -u root -p
-```
-
-## 4. Configure `.env`
-
-```env
-DB_HOST=127.0.0.1
-DB_PORT=3306
-DB_NAME=dbd
-DB_USER=dbd_app
-DB_PASSWORD=your_real_password
-REQUEST_TIMEOUT=30
-
-DBD_BASE_URL=https://datawarehouse.dbd.go.th
-DBD_MAX_AUTH_ATTEMPTS=4
-DBD_REQUEST_DELAY_SECONDS=0.5
-```
-
-Never commit `.env`.
-
-## 5. Test database connection
-
-```powershell
+dbd-data --version
 dbd-data check-db
+dbd-data migrate
 ```
 
-## 6. Fetch and store a company profile
+Migrations require CREATE/ALTER/INDEX privileges on the configured database.
+Runtime workers need SELECT/INSERT/UPDATE/DELETE. Use a schema administrator for
+migration if your runtime user has only DML privileges. Migrations adopt existing
+numbered SQL schemas and preserve existing data; they also backfill Company Master.
+Alembic records the applied revisions. `scripts/apply_migrations.py` remains a
+compatibility entrypoint. It no longer accepts individual numeric SQL prefixes.
+
+## Fetch a company
 
 ```powershell
-dbd-data fetch-company 70107556000051
-```
-
-`70107556000051` is the 14-digit code from a
-`datawarehouse.dbd.go.th/company/profile/<code>` URL (1-digit jpTypeCode +
-13-digit jpNo).
-
-This covers all four tabs of the web page and prints:
-
-```text
-profile          raw_response_id=3
-                 jp_no=0107556000051 jp_type_code=7
-                 jp_name=ทิพยประกันชีวิต จำกัด (มหาชน)
-committees       16 row(s)
-committee_signs  4 row(s)
-nations          1 row(s)
-name_history     1 row(s)
-capital_history  4 row(s)
-transformations  1 row(s)
-nation_history   10 row(s)
-financials       fiscal_year=2568
-                 5 submission(s), 5 statement(s), 175 item(s)
-industry_bench   30 item(s)
-```
-
-Fetch only part of it:
-
-```powershell
+dbd-data fetch-company 70107556000051 --concurrency 4 --rate 5
 dbd-data fetch-company 70107556000051 --only profile
-dbd-data fetch-company 70107556000051 --only details,financials
-dbd-data fetch-company 70107556000051 --fiscal-year 2567
+dbd-data fetch-company 70107556000051 --only financials --fiscal-year 2568
 ```
 
-Every fetch stores the full decrypted response in `raw_responses`
-(append-only source of truth) alongside the normalized tables:
+The default creates eleven endpoint tasks: profile, seven company details, and
+three financial resources. Financial tasks depend on a successfully persisted
+profile; requesting financials automatically includes that prerequisite. A
+confirmed absence of submitted fiscal years is `not_available`, not a retry loop.
 
-| Web page tab | Tables |
-| --- | --- |
-| ข้อมูลนิติบุคคล | `companies`, `company_facts`, `company_committees`, `company_committee_signs`, `company_transformations` |
-| ข้อมูลงบการเงิน | `financial_submissions`, `financial_statements`, `financial_statement_items`, `industry_benchmarks`, `industry_benchmark_items` |
-| การลงทุนจำแนกตามสัญชาติ | `company_nations`, `company_nation_history` |
-| ประวัติการเปลี่ยนแปลง | `company_name_history`, `company_capital_history` |
+Codes consist of one type character plus a 13-digit registration number. Letter
+types such as `A` are accepted. Registration numbers remain strings.
 
-## 7. Ingest many companies (resumable)
-
-Put one 14-digit code per line in a text file — blank lines, `#` comments and
-pasted profile URLs are all accepted:
-
-```text
-# examples
-70107556000051
-https://datawarehouse.dbd.go.th/company/profile/70107537000939
-```
+## Discover the master
 
 ```powershell
-dbd-data bulk --file codes.txt        # create a run and start working it
-dbd-data bulk                          # resume the latest unfinished run
-dbd-data bulk --run-id 3 --limit 50    # work 50 more of a specific run
-dbd-data bulk-status                   # list runs and their progress
-dbd-data bulk-status 3                 # show run 3's failures
-dbd-data bulk-retry 3                  # re-queue run 3's failed companies
+dbd-data discover 010 --concurrency 16 --rate 10 --max-buckets 10
+dbd-data discover
+dbd-data discover-status
+dbd-data discover-retry
+dbd-data master-status
 ```
 
-Progress is committed per company, so Ctrl+C, a crash, or a dropped connection
-costs at most the company in flight. A company that fails is recorded with its
-error and skipped rather than aborting the batch — one bad code does not cost
-the whole run. One auth token is reused across the batch instead of
-re-authenticating per company.
+Search buckets exceeding the configured backend ceiling are split by legal type,
+province and business size. Each page has its own checkpoint. Failed pages never
+count as completed, and retries skip pages already committed. Malformed responses
+are archived before conversion. Search seeds master identities and missing company
+projections; it does not overwrite richer existing company records.
 
-## 8. Enumerate companies at scale (discovery)
+`discover-refresh` opens another pass over existing leaf buckets. It resets page
+checkpoints, retaining archived responses. Use `--bucket-id N` for one leaf.
+Matching parent/child counts is a count check, not proof of complete enumeration.
+Changes to the live source and overlapping searches can affect coverage.
 
-`bulk` walks a list of company codes you already have. `discover` finds the
-companies in the first place, by paging the search endpoint concurrently.
+## Bulk ingestion
+
+Input files accept one full company code or DBD profile URL per line, UTF-8/BOM,
+blank lines and `#` comments. Invalid lines fail explicitly; arbitrary embedded
+14-digit substrings are not accepted. Imports stream bounded batches and dedupe
+identities/tasks in MySQL rather than keeping a million-number set in memory.
 
 ```powershell
-dbd-data discover 65110 --type biz        # one TSIC bucket
-dbd-data discover --seed-file seeds.txt   # many seed keywords
-dbd-data discover                          # resume: pending buckets drive it
-dbd-data discover-status                   # coverage so far
+dbd-data bulk --file codes.txt --only profile --enqueue-only
+dbd-data bulk --master --only profile --enqueue-only
+dbd-data bulk --run-id 2 --concurrency 32 --rate 10
+dbd-data bulk --run-id 2 --limit 1000
+dbd-data bulk-status 2
+dbd-data bulk-retry 2
+dbd-data bulk --run-id 2
 ```
 
-Why this is much cheaper than it looks: a search page returns the **same field
-set as the per-company profile endpoint**, so one request yields ten company
-rows rather than one. Enumerating a million companies costs ~100,000 requests,
-not ~1,000,000.
+`--limit` counts **endpoint attempts**, not companies. A run's endpoint selection
+and fiscal year are immutable when resuming. Creating another run is an explicit
+refresh; tasks dedupe within a run, not across refreshes. An interrupted import
+remains `building` and cannot be worked; re-import the same input as a new run.
 
-Measured: **~0.12 s/request with 10 in flight**, versus ~1.1 s/request for the
-sequential path — so ~1.5-3.5 hours for a million companies at the default
-rate, rather than days.
+One API manager per database is enforced with a MySQL connection-scoped lock.
+Within it, async workers share one paced rate limiter, token lifecycle and cooldown.
+Concurrency and requests/second are separate controls. 429/503 responses reduce
+rate and share Retry-After cooldown. Increasing concurrency does not establish
+what request rate DBD can sustain. Start modestly and observe successful throughput.
 
-### Limits this design is built around
+Ctrl+C returns unfinished tasks to pending. If a process dies, expired leases are
+recovered; live leases are not reset. Lease versions fence stale writers. Work may
+be delivered more than once; projections and task completion commit together.
 
-These are backend-enforced, confirmed against the live service:
+For pre-0.2 company-level runs, use `dbd-data legacy-bulk --run-id N`.
+New and legacy run IDs belong to different tables.
 
-| Limit | Value | Consequence |
-| --- | --- | --- |
-| `itemsPerPage` | locked at 10 | larger values are ignored |
-| `currentPage` | max 1000 | one query can never exceed **10,000 rows** |
-| `keyword` | min 3 chars, required | a filters-only request returns HTTP 400 |
+## Raw data, replay and monitoring
 
-So any bucket over 10,000 rows must be split before it can be read. `discover`
-splits by jpType, then province, then business size, and records for every
-split whether `SUM(children) == parent`. A split that does not balance is
-flagged (`partition_lossless = 0`) and reported by `discover-status` rather
-than being silently trusted. Validation is deferred until every child has
-actually been counted, so a half-finished run never reports a good partition
-as broken.
-
-**Read the delta, not just the flag.** A real measurement against the live
-service: keyword `010` counted 962,862, and its eight jpType children summed
-to 962,863 — a delta of `+1`. That is almost certainly one registration
-changing between the parent count and the child counts, not a partition
-losing rows. A delta of a few is data drift; a delta of thousands means the
-split is genuinely lossy. `discover-status` prints the delta for this reason.
-
-### What it does not claim
-
-Search matches broadly, so buckets can overlap and seed keywords may not cover
-every company. Companies are deduplicated on `(jp_type_code, jp_no)` and
-coverage is reported from what was actually seen. **Do not read the row count
-as "every company in Thailand"** unless the partitions validate and the totals
-are reconciled against an authoritative figure.
-
-### Search vs. profile completeness
-
-A search row populates ~27 fields; a profile fetch populates ~68. Fields such
-as `regDate`, `submitFinYear`, `paidAmt` and the financial ratios come back
-null from search. The upsert therefore **merges** (`COALESCE`) instead of
-overwriting, so running discovery after a profile fetch cannot erase the
-richer data. Run `discover` for breadth, then `fetch-company` / `bulk` for
-depth on the companies you care about.
-
-### Being a good citizen
-
-This is a public government service. Defaults are moderate on purpose
-(`DBD_CONCURRENCY=15`, `DBD_RATE_PER_SECOND=15`), a single token bucket caps
-the whole process rather than per-worker sleeps, and a 429/503 permanently
-reduces the rate instead of retrying into it. Raise them only if you have a
-reason to.
-
-## 9. Verify data
-
-```sql
-USE dbd;
-
-SELECT id, jp_no, endpoint, requested_at, response_body_sha256
-FROM raw_responses
-ORDER BY id DESC
-LIMIT 10;
-
-SELECT *
-FROM companies
-WHERE jp_no = '0107556000051';
-
-SELECT fact_key, fact_value
-FROM company_facts
-WHERE jp_no = '0107556000051'
-ORDER BY id;
-
--- งบแสดงฐานะการเงิน: one line item across every submitted fiscal year
-SELECT fiscal_year, amount, pct_change
-FROM financial_statement_items
-WHERE jp_no = '0107556000051' AND item_code = 'assets'
-ORDER BY fiscal_year;
-
-SELECT fiscal_year, current_ratio, debt_to_equity, return_on_equity
-FROM financial_statements
-WHERE jp_no = '0107556000051'
-ORDER BY fiscal_year;
-```
-
-Statement line items are stored tall (`item_code` / `amount` / `amount_ly` /
-`pct_change`) rather than as ~150 columns, because the source encodes each as
-a `base` / `baseLy` / `basePc` triplet. The triplets are detected from the
-payload, so a line item DBD adds later is stored with no schema change.
-
-## Manual smoke-testing new endpoints
-
-`scripts/dbd_test.py` is a standalone script (not imported by the production
-package) for poking at DBD endpoints not yet reverse-engineered — auth,
-decryption, and the working `company_profile` call are already wired up in
-it as a reference. Once a new endpoint is confirmed working there, promote
-it into `src/dbd/client/endpoints/`, add a `contracts/` module, a
-`pipelines/` module, and a repository — following the `company_profile`
-example already in this repo.
+`response_archive` stores decoded payloads before validation, together with request
+parameters and timing. Decimal values are serialized as exact decimal strings.
+Tokens, encryption keys and cookies are never included. Transport/auth failures
+store an error class, not an arbitrary HTTP body. The older `raw_responses` table
+continues to support existing projection foreign keys.
 
 ```powershell
-python scripts\dbd_test.py
+dbd-data replay 4
+dbd-data bulk --run-id 2 --metrics-port 9108
 ```
 
-## Git workflow
+Replay processes an archived endpoint task without an API call and cannot replace
+a newer endpoint projection with an older snapshot. Search pages are retried with
+`discover-retry`. Metrics are exposed at `http://127.0.0.1:9108/metrics`; structured
+logs identify task/endpoint/error without dumping response bodies or credentials.
+
+See [architecture](docs/ARCHITECTURE.md), [operations](docs/OPERATIONS.md), and
+[validation](docs/VALIDATION.md) for guarantees, boundaries and measured results.
+
+## Development
 
 ```powershell
-git status
-git add .
-git commit -m "feat: add company profile ingestion"
-git push
+.\scripts\bootstrap.ps1 -Dev
+.\.venv\Scripts\python.exe -m pytest tests -q
+.\.venv\Scripts\python.exe -m ruff check src tests
 ```
 
-Do not commit `.env`, database passwords, or generated raw files.
+Integration tests require `DBD_INTEGRATION=1` and a disposable database whose name
+starts with `dbd_test_`. They must never run against the real data database.
+The test database user needs migration privileges. `scripts/benchmark_queue.py`
+uses the same database-name guard and never contacts the DBD API.

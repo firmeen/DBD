@@ -15,7 +15,11 @@ from ..client.endpoints.financials import (
     statements_path,
     submissions_path,
 )
-from ..contracts.financial import normalize_benchmark, normalize_statements, normalize_submissions
+from ..contracts.financial import (
+    normalize_benchmark,
+    normalize_statements,
+    normalize_submissions,
+)
 from ..core.exceptions import ContractError
 from ..storage.mysql.repositories.company_repository import find_submit_fin_year
 from ..storage.mysql.repositories.financial_repository import (

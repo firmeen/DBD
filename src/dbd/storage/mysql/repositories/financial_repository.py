@@ -88,7 +88,7 @@ def save_statements(
                 for statement in statements:
                     cur.execute(
                         f"""
-                        INSERT INTO financial_statements ({', '.join(header_columns)})
+                        INSERT INTO financial_statements ({", ".join(header_columns)})
                         VALUES ({placeholders})
                         ON DUPLICATE KEY UPDATE {assignments}
                         """,

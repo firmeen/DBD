@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from ...contracts.identity import parse_code
 from .. import DbdClient
 
 
@@ -9,10 +10,8 @@ def split_company_code(code: str) -> tuple[str, str]:
     The frontend splits it as jpTypeCode = code[0], jpNo = code[1:].
     e.g. "70107556000051" -> ("7", "0107556000051")
     """
-    code = code.strip()
-    if len(code) < 2:
-        raise ValueError(f"Invalid company code: {code!r}")
-    return code[0], code[1:]
+    parsed = parse_code(code)
+    return parsed.jp_type_code, parsed.jp_no
 
 
 def profile_path(jp_type_code: str, jp_no: str) -> str:

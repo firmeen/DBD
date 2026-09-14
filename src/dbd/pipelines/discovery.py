@@ -1,10 +1,8 @@
 from __future__ import annotations
 
 import asyncio
-import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from hashlib import sha256
 
 from ..client.async_client import AsyncDbdClient
 from ..client.endpoints.search import (
@@ -17,10 +15,8 @@ from ..client.endpoints.search import (
 from ..contracts.company import normalize
 from ..core.settings import settings
 from ..storage.mysql.repositories.discovery_repository import (
-    child_total,
     discovery_summary,
     pending_buckets,
-    save_page,
     update_bucket,
     upsert_bucket,
 )
@@ -122,65 +118,56 @@ async def _count(client: AsyncDbdClient, filters: SearchFilters) -> tuple[int, i
     return page.total_items, page.total_pages
 
 
-async def _drain_bucket(
-    client: AsyncDbdClient,
-    bucket_id: int,
-    filters: SearchFilters,
-    pages_total: int,
-    start_page: int,
-    *,
-    verbose: bool,
-) -> tuple[int, int]:
-    """Read every page of a bucket concurrently. Returns (pages, companies)."""
-    update_bucket(bucket_id, status="draining")
+async def _drain_bucket(client, bucket_id, filters, pages_total, start_page, *, verbose):
+    from ..core.exceptions import ContractError
+    from ..storage.mysql.repositories.discovery_repository import (
+        archive_search,
+        completed_pages,
+        fail_page,
+        finish_page,
+        page_progress,
+    )
 
-    pages = list(range(start_page, pages_total + 1))
-    written_total = 0
-    done_pages = 0
+    update_bucket(bucket_id, status="draining", last_error=None)
+    completed = await asyncio.to_thread(completed_pages, bucket_id)
+    # Never derive a page number from a count of successful concurrent requests.
+    pages = [p for p in range(1, pages_total + 1) if p not in completed]
 
-    async def one_page(page_no: int) -> int:
-        data = await client.post(SEARCH_PATH, filters.payload(page=page_no), referer=SEARCH_REFERER)
-        page = parse_search_response(data)
-        if not page.rows:
-            return 0
+    async def one_page(page_no):
+        try:
+            requested = _now()
+            data = await client.post(SEARCH_PATH, filters.payload(page=page_no), referer=SEARCH_REFERER)
+            archive_id = await asyncio.to_thread(archive_search, bucket_id, page_no, filters, data, requested)
+            page = parse_search_response(data)
+            if page.current_page != page_no or (not page.rows and page.total_items > 0):
+                raise ContractError("Search page number or empty-page contract mismatch")
+            profiles = [normalize(row) for row in page.rows]
+            return await asyncio.to_thread(
+                finish_page, bucket_id, page_no, archive_id, profiles, data, requested
+            )
+        except Exception as exc:
+            await asyncio.to_thread(fail_page, bucket_id, page_no, type(exc).__name__)
+            return None
 
-        profiles = []
-        for row in page.rows:
-            try:
-                profiles.append(normalize(row))
-            except Exception:
-                # A single malformed row must not lose the rest of the page;
-                # the raw payload is still stored for reprocessing.
-                continue
-
-        return await asyncio.to_thread(
-            save_page,
-            bucket_id=bucket_id,
-            profiles=profiles,
-            raw_json=data,
-            request_path=SEARCH_PATH,
-            requested_at=_now(),
-            body_sha256=sha256(json.dumps(data, sort_keys=True, default=str).encode("utf-8")).hexdigest(),
-        )
-
-    # Chunk so progress is committed steadily rather than only at the end.
-    chunk = max(1, client.concurrency)
-    for i in range(0, len(pages), chunk):
-        batch = pages[i : i + chunk]
-        results = await asyncio.gather(*(one_page(p) for p in batch), return_exceptions=True)
-
-        for result in results:
-            if isinstance(result, Exception):
-                continue
-            written_total += result
-            done_pages += 1
-
-        update_bucket(bucket_id, pages_done=done_pages + start_page - 1, rows_seen=written_total)
+    fetched = written = 0
+    for offset in range(0, len(pages), client.concurrency):
+        results = await asyncio.gather(*(one_page(p) for p in pages[offset : offset + client.concurrency]))
+        fetched += sum(r is not None for r in results)
+        written += sum(r for r in results if r is not None)
+        progress = await asyncio.to_thread(page_progress, bucket_id)
+        update_bucket(bucket_id, pages_done=progress["done"], rows_seen=progress["rows"])
         if verbose:
-            print(f"    pages {done_pages + start_page - 1}/{pages_total}  companies {written_total}")
-
-    update_bucket(bucket_id, status="done", pages_done=pages_total, rows_seen=written_total)
-    return done_pages, written_total
+            print(f"    pages {progress['done']}/{pages_total}, rows {progress['rows']}")
+    progress = await asyncio.to_thread(page_progress, bucket_id)
+    complete = progress["done"] == pages_total and progress["failed"] == 0
+    update_bucket(
+        bucket_id,
+        status="done" if complete else "failed",
+        pages_done=progress["done"],
+        rows_seen=progress["rows"],
+        last_error=None if complete else "One or more pages failed; run discover-retry",
+    )
+    return fetched, written
 
 
 async def _process_bucket(
@@ -228,12 +215,7 @@ async def _process_bucket(
             print(f"    too large -> split into {len(children)} child bucket(s)")
         return 0, 0
 
-    start_page = int(row["pages_done"] or 0) + 1
-    if start_page > (pages_total or 0):
-        update_bucket(bucket_id, status="done")
-        return 0, 0
-
-    return await _drain_bucket(client, bucket_id, filters, pages_total, start_page, verbose=verbose)
+    return await _drain_bucket(client, bucket_id, filters, pages_total, 1, verbose=verbose)
 
 
 def validate_splits(verbose: bool = True) -> int:
@@ -304,8 +286,8 @@ async def run(
 ) -> DiscoveryResult:
     """Enumerate companies from seed keywords, splitting oversized buckets.
 
-    One search page carries ten complete company profiles — the same field set
-    the per-company profile endpoint returns — so this writes full company rows
+    One search page carries ten complete company profiles โ€” the same field set
+    the per-company profile endpoint returns โ€” so this writes full company rows
     rather than only a list of registration numbers.
     """
     buckets_processed = pages_fetched = companies_written = 0

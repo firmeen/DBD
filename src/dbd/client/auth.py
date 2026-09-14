@@ -82,9 +82,11 @@ class DbdAuth:
                 time.sleep(1)
                 continue
 
-            raise DbdAuthError(f"Authentication failed: {response.status_code} {response.text[:500]}")
+            raise DbdAuthError(f"Authentication failed: HTTP {response.status_code}")
 
-        raise DbdAuthError(f"Unable to obtain a DBD access token after {settings.dbd_max_auth_attempts} attempts")
+        raise DbdAuthError(
+            f"Unable to obtain a DBD access token after {settings.dbd_max_auth_attempts} attempts"
+        )
 
 
 def _parse_retry_after(value: str | None) -> int:

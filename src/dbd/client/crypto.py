@@ -5,6 +5,7 @@ import gzip
 import json
 import time
 import zlib
+from decimal import Decimal
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -64,10 +65,10 @@ def decrypt_envelope(envelope: dict, request_path: str, access_token: str) -> di
     iv = b64url_decode(envelope["iv"])
     ciphertext = b64url_decode(envelope["ct"])
 
-    aad = f"bdw|v{kid}|{request_path}".encode("utf-8")
+    aad = f"bdw|v{kid}|{request_path}".encode()
 
     key = HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=aad).derive(enc_key)
     plaintext = AESGCM(key).decrypt(iv, ciphertext, aad)
     plaintext = _decompress(plaintext)
 
-    return json.loads(plaintext.decode("utf-8"))
+    return json.loads(plaintext.decode("utf-8"), parse_float=Decimal)

@@ -38,9 +38,7 @@ def create_run(*, source_label: str, parts: list[str], company_codes: list[str])
 
 def latest_unfinished_run() -> dict | None:
     with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            "SELECT * FROM ingestion_runs WHERE finished_at IS NULL ORDER BY id DESC LIMIT 1"
-        )
+        cur.execute("SELECT * FROM ingestion_runs WHERE finished_at IS NULL ORDER BY id DESC LIMIT 1")
         return cur.fetchone()
 
 
@@ -53,6 +51,7 @@ def reset_stale_tasks(run_id: int) -> int:
                 (run_id,),
             )
             count = cur.rowcount
+            cur.execute("UPDATE ingestion_runs SET finished_at=NULL WHERE id=%s", (run_id,))
         conn.commit()
     return count
 
@@ -86,12 +85,17 @@ def claim_next_task(run_id: int) -> dict | None:
             raise
 
 
-def finish_task(task_id: int, *, error: str | None = None) -> None:
+def finish_task(task_id: int, *, error: str | None = None, interrupted: bool = False) -> None:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE ingestion_tasks SET status=%s, last_error=%s, finished_at=%s WHERE id=%s",
-                ("failed" if error else "done", error[:2000] if error else None, _now(), task_id),
+                (
+                    "pending" if interrupted else "failed" if error else "done",
+                    error[:2000] if error else None,
+                    _now(),
+                    task_id,
+                ),
             )
         conn.commit()
 
@@ -160,5 +164,12 @@ def requeue_failed(run_id: int) -> int:
                 (run_id,),
             )
             count = cur.rowcount
+            cur.execute("UPDATE ingestion_runs SET finished_at=NULL WHERE id=%s", (run_id,))
         conn.commit()
     return count
+
+
+def get_run(run_id):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM ingestion_runs WHERE id=%s", (run_id,))
+        return cur.fetchone()

@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass, field
 
 from ..core.exceptions import ContractError
-from .common import as_list, to_date
+from .common import money, require_rows, to_date
 
 # Ratio metrics carry a single value per fiscal year (no Ly/Pc pair), so they
 # are promoted to typed columns on financial_statements.
@@ -56,9 +56,9 @@ def _split_items(row: dict) -> list[dict]:
 
     items = []
     for base in sorted(bases):
-        amount = row.get(base)
-        amount_ly = row.get(f"{base}Ly")
-        pct = row.get(f"{base}Pc")
+        amount = money(row.get(base))
+        amount_ly = money(row.get(f"{base}Ly"))
+        pct = money(row.get(f"{base}Pc"))
         if amount is None and amount_ly is None and pct is None:
             continue
         items.append(
@@ -80,7 +80,7 @@ def normalize_statements(data: object) -> list[FinancialStatement]:
         raise ContractError("Financial response is missing 'finStatementDailyDtos'")
 
     statements = []
-    for row in as_list(data.get("finStatementDailyDtos")):
+    for row in require_rows(data.get("finStatementDailyDtos"), "fiscalYear"):
         fiscal_year = row.get("fiscalYear")
         if not fiscal_year:
             continue
@@ -93,7 +93,7 @@ def normalize_statements(data: object) -> list[FinancialStatement]:
                 business_size_code=row.get("businessSizeCode"),
                 business_size_desc=row.get("businessSizeDesc"),
                 update_date=to_date(row.get("updateDate")),
-                ratios={column: row.get(source) for source, column in _RATIO_COLUMNS.items()},
+                ratios={column: money(row.get(source)) for source, column in _RATIO_COLUMNS.items()},
                 items=_split_items(row),
             )
         )
@@ -179,6 +179,6 @@ def normalize_submissions(data: object) -> list[dict]:
             "status_code": row.get("statusCode"),
             "update_date": to_date(row.get("updateDate")),
         }
-        for row in as_list(data)
+        for row in require_rows(data, "submitYear")
         if row.get("submitYear") is not None
     ]

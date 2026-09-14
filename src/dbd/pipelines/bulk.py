@@ -93,7 +93,7 @@ def process(run_id: int, parts: list[str], limit: int | None = None, *, verbose:
                 print(f"  [{processed}] {code} ok")
         except KeyboardInterrupt:
             # Leave it pending so the next run retries it cleanly.
-            finish_task(task["id"], error="interrupted")
+            finish_task(task["id"], error="interrupted", interrupted=True)
             raise
         except Exception as exc:
             finish_task(task["id"], error=f"{type(exc).__name__}: {exc}")

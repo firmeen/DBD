@@ -13,3 +13,9 @@ data/export/
 .DS_Store
 Thumbs.db
 company_profile_*.json
+
+*.egg-info/
+build/
+dist/
+.coverage
+pytest-cache-files-*/

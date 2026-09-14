@@ -66,9 +66,7 @@ COMPANY_COLUMNS: tuple[str, ...] = (
 )
 
 # first_seen_at is intentionally absent: it must survive later refreshes.
-_COMPANY_UPDATE_COLUMNS = tuple(
-    c for c in COMPANY_COLUMNS if c not in ("jp_no", "first_seen_at")
-)
+_COMPANY_UPDATE_COLUMNS = tuple(c for c in COMPANY_COLUMNS if c not in ("jp_no", "first_seen_at"))
 
 # These always take the incoming value — they describe the write, not the company.
 _ALWAYS_OVERWRITE = {"latest_raw_response_id", "last_seen_at", "jp_type_code"}
@@ -128,7 +126,7 @@ def company_values(profile: CompanyProfile, raw_response_id: int, requested_at: 
     )
 
 
-def company_upsert_sql() -> str:
+def company_upsert_sql(present_fields: set[str] | None = None) -> str:
     """Merge rather than overwrite.
 
     The same company arrives from two sources of different richness: a search
@@ -139,7 +137,9 @@ def company_upsert_sql() -> str:
     """
     placeholders = ", ".join(["%s"] * len(COMPANY_COLUMNS))
     assignments = ", ".join(
-        f"{c} = VALUES({c})" if c in _ALWAYS_OVERWRITE else f"{c} = COALESCE(VALUES({c}), {c})"
+        f"{c} = VALUES({c})"
+        if c in _ALWAYS_OVERWRITE or (present_fields is not None and c in present_fields)
+        else f"{c} = COALESCE(VALUES({c}), {c})"
         for c in _COMPANY_UPDATE_COLUMNS
     )
     return (
@@ -167,10 +167,9 @@ def bulk_upsert_companies(cur, profiles, raw_response_id: int, requested_at: dat
 
 def find_submit_fin_year(jp_no: str) -> str | None:
     """The profile's `submitFinYear` ("2568 2567 ...") as already stored."""
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT submit_fin_year FROM companies WHERE jp_no = %s", (jp_no,))
-            row = cur.fetchone()
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT submit_fin_year FROM companies WHERE jp_no = %s", (jp_no,))
+        row = cur.fetchone()
     return row["submit_fin_year"] if row else None
 
 
@@ -212,7 +211,7 @@ def save_company_profile(
                 raw_response_id = int(cur.lastrowid)
 
                 cur.execute(
-                    company_upsert_sql(),
+                    company_upsert_sql(profile.present_fields),
                     company_values(profile, raw_response_id, requested_at),
                 )
 
@@ -224,7 +223,7 @@ def save_company_profile(
                         ) VALUES (%s, %s, %s, %s)
                         """,
                         [
-                            (raw_response_id, profile.jp_no, key, None if value is None else str(value))
+                            (raw_response_id, profile.jp_no, key, None if value is None else _json(value))
                             for key, value in profile.facts.items()
                         ],
                     )

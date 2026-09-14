@@ -1,16 +1,21 @@
-$ErrorActionPreference = "Stop"
-
-if (-not (Test-Path ".venv")) {
-    py -m venv .venv
+param([switch]$Dev, [switch]$InstallCommand)
+$ErrorActionPreference = 'Stop'
+$dbdRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+Push-Location -LiteralPath $dbdRoot
+try {
+    if (-not (Test-Path -LiteralPath '.venv\Scripts\python.exe')) {
+        py -m venv .venv
+        if ($LASTEXITCODE -ne 0) { throw 'Virtual environment creation failed.' }
+    }
+    $dbdPackage = if ($Dev) { '.[dev]' } else { '.' }
+    & .\.venv\Scripts\python.exe -m pip install -c requirements.lock -e $dbdPackage
+    if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+    if (-not (Test-Path -LiteralPath '.env')) {
+        Copy-Item -LiteralPath '.env.example' -Destination '.env'
+        Write-Host 'Created .env. Set DB_PASSWORD before connecting.'
+    }
+    if ($InstallCommand) { & .\scripts\install-command.ps1 }
+    Write-Host 'Bootstrap complete. Run dbd-data migrate with schema privileges.'
+} finally {
+    Pop-Location
 }
-
-& .\.venv\Scripts\python.exe -m pip install --upgrade pip
-& .\.venv\Scripts\python.exe -m pip install -e .
-
-if (-not (Test-Path ".env")) {
-    Copy-Item ".env.example" ".env"
-    Write-Host "Created .env from .env.example. Edit DB_PASSWORD before running."
-}
-
-Write-Host "Bootstrap complete."
-Write-Host "Activate with: .\.venv\Scripts\Activate.ps1"

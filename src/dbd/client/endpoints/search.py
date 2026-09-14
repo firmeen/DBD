@@ -2,6 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from ...contracts.common import as_list
+from ...core.exceptions import ContractError
+
 SEARCH_PATH = "/api/v1/company-profiles/infos"
 SEARCH_REFERER = "https://datawarehouse.dbd.go.th/juristic/searchInfo"
 
@@ -76,8 +79,19 @@ def parse_search_response(data: object) -> SearchPage:
     if not isinstance(data, dict):
         raise TypeError(f"Expected a JSON object from search, got {type(data).__name__}")
 
-    meta = data.get("meta") or {}
-    rows = data.get("contents") or []
+    meta = data.get("meta")
+    if (
+        not isinstance(meta, dict)
+        or any(k not in meta for k in ("totalItems", "totalPages", "currentPage"))
+        or "contents" not in data
+    ):
+        raise ContractError("Search response is missing pagination metadata or contents")
+    for key in ("totalItems", "totalPages", "currentPage"):
+        if isinstance(meta[key], bool) or not isinstance(meta[key], int) or meta[key] < 0:
+            raise ContractError(f"Invalid search metadata: {key}")
+    if meta["totalItems"] > 0 and meta["totalPages"] < 1:
+        raise ContractError("Nonempty search has no pages")
+    rows = as_list(data["contents"])
 
     return SearchPage(
         total_items=int(meta.get("totalItems") or 0),

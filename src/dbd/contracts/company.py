@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import date
+from decimal import Decimal
 
 from ..core.exceptions import ContractError
-from .common import as_list, to_date
+from .common import as_list, money, require_rows, to_date
+from .identity import identity
 
 # Top-level scalar fields promoted to dedicated `companies` columns because
 # they're used for identity, search, or business calculations. Everything
@@ -79,10 +81,10 @@ class CompanyProfile:
     reg_date: date | None = None
     stat_change_date: date | None = None
     update_date: date | None = None
-    cap_amt: float | None = None
-    paid_amt: float | None = None
-    share_qty: float | None = None
-    share_vol: float | None = None
+    cap_amt: Decimal | None = None
+    paid_amt: Decimal | None = None
+    share_qty: Decimal | None = None
+    share_vol: Decimal | None = None
     business_size_code: str | None = None
     business_type_code: str | None = None
     business_type_desc: str | None = None
@@ -96,12 +98,13 @@ class CompanyProfile:
     submit_obj_name_keyin: str | None = None
     ampur_desc: str | None = None
     tumbon_desc: str | None = None
-    total_asset: float | None = None
-    total_equity: float | None = None
-    total_income: float | None = None
-    net_profit: float | None = None
+    total_asset: Decimal | None = None
+    total_equity: Decimal | None = None
+    total_income: Decimal | None = None
+    net_profit: Decimal | None = None
     submit_fin_year: str | None = None
     facts: dict = field(default_factory=dict)
+    present_fields: set[str] = field(default_factory=set)
 
 
 _to_date = to_date
@@ -118,6 +121,19 @@ def validate(data: object) -> dict:
     if missing:
         raise ContractError(f"Company profile response is missing required field(s): {missing}")
 
+    identity(data["jpNo"], data["jpTypeCode"])
+    for key in (
+        "locationProvince",
+        "jpStatus",
+        "jpType",
+        "businessType",
+        "setupObjType",
+        "submitObjType",
+        "locationAmpur",
+        "locationTumbon",
+    ):
+        if data.get(key) is not None and not isinstance(data[key], dict):
+            raise ContractError(f"Expected object or null for {key}")
     return data
 
 
@@ -161,10 +177,10 @@ def normalize(data: dict) -> CompanyProfile:
         reg_date=_to_date(data.get("regDate")),
         stat_change_date=_to_date(data.get("statChangeDate")),
         update_date=_to_date(data.get("updateDate")),
-        cap_amt=data.get("capAmt"),
-        paid_amt=data.get("paidAmt"),
-        share_qty=data.get("shareQty"),
-        share_vol=data.get("shareVol"),
+        cap_amt=money(data.get("capAmt")),
+        paid_amt=money(data.get("paidAmt")),
+        share_qty=money(data.get("shareQty")),
+        share_vol=money(data.get("shareVol")),
         business_size_code=data.get("businessSizeCode"),
         business_type_code=data.get("businessTypeCode"),
         business_type_desc=business_type.get("businessTypeDesc"),
@@ -178,18 +194,62 @@ def normalize(data: dict) -> CompanyProfile:
         submit_obj_name_keyin=data.get("submitObjNameKeyin"),
         ampur_desc=location_ampur.get("ampurDesc"),
         tumbon_desc=location_tumbon.get("tumbonDesc"),
-        total_asset=data.get("totalAsset"),
-        total_equity=data.get("totalEquity"),
-        total_income=data.get("totalIncome"),
-        net_profit=data.get("netProfit"),
+        total_asset=money(data.get("totalAsset")),
+        total_equity=money(data.get("totalEquity")),
+        total_income=money(data.get("totalIncome")),
+        net_profit=money(data.get("netProfit")),
         submit_fin_year=data.get("submitFinYear"),
     )
 
-    profile.facts = {
-        key: value
-        for key, value in data.items()
-        if key not in _PROMOTED_FIELDS and not isinstance(value, (dict, list))
+    sources = {
+        "jp_name": "jpName",
+        "jp_name_e": "jpNameE",
+        "jp_search_name": "jpSearchName",
+        "jp_stat_code": "jpStatCode",
+        "address": "address",
+        "address_e": "addressE",
+        "ampur_code": "ampurCode",
+        "tumbon_code": "tumbonCode",
+        "pv_code": "pvCode",
+        "zip_code": "zipCode",
+        "phone_no": "phoneNo",
+        "email": "email",
+        "website_1": "webSite1",
+        "website_2": "webSite2",
+        "website_3": "webSite3",
+        "website_4": "webSite4",
+        "reg_date": "regDate",
+        "stat_change_date": "statChangeDate",
+        "update_date": "updateDate",
+        "cap_amt": "capAmt",
+        "paid_amt": "paidAmt",
+        "share_qty": "shareQty",
+        "share_vol": "shareVol",
+        "business_size_code": "businessSizeCode",
+        "business_type_code": "businessTypeCode",
+        "setup_obj_code": "setupObjCode",
+        "setup_obj_name_keyin": "setupObjNameKeyin",
+        "submit_obj_code": "submitObjCode",
+        "submit_obj_name_keyin": "submitObjNameKeyin",
+        "total_asset": "totalAsset",
+        "total_equity": "totalEquity",
+        "total_income": "totalIncome",
+        "net_profit": "netProfit",
+        "submit_fin_year": "submitFinYear",
+        "jp_stat_desc": "jpStatus",
+        "jp_type_desc": "jpType",
+        "pv_desc": "locationProvince",
+        "business_type_desc": "businessType",
+        "setup_obj_desc": "setupObjType",
+        "setup_obj_grp_code": "setupObjType",
+        "setup_obj_grp_desc": "setupObjType",
+        "submit_obj_desc": "submitObjType",
+        "ampur_desc": "locationAmpur",
+        "tumbon_desc": "locationTumbon",
     }
+    profile.present_fields = {column for column, source in sources.items() if source in data}
+
+    profile.facts = {key: value for key, value in data.items() if key not in _PROMOTED_FIELDS}
 
     return profile
 
@@ -228,7 +288,7 @@ def normalize_committees(data: object) -> list[dict]:
             "phone_no": _blank(row.get("phoneNo")),
             "update_date": to_date(row.get("updateDate")),
         }
-        for row in as_list(data)
+        for row in require_rows(data, "cmtSeq")
         if row.get("cmtSeq") is not None
     ]
 
@@ -240,14 +300,24 @@ def normalize_committee_signs(data: object) -> list[dict]:
             "sign_description": _blank(row.get("signDescription")),
             "sign_description_e": _blank(row.get("signDescriptionE")),
         }
-        for row in as_list(data)
+        for row in require_rows(data, "signSeq")
         if row.get("signSeq") is not None
     ]
 
 
 def normalize_nations(data: object) -> list[dict]:
     rows = []
+    details = []
     for row in as_list(data):
+        nationality = row.get("nationality")
+        if nationality is not None and not isinstance(nationality, dict):
+            raise ContractError("Expected a nationality object")
+        # DBD appends an aggregate, not a country: observed code WORLD2.
+        # Keep it in the archive; other missing keys remain contract errors.
+        if row.get("ntCode") is None and (nationality or {}).get("ntCode") == "WORLD2":
+            continue
+        details.append(row)
+    for row in require_rows(details, "ntCode"):
         nt_code = row.get("ntCode")
         if not nt_code:
             continue
@@ -280,7 +350,7 @@ def normalize_name_history(data: object) -> list[dict]:
             "seq_desc_e": _blank(row.get("seqDescE")),
             "update_date": to_date(row.get("updateDate")),
         }
-        for row in as_list(data)
+        for row in require_rows(data, "seqNo")
         if row.get("seqNo") is not None
     ]
 
@@ -298,7 +368,7 @@ def normalize_capital_history(data: object) -> list[dict]:
             "seq_desc_e": _blank(row.get("seqDescE")),
             "update_date": to_date(row.get("updateDate")),
         }
-        for row in as_list(data)
+        for row in require_rows(data, "seqNo")
         if row.get("seqNo") is not None
     ]
 
@@ -353,16 +423,7 @@ def normalize_transformations(data: object) -> list[dict]:
     return rows
 
 
-def _money(value: object) -> float | None:
-    """Chart series return formatted strings like "2,525,000,000.00"."""
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    try:
-        return float(str(value).replace(",", "").strip())
-    except ValueError:
-        return None
+_money = money
 
 
 def normalize_nation_history(data: object) -> list[dict]:
@@ -384,7 +445,9 @@ def normalize_nation_history(data: object) -> list[dict]:
                     "fiscal_year": str(label),
                     "nation_group": group,
                     "share_amt": _money(point.get("shareAmt")),
-                    "share_pct": _money(point.get("sharePctVol")) or point.get("y"),
+                    "share_pct": _money(point["sharePctVol"])
+                    if point.get("sharePctVol") is not None
+                    else _money(point.get("y")),
                 }
             )
     return rows

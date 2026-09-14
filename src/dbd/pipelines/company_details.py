@@ -5,9 +5,16 @@ from datetime import datetime, timezone
 from hashlib import sha256
 
 from ..client import DbdClient
-from ..client.endpoints.companies import collection_path, get_collection, split_company_code
+from ..client.endpoints.companies import (
+    collection_path,
+    get_collection,
+    split_company_code,
+)
 from ..contracts.company import COLLECTION_NORMALIZERS
-from ..storage.mysql.repositories.company_detail_repository import RESOURCES, save_collection
+from ..storage.mysql.repositories.company_detail_repository import (
+    RESOURCES,
+    save_collection,
+)
 
 
 def run_one(client: DbdClient, company_code: str, resource: str) -> tuple[int, int]:

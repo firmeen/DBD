@@ -50,7 +50,11 @@ class DbdClient:
 
         data = response.json()
 
-        if response.headers.get("x-encrypted", "").lower() == "true" and isinstance(data, dict) and "ct" in data:
+        if (
+            response.headers.get("x-encrypted", "").lower() == "true"
+            and isinstance(data, dict)
+            and "ct" in data
+        ):
             try:
                 data = decrypt_envelope(data, path, token)
             except DbdTokenExpiredError:
@@ -59,7 +63,11 @@ class DbdClient:
                 self._auth.invalidate()
                 return self.get(path, params, _retried=True)
 
-        if response.headers.get("x-wrapped", "").lower() == "true" and isinstance(data, dict) and "data" in data:
+        if (
+            response.headers.get("x-wrapped", "").lower() == "true"
+            and isinstance(data, dict)
+            and "data" in data
+        ):
             data = data["data"]
 
         time.sleep(settings.dbd_request_delay_seconds)

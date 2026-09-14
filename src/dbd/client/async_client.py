@@ -1,83 +1,109 @@
 from __future__ import annotations
 
 import asyncio
-import random
+import json
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from decimal import Decimal
+from email.utils import parsedate_to_datetime
 
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException as RequestsError
+from tenacity import (
+    AsyncRetrying,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random_exponential,
+)
 
 from ..core.exceptions import DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
+from ..core.telemetry import LATENCY, REQUESTS
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
 from .rate_limit import TokenBucket
 from .session import WARMUP_PAGE_URL, create_session
 
-_RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+
+class TransientHttpError(RuntimeError):
+    pass
+
+
+class PermanentHttpError(ValueError):
+    pass
+
+
+@dataclass
+class ApiResponse:
+    data: object
+    status: int
+    requested_at: datetime
+    received_at: datetime
+
+
+def retry_after(value: str | None) -> float:
+    if not value:
+        return 1.0
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        try:
+            return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+        except (ValueError, TypeError, OverflowError):
+            return 1.0
 
 
 class AsyncDbdClient:
-    """Concurrent DBD client for bulk work.
-
-    The sync DbdClient stays the right tool for one company. This exists for
-    the enumeration workload, where the cost is dominated by waiting on the
-    network: measured at ~0.12 s/request with 10 in flight versus ~1.1 s/request
-    sequentially.
-
-    Three things keep it polite rather than merely fast:
-      - one global TokenBucket caps requests/second across every worker,
-      - a Semaphore caps how many are in flight at once,
-      - a 429/503 permanently reduces the rate instead of just retrying into it.
-    """
-
-    def __init__(
-        self,
-        *,
-        concurrency: int | None = None,
-        rate_per_second: float | None = None,
-        max_retries: int = 4,
-    ) -> None:
-        self.concurrency = concurrency or settings.dbd_concurrency
-        self.rate = TokenBucket(rate_per_second or settings.dbd_rate_per_second)
-        self.max_retries = max_retries
-
+    def __init__(self, *, concurrency=None, rate_per_second=None, max_retries=None):
+        self.concurrency = settings.dbd_concurrency if concurrency is None else concurrency
+        if self.concurrency < 1:
+            raise ValueError("concurrency must be positive")
+        self.rate = TokenBucket(settings.dbd_rate_per_second if rate_per_second is None else rate_per_second)
+        self.max_retries = settings.dbd_http_retries if max_retries is None else max_retries
         self._semaphore = asyncio.Semaphore(self.concurrency)
-        self._session: AsyncSession | None = None
         self._auth = DbdAuth()
         self._auth_lock = asyncio.Lock()
-        self._token: str | None = None
+        self._token = None
+        self._session = None
+        self._auth_session = None
+        self.requests_made = self.retries_made = self.rate_limit_hits = 0
 
-        self.requests_made = 0
-        self.retries_made = 0
-        self.rate_limit_hits = 0
-
-    async def __aenter__(self) -> "AsyncDbdClient":
-        self._session = AsyncSession(impersonate="chrome")
-        await self._ensure_token()
+    async def __aenter__(self):
+        self._session = AsyncSession(impersonate="chrome", max_clients=self.concurrency)
+        self._auth_session = create_session()
+        try:
+            await self._ensure_token()
+        except BaseException:
+            await self.__aexit__()
+            raise
         return self
 
-    async def __aexit__(self, *exc_info) -> None:
+    async def __aexit__(self, *args):
         if self._session is not None:
             await self._session.close()
             self._session = None
+        if self._auth_session is not None:
+            self._auth_session.close()
+            self._auth_session = None
 
-    async def _ensure_token(self, *, force: bool = False) -> str:
+    async def _ensure_token(self, *, rejected=None, force=False):
         async with self._auth_lock:
-            if force:
+            # A rejected OLD token must not invalidate a refresh already done
+            # by another coroutine.
+            if force or (rejected is not None and rejected == self._token):
                 self._auth.invalidate()
                 self._token = None
-
-            if self._token is None:
-                # The handshake (warm-up cookies + /api/refresh) is proven on the
-                # sync session; run it in a thread rather than reimplementing it.
+            if self._token is None or time.time() >= self._auth._expires_at - 15:
                 self._token = await asyncio.to_thread(self._blocking_token)
-
+                if self._session is not None and self._auth_session is not None:
+                    self._session.cookies.update(self._auth_session.cookies)
             return self._token
 
-    def _blocking_token(self) -> str:
-        session = create_session()
-        return self._auth.get_token(session)
+    def _blocking_token(self):
+        return self._auth.get_token(self._auth_session)
 
-    def _headers(self, token: str, referer: str) -> dict:
+    def _headers(self, token, referer):
         return {
             "Accept": "application/json",
             "Content-Type": "application/json",
@@ -89,95 +115,80 @@ class AsyncDbdClient:
             "Sec-Fetch-Site": "same-origin",
         }
 
-    async def request(
-        self,
-        method: str,
-        path: str,
-        *,
-        json_body: dict | None = None,
-        params: dict | None = None,
-        referer: str = WARMUP_PAGE_URL,
-        timeout: int | None = None,
-    ) -> object:
-        """One authenticated, rate-limited, decrypted request with retries."""
-        assert self._session is not None, "use `async with AsyncDbdClient(...)`"
-
-        url = settings.dbd_base_url + path
-        timeout = timeout or settings.request_timeout
-        last_error: Exception | None = None
-
-        for attempt in range(self.max_retries + 1):
-            token = await self._ensure_token()
-
-            await self.rate.acquire()
-            async with self._semaphore:
-                try:
-                    response = await self._session.request(
-                        method,
-                        url,
-                        json=json_body,
-                        params=params,
-                        headers=self._headers(token, referer),
-                        timeout=timeout,
-                    )
-                    self.requests_made += 1
-                except Exception as exc:  # network/timeout
-                    last_error = exc
+    async def fetch(
+        self, method, path, *, json_body=None, params=None, referer=WARMUP_PAGE_URL, timeout=None
+    ):
+        if self._session is None:
+            raise RuntimeError("Use async with AsyncDbdClient")
+        retry = AsyncRetrying(
+            stop=stop_after_attempt(self.max_retries + 1),
+            wait=wait_random_exponential(multiplier=1, max=30),
+            retry=retry_if_exception_type(
+                (TransientHttpError, DbdTokenExpiredError, RequestsError, TimeoutError)
+            ),
+            reraise=True,
+        )
+        async for attempt in retry:
+            with attempt:
+                if attempt.retry_state.attempt_number > 1:
                     self.retries_made += 1
-                    await self._backoff(attempt)
-                    continue
+                async with self._semaphore:
+                    await self.rate.acquire()
+                    token = await self._ensure_token()
+                    requested = datetime.now(timezone.utc).replace(tzinfo=None)
+                    self.requests_made += 1
+                    with LATENCY.time():
+                        try:
+                            response = await self._session.request(
+                                method,
+                                settings.dbd_base_url.rstrip("/") + path,
+                                json=json_body,
+                                params=params,
+                                headers=self._headers(token, referer),
+                                timeout=timeout or settings.request_timeout,
+                            )
+                        except (RequestsError, TimeoutError):
+                            REQUESTS.labels("network_error").inc()
+                            raise
+                    status = response.status_code
+                    REQUESTS.labels(str(status)).inc()
+                    if status in (429, 503):
+                        self.rate_limit_hits += 1
+                        self.rate.slow_down()
+                        self.rate.cooldown(retry_after(response.headers.get("retry-after")))
+                    if status == 401:
+                        await self._ensure_token(rejected=token)
+                        raise TransientHttpError("HTTP 401")
+                    if status == 403:
+                        raise DbdForbiddenError("HTTP 403")
+                    if status in (429, 500, 502, 503, 504):
+                        raise TransientHttpError(f"HTTP {status}")
+                    if status >= 400:
+                        raise PermanentHttpError(f"HTTP {status}")
+                    try:
+                        data = self._decode(response, path, token)
+                    except DbdTokenExpiredError:
+                        await self._ensure_token(rejected=token)
+                        raise
+                    return ApiResponse(
+                        data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
+                    )
 
-            status = response.status_code
-
-            if status == 401:
-                await self._ensure_token(force=True)
-                self.retries_made += 1
-                continue
-
-            if status == 403:
-                raise DbdForbiddenError(f"403 Forbidden: {path}")
-
-            if status in _RETRYABLE_STATUS:
-                self.rate_limit_hits += 1
-                self.retries_made += 1
-                if status in (429, 503):
-                    self.rate.slow_down()
-                await self._backoff(attempt, response.headers.get("retry-after"))
-                continue
-
-            if status >= 400:
-                raise RuntimeError(f"HTTP {status} for {path}: {response.text[:200]}")
-
-            return self._decode(response, path, token)
-
-        raise RuntimeError(f"{path} failed after {self.max_retries} retries: {last_error}")
-
-    async def _backoff(self, attempt: int, retry_after: str | None = None) -> None:
-        if retry_after:
-            try:
-                await asyncio.sleep(max(1.0, float(retry_after)))
-                return
-            except ValueError:
-                pass
-        # Exponential with jitter, so concurrent workers do not retry in lockstep.
-        await asyncio.sleep(min(30.0, (2**attempt) * (0.5 + random.random())))
-
-    def _decode(self, response, path: str, token: str) -> object:
-        data = response.json()
-
-        if response.headers.get("x-encrypted", "").lower() == "true" and isinstance(data, dict) and "ct" in data:
-            try:
-                data = decrypt_envelope(data, path, token)
-            except DbdTokenExpiredError:
-                raise
-
-        if response.headers.get("x-wrapped", "").lower() == "true" and isinstance(data, dict) and "data" in data:
+    def _decode(self, response, path, token):
+        data = json.loads(response.content, parse_float=Decimal)
+        if response.headers.get("x-encrypted", "").lower() == "true":
+            data = decrypt_envelope(data, path, token)
+        if response.headers.get("x-wrapped", "").lower() == "true":
+            if not isinstance(data, dict) or "data" not in data:
+                raise ValueError("Malformed wrapped response")
             data = data["data"]
-
         return data
 
-    async def get(self, path: str, params: dict | None = None, **kw) -> object:
-        return await self.request("GET", path, params=params, **kw)
+    async def request(self, method, path, **kwargs):
+        return (await self.fetch(method, path, **kwargs)).data
 
-    async def post(self, path: str, json_body: dict, **kw) -> object:
-        return await self.request("POST", path, json_body=json_body, **kw)
+    async def get(self, path, params=None, **kwargs):
+        return await self.request("GET", path, params=params, **kwargs)
+
+    async def post(self, path, json_body, **kwargs):
+        return await self.request("POST", path, json_body=json_body, **kwargs)
