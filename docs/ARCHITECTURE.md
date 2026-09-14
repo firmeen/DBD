@@ -105,6 +105,63 @@ one pipeline, because there is currently one verified endpoint
 gets reverse-engineered (financials, shareholders-by-nationality, change
 history), not to build out the shape in advance.
 
+## Two clients, on purpose
+
+`client/client.py` (sync) serves one company at a time: simple, and the right
+shape for `fetch-company`. `client/async_client.py` serves the enumeration
+workload, where the cost is almost entirely waiting on the network.
+
+```text
+sync    ~1.1 s/request   (sequential + a fixed per-request delay)
+async   ~0.12 s/request  (10 in flight, one global token bucket)
+```
+
+Both share `auth`, `crypto` and `session`, so there is one implementation of
+the handshake and one of the decryption. The async client obtains its token by
+running the proven sync handshake in a thread rather than reimplementing it.
+
+Politeness is structural, not incidental:
+
+- one `TokenBucket` caps requests/second for the whole process, which a
+  per-request `sleep` cannot express across N workers;
+- a `Semaphore` caps how many requests are in flight;
+- 429/503 permanently lowers the rate (`slow_down`) instead of retrying into
+  a service that is already asking for less traffic;
+- backoff is exponential with jitter, so workers do not retry in lockstep.
+
+## Discovery, and why it is bounded
+
+The search endpoint returns the same field set as the profile endpoint, so one
+page yields ten complete company rows. That makes a million companies cost
+~100k requests instead of ~1M.
+
+It is bounded by backend limits rather than by our choices: `itemsPerPage` is
+locked at 10, `currentPage` stops at 1000, and a keyword of at least three
+characters is mandatory. One query therefore tops out at 10,000 rows, and
+anything larger has to be partitioned (jpType, then province, then business
+size) until every leaf fits.
+
+Every split records whether `SUM(children) == parent`. That check is the only
+thing standing between "we partitioned" and "we partitioned without losing
+rows", so its result is stored (`discovery_buckets.partition_lossless`) rather
+than assumed, and a failing split is surfaced by `discover-status`.
+
+Completeness is deliberately not claimed anywhere in the schema or the CLI
+output. Search matches broadly, buckets can overlap, and seeds may not reach
+every company; dedup is on `(jp_type_code, jp_no)` and coverage is reported as
+what was seen.
+
+## Merging two sources of different richness
+
+The same company arrives from search (~27 populated fields) and from the
+profile endpoint (~68). A plain `col = VALUES(col)` upsert let a later search
+page erase `regDate`, `submitFinYear`, `paidAmt` and every financial ratio the
+profile had already supplied — a real regression, caught by diffing the two
+payloads. `company_upsert_sql()` now merges with `COALESCE`, so a NULL from
+the thinner source never overwrites a known value. Only the columns that
+describe the write itself (`latest_raw_response_id`, `last_seen_at`) are
+unconditionally overwritten.
+
 ## Explicitly deferred (add when the need actually shows up, not before)
 
 - **Alembic migrations** — plain numbered `sql/NNN_*.sql` files are enough

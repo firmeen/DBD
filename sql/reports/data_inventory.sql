@@ -35,6 +35,7 @@
      ส่วนที่ 12 ตรวจสอบคุณภาพข้อมูล
      ส่วนที่ 13 ข้อจำกัด / สิ่งที่ยังไม่ได้ดึง  (อ่านก่อนรายงานหัวหน้า)
      ส่วนที่ 14 สถานะการดึงข้อมูลแบบ bulk (resume ได้)
+     ส่วนที่ 15 Discovery: การกวาดรายชื่อบริษัทระดับล้านราย + ความครบถ้วน
    ========================================================================== */
 
 USE dbd;
@@ -598,3 +599,69 @@ WHERE t.status = 'failed'
 ORDER BY t.run_id DESC, t.id;
 
 /* สั่งลองใหม่เฉพาะตัวที่ล้มเหลว:  dbd-data bulk-retry <run_id>  */
+
+
+/* ============================================================================
+   ส่วนที่ 15 — Discovery: การกวาดรายชื่อบริษัทเป็นล้านราย
+   ----------------------------------------------------------------------------
+   ข้อจำกัดจากฝั่ง DBD ที่ระบบถูกออกแบบมารองรับ:
+     - itemsPerPage ถูกล็อคที่ 10 (ส่งค่ามากกว่านี้ไปก็ไม่มีผล)
+     - currentPage สูงสุด 1000  ->  1 query ได้ไม่เกิน 10,000 แถว
+     - ต้องมี keyword อย่างน้อย 3 ตัวอักษร (ยิง filter เปล่า ๆ ได้ 400)
+
+   ดังนั้น bucket ไหนเกิน 10,000 ต้องถูกซอย (jpType -> จังหวัด -> ขนาดธุรกิจ)
+   และทุกครั้งที่ซอย ระบบจะเช็คว่า SUM(ลูก) == พ่อ หรือไม่ แล้วบันทึกผลไว้
+   ========================================================================== */
+
+SELECT
+    status                       AS `สถานะ`,
+    COUNT(*)                     AS `จำนวน bucket`,
+    SUM(COALESCE(rows_seen, 0))  AS `แถวที่ดึงมาได้`
+FROM discovery_buckets
+GROUP BY status
+ORDER BY FIELD(status,'pending','counted','draining','done','split','failed');
+
+/* ความคืบหน้าโดยรวม + จำนวนบริษัทที่ไม่ซ้ำกัน */
+SELECT
+    (SELECT COUNT(*) FROM discovery_sightings)                            AS `บริษัทไม่ซ้ำ`,
+    (SELECT COALESCE(SUM(rows_seen),0) FROM discovery_buckets)            AS `แถวที่ดึงทั้งหมด`,
+    (SELECT COUNT(*) FROM discovery_buckets)                              AS `bucket ทั้งหมด`,
+    (SELECT COUNT(*) FROM discovery_buckets WHERE status='done')          AS `เสร็จแล้ว`,
+    (SELECT COUNT(*) FROM discovery_buckets
+       WHERE status IN ('pending','counted','draining'))                  AS `ยังค้าง`,
+    (SELECT COUNT(*) FROM discovery_buckets WHERE partition_lossless = 0) AS `การซอยที่ยอดไม่ตรง`;
+
+/* ===== จุดที่ต้องระวังก่อนเคลมกับหัวหน้า =====
+   ถ้าคอลัมน์ "การซอยที่ยอดไม่ตรง" > 0 แปลว่ามี bucket ที่ SUM(ลูก) != พ่อ
+   ห้ามเคลมว่าข้อมูลใต้ bucket นั้นครบ 100%  ดู query ถัดไป */
+
+SELECT
+    b.id                AS `bucket`,
+    b.keyword           AS `keyword`,
+    b.jp_types          AS `jpType`,
+    b.pv_codes          AS `จังหวัด`,
+    b.total_items       AS `ยอดของพ่อ`,
+    (SELECT COALESCE(SUM(c.total_items),0) FROM discovery_buckets c WHERE c.parent_id = b.id)
+                        AS `ยอดรวมของลูก`,
+    b.partition_lossless AS `ยอดตรงหรือไม่ (1=ตรง)`
+FROM discovery_buckets b
+WHERE b.status = 'split'
+ORDER BY b.partition_lossless IS NULL, b.partition_lossless, b.id;
+
+/* bucket ที่ดึงไม่สำเร็จ / ซอยต่อไม่ได้แล้ว */
+SELECT id AS `bucket`, keyword, jp_types AS `jpType`, pv_codes AS `จังหวัด`,
+       total_items AS `จำนวนแถว`, last_error AS `สาเหตุ`
+FROM discovery_buckets
+WHERE status = 'failed'
+ORDER BY id;
+
+/* ข้อมูลที่ได้จาก discovery "บาง" กว่าการดึง profile รายตัว
+   search คืนค่าจริงราว 27 ฟิลด์ / profile คืนราว 68 ฟิลด์
+   query นี้บอกว่าบริษัทไหนยังมีแต่ข้อมูลจาก search (ควรตามเก็บ profile ต่อ) */
+SELECT
+    COUNT(*)                                                     AS `บริษัททั้งหมด`,
+    SUM(reg_date IS NULL)                                        AS `ยังไม่มีวันจดทะเบียน`,
+    SUM(submit_fin_year IS NULL)                                 AS `ยังไม่มีปีที่ส่งงบ`,
+    SUM(total_asset IS NULL)                                     AS `ยังไม่มีสินทรัพย์รวม`,
+    SUM(jp_no IN (SELECT jp_no FROM financial_statements))       AS `มีงบการเงินแล้ว`
+FROM companies;

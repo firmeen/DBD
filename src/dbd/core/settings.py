@@ -26,5 +26,14 @@ class Settings:
     dbd_max_auth_attempts: int = int(os.getenv("DBD_MAX_AUTH_ATTEMPTS", "4"))
     dbd_request_delay_seconds: float = float(os.getenv("DBD_REQUEST_DELAY_SECONDS", "0.5"))
 
+    # Bulk/async settings. These hit a public government service, so the
+    # defaults are deliberately moderate rather than as fast as possible.
+    dbd_concurrency: int = int(os.getenv("DBD_CONCURRENCY", "15"))
+    dbd_rate_per_second: float = float(os.getenv("DBD_RATE_PER_SECOND", "15"))
+    # Counting a large bucket is slow server-side: keyword "010" matches
+    # ~963k rows and a filtered count on it exceeded 40 s.
+    dbd_count_timeout_seconds: int = int(os.getenv("DBD_COUNT_TIMEOUT_SECONDS", "120"))
+    dbd_write_batch_size: int = int(os.getenv("DBD_WRITE_BATCH_SIZE", "500"))
+
 
 settings = Settings()

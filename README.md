@@ -199,7 +199,69 @@ error and skipped rather than aborting the batch — one bad code does not cost
 the whole run. One auth token is reused across the batch instead of
 re-authenticating per company.
 
-## 8. Verify data
+## 8. Enumerate companies at scale (discovery)
+
+`bulk` walks a list of company codes you already have. `discover` finds the
+companies in the first place, by paging the search endpoint concurrently.
+
+```powershell
+dbd-data discover 65110 --type biz        # one TSIC bucket
+dbd-data discover --seed-file seeds.txt   # many seed keywords
+dbd-data discover                          # resume: pending buckets drive it
+dbd-data discover-status                   # coverage so far
+```
+
+Why this is much cheaper than it looks: a search page returns the **same field
+set as the per-company profile endpoint**, so one request yields ten company
+rows rather than one. Enumerating a million companies costs ~100,000 requests,
+not ~1,000,000.
+
+Measured: **~0.12 s/request with 10 in flight**, versus ~1.1 s/request for the
+sequential path — so ~1.5-3.5 hours for a million companies at the default
+rate, rather than days.
+
+### Limits this design is built around
+
+These are backend-enforced, confirmed against the live service:
+
+| Limit | Value | Consequence |
+| --- | --- | --- |
+| `itemsPerPage` | locked at 10 | larger values are ignored |
+| `currentPage` | max 1000 | one query can never exceed **10,000 rows** |
+| `keyword` | min 3 chars, required | a filters-only request returns HTTP 400 |
+
+So any bucket over 10,000 rows must be split before it can be read. `discover`
+splits by jpType, then province, then business size, and records for every
+split whether `SUM(children) == parent`. A split that does not balance is
+flagged (`partition_lossless = 0`) and reported by `discover-status` rather
+than being silently trusted.
+
+### What it does not claim
+
+Search matches broadly, so buckets can overlap and seed keywords may not cover
+every company. Companies are deduplicated on `(jp_type_code, jp_no)` and
+coverage is reported from what was actually seen. **Do not read the row count
+as "every company in Thailand"** unless the partitions validate and the totals
+are reconciled against an authoritative figure.
+
+### Search vs. profile completeness
+
+A search row populates ~27 fields; a profile fetch populates ~68. Fields such
+as `regDate`, `submitFinYear`, `paidAmt` and the financial ratios come back
+null from search. The upsert therefore **merges** (`COALESCE`) instead of
+overwriting, so running discovery after a profile fetch cannot erase the
+richer data. Run `discover` for breadth, then `fetch-company` / `bulk` for
+depth on the companies you care about.
+
+### Being a good citizen
+
+This is a public government service. Defaults are moderate on purpose
+(`DBD_CONCURRENCY=15`, `DBD_RATE_PER_SECOND=15`), a single token bucket caps
+the whole process rather than per-worker sleeps, and a 429/503 permanently
+reduces the rate instead of retrying into it. Raise them only if you have a
+reason to.
+
+## 9. Verify data
 
 ```sql
 USE dbd;

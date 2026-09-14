@@ -120,6 +120,49 @@ def command_bulk_retry(run_id: int) -> None:
         print(f"now run: dbd-data bulk --run-id {run_id}")
 
 
+def command_discover(
+    seeds: list[str], search_type: str, concurrency: int | None, rate: float | None, max_buckets: int | None
+) -> None:
+    import asyncio
+
+    from ..pipelines import discovery
+
+    result = asyncio.run(
+        discovery.run(
+            seeds,
+            search_type=search_type,
+            concurrency=concurrency,
+            rate=rate,
+            max_buckets=max_buckets,
+        )
+    )
+
+    print(
+        f"\nbuckets {result.buckets_processed}, pages {result.pages_fetched}, "
+        f"companies written {result.companies_written}, requests {result.requests_made}"
+    )
+    command_discover_status()
+
+
+def command_discover_status() -> None:
+    from ..pipelines import discovery
+
+    s = discovery.summary()
+    print("\ndiscovery so far:")
+    print(f"  unique companies : {int(s['unique_companies']):,}")
+    print(f"  rows fetched     : {int(s['rows_fetched']):,}")
+    print(
+        f"  buckets          : {s['buckets']} total "
+        f"({s['buckets_done']} done, {s['buckets_split']} split, "
+        f"{s['buckets_open']} open, {s['buckets_failed']} failed)"
+    )
+    if int(s["partitions_lossy"] or 0):
+        print(
+            f"  WARNING: {s['partitions_lossy']} partition(s) where SUM(children) != parent -"
+            " coverage under those buckets is not provably complete"
+        )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(prog="dbd-data")
     sub = parser.add_subparsers(dest="command", required=True)
@@ -149,6 +192,16 @@ def main() -> None:
     retry_cmd = sub.add_parser("bulk-retry", help="Re-queue a run's failed companies")
     retry_cmd.add_argument("run_id", type=int)
 
+    disc = sub.add_parser("discover", help="Enumerate companies via search (concurrent, resumable)")
+    disc.add_argument("seeds", nargs="*", help="Seed keywords, min 3 chars each (e.g. TSIC codes)")
+    disc.add_argument("--seed-file", help="File with one seed keyword per line")
+    disc.add_argument("--type", default="", help='Search type: "" (normal) or "biz" (TSIC)')
+    disc.add_argument("--concurrency", type=int, help="Requests in flight (default from .env)")
+    disc.add_argument("--rate", type=float, help="Requests per second cap (default from .env)")
+    disc.add_argument("--max-buckets", type=int, help="Stop after N buckets (useful for a trial run)")
+
+    sub.add_parser("discover-status", help="Show discovery coverage so far")
+
     args = parser.parse_args()
 
     if args.command == "check-db":
@@ -161,6 +214,26 @@ def main() -> None:
 
     if args.command == "bulk-retry":
         command_bulk_retry(args.run_id)
+        return
+
+    if args.command == "discover-status":
+        command_discover_status()
+        return
+
+    if args.command == "discover":
+        seeds = list(args.seeds)
+        if args.seed_file:
+            with open(args.seed_file, encoding="utf-8-sig") as handle:
+                seeds += [
+                    line.strip()
+                    for line in handle
+                    if line.strip() and not line.strip().startswith("#")
+                ]
+        # Resuming an existing run needs no seeds: pending buckets drive it.
+        short = [s for s in seeds if len(s) < 3]
+        if short:
+            raise SystemExit(f"Seed keywords must be at least 3 characters: {short}")
+        command_discover(seeds, args.type, args.concurrency, args.rate, args.max_buckets)
         return
 
     if args.command == "bulk":
