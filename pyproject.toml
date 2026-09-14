@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=75"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "dbd-data"
+version = "0.1.0"
+description = "DBD DataWarehouse company data ingestion into MySQL"
+requires-python = ">=3.11"
+dependencies = [
+  "curl_cffi>=0.7,<1",
+  "cryptography>=43,<45",
+  "truststore>=0.10,<1",
+  "browser-cookie3>=0.19,<1",
+  "PyMySQL>=1.1,<2",
+  "python-dotenv>=1.1,<2",
+]
+
+[project.scripts]
+dbd-data = "dbd.cli.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]

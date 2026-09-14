@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.env
+.env.*
+!.env.example
+logs/
+data/raw/
+data/export/
+*.log
+.DS_Store
+Thumbs.db
+company_profile_*.json

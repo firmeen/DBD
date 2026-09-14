@@ -1,0 +1,11 @@
+-- Run as MySQL administrator/root.
+-- Replace the password before executing. Do not commit the real password.
+
+CREATE USER IF NOT EXISTS 'dbd_app'@'localhost'
+  IDENTIFIED BY 'CHANGE_TO_A_STRONG_PASSWORD';
+
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON dbd.*
+  TO 'dbd_app'@'localhost';
+
+SHOW GRANTS FOR 'dbd_app'@'localhost';
