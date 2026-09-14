@@ -246,21 +246,49 @@ def validate_splits(verbose: bool = True) -> int:
 
     checked = 0
     with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT id, total_items FROM discovery_buckets WHERE status = 'split'")
+        # A partition can only be judged once every child has been counted.
+        # Comparing against a partial sum would report a perfectly good split
+        # as lossy, which would discredit the one guarantee this check exists
+        # to provide.
+        cur.execute(
+            """
+            SELECT p.id, p.total_items,
+                   COUNT(c.id)                              AS child_count,
+                   SUM(c.total_items IS NULL)               AS uncounted,
+                   COALESCE(SUM(c.total_items), 0)          AS child_sum
+            FROM discovery_buckets p
+            JOIN discovery_buckets c ON c.parent_id = p.id
+            WHERE p.status = 'split' AND p.total_items IS NOT NULL
+            GROUP BY p.id, p.total_items
+            """
+        )
         rows = cur.fetchall()
 
     for row in rows:
-        parent_total = row["total_items"]
-        if parent_total is None:
+        if int(row["uncounted"] or 0) > 0:
+            if verbose:
+                print(
+                    f"  bucket {row['id']}: {int(row['uncounted'])}/{int(row['child_count'])} "
+                    "child bucket(s) not counted yet - validation deferred"
+                )
             continue
-        children = child_total(int(row["id"]))
-        if children == 0:
-            continue
+
+        parent_total = int(row["total_items"])
+        children = int(row["child_sum"])
         lossless = 1 if children == parent_total else 0
         update_bucket(int(row["id"]), partition_lossless=lossless)
         checked += 1
+
         if verbose and not lossless:
-            print(f"  bucket {row['id']}: SUM(children)={children:,} != parent={parent_total:,}")
+            delta = children - parent_total
+            # The counts are taken at different moments against live data, so a
+            # delta of a row or two usually means a registration changed between
+            # the parent count and the child counts, not a broken partition.
+            # A large delta means the split really is losing or duplicating rows.
+            print(
+                f"  bucket {row['id']}: SUM(children)={children:,} vs parent={parent_total:,} "
+                f"(delta {delta:+,})"
+            )
 
     return checked
 

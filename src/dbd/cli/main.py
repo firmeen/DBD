@@ -158,8 +158,10 @@ def command_discover_status() -> None:
     )
     if int(s["partitions_lossy"] or 0):
         print(
-            f"  WARNING: {s['partitions_lossy']} partition(s) where SUM(children) != parent -"
-            " coverage under those buckets is not provably complete"
+            f"  NOTE: {s['partitions_lossy']} partition(s) where SUM(children) != parent."
+            " Check the delta before drawing conclusions: a row or two is usually"
+            " live data changing between counts, a large gap means the split is"
+            " losing rows. See section 15 of sql/reports/data_inventory.sql."
         )
 
 

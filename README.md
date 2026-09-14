@@ -234,7 +234,16 @@ So any bucket over 10,000 rows must be split before it can be read. `discover`
 splits by jpType, then province, then business size, and records for every
 split whether `SUM(children) == parent`. A split that does not balance is
 flagged (`partition_lossless = 0`) and reported by `discover-status` rather
-than being silently trusted.
+than being silently trusted. Validation is deferred until every child has
+actually been counted, so a half-finished run never reports a good partition
+as broken.
+
+**Read the delta, not just the flag.** A real measurement against the live
+service: keyword `010` counted 962,862, and its eight jpType children summed
+to 962,863 — a delta of `+1`. That is almost certainly one registration
+changing between the parent count and the child counts, not a partition
+losing rows. A delta of a few is data drift; a delta of thousands means the
+split is genuinely lossy. `discover-status` prints the delta for this reason.
 
 ### What it does not claim
 
