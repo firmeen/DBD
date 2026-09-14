@@ -8,15 +8,21 @@ from hashlib import sha256
 from ..client import DbdClient
 from ..client.endpoints.companies import get_company_profile, split_company_code
 from ..client.endpoints.financials import (
+    benchmark_path,
     get_financial_statements,
     get_financial_submissions,
+    get_industry_benchmark,
     statements_path,
     submissions_path,
 )
-from ..contracts.financial import normalize_statements, normalize_submissions
+from ..contracts.financial import normalize_benchmark, normalize_statements, normalize_submissions
 from ..core.exceptions import ContractError
 from ..storage.mysql.repositories.company_repository import find_submit_fin_year
-from ..storage.mysql.repositories.financial_repository import save_statements, save_submissions
+from ..storage.mysql.repositories.financial_repository import (
+    save_benchmark,
+    save_statements,
+    save_submissions,
+)
 
 
 @dataclass
@@ -25,6 +31,7 @@ class FinancialResult:
     submissions: int
     statements: int
     items: int
+    benchmark_items: int = 0
 
 
 def resolve_fiscal_year(client: DbdClient, company_code: str) -> str:
@@ -83,9 +90,28 @@ def run(client: DbdClient, company_code: str, fiscal_year: str | None = None) ->
         request_path=statements_path(jp_type_code, jp_no),
     )
 
+    requested_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    raw_benchmark = get_industry_benchmark(client, company_code, fiscal_year)
+    benchmark = normalize_benchmark(raw_benchmark)
+
+    benchmark_items = 0
+    if benchmark is not None:
+        _, benchmark_items = save_benchmark(
+            jp_type_code=jp_type_code,
+            jp_no=jp_no,
+            benchmark=benchmark,
+            raw_json=raw_benchmark,
+            requested_at=requested_at,
+            body_sha256=sha256(
+                json.dumps(raw_benchmark, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest(),
+            request_path=benchmark_path(jp_type_code, jp_no),
+        )
+
     return FinancialResult(
         fiscal_year=fiscal_year,
         submissions=submissions_saved,
         statements=statement_count,
         items=item_count,
+        benchmark_items=benchmark_items,
     )

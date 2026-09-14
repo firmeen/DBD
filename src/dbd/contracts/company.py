@@ -40,8 +40,11 @@ _PROMOTED_FIELDS = (
     "shareQty",
     "shareVol",
     "businessSizeCode",
+    "businessTypeCode",
     "setupObjCode",
     "setupObjNameKeyin",
+    "submitObjCode",
+    "submitObjNameKeyin",
     "totalAsset",
     "totalEquity",
     "totalIncome",
@@ -81,8 +84,18 @@ class CompanyProfile:
     share_qty: float | None = None
     share_vol: float | None = None
     business_size_code: str | None = None
+    business_type_code: str | None = None
+    business_type_desc: str | None = None
     setup_obj_code: str | None = None
+    setup_obj_desc: str | None = None
+    setup_obj_grp_code: str | None = None
+    setup_obj_grp_desc: str | None = None
     setup_obj_name_keyin: str | None = None
+    submit_obj_code: str | None = None
+    submit_obj_desc: str | None = None
+    submit_obj_name_keyin: str | None = None
+    ampur_desc: str | None = None
+    tumbon_desc: str | None = None
     total_asset: float | None = None
     total_equity: float | None = None
     total_income: float | None = None
@@ -117,6 +130,11 @@ def normalize(data: dict) -> CompanyProfile:
     location_province = data.get("locationProvince") or {}
     jp_status = data.get("jpStatus") or {}
     jp_type = data.get("jpType") or {}
+    business_type = data.get("businessType") or {}
+    setup_obj_type = data.get("setupObjType") or {}
+    submit_obj_type = data.get("submitObjType") or {}
+    location_ampur = data.get("locationAmpur") or {}
+    location_tumbon = data.get("locationTumbon") or {}
 
     profile = CompanyProfile(
         jp_no=data["jpNo"],
@@ -148,8 +166,18 @@ def normalize(data: dict) -> CompanyProfile:
         share_qty=data.get("shareQty"),
         share_vol=data.get("shareVol"),
         business_size_code=data.get("businessSizeCode"),
+        business_type_code=data.get("businessTypeCode"),
+        business_type_desc=business_type.get("businessTypeDesc"),
         setup_obj_code=data.get("setupObjCode"),
+        setup_obj_desc=setup_obj_type.get("objDesc"),
+        setup_obj_grp_code=setup_obj_type.get("objGrpCode"),
+        setup_obj_grp_desc=setup_obj_type.get("objGrpDesc"),
         setup_obj_name_keyin=data.get("setupObjNameKeyin"),
+        submit_obj_code=data.get("submitObjCode"),
+        submit_obj_desc=submit_obj_type.get("objDesc"),
+        submit_obj_name_keyin=data.get("submitObjNameKeyin"),
+        ampur_desc=location_ampur.get("ampurDesc"),
+        tumbon_desc=location_tumbon.get("tumbonDesc"),
         total_asset=data.get("totalAsset"),
         total_equity=data.get("totalEquity"),
         total_income=data.get("totalIncome"),
@@ -282,3 +310,85 @@ COLLECTION_NORMALIZERS = {
     "name_history": normalize_name_history,
     "capital_history": normalize_capital_history,
 }
+
+
+# One response carries all four directions; empty lists are normal.
+# (normalize_transformations / normalize_nation_history are registered below)
+_TRANSFORM_DIRECTIONS = {
+    "transformFroms": "transform_from",
+    "transformTos": "transform_to",
+    "mergerFroms": "merger_from",
+    "mergerTos": "merger_to",
+}
+
+
+def normalize_transformations(data: object) -> list[dict]:
+    """แปรสภาพ / ควบรวม — flatten the four direction lists into one table."""
+    if data is None:
+        return []
+    if not isinstance(data, dict):
+        raise ContractError(f"Expected a JSON object for transformations, got {type(data).__name__}")
+
+    rows = []
+    for source_key, direction in _TRANSFORM_DIRECTIONS.items():
+        for index, row in enumerate(as_list(data.get(source_key)), start=1):
+            # Field names differ per direction (transformFromJpNo vs mergerFromJpNo);
+            # take whichever prefix this row actually carries.
+            prefix = "transformFrom" if direction.startswith("transform") else "mergerFrom"
+            if direction.endswith("_to"):
+                prefix = prefix.replace("From", "To")
+
+            rows.append(
+                {
+                    "direction": direction,
+                    "seq_no": row.get("transformSeqNo") or row.get("mergerSeqNo") or index,
+                    "jp_name": _blank(row.get("jpName")),
+                    "related_jp_no": _blank(row.get(f"{prefix}JpNo")),
+                    "related_jp_type_code": _blank(row.get(f"{prefix}JpTypeCode")),
+                    "related_jp_name": _blank(row.get(f"{prefix}JpName")),
+                    "change_date": to_date(row.get("transformDate") or row.get("mergerDate")),
+                    "update_date": to_date(row.get("updateDate")),
+                }
+            )
+    return rows
+
+
+def _money(value: object) -> float | None:
+    """Chart series return formatted strings like "2,525,000,000.00"."""
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        return float(str(value).replace(",", "").strip())
+    except ValueError:
+        return None
+
+
+def normalize_nation_history(data: object) -> list[dict]:
+    """The 5-year nationality chart behind tab 3."""
+    if data is None:
+        return []
+    if not isinstance(data, dict):
+        raise ContractError(f"Expected a JSON object for nation charts, got {type(data).__name__}")
+
+    chart = data.get("customChart") or {}
+    rows = []
+    for series_key, group in (("shareHistTHDps", "TH"), ("shareHistOTDps", "OTHER")):
+        for point in as_list(chart.get(series_key)):
+            label = point.get("label")
+            if label is None:
+                continue
+            rows.append(
+                {
+                    "fiscal_year": str(label),
+                    "nation_group": group,
+                    "share_amt": _money(point.get("shareAmt")),
+                    "share_pct": _money(point.get("sharePctVol")) or point.get("y"),
+                }
+            )
+    return rows
+
+
+COLLECTION_NORMALIZERS["transformations"] = normalize_transformations
+COLLECTION_NORMALIZERS["nation_history"] = normalize_nation_history

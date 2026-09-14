@@ -33,6 +33,8 @@ _COLLECTIONS = {
     "nations": "nations",
     "name_history": "names",
     "capital_history": "capitals",
+    "transformations": "mergers",
+    "nation_history": "nations/charts",
 }
 
 

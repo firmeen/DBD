@@ -30,11 +30,15 @@ dbd-data/
 │   └── ROADMAP.md
 ├── scripts/
 │   ├── bootstrap.ps1
-│   └── dbd_test.py       manual smoke-test, not part of the production package
+│   ├── apply_migrations.py  run sql/NNN_*.sql in order (re-runnable)
+│   └── dbd_test.py          manual smoke-test, not part of the production package
 ├── sql/
 │   ├── 001_schema.sql              raw_responses, companies, company_facts
 │   ├── 002_company_details.sql     committees, signs, nations, name/capital history
 │   ├── 003_financials.sql          submissions, statements, statement items
+│   ├── 004_enrichment.sql          decoded labels, transformations, nation history, benchmarks
+│   ├── 005_bulk_ingestion.sql      resumable bulk run/task state
+│   ├── reports/data_inventory.sql  read-only report for DBeaver
 │   └── admin/
 │       └── 001_create_app_user.sql.example
 └── src/
@@ -85,12 +89,19 @@ The application user intentionally has no global/admin privileges.
 
 ## 3. Create tables
 
-Apply in order:
+```powershell
+python scripts\apply_migrations.py
+```
+
+Applies every `sql/NNN_*.sql` in order and is safe to re-run — statements that
+are already applied are reported as "already present" rather than failing.
+
+Note for PowerShell users: `mysql -u root -p < sql\001_schema.sql` does **not**
+work, because `<` input redirection is bash syntax. If you prefer the mysql
+client, pipe instead:
 
 ```powershell
-mysql -u root -p < sql\001_schema.sql
-mysql -u root -p < sql\002_company_details.sql
-mysql -u root -p < sql\003_financials.sql
+Get-Content sql\001_schema.sql | mysql -u root -p
 ```
 
 ## 4. Configure `.env`
@@ -137,8 +148,11 @@ committee_signs  4 row(s)
 nations          1 row(s)
 name_history     1 row(s)
 capital_history  4 row(s)
+transformations  1 row(s)
+nation_history   10 row(s)
 financials       fiscal_year=2568
                  5 submission(s), 5 statement(s), 175 item(s)
+industry_bench   30 item(s)
 ```
 
 Fetch only part of it:
@@ -154,12 +168,38 @@ Every fetch stores the full decrypted response in `raw_responses`
 
 | Web page tab | Tables |
 | --- | --- |
-| ข้อมูลนิติบุคคล | `companies`, `company_facts`, `company_committees`, `company_committee_signs` |
-| ข้อมูลงบการเงิน | `financial_submissions`, `financial_statements`, `financial_statement_items` |
-| การลงทุนจำแนกตามสัญชาติ | `company_nations` |
+| ข้อมูลนิติบุคคล | `companies`, `company_facts`, `company_committees`, `company_committee_signs`, `company_transformations` |
+| ข้อมูลงบการเงิน | `financial_submissions`, `financial_statements`, `financial_statement_items`, `industry_benchmarks`, `industry_benchmark_items` |
+| การลงทุนจำแนกตามสัญชาติ | `company_nations`, `company_nation_history` |
 | ประวัติการเปลี่ยนแปลง | `company_name_history`, `company_capital_history` |
 
-## 7. Verify data
+## 7. Ingest many companies (resumable)
+
+Put one 14-digit code per line in a text file — blank lines, `#` comments and
+pasted profile URLs are all accepted:
+
+```text
+# examples
+70107556000051
+https://datawarehouse.dbd.go.th/company/profile/70107537000939
+```
+
+```powershell
+dbd-data bulk --file codes.txt        # create a run and start working it
+dbd-data bulk                          # resume the latest unfinished run
+dbd-data bulk --run-id 3 --limit 50    # work 50 more of a specific run
+dbd-data bulk-status                   # list runs and their progress
+dbd-data bulk-status 3                 # show run 3's failures
+dbd-data bulk-retry 3                  # re-queue run 3's failed companies
+```
+
+Progress is committed per company, so Ctrl+C, a crash, or a dropped connection
+costs at most the company in flight. A company that fails is recorded with its
+error and skipped rather than aborting the batch — one bad code does not cost
+the whole run. One auth token is reused across the batch instead of
+re-authenticating per company.
+
+## 8. Verify data
 
 ```sql
 USE dbd;

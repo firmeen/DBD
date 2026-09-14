@@ -81,6 +81,23 @@ _TABLES: dict[str, tuple[str, tuple[str, ...]]] = {
             "update_date",
         ),
     ),
+    "transformations": (
+        "company_transformations",
+        (
+            "direction",
+            "seq_no",
+            "jp_name",
+            "related_jp_no",
+            "related_jp_type_code",
+            "related_jp_name",
+            "change_date",
+            "update_date",
+        ),
+    ),
+    "nation_history": (
+        "company_nation_history",
+        ("fiscal_year", "nation_group", "share_amt", "share_pct"),
+    ),
 }
 
 RESOURCES = tuple(_TABLES)

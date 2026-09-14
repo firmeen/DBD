@@ -101,6 +101,73 @@ def normalize_statements(data: object) -> list[FinancialStatement]:
     return statements
 
 
+@dataclass
+class IndustryBenchmark:
+    submit_obj_code: str
+    fiscal_year: str
+    business_size_code: str
+    location_type: str
+    location_no: str
+    submit_fin_cnt: int | None = None
+    profit_cnt: int | None = None
+    loss_cnt: int | None = None
+    update_date: object = None
+    items: list[dict] = field(default_factory=list)
+
+
+_BENCHMARK_SUFFIX = re.compile(r"^(.*?)(A|Ly|Pc|T)$")
+
+
+def normalize_benchmark(data: object) -> IndustryBenchmark | None:
+    """ค่าเฉลี่ยในประเภทธุรกิจ.
+
+    Despite being requested per company, this response describes the whole
+    TSIC group: A = average, T = industry total, Ly = last year's average,
+    Pc = % change. Returns None when the industry has no published figures.
+    """
+    if not isinstance(data, dict):
+        raise ContractError(f"Expected a JSON object for industry benchmark, got {type(data).__name__}")
+
+    obj_code = data.get("submitObjCode")
+    fiscal_year = data.get("fiscalYear")
+    if not obj_code or not fiscal_year:
+        return None
+
+    bases: set[str] = set()
+    for key in data:
+        match = _BENCHMARK_SUFFIX.match(key)
+        if match and match.group(1):
+            bases.add(match.group(1))
+
+    items = []
+    for base in sorted(bases):
+        values = (data.get(f"{base}A"), data.get(f"{base}Ly"), data.get(f"{base}Pc"), data.get(f"{base}T"))
+        if all(v is None for v in values):
+            continue
+        items.append(
+            {
+                "item_code": base,
+                "avg_amount": values[0],
+                "avg_amount_ly": values[1],
+                "pct_change": values[2],
+                "industry_total": values[3],
+            }
+        )
+
+    return IndustryBenchmark(
+        submit_obj_code=str(obj_code),
+        fiscal_year=str(fiscal_year),
+        business_size_code=data.get("businessSizeCode") or "",
+        location_type=data.get("locationType") or "",
+        location_no=data.get("locationNo") or "",
+        submit_fin_cnt=data.get("submitFinCnt"),
+        profit_cnt=data.get("profitCnt"),
+        loss_cnt=data.get("lossCnt"),
+        update_date=to_date(data.get("updateDate")),
+        items=items,
+    )
+
+
 def normalize_submissions(data: object) -> list[dict]:
     return [
         {

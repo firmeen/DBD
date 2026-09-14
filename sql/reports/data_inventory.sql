@@ -34,6 +34,7 @@
      ส่วนที่ 11 ข้อมูลส่วนเกินที่เก็บไว้แต่เว็บไม่ได้แสดง
      ส่วนที่ 12 ตรวจสอบคุณภาพข้อมูล
      ส่วนที่ 13 ข้อจำกัด / สิ่งที่ยังไม่ได้ดึง  (อ่านก่อนรายงานหัวหน้า)
+     ส่วนที่ 14 สถานะการดึงข้อมูลแบบ bulk (resume ได้)
    ========================================================================== */
 
 USE dbd;
@@ -62,9 +63,13 @@ UNION ALL SELECT 'กรรมการลงชื่อผูกพัน',   
 UNION ALL SELECT 'สัดส่วนผู้ถือหุ้นตามสัญชาติ', COUNT(*), 'company_nations'      FROM company_nations
 UNION ALL SELECT 'ประวัติเปลี่ยนชื่อ',    COUNT(*), 'company_name_history'      FROM company_name_history
 UNION ALL SELECT 'ประวัติเปลี่ยนทุน',     COUNT(*), 'company_capital_history'   FROM company_capital_history
+UNION ALL SELECT 'แปรสภาพ/ควบรวม',        COUNT(*), 'company_transformations'   FROM company_transformations
+UNION ALL SELECT 'สัญชาติย้อนหลัง 5 ปี',   COUNT(*), 'company_nation_history'    FROM company_nation_history
 UNION ALL SELECT 'ประวัติการนำส่งงบ',     COUNT(*), 'financial_submissions'     FROM financial_submissions
 UNION ALL SELECT 'งบการเงิน (รายปี)',     COUNT(*), 'financial_statements'      FROM financial_statements
 UNION ALL SELECT 'รายการในงบการเงิน',     COUNT(*), 'financial_statement_items' FROM financial_statement_items
+UNION ALL SELECT 'ค่าเฉลี่ยประเภทธุรกิจ',  COUNT(*), 'industry_benchmarks'       FROM industry_benchmarks
+UNION ALL SELECT 'รายการค่าเฉลี่ยธุรกิจ',  COUNT(*), 'industry_benchmark_items'  FROM industry_benchmark_items
 UNION ALL SELECT 'ฟิลด์เสริมนิติบุคคล',   COUNT(*), 'company_facts'             FROM company_facts
 UNION ALL SELECT 'JSON ดิบจาก API (ทุกครั้งที่ดึง)', COUNT(*), 'raw_responses'  FROM raw_responses;
 
@@ -99,6 +104,8 @@ SELECT
     (SELECT COUNT(*) FROM company_nations         x WHERE x.jp_no = c.jp_no) AS สัญชาติ,
     (SELECT COUNT(*) FROM company_name_history    x WHERE x.jp_no = c.jp_no) AS ประวัติชื่อ,
     (SELECT COUNT(*) FROM company_capital_history x WHERE x.jp_no = c.jp_no) AS ประวัติทุน,
+    (SELECT COUNT(*) FROM company_transformations x WHERE x.jp_no = c.jp_no) AS แปรสภาพ,
+    (SELECT COUNT(*) FROM company_nation_history  x WHERE x.jp_no = c.jp_no) AS สัญชาติย้อนหลัง,
     (SELECT COUNT(*) FROM financial_submissions   x WHERE x.jp_no = c.jp_no) AS การนำส่งงบ,
     (SELECT COUNT(*) FROM financial_statements    x WHERE x.jp_no = c.jp_no) AS ปีงบที่มี,
     (SELECT COUNT(*) FROM financial_statement_items x WHERE x.jp_no = c.jp_no) AS รายการงบ,
@@ -160,11 +167,29 @@ SELECT
 FROM companies c
 WHERE c.jp_no = @jp_no;
 
-/* ข้อควรระวังที่ต้องบอกหัวหน้า:
-   - "กลุ่มธุรกิจ" ที่เว็บแสดงเป็นคำว่า "บริการ" เราได้มาเป็น "รหัส" เท่านั้น
-     (company_facts.businessTypeCode = 'D') ยังไม่มีตารางแปลรหัสเป็นคำอ่าน
-   - "ประเภทธุรกิจ 65110" เราเก็บรหัสไว้ แต่คำอธิบาย "การประกันชีวิต"
-     ยังไม่ได้ดึง ต้องใช้ตาราง reference ของ DBD (/commons/business-types) */
+/* หมายเหตุ: รหัสทุกตัวมีคำอ่านกำกับแล้ว เช่น business_type_code 'D' ->
+   business_type_desc 'บริการ' และ setup_obj_code '65110' -> 'การประกันชีวิต'
+   คำอ่านพวกนี้ติดมากับ payload ของ profile อยู่แล้ว ไม่ต้องเรียก API เพิ่ม */
+
+
+/* ----------------------------------------------------------------------------
+   4.2 ข้อมูลการเปลี่ยนแปลงสถานะ — แปรสภาพ / ควบรวม
+        (การ์ดล่างสุดของแท็บ 1 เช่น "นิติบุคคลนี้แปรสภาพมาจาก ...")
+   -------------------------------------------------------------------------- */
+
+SELECT
+    CASE t.direction
+        WHEN 'transform_from' THEN 'แปรสภาพมาจาก'
+        WHEN 'transform_to'   THEN 'แปรสภาพไปเป็น'
+        WHEN 'merger_from'    THEN 'ควบรวมมาจาก'
+        WHEN 'merger_to'      THEN 'ควบรวมไปเป็น'
+    END                      AS `ประเภทการเปลี่ยนแปลง`,
+    t.change_date            AS `วันที่`,
+    t.related_jp_name        AS `นิติบุคคลที่เกี่ยวข้อง`,
+    t.related_jp_no          AS `เลขทะเบียนที่เกี่ยวข้อง`
+FROM company_transformations t
+WHERE t.jp_no = @jp_no
+ORDER BY t.direction, t.seq_no;
 
 
 /* ============================================================================
@@ -357,10 +382,58 @@ FROM company_nations n
 WHERE n.jp_no = @jp_no
 ORDER BY n.share_amt DESC;
 
-/* ข้อจำกัดที่ต้องบอกหัวหน้า:
-   ตารางนี้เป็น "ภาพ ณ ปัจจุบัน" ปีเดียว
-   ส่วนกราฟแท่ง 5 ปีย้อนหลัง (2565-2569) บนหน้าเว็บ ยังไม่ได้ดึง
+/* หมายเหตุ: ตารางนี้เป็น "ภาพ ณ ปัจจุบัน"
+   ส่วนกราฟแท่ง 5 ปีย้อนหลังอยู่ที่ company_nation_history (ดู 9.2)
    แถว "รวมทุกสัญชาติ" ไม่ได้เก็บ เพราะคำนวณเองได้จาก SUM() */
+
+
+/* ----------------------------------------------------------------------------
+   9.2 กราฟสัดส่วนสัญชาติย้อนหลัง 5 ปี (ไทย vs ต่างชาติ)
+   -------------------------------------------------------------------------- */
+
+SELECT
+    h.fiscal_year                                              AS `ปี`,
+    MAX(CASE WHEN h.nation_group = 'TH'    THEN h.share_pct END) AS `ไทย %`,
+    MAX(CASE WHEN h.nation_group = 'OTHER' THEN h.share_pct END) AS `ต่างชาติ %`,
+    MAX(CASE WHEN h.nation_group = 'TH'    THEN h.share_amt END) AS `มูลค่าไทย (บาท)`,
+    MAX(CASE WHEN h.nation_group = 'OTHER' THEN h.share_amt END) AS `มูลค่าต่างชาติ (บาท)`
+FROM company_nation_history h
+WHERE h.jp_no = @jp_no
+GROUP BY h.fiscal_year
+ORDER BY h.fiscal_year;
+
+/* ค่า NULL ในคอลัมน์ต่างชาติ = ไม่มีผู้ถือหุ้นต่างชาติในปีนั้น */
+
+
+/* ----------------------------------------------------------------------------
+   9.3 เทียบบริษัทกับค่าเฉลี่ยในประเภทธุรกิจเดียวกัน
+        (ตรงกับ toggle "เปรียบเทียบในประเภทธุรกิจ" บนแท็บ 2)
+
+        สำคัญ: ตาราง industry_benchmarks เก็บตาม "ประเภทธุรกิจ" ไม่ใช่ตามบริษัท
+        ดังนั้นบริษัทหลายรายที่อยู่ TSIC เดียวกันจะใช้แถวเดียวกัน
+   -------------------------------------------------------------------------- */
+
+SELECT
+    b.submit_obj_code       AS `รหัสประเภทธุรกิจ`,
+    c.submit_obj_desc       AS `ประเภทธุรกิจ`,
+    b.fiscal_year           AS `ปีงบ`,
+    b.business_size_code    AS `ขนาด`,
+    b.submit_fin_cnt        AS `จำนวนบริษัทในกลุ่ม`,
+    b.profit_cnt            AS `บริษัทที่กำไร`,
+    b.loss_cnt              AS `บริษัทที่ขาดทุน`,
+    i.item_code             AS `รายการ`,
+    own.amount              AS `บริษัทนี้`,
+    i.avg_amount            AS `ค่าเฉลี่ยในกลุ่ม`,
+    ROUND(own.amount - i.avg_amount, 2)                          AS `ต่างจากค่าเฉลี่ย`,
+    i.industry_total        AS `รวมทั้งกลุ่ม`
+FROM companies c
+JOIN industry_benchmarks      b  ON b.submit_obj_code = c.submit_obj_code
+JOIN industry_benchmark_items i  ON i.benchmark_id = b.id
+LEFT JOIN financial_statement_items own
+       ON own.jp_no = c.jp_no AND own.fiscal_year = b.fiscal_year AND own.item_code = i.item_code
+WHERE c.jp_no = @jp_no
+  AND i.item_code IN ('assets','liabilities','equity','revenue','profitloss')
+ORDER BY i.item_code;
 
 
 /* ============================================================================
@@ -459,24 +532,21 @@ ORDER BY fiscal_year;
 
    >>> อ่านส่วนนี้ก่อนรายงานหัวหน้า เพื่อไม่ให้เคลมเกินจริง <<<
 
-   ดึงครบแล้ว (4 แท็บหลัก):
+   ดึงครบแล้ว (ครบทั้ง 4 แท็บหลัก):
      [x] ข้อมูลนิติบุคคล + รายชื่อกรรมการ + กรรมการลงชื่อผูกพัน
+     [x] ข้อมูลการเปลี่ยนแปลงสถานะ (แปรสภาพ / ควบรวม)
      [x] งบการเงิน: งบแสดงฐานะการเงิน + งบกำไรขาดทุน + อัตราส่วน (ครบทุกปีที่ส่ง)
      [x] ประวัติการนำส่งงบการเงิน
-     [x] การลงทุนจำแนกตามสัญชาติ (ภาพปัจจุบัน)
+     [x] ค่าเฉลี่ยเปรียบเทียบในประเภทธุรกิจเดียวกัน
+     [x] การลงทุนจำแนกตามสัญชาติ (ภาพปัจจุบัน + ย้อนหลัง 5 ปี)
      [x] ประวัติการเปลี่ยนชื่อ + ประวัติการเปลี่ยนแปลงทุน
+     [x] คำอ่านของรหัสทุกตัว (65110 -> การประกันชีวิต, D -> บริการ,
+         รวมถึงจังหวัด/อำเภอ/ตำบล) ได้มาพร้อม payload ไม่ต้องเรียก API เพิ่ม
 
    ยังไม่ได้ดึง (รู้ endpoint แล้ว ต่อเพิ่มได้):
-     [ ] "ข้อมูลการเปลี่ยนแปลงสถานะ" เช่น แปรสภาพ/ควบรวมมาจากบริษัทใด
-         (หน้าเว็บแท็บ 1 ล่างสุด — endpoint /company-profiles/mergers)
-     [ ] กราฟสัดส่วนสัญชาติ 5 ปีย้อนหลัง
-         (แท็บ 3 — endpoint /company-profiles/nations/charts)
-     [ ] ค่าเฉลี่ยเปรียบเทียบในประเภทธุรกิจเดียวกัน
-         (แท็บ 2 ปุ่ม "เปรียบเทียบในประเภทธุรกิจ" — endpoint /fin/basics)
-     [ ] ผู้ชำระบัญชี (ใช้เฉพาะบริษัทที่เลิกกิจการ)
+     [ ] ผู้ชำระบัญชี (ใช้เฉพาะบริษัทที่เลิกกิจการ — คืน 404 ถ้ายังดำเนินกิจการ)
      [ ] รายชื่อหุ้นส่วน (ใช้กับ หจก. ไม่ใช่ บมจ.)
-     [ ] ตารางแปลรหัส -> คำอ่าน (ประเภทธุรกิจ, กลุ่มธุรกิจ, จังหวัด)
-         ทำให้ตอนนี้เห็นเป็นรหัส 65110 / 'D' แทนคำว่า "การประกันชีวิต" / "บริการ"
+     [ ] ใบอนุญาต ธปท./ก.ล.ต./เครื่องหมายการค้า (endpoint /ext/*)
 
    ยังไม่ได้แตะเลย (อีก 2 แท็บบนหน้าเว็บ):
      [ ] รางวัล/สัญลักษณ์
@@ -492,3 +562,39 @@ ORDER BY fiscal_year;
        ถ้าต้องการเฉพาะค่าล่าสุด ต้อง filter ด้วย latest_raw_response_id
        (ดูตัวอย่างในส่วนที่ 11)
    ========================================================================== */
+
+
+/* ============================================================================
+   ส่วนที่ 14 — สถานะการดึงข้อมูลแบบ bulk
+   ----------------------------------------------------------------------------
+   ระบบดึงหลายบริษัทพร้อมกันได้ และ resume ได้ถ้าโปรแกรมหยุดกลางคัน
+   สถานะถูก commit ทีละบริษัท -> ถ้า Ctrl+C หรือเน็ตหลุด เสียแค่บริษัทเดียว
+   ========================================================================== */
+
+SELECT
+    r.id                                   AS `run`,
+    r.source_label                         AS `ไฟล์ต้นทาง`,
+    r.parts                                AS `ส่วนที่ดึง`,
+    r.total_tasks                          AS `ทั้งหมด`,
+    SUM(t.status = 'done')                 AS `สำเร็จ`,
+    SUM(t.status = 'failed')               AS `ล้มเหลว`,
+    SUM(t.status = 'pending')              AS `รอดำเนินการ`,
+    r.created_at                           AS `เริ่มเมื่อ`,
+    r.finished_at                          AS `เสร็จเมื่อ`
+FROM ingestion_runs r
+LEFT JOIN ingestion_tasks t ON t.run_id = r.id
+GROUP BY r.id
+ORDER BY r.id DESC;
+
+/* รายชื่อบริษัทที่ดึงไม่สำเร็จ พร้อมสาเหตุ */
+SELECT
+    t.run_id        AS `run`,
+    t.company_code  AS `รหัสบริษัท`,
+    t.attempts      AS `พยายามกี่ครั้ง`,
+    t.last_error    AS `สาเหตุ`,
+    t.finished_at   AS `เมื่อ`
+FROM ingestion_tasks t
+WHERE t.status = 'failed'
+ORDER BY t.run_id DESC, t.id;
+
+/* สั่งลองใหม่เฉพาะตัวที่ล้มเหลว:  dbd-data bulk-retry <run_id>  */

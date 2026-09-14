@@ -26,3 +26,17 @@ def get_financial_statements(client: DbdClient, company_code: str, fiscal_year: 
 def get_financial_submissions(client: DbdClient, company_code: str, fiscal_year: str) -> list:
     jp_type_code, jp_no = split_company_code(company_code)
     return client.get(submissions_path(jp_type_code, jp_no), {"fiscalYear": fiscal_year})
+
+
+def benchmark_path(jp_type_code: str, jp_no: str) -> str:
+    return f"/api/v1/fin/basics/{jp_type_code}/{jp_no}"
+
+
+def get_industry_benchmark(client: DbdClient, company_code: str, fiscal_year: str) -> dict:
+    """ค่าเฉลี่ยในประเภทธุรกิจ.
+
+    Addressed by company but answers about the company's whole TSIC group —
+    do not mistake this for the company's own figures.
+    """
+    jp_type_code, jp_no = split_company_code(company_code)
+    return client.get(benchmark_path(jp_type_code, jp_no), {"fiscalYear": fiscal_year})

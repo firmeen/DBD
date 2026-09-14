@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from ....contracts.financial import FinancialStatement
+from ....contracts.financial import FinancialStatement, IndustryBenchmark
 from ..engine import connect
 from .raw_repository import insert_raw_response
 
@@ -138,6 +138,99 @@ def save_statements(
 
             conn.commit()
             return raw_response_id, len(statements), item_count
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def save_benchmark(
+    *,
+    jp_type_code: str,
+    jp_no: str,
+    benchmark: IndustryBenchmark,
+    raw_json: object,
+    requested_at: datetime,
+    body_sha256: str,
+    request_path: str,
+) -> tuple[int, int]:
+    """Upsert one industry benchmark. Keyed by industry, so repeated companies
+    in the same TSIC group refresh one row rather than duplicating it.
+    Returns (benchmark_id, item_count).
+    """
+    with connect() as conn:
+        try:
+            with conn.cursor() as cur:
+                raw_response_id = insert_raw_response(
+                    cur,
+                    jp_type_code=jp_type_code,
+                    jp_no=jp_no,
+                    endpoint="industry_benchmark",
+                    request_path=request_path,
+                    requested_at=requested_at,
+                    http_status=200,
+                    body_sha256=body_sha256,
+                    raw_json=raw_json,
+                )
+
+                cur.execute(
+                    """
+                    INSERT INTO industry_benchmarks (
+                        raw_response_id, submit_obj_code, fiscal_year,
+                        business_size_code, location_type, location_no,
+                        submit_fin_cnt, profit_cnt, loss_cnt, update_date,
+                        first_seen_at, last_seen_at
+                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE
+                        raw_response_id = VALUES(raw_response_id),
+                        submit_fin_cnt = VALUES(submit_fin_cnt),
+                        profit_cnt = VALUES(profit_cnt),
+                        loss_cnt = VALUES(loss_cnt),
+                        update_date = VALUES(update_date),
+                        last_seen_at = VALUES(last_seen_at),
+                        id = LAST_INSERT_ID(id)
+                    """,
+                    (
+                        raw_response_id,
+                        benchmark.submit_obj_code,
+                        benchmark.fiscal_year,
+                        benchmark.business_size_code,
+                        benchmark.location_type,
+                        benchmark.location_no,
+                        benchmark.submit_fin_cnt,
+                        benchmark.profit_cnt,
+                        benchmark.loss_cnt,
+                        benchmark.update_date,
+                        requested_at,
+                        requested_at,
+                    ),
+                )
+                benchmark_id = int(cur.lastrowid)
+
+                cur.execute("DELETE FROM industry_benchmark_items WHERE benchmark_id = %s", (benchmark_id,))
+
+                if benchmark.items:
+                    cur.executemany(
+                        """
+                        INSERT INTO industry_benchmark_items (
+                            benchmark_id, item_code, avg_amount,
+                            avg_amount_ly, pct_change, industry_total
+                        ) VALUES (%s, %s, %s, %s, %s, %s)
+                        """,
+                        [
+                            (
+                                benchmark_id,
+                                item["item_code"],
+                                item["avg_amount"],
+                                item["avg_amount_ly"],
+                                item["pct_change"],
+                                item["industry_total"],
+                            )
+                            for item in benchmark.items
+                        ],
+                    )
+
+            conn.commit()
+            return benchmark_id, len(benchmark.items)
         except Exception:
             conn.rollback()
             raise
