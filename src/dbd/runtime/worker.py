@@ -63,6 +63,13 @@ async def handle_task(repo, client, task, writes):
             await repo.finish(task, "not_available", "no_submitted_fiscal_year")
             TASKS.labels(endpoint, "not_available").inc()
             return
+        if endpoint == "industry_benchmark" and await repo.benchmark_covered(task, year):
+            # Another company in the same TSIC/year/size already fetched this
+            # scope in this run, and the row it wrote is the row this request
+            # would rewrite unchanged. Skipping removes the request, not data.
+            await repo.finish(task, "not_available", "benchmark_already_current")
+            TASKS.labels(endpoint, "not_available").inc()
+            return
         path = request_path(endpoint, task["jp_type_code"], task["jp_no"])
         params = {"fiscalYear": year} if year else None
         response = await client.fetch("GET", path, params=params)

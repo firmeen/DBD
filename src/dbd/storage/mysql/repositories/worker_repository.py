@@ -324,6 +324,47 @@ class WorkerRepository:
                 {"status": status, "error": error, "id": archive_id},
             )
 
+    async def benchmark_covered(self, task, year):
+        """True when this company's industry benchmark was already fetched in this run.
+
+        /fin/basics is addressed per company but answers about the company's whole
+        TSIC group, and industry_benchmarks is keyed by
+        (submit_obj_code, fiscal_year, business_size_code, location_type, location_no)
+        with no company column. Every company sharing that scope therefore rewrites
+        one row with identical values. Fetching once per scope per run keeps the data
+        identical while removing the repeat requests.
+
+        Scoped to the current run so a later refresh still re-reads the figures
+        instead of trusting an old row forever.
+        """
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                SELECT 1
+                FROM companies c
+                JOIN worker_runs r
+                  ON r.id = :run_id
+                JOIN industry_benchmarks b
+                  ON b.submit_obj_code = c.submit_obj_code
+                 AND b.fiscal_year = :year
+                 AND b.business_size_code <=> c.business_size_code
+                 AND b.last_seen_at >= r.created_at
+                WHERE c.jp_no = :no
+                  AND c.jp_type_code = :kind
+                  AND c.submit_obj_code IS NOT NULL
+                LIMIT 1
+            """),
+                    {
+                        "no": task["jp_no"],
+                        "kind": task["jp_type_code"],
+                        "year": year,
+                        "run_id": task["run_id"],
+                    },
+                )
+            ).first()
+            return row is not None
+
     async def fiscal_year(self, task):
         if task["fiscal_year"]:
             return task["fiscal_year"]

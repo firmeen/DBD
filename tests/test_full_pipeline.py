@@ -107,3 +107,71 @@ async def test_bad_collection_does_not_delete_previous_rows(repo):
                 text("SELECT COUNT(*) FROM company_committees WHERE jp_no=:no"), {"no": ids[0].jp_no}
             )
         ).scalar() == 1
+
+
+class SharedIndustryApi(FakeApi):
+    """Every company reports the same TSIC/size, so they all share one benchmark scope."""
+
+    benchmark_calls = 0
+
+    async def fetch(self, method, path, **kwargs):
+        result = await super().fetch(method, path, **kwargs)
+        if "/info/" in path:
+            result.data.update(
+                submitFinYear="2568", submitObjCode="65110", businessSizeCode="L"
+            )
+        elif "/fin/basics/" in path:
+            type(self).benchmark_calls += 1
+            result.data = {
+                "submitObjCode": "65110",
+                "fiscalYear": "2568",
+                "businessSizeCode": "L",
+                "locationType": "TH",
+                "locationNo": "00",
+                "submitFinCnt": 16,
+                "assetsA": "100",
+                "assetsT": "1600",
+            }
+        elif "/fin/" in path:
+            result.data = []
+        return result
+
+
+async def test_industry_benchmark_fetched_once_per_scope(repo):
+    """The benchmark endpoint is addressed per company but answers per TSIC group.
+
+    Companies sharing a scope must not each issue the request: at a million
+    companies that is ~600k requests rewriting a few thousand identical rows.
+    """
+    SharedIndustryApi.benchmark_calls = 0
+    run, _ = await new_run(repo, endpoints(["profile", "financials"]), count=5)
+
+    result = await process(repo, run, concurrency=1, client_factory=SharedIndustryApi)
+
+    # 5 profiles + 5 submissions + 5 statements all still run; only the
+    # benchmark collapses to one request plus four skips.
+    assert SharedIndustryApi.benchmark_calls == 1, "benchmark scope fetched more than once"
+    assert result.get("not_available", 0) >= 4
+
+    async with repo.engine.connect() as conn:
+        # The data is still there - one row is what this scope has always produced.
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM industry_benchmarks"
+                    " WHERE submit_obj_code='65110' AND fiscal_year='2568'"
+                )
+            )
+        ).scalar()
+        assert rows == 1
+
+        skipped = (
+            await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM endpoint_tasks WHERE run_id=:run"
+                    " AND endpoint='industry_benchmark' AND last_error='benchmark_already_current'"
+                ),
+                {"run": run},
+            )
+        ).scalar()
+        assert skipped == 4
