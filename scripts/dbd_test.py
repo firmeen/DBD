@@ -27,7 +27,6 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
-
 BASE_URL = "https://datawarehouse.dbd.go.th"
 HOME_URL = f"{BASE_URL}/"
 PAGE_URL = f"{BASE_URL}/biztype/overview"

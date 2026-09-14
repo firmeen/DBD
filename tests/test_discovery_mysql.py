@@ -1,11 +1,13 @@
 from uuid import uuid4
 
-from test_mysql_workers import pytestmark, schema
+import pytest
 
 from dbd.client.endpoints.search import SearchFilters
 from dbd.pipelines.discovery import _drain_bucket
 from dbd.storage.mysql.engine import connect
 from dbd.storage.mysql.repositories.discovery_repository import get_bucket, upsert_bucket
+
+pytestmark = pytest.mark.integration
 
 
 async def test_real_page_checkpoint_and_raw_survive_schema_error():

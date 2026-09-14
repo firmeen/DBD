@@ -289,20 +289,16 @@ from __future__ import annotations
 import base64
 import gzip
 import json
-import math
 import sys
 import time
 import zlib
-
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
-
-from curl_cffi import requests
 
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-
+from curl_cffi import requests
 
 # =============================================================================
 # GLOBAL CONSTANTS

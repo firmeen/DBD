@@ -1,10 +1,13 @@
 from decimal import Decimal
 
+import pytest
 from sqlalchemy import text
 from test_mysql_workers import FakeApi, new_run
 
 from dbd.runtime.resources import endpoints
 from dbd.runtime.worker import process
+
+pytestmark = pytest.mark.integration
 
 
 class FullApi(FakeApi):

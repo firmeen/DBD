@@ -1,7 +1,6 @@
 """Run only against a disposable MySQL instance/database, never the user DB."""
 
 import asyncio
-import os
 from datetime import datetime, timezone
 from uuid import uuid4
 
@@ -10,36 +9,9 @@ from sqlalchemy import text
 
 from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
-from dbd.core.settings import settings
 from dbd.runtime.worker import process
-from dbd.storage.mysql.async_engine import create_engine
-from dbd.storage.mysql.migrations import migrate
-from dbd.storage.mysql.repositories.worker_repository import WorkerRepository
 
-pytestmark = [
-    pytest.mark.integration,
-    pytest.mark.skipif(
-        os.getenv("DBD_INTEGRATION") != "1" or not settings.db_name.startswith("dbd_test_"),
-        reason="Requires DBD_INTEGRATION=1 and a disposable dbd_test_* database",
-    ),
-]
-
-
-@pytest.fixture(scope="module", autouse=True)
-def schema():
-    if os.getenv("DBD_INTEGRATION") == "1" and settings.db_name.startswith("dbd_test_"):
-        migrate()
-        migrate()  # Real adoption and repeatability, not just DDL string checks.
-
-
-@pytest.fixture
-async def repo():
-    engine = create_engine()
-    try:
-        yield WorkerRepository(engine)
-    finally:
-        assert engine.pool.checkedout() == 0, "Worker left a database connection checked out"
-        await engine.dispose()
+pytestmark = pytest.mark.integration
 
 
 async def new_run(repo, resources=("profile",), count=1):
