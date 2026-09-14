@@ -106,6 +106,57 @@ async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
     return [str(r["pvCode"]) for r in data if isinstance(r, dict) and r.get("pvCode")]
 
 
+async def province_seeds(client: AsyncDbdClient) -> list[str]:
+    """The seed set that provably covers every company.
+
+    A Thai juristic person number is thirteen digits beginning with "0" followed
+    by the two-digit province code of *registration*. Verified against every row
+    already collected: all 13 digits long, all starting with "0", and every
+    distinct three-digit prefix is "0" + a code from /commons/provinces.
+
+    Search matches a number as a substring, so a search for "0" + province
+    necessarily returns every company whose number *starts* with it. Seeding one
+    keyword per province therefore covers the whole registration space by
+    construction - no reconciliation against an external total required - using
+    about 77 seeds rather than the 1,000 that blind three-digit enumeration
+    would need.
+
+    Substring matching also returns companies that merely contain the seed
+    elsewhere. Those are harmless duplicates: they are deduplicated on
+    (jp_type_code, jp_no), and they can only add coverage, never remove it.
+
+    Note this is the registration province, which is not always the company's
+    current address province - a company that moves keeps its original number.
+    That is exactly why seeding is done on the number and not on the pvCodeList
+    filter, which matches the current address and would miss relocated companies.
+    """
+    provinces = await fetch_provinces(client)
+    return sorted({f"0{str(pv).zfill(2)}" for pv in provinces if str(pv).strip()})
+
+
+def coverage_gaps() -> list[str]:
+    """Company-number prefixes that no completed seed bucket could have produced.
+
+    A non-empty result means the seed set did not actually cover the data, which
+    is the one way this strategy can fail silently.
+    """
+    from ..storage.mysql.engine import connect
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT LEFT(s.jp_no, 3) AS prefix
+            FROM discovery_sightings s
+            WHERE NOT EXISTS (
+                SELECT 1 FROM discovery_buckets b
+                WHERE b.keyword = LEFT(s.jp_no, 3)
+            )
+            ORDER BY prefix
+            """
+        )
+        return [row["prefix"] for row in cur.fetchall()]
+
+
 async def _count(client: AsyncDbdClient, filters: SearchFilters) -> tuple[int, int]:
     """Page 1 doubles as the count probe, so nothing is wasted."""
     data = await client.post(
@@ -296,6 +347,15 @@ async def run(
         provinces = await fetch_provinces(client)
         if verbose:
             print(f"provinces available for splitting: {len(provinces)}")
+
+        if not seeds and not pending_buckets(limit=1):
+            # Nothing given and nothing outstanding: start a full pass from the
+            # province-prefix cover, which is complete by construction. With work
+            # still pending this stays a plain resume, and explicit seeds are
+            # still honoured for probing a single bucket.
+            seeds = await province_seeds(client)
+            if verbose:
+                print(f"seeding from province prefixes: {len(seeds)} seeds ({seeds[0]}..{seeds[-1]})")
 
         for seed in seeds:
             upsert_bucket(SearchFilters(keyword=seed, search_type=search_type))

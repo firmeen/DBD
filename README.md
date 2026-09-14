@@ -123,8 +123,14 @@ a newer endpoint projection with an older snapshot. Search pages are retried wit
 `discover-retry`. Metrics are exposed at `http://127.0.0.1:9108/metrics`; structured
 logs identify task/endpoint/error without dumping response bodies or credentials.
 
-See [architecture](docs/ARCHITECTURE.md), [operations](docs/OPERATIONS.md), and
-[validation](docs/VALIDATION.md) for guarantees, boundaries and measured results.
+See the [runbook](docs/RUNBOOK.md) to go from an empty database to a full
+collection, and [architecture](docs/ARCHITECTURE.md),
+[operations](docs/OPERATIONS.md) and [validation](docs/VALIDATION.md) for
+guarantees, boundaries and measured results.
+
+Scope: tabs 1 and 2 of the company page (ข้อมูลนิติบุคคล, ข้อมูลงบการเงิน),
+seven endpoints per company. Tabs 3 and 4 remain implemented but are not
+collected by default; request them with `--only nationality,history`.
 
 ## Development
 

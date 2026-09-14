@@ -174,6 +174,20 @@ def command_discover_status() -> None:
             " losing rows. See section 15 of sql/reports/data_inventory.sql."
         )
 
+    # The province-prefix seed set covers every company number by construction.
+    # A prefix appearing in the data that no seed could have produced is the one
+    # symptom that the assumption is wrong, so it is checked rather than trusted.
+    gaps = discovery.coverage_gaps()
+    if gaps:
+        print(
+            f"\n  COVERAGE GAP: {len(gaps)} company-number prefix(es) were collected that no"
+            " seed bucket covers:"
+        )
+        print(f"    {', '.join(gaps[:20])}{' ...' if len(gaps) > 20 else ''}")
+        print("    Seed these prefixes explicitly: dbd-data discover " + " ".join(gaps[:5]))
+    else:
+        print("  coverage         : every collected number matches a seeded prefix")
+
 
 def main() -> None:
     parser = argparse.ArgumentParser(prog="dbd-data")
