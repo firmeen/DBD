@@ -13,17 +13,39 @@ from ..contracts.financial import (
     normalize_submissions,
 )
 
+# Grouped by the tab each endpoint appears on in the DBD web UI, left to right:
+#   1 ข้อมูลนิติบุคคล            profile + details
+#   2 ข้อมูลงบการเงิน            financials
+#   3 การลงทุนจำแนกตามสัญชาติ    nationality   (not collected by default)
+#   4 ประวัติการเปลี่ยนแปลง       history       (not collected by default)
+#
+# Tabs 3 and 4 are intentionally still implemented - normalizers, repositories
+# and tables are untouched - but are left out of DEFAULT_PARTS. Skipping them
+# removes four requests per company, which is about four million requests and
+# roughly four days at a million companies. Ask for them explicitly with
+# `--only nationality,history` if they are ever wanted again.
 PARTS = {
     "profile": ("profile",),
-    "details": tuple(COLLECTION_NORMALIZERS),
+    "details": ("committees", "committee_signs", "transformations"),
     "financials": ("financial_submissions", "financial_statements", "industry_benchmark"),
+    "nationality": ("nations", "nation_history"),
+    "history": ("name_history", "capital_history"),
 }
+
+DEFAULT_PARTS = ("profile", "details", "financials")
+
 FINANCIAL = set(PARTS["financials"])
+
+# Every endpoint still has a normalizer, whether or not it is collected by
+# default. A mismatch means a part list drifted away from the contracts.
+assert {e for group in PARTS.values() for e in group} - FINANCIAL - {"profile"} == set(
+    COLLECTION_NORMALIZERS
+), "PARTS and COLLECTION_NORMALIZERS disagree"
 
 
 def endpoints(parts: list[str]) -> tuple[str, ...]:
     if not parts or any(p not in PARTS for p in parts):
-        raise ValueError("Choose at least one of profile,details,financials")
+        raise ValueError(f"Choose at least one of {','.join(PARTS)}")
     # The profile is a durable prerequisite for automatic fiscal-year selection.
     selected = [e for p in parts for e in PARTS[p]]
     if "financials" in parts and "profile" not in selected:

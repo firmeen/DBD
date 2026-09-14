@@ -78,3 +78,32 @@ def test_code_import_is_streamed_and_strict(tmp_path):
     p.write_text("7010755600005199")
     with pytest.raises(ContractError):
         list(code_batches(str(p), 100))
+
+
+def test_default_parts_cover_tabs_one_and_two_only():
+    """Tabs 3-4 stay implemented but are not collected by default.
+
+    Each endpoint left in the default costs one request per company, so at a
+    million companies the four dropped ones are ~4M requests and ~4 days.
+    """
+    from dbd.runtime.resources import DEFAULT_PARTS, PARTS, endpoints
+
+    default = endpoints(list(DEFAULT_PARTS))
+
+    assert default == (
+        "profile",
+        "committees",
+        "committee_signs",
+        "transformations",
+        "financial_submissions",
+        "financial_statements",
+        "industry_benchmark",
+    )
+
+    # Tab 3 (nationality) and tab 4 (history) must not sneak back into a default run.
+    dropped = {"nations", "nation_history", "name_history", "capital_history"}
+    assert dropped.isdisjoint(default)
+
+    # ...but must still be reachable, because the code and tables were kept.
+    assert set(endpoints(["nationality", "history"])) == dropped
+    assert dropped <= set(endpoints(list(PARTS)))

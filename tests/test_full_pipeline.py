@@ -4,7 +4,7 @@ import pytest
 from sqlalchemy import text
 from test_mysql_workers import FakeApi, new_run
 
-from dbd.runtime.resources import endpoints
+from dbd.runtime.resources import PARTS, endpoints
 from dbd.runtime.worker import process
 
 pytestmark = pytest.mark.integration
@@ -60,8 +60,11 @@ class FullApi(FakeApi):
 
 
 async def test_all_endpoints_and_explicit_null_refresh(repo):
-    run, ids = await new_run(repo, endpoints(["profile", "details", "financials"]))
-    assert await process(repo, run, concurrency=4, client_factory=FullApi) == {"done": 11}
+    # Every implemented endpoint, not just the default selection: tabs 3-4 are
+    # excluded from DEFAULT_PARTS but still supported, and must keep projecting.
+    resources = endpoints(list(PARTS))
+    run, ids = await new_run(repo, resources)
+    assert await process(repo, run, concurrency=4, client_factory=FullApi) == {"done": len(resources)}
     async with repo.engine.connect() as conn:
         amount = (
             await conn.execute(

@@ -11,7 +11,7 @@ from ..core.exceptions import ContractError, DbdAuthError, DbdForbiddenError
 from ..core.settings import settings
 from ..core.telemetry import IN_FLIGHT, TASKS, log
 from ..storage.mysql.repositories.projection_repository import LeaseLost, project
-from .resources import FINANCIAL, endpoints, request_path
+from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
 
 def code_batches(path: str, size: int):
@@ -33,10 +33,10 @@ def code_batches(path: str, size: int):
 
 
 async def prepare(repo, *, file=None, master=False, parts=None, fiscal_year=None):
-    resources = endpoints(parts or ["profile", "details", "financials"])
+    resources = endpoints(list(parts or DEFAULT_PARTS))
     run_id = await repo.create_run(
         str(Path(file).resolve()) if file else "company_master",
-        parts or ["profile", "details", "financials"],
+        list(parts or DEFAULT_PARTS),
         fiscal_year,
     )
     if file:
