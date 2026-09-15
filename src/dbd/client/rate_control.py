@@ -18,12 +18,7 @@ def _positive_rate(value: float) -> float:
 
 
 class RedisPacer:
-    """Redis-backed global request pacer shared by independent worker processes.
-
-    The Lua script reserves one future admission slot atomically using Redis TIME,
-    so workers on different machines share one smooth global cap without relying
-    on synchronized local clocks or fixed windows with boundary bursts.
-    """
+    """Redis-backed smooth request pacer shared by independent processes."""
 
     _SCRIPT = """
 local now = redis.call('TIME')
@@ -72,8 +67,10 @@ return wait_ms
 class EndpointRateController:
     """Global cap plus independent adaptive endpoint limiters.
 
-    A 429/503 penalizes only the endpoint that produced it. The global pacer is a
-    hard admission ceiling; in distributed mode it is coordinated through Redis.
+    Local endpoint buckets react to endpoint-specific 429/503 responses. When Redis
+    is configured, the global cap is shared across processes and every explicitly
+    configured endpoint target also receives its own shared Redis pacer. Therefore
+    an endpoint target is an aggregate cap, not a per-machine multiplier.
     """
 
     def __init__(
@@ -88,19 +85,35 @@ class EndpointRateController:
         self._endpoint_targets = {
             str(key): _positive_rate(value) for key, value in (endpoint_rates or {}).items()
         }
+        self._redis_url = redis_url
+        self._redis_key = redis_key
         self._global = (
             RedisPacer(redis_url, redis_key, self.target_rate)
             if redis_url
             else TokenBucket(self.target_rate)
         )
+        self._shared_endpoints: dict[str, RedisPacer] = {}
+        if redis_url:
+            self._shared_endpoints = {
+                endpoint: RedisPacer(
+                    redis_url,
+                    f"{redis_key}:endpoint:{endpoint}",
+                    min(self.target_rate, target),
+                )
+                for endpoint, target in self._endpoint_targets.items()
+            }
         self._endpoints: dict[str, TokenBucket] = {}
         EFFECTIVE_RATE.set(self.target_rate)
 
     async def open(self) -> None:
         if isinstance(self._global, RedisPacer):
             await self._global.open()
+        for pacer in self._shared_endpoints.values():
+            await pacer.open()
 
     async def close(self) -> None:
+        for pacer in self._shared_endpoints.values():
+            await pacer.close()
         if isinstance(self._global, RedisPacer):
             await self._global.close()
 
@@ -123,6 +136,8 @@ class EndpointRateController:
             self._global.target_rate = self.target_rate
             self._global._set_rate(self.target_rate)
         EFFECTIVE_RATE.set(self.target_rate)
+        for endpoint, pacer in self._shared_endpoints.items():
+            pacer.set_rate(self._target_for(endpoint))
         for endpoint, bucket in self._endpoints.items():
             target = self._target_for(endpoint)
             bucket.target_rate = target
@@ -131,8 +146,13 @@ class EndpointRateController:
         return self.target_rate
 
     async def acquire(self, endpoint: str) -> None:
-        await self._global.acquire()
+        # Wait on the adaptive/local endpoint gate first so a slow endpoint does
+        # not reserve a global Redis slot that it cannot use yet.
         await self._bucket(endpoint).acquire()
+        shared_endpoint = self._shared_endpoints.get(endpoint)
+        if shared_endpoint is not None:
+            await shared_endpoint.acquire()
+        await self._global.acquire()
 
     def penalize(self, endpoint: str, cooldown_seconds: float) -> tuple[float, float]:
         bucket = self._bucket(endpoint)
