@@ -4,8 +4,8 @@
   "type": "module",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
     "start": "next start",
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{ts,tsx}\"",
@@ -16,7 +16,9 @@
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio",
     "db:check": "drizzle-kit check",
-    "prepare": "husky"
+    "prepare": "husky",
+    "dev:turbo": "next dev",
+    "build:turbo": "next build"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
@@ -167,7 +169,7 @@
     "@storybook/addon-a11y": "^10.6.0",
     "@storybook/addon-vitest": "^10.6.0",
     "@storybook/nextjs": "^10.6.0",
-    "@tailwindcss/postcss": "^4",
+    "@tailwindcss/postcss": "4.3.2",
     "@tanstack/eslint-plugin-query": "^5.102.8",
     "@types/d3": "^7.4.3",
     "@types/file-saver": "^2.0.7",
@@ -190,7 +192,7 @@
     "prettier-plugin-tailwindcss": "^0.8.1",
     "source-map-explorer": "^2.5.3",
     "storybook": "^10.6.0",
-    "tailwindcss": "^4",
+    "tailwindcss": "4.3.2",
     "typescript": "^5"
   }
 }
