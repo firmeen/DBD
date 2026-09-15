@@ -19,7 +19,7 @@ from tenacity import (
 
 from ..core.exceptions import DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
-from ..core.telemetry import LATENCY, REQUESTS
+from ..core.telemetry import LATENCY, REQUESTS, log
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
 from .rate_limit import TokenBucket
@@ -52,6 +52,14 @@ def retry_after(value: str | None) -> float:
             return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
         except (ValueError, TypeError, OverflowError):
             return 1.0
+
+
+def _curl_code(exc) -> object:
+    """Extract curl_cffi's numeric code when present without serializing the exception."""
+    code = getattr(exc, "code", None)
+    if code is not None:
+        return code
+    return getattr(exc, "curl_code", None)
 
 
 class AsyncDbdClient:
@@ -89,8 +97,6 @@ class AsyncDbdClient:
 
     async def _ensure_token(self, *, rejected=None, force=False):
         async with self._auth_lock:
-            # A rejected OLD token must not invalidate a refresh already done
-            # by another coroutine.
             if force or (rejected is not None and rejected == self._token):
                 self._auth.invalidate()
                 self._token = None
@@ -147,15 +153,32 @@ class AsyncDbdClient:
                                 headers=self._headers(token, referer),
                                 timeout=timeout or settings.request_timeout,
                             )
-                        except (RequestsError, TimeoutError):
+                        except (RequestsError, TimeoutError) as exc:
                             REQUESTS.labels("network_error").inc()
+                            log.warning(
+                                "http_transport_error",
+                                stage="request",
+                                path=path,
+                                exception_type=type(exc).__name__,
+                                curl_code=_curl_code(exc),
+                            )
                             raise
                     status = response.status_code
                     REQUESTS.labels(str(status)).inc()
                     if status in (429, 503):
                         self.rate_limit_hits += 1
-                        self.rate.slow_down()
-                        self.rate.cooldown(retry_after(response.headers.get("retry-after")))
+                        old_rate = self.rate.rate
+                        new_rate = self.rate.slow_down()
+                        cooldown = retry_after(response.headers.get("retry-after"))
+                        self.rate.cooldown(cooldown)
+                        log.warning(
+                            "rate_penalty",
+                            status=status,
+                            path=path,
+                            old_rate=old_rate,
+                            new_rate=new_rate,
+                            cooldown_seconds=cooldown,
+                        )
                     if status == 401:
                         await self._ensure_token(rejected=token)
                         raise TransientHttpError("HTTP 401")
@@ -170,6 +193,9 @@ class AsyncDbdClient:
                     except DbdTokenExpiredError:
                         await self._ensure_token(rejected=token)
                         raise
+                    recovered = self.rate.recover()
+                    if recovered is not None:
+                        log.info("rate_recovered", path=path, effective_rate=recovered)
                     return ApiResponse(
                         data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
                     )
