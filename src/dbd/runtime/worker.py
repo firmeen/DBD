@@ -32,10 +32,6 @@ def code_batches(path: str, size: int):
             yield batch
 
 
-# jp_stat_code values, from /commons and confirmed against collected data.
-# Only "1" describes a company that is still operating and therefore still
-# filing; the rest are struck off, liquidated, dissolved or already transformed
-# into another entity, and hold no current data worth a request.
 STATUS_OPERATING = ("1",)
 
 
@@ -63,29 +59,33 @@ async def prepare(repo, *, file=None, master=False, parts=None, fiscal_year=None
     return run_id
 
 
+async def _finish_if_owned(repo, task, status, error=None) -> bool:
+    finished = await repo.finish(task, status, error)
+    if not finished:
+        log.warning("lease_lost_before_finish", task_id=task["id"], endpoint=task["endpoint"])
+    return finished
+
+
 async def handle_task(repo, client, task, writes):
     archive_id = None
     try:
         endpoint = task["endpoint"]
         year = await repo.fiscal_year(task) if endpoint in FINANCIAL else None
         if endpoint in FINANCIAL and year is None:
-            await repo.finish(task, "not_available", "no_submitted_fiscal_year")
-            TASKS.labels(endpoint, "not_available").inc()
+            if await _finish_if_owned(repo, task, "not_available", "no_submitted_fiscal_year"):
+                TASKS.labels(endpoint, "not_available").inc()
             return
-        if endpoint == "industry_benchmark" and await repo.benchmark_covered(task, year):
-            # Another company in the same TSIC/year/size already fetched this
-            # scope in this run, and the row it wrote is the row this request
-            # would rewrite unchanged. Skipping removes the request, not data.
-            await repo.finish(task, "not_available", "benchmark_already_current")
-            TASKS.labels(endpoint, "not_available").inc()
-            return
+
+        # Do not pre-skip industry_benchmark across companies from TSIC/year/size
+        # alone. The persisted natural key also includes locationType/locationNo,
+        # which is only known from the response. Guessing that scope can drop valid
+        # regional benchmark data. Natural-key projection fencing deduplicates writes
+        # safely after the full scope is known.
         path = request_path(endpoint, task["jp_type_code"], task["jp_no"])
         params = {"fiscalYear": year} if year else None
         response = await client.fetch("GET", path, params=params)
         archive_id = await repo.archive(task, response, path, params)
         async with writes:
-            # Each thread gets a pooled connection and a ContextVar-isolated
-            # transaction; the semaphore bounds both DB pressure and payload RAM.
             outcome = await asyncio.to_thread(
                 project, task, archive_id, response.data, response.requested_at, path, year or ""
             )
@@ -97,17 +97,20 @@ async def handle_task(repo, client, task, writes):
     except Exception as exc:
         terminal = isinstance(exc, (ContractError, DbdForbiddenError, DbdAuthError, ValueError, TypeError))
         status = "failed" if terminal or task["attempts"] >= settings.dbd_max_task_attempts else "retry_wait"
-        # Never persist arbitrary transport bodies, tokens, cookies or credentials.
         code = type(exc).__name__
         if archive_id:
             await repo.mark_archive(
                 archive_id, "invalid" if isinstance(exc, ContractError) else "failed", code
             )
-        await repo.finish(task, status, code)
-        TASKS.labels(task["endpoint"], status).inc()
-        log.warning(
-            "task_failed", task_id=task["id"], endpoint=task["endpoint"], error_code=code, status=status
-        )
+        if await _finish_if_owned(repo, task, status, code):
+            TASKS.labels(task["endpoint"], status).inc()
+            log.warning(
+                "task_failed",
+                task_id=task["id"],
+                endpoint=task["endpoint"],
+                error_code=code,
+                status=status,
+            )
 
 
 async def process(
@@ -175,8 +178,6 @@ async def process(
                     group.create_task(consume_and_signal(client))
     finally:
         stop.set()
-        # In-progress DB threads may finish during shutdown. Their transaction
-        # locks serialize against this release, avoiding false pending outcomes.
         await repo.release(owner)
     await repo.close_if_complete(run_id)
     return await repo.progress(run_id)
