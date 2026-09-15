@@ -1,4 +1,9 @@
+import asyncio
+
+import pytest
+
 from dbd.client.endpoints.search import SearchFilters
+from dbd.core.exceptions import ContractError
 from dbd.pipelines import discovery
 from dbd.storage.mysql.repositories import discovery_repository as repository
 
@@ -23,8 +28,8 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
                 "contents": [{"jpTypeCode": "7", "jpNo": str(page).zfill(13)}],
             }
 
-    def archive(*args):
-        archives.append(args)
+    def archive(*args, **kwargs):
+        archives.append((args, kwargs))
         return len(archives)
 
     def finish(bucket, page, *args):
@@ -44,6 +49,8 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
         lambda b: {
             "done": list(states.values()).count("done"),
             "failed": list(states.values()).count("failed"),
+            "partial": list(states.values()).count("partial"),
+            "rejected": 0,
             "rows": list(states.values()).count("done"),
         },
     )
@@ -59,23 +66,33 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
     assert updates[-1]["rows_seen"] == 3
 
 
-def test_province_seed_cover_is_complete_by_construction():
-    """Seeds must cover every possible company-number prefix.
+def test_invalid_row_is_quarantined_without_losing_valid_neighbor():
+    profiles, rejected = discovery._normalize_rows(
+        [
+            {"jpTypeCode": "7", "jpNo": "0107556000051", "jpName": "valid"},
+            {"jpTypeCode": "7", "jpNo": "short", "jpName": "invalid"},
+        ]
+    )
+    assert [(p.jp_type_code, p.jp_no) for p in profiles] == [("7", "0107556000051")]
+    assert len(rejected) == 1
+    assert rejected[0]["row_index"] == 1
+    assert rejected[0]["error_code"] == "ContractError"
 
-    A Thai juristic person number is 13 digits: "0" + two-digit registration
-    province + serial. Search matches numbers as a substring, so searching
-    "0"+province necessarily returns everything whose number starts with it.
-    Seeding one keyword per province therefore covers the registration space
-    without needing an external total to confirm it.
-    """
-    import asyncio
 
+def test_observed_type_a_short_identity_is_not_quarantined():
+    profiles, rejected = discovery._normalize_rows(
+        [{"jpTypeCode": "A", "jpNo": "12345678901", "jpName": "observed type A"}]
+    )
+    assert profiles[0].jp_no == "12345678901"
+    assert rejected == []
+
+
+async def test_province_seed_cover_includes_audited_exception():
     from dbd.pipelines.discovery import province_seeds
 
     class Client:
         async def get(self, path, params=None, **kw):
             assert path == "/api/v1/commons/provinces"
-            # Deliberately messy: unsorted, duplicated, and a single-digit code.
             return [
                 {"pvCode": "10"},
                 {"pvCode": "96"},
@@ -85,17 +102,26 @@ def test_province_seed_cover_is_complete_by_construction():
                 {"nope": 1},
             ]
 
-    seeds = asyncio.run(province_seeds(Client()))
+    seeds = await province_seeds(Client())
 
-    assert seeds == ["005", "010", "096"], seeds
-    assert all(len(s) == 3 for s in seeds), "search requires a keyword of at least 3 characters"
-    assert len(seeds) == len(set(seeds)), "a duplicated seed would refetch a whole province"
-
-    # Every real number beginning with a seeded province is reachable from a seed.
+    assert seeds == ["005", "010", "096", "099"], seeds
+    assert all(len(s) == 3 for s in seeds)
+    assert len(seeds) == len(set(seeds))
     for number, expected in [
         ("0107556000051", "010"),
         ("0965568000123", "096"),
         ("0055560000001", "005"),
+        ("0991234567890", "099"),
     ]:
         assert number[:3] in seeds, number
         assert number.startswith(expected)
+
+
+@pytest.mark.parametrize("payload", [None, {}, {"unexpected": []}, []])
+async def test_invalid_or_empty_province_response_fails_loudly(payload):
+    class Client:
+        async def get(self, path, **kwargs):
+            return payload
+
+    with pytest.raises(ContractError):
+        await discovery.fetch_provinces(Client())
