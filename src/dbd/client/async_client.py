@@ -20,7 +20,7 @@ from tenacity import (
 
 from ..core.exceptions import DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
-from ..core.telemetry import LATENCY, REQUESTS, log
+from ..core.telemetry import EFFECTIVE_RATE, HTTP_RETRIES, LATENCY, REQUESTS, log
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
 from .rate_limit import TokenBucket
@@ -69,6 +69,7 @@ class AsyncDbdClient:
         if self.concurrency < 1:
             raise ValueError("concurrency must be positive")
         self.rate = TokenBucket(settings.dbd_rate_per_second if rate_per_second is None else rate_per_second)
+        EFFECTIVE_RATE.set(self.rate.rate)
         self.max_retries = settings.dbd_http_retries if max_retries is None else max_retries
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._auth = DbdAuth()
@@ -139,6 +140,7 @@ class AsyncDbdClient:
             with attempt:
                 if attempt.retry_state.attempt_number > 1:
                     self.retries_made += 1
+                    HTTP_RETRIES.inc()
                 async with self._semaphore:
                     await self.rate.acquire()
                     token = await self._ensure_token()
@@ -170,6 +172,7 @@ class AsyncDbdClient:
                         self.rate_limit_hits += 1
                         old_rate = self.rate.rate
                         new_rate = self.rate.slow_down()
+                        EFFECTIVE_RATE.set(new_rate)
                         cooldown = retry_after(response.headers.get("retry-after"))
                         self.rate.cooldown(cooldown)
                         log.warning(
@@ -208,6 +211,7 @@ class AsyncDbdClient:
                         raise
                     recovered = self.rate.recover()
                     if recovered is not None:
+                        EFFECTIVE_RATE.set(recovered)
                         log.info("rate_recovered", path=path, effective_rate=recovered)
                     return ApiResponse(
                         data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
