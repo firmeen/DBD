@@ -13,8 +13,9 @@ dbd-data --version
 
 Back up the database before schema maintenance. Migrations are forward-only; the
 supported rollback is restore-from-backup. V2 currently requires migrations through
-`0006_external_archive_backend` even when the default inline-MySQL archive mode is
-used; the new columns are metadata-only until external storage is enabled.
+`0007_project_attempt_budget` even when the default inline-MySQL archive mode is
+used. Migration 0006 adds external-archive metadata; 0007 separates fetch and
+projection retry accounting.
 
 ### Archive backend preflight
 
@@ -114,6 +115,11 @@ the encrypted object first, then commit object reference + `stage=project` in on
 MySQL transaction. Once that durable boundary succeeds, crash recovery projects
 from the archive and does not repeat the upstream HTTP request.
 
+Fetch and project retries are accounted separately. `attempts` is the fetch-stage
+budget and `project_attempts` is the project-stage budget. Therefore a response
+archived successfully on the last allowed fetch attempt still has a fresh projection
+budget. `DBD_MAX_TASK_ATTEMPTS` is the ceiling for each stage independently.
+
 Default endpoints:
 
 | Tab | Endpoints |
@@ -172,8 +178,9 @@ singleton manager lock and rely on row leases/version fences plus shared Redis p
 
 Ctrl+C returns that process's unfinished leases to pending. Process death is recovered
 after lease expiry. Stage and `raw_response_id` survive release/recovery, so a
-project-stage task resumes from archive rather than repeating HTTP. Projection still
-checks lease owner/version/expiry before commit.
+project-stage task resumes from archive rather than repeating HTTP. Fetch and project
+retry counters remain independent across this boundary. Projection still checks lease
+owner/version/expiry before commit.
 
 ## 6. Archive replay, encryption and key rotation
 
@@ -190,9 +197,10 @@ Supported archive forms:
 - AES-256-GCM encrypted JSON/zstd in configured S3-compatible storage.
 
 For external rows, replay/recovery validates object ciphertext SHA-256, AES-GCM
-authentication/AAD and canonical plaintext SHA-256 before decoding. Missing object,
-missing key, checksum mismatch, authentication failure or decode failure is an
-archive/project failure; it does **not** silently fall back to DBD refetch.
+authentication/AAD, restores the canonical JSON bytes from JSON/zstd, validates the
+serialized-payload SHA-256, and only then parses JSON. Missing object, missing key,
+checksum mismatch, authentication failure or decode failure is an archive/project
+failure; it does **not** silently fall back to DBD refetch.
 
 ### Rotate archive encryption keys
 
@@ -238,10 +246,10 @@ decrypted, checksum-verified and replayed without contacting DBD.
 ## 8. Failure inspection
 
 ```sql
-SELECT stage, endpoint, status, last_error, COUNT(*)
+SELECT stage, endpoint, status, attempts, project_attempts, last_error, COUNT(*)
 FROM endpoint_tasks
 WHERE run_id = :run
-GROUP BY stage, endpoint, status, last_error
+GROUP BY stage, endpoint, status, attempts, project_attempts, last_error
 ORDER BY stage, endpoint, status, COUNT(*) DESC;
 
 SELECT payload_backend, payload_key_id, processing_status, error_code, endpoint, COUNT(*)
