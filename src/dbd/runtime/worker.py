@@ -142,6 +142,11 @@ async def process(
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed workers require DBD_REDIS_URL for one shared global rate cap")
 
+    # Validate backend selection, bucket/key settings and encryption-key shape before
+    # opening an HTTP client or claiming work. A configuration defect must not spend
+    # an upstream DBD request before the collector knows it can durably archive it.
+    _ = repo.archive_backend
+
     projection_workers = min(settings.dbd_projection_workers, settings.db_pool_size)
     archive_workers = settings.dbd_archive_workers
     owner = uuid4().hex
