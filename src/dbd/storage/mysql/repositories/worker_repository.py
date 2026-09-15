@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from hashlib import sha256
 
 from sqlalchemy import bindparam, text
 from sqlalchemy.exc import OperationalError
@@ -14,6 +13,8 @@ from tenacity import (
 )
 
 from ....core.settings import settings
+from ....core.telemetry import ARCHIVE_BYTES, PIPELINE_BATCH_SIZE
+from ...archive_codec import decode_payload, encode_payload
 
 
 def deadlock(exc):
@@ -101,7 +102,6 @@ class WorkerRepository:
             )
 
     async def master_population(self):
-        """Return explicit scheduling denominators and exclusion reasons."""
         async with self.engine.connect() as conn:
             row = (
                 await conn.execute(
@@ -122,13 +122,6 @@ class WorkerRepository:
 
     @transaction_retry
     async def enqueue_master(self, run_id, resources, after_id, batch_size, statuses=None):
-        """Enqueue discovered companies, optionally restricted by latest observed status.
-
-        Discovery updates company_master.observed_jp_stat_code every time a valid
-        search/profile observation carries a status. This avoids filtering from the
-        `companies` projection, which discovery intentionally INSERT IGNOREs and can
-        therefore contain an older status than the latest discovery observation.
-        """
         clause = ""
         params = {"after": after_id, "size": batch_size}
         if statuses:
@@ -181,7 +174,7 @@ class WorkerRepository:
                 UPDATE endpoint_tasks t JOIN endpoint_tasks p
                   ON p.run_id=t.run_id AND p.company_id=t.company_id AND p.endpoint='profile'
                 SET t.status='failed',t.last_error='profile_dependency_failed'
-                WHERE t.run_id=:run AND t.status IN ('pending','retry_wait')
+                WHERE t.run_id=:run AND t.stage='fetch' AND t.status IN ('pending','retry_wait')
                   AND t.endpoint IN ('financial_submissions','financial_statements','industry_benchmark')
                   AND p.status='failed'
             """),
@@ -189,61 +182,98 @@ class WorkerRepository:
             )
 
     @transaction_retry
-    async def claim(self, run_id, owner):
+    async def claim_batch(self, run_id, owner, *, stage="fetch", limit=None):
+        """Claim a bounded batch while preserving lease/version fencing.
+
+        Stage `project` is durable work whose HTTP response is already archived;
+        reclaiming it after a crash therefore never contacts DBD again.
+        """
+        if stage not in ("fetch", "project"):
+            raise ValueError("stage must be fetch or project")
+        limit = settings.dbd_claim_batch_size if limit is None else int(limit)
+        if limit < 1:
+            return []
+
+        claimed: list[dict] = []
         async with self.engine.begin() as conn:
-            row = None
             for status in ("pending", "retry_wait"):
-                row = (
-                    (
-                        await conn.execute(
-                            text("""
-                    SELECT t.* FROM endpoint_tasks t
-                    WHERE t.run_id=:run AND t.status=:status
-                      AND t.available_at<=UTC_TIMESTAMP(6) AND t.attempts<:max_attempts
+                remaining = limit - len(claimed)
+                if remaining <= 0:
+                    break
+                dependency = ""
+                if stage == "fetch":
+                    dependency = """
                       AND (t.endpoint NOT IN ('financial_submissions','financial_statements','industry_benchmark')
                         OR EXISTS (SELECT 1 FROM endpoint_tasks p WHERE p.run_id=t.run_id
                           AND p.company_id=t.company_id AND p.endpoint='profile' AND p.status='done'))
-                    ORDER BY t.available_at,t.id LIMIT 1 FOR UPDATE SKIP LOCKED
-                """),
-                            {"run": run_id, "status": status, "max_attempts": settings.dbd_max_task_attempts},
-                        )
+                    """
+                rows = (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT t.* FROM endpoint_tasks t
+                            WHERE t.run_id=:run AND t.stage=:stage AND t.status=:status
+                              AND t.available_at<=UTC_TIMESTAMP(6) AND t.attempts<:max_attempts
+                            """
+                            + dependency
+                            + """
+                            ORDER BY t.available_at,t.id LIMIT :limit FOR UPDATE SKIP LOCKED
+                            """
+                        ),
+                        {
+                            "run": run_id,
+                            "stage": stage,
+                            "status": status,
+                            "max_attempts": settings.dbd_max_task_attempts,
+                            "limit": remaining,
+                        },
                     )
-                    .mappings()
-                    .first()
-                )
-                if row is not None:
-                    break
-            if row is None:
-                return None
-            task = dict(row)
-            await conn.execute(
-                text("""
+                ).mappings().all()
+                claimed.extend(dict(row) for row in rows)
+
+            if not claimed:
+                return []
+
+            ids = [task["id"] for task in claimed]
+            update = text("""
                 UPDATE endpoint_tasks SET status='running',attempts=attempts+1,
                   lease_owner=:owner,lease_version=lease_version+1,
-                  lease_expires_at=TIMESTAMPADD(SECOND,:lease,UTC_TIMESTAMP(6)) WHERE id=:id
-            """),
-                {"owner": owner, "lease": settings.dbd_lease_seconds, "id": task["id"]},
+                  lease_expires_at=TIMESTAMPADD(SECOND,:lease,UTC_TIMESTAMP(6))
+                WHERE id IN :ids
+            """).bindparams(bindparam("ids", expanding=True))
+            await conn.execute(
+                update,
+                {"owner": owner, "lease": settings.dbd_lease_seconds, "ids": ids},
             )
-            metadata = (
-                (
-                    await conn.execute(
-                        text("""
-                SELECT m.jp_no,m.jp_type_code,r.fiscal_year FROM company_master m
-                CROSS JOIN worker_runs r WHERE m.company_id=:company AND r.id=:run
-            """),
-                        {"company": task["company_id"], "run": run_id},
-                    )
+
+            metadata_query = text("""
+                SELECT t.id,m.jp_no,m.jp_type_code,r.fiscal_year
+                FROM endpoint_tasks t
+                JOIN company_master m ON m.company_id=t.company_id
+                JOIN worker_runs r ON r.id=t.run_id
+                WHERE t.id IN :ids
+            """).bindparams(bindparam("ids", expanding=True))
+            metadata_rows = (
+                await conn.execute(metadata_query, {"ids": ids})
+            ).mappings().all()
+            metadata = {row["id"]: row for row in metadata_rows}
+            for task in claimed:
+                task.update(metadata[task["id"]])
+                task.update(
+                    lease_owner=owner,
+                    lease_version=task["lease_version"] + 1,
+                    attempts=task["attempts"] + 1,
                 )
-                .mappings()
-                .one()
-            )
-            task.update(metadata)
-            task.update(
-                lease_owner=owner,
-                lease_version=task["lease_version"] + 1,
-                attempts=task["attempts"] + 1,
-            )
-            return task
+
+        PIPELINE_BATCH_SIZE.labels(f"claim_{stage}").observe(len(claimed))
+        return claimed
+
+    async def claim(self, run_id, owner):
+        claimed = await self.claim_batch(run_id, owner, stage="fetch", limit=1)
+        return claimed[0] if claimed else None
+
+    async def claim_project_batch(self, run_id, owner, limit=None):
+        return await self.claim_batch(run_id, owner, stage="project", limit=limit)
 
     @transaction_retry
     async def heartbeat(self, owner):
@@ -258,7 +288,6 @@ class WorkerRepository:
 
     @transaction_retry
     async def finish_identity_conflict(self, task, archive_id=None, error="IdentityConflict") -> bool:
-        """Atomically persist conflict state and fail the task while lease-owned."""
         async with self.engine.begin() as conn:
             result = await conn.execute(
                 text("""
@@ -325,6 +354,18 @@ class WorkerRepository:
                 {"owner": owner},
             )
 
+    async def owner_running(self, owner):
+        async with self.engine.connect() as conn:
+            return int(
+                (
+                    await conn.execute(
+                        text("SELECT COUNT(*) FROM endpoint_tasks WHERE lease_owner=:owner AND status='running'"),
+                        {"owner": owner},
+                    )
+                ).scalar()
+                or 0
+            )
+
     async def progress(self, run_id):
         async with self.engine.connect() as conn:
             rows = (
@@ -334,6 +375,19 @@ class WorkerRepository:
                 )
             ).all()
             return dict(rows)
+
+    async def progress_by_stage(self, run_id):
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text("""
+                    SELECT stage,status,COUNT(*) n FROM endpoint_tasks
+                    WHERE run_id=:id GROUP BY stage,status ORDER BY stage,status
+                """),
+                    {"id": run_id},
+                )
+            ).mappings().all()
+            return [dict(row) for row in rows]
 
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
@@ -368,29 +422,140 @@ class WorkerRepository:
                 )
             return result.rowcount
 
-    async def archive(self, task, response, path, params):
-        payload = json.dumps(response.data, ensure_ascii=False, default=str)
-        async with self.engine.begin() as conn:
-            result = await conn.execute(
-                text("""
-                INSERT INTO response_archive(task_id,company_id,endpoint,request_path,request_context,
-                  http_status,requested_at,received_at,payload,payload_sha256)
-                VALUES (:task,:company,:endpoint,:path,:context,:status,:requested,:received,:payload,:sha)
-            """),
-                {
-                    "task": task["id"],
-                    "company": task["company_id"],
-                    "endpoint": task["endpoint"],
-                    "path": path,
-                    "context": json.dumps({"method": "GET", "params": params}),
-                    "status": response.status,
-                    "requested": response.requested_at,
-                    "received": response.received_at,
-                    "payload": payload,
-                    "sha": sha256(payload.encode()).hexdigest(),
-                },
+    async def archive_batch(self, items):
+        """Archive decoded responses and durably advance tasks to project stage.
+
+        The transaction commits the raw archive and the stage transition together.
+        Once this returns, a crash can resume from response_archive without another
+        network request.
+        """
+        if not items:
+            return []
+        prepared = []
+        for item in items:
+            encoded = encode_payload(
+                item["response"].data,
+                compress=settings.dbd_archive_compress,
+                threshold=settings.dbd_archive_compress_threshold,
             )
-            return result.lastrowid
+            prepared.append((item, encoded))
+
+        archived = []
+        async with self.engine.begin() as conn:
+            for item, encoded in prepared:
+                task = item["task"]
+                owned = (
+                    await conn.execute(
+                        text("""
+                        SELECT id FROM endpoint_tasks
+                        WHERE id=:id AND stage='fetch' AND status='running'
+                          AND lease_owner=:owner AND lease_version=:version
+                          AND lease_expires_at>UTC_TIMESTAMP(6)
+                        FOR UPDATE
+                    """),
+                        {
+                            "id": task["id"],
+                            "owner": task["lease_owner"],
+                            "version": task["lease_version"],
+                        },
+                    )
+                ).first()
+                if owned is None:
+                    continue
+                response = item["response"]
+                result = await conn.execute(
+                    text("""
+                    INSERT INTO response_archive(
+                      task_id,company_id,endpoint,request_path,request_context,
+                      http_status,requested_at,received_at,payload,payload_codec,payload_zstd,
+                      payload_original_bytes,payload_stored_bytes,payload_sha256
+                    ) VALUES (
+                      :task,:company,:endpoint,:path,:context,
+                      :status,:requested,:received,:payload,:codec,:payload_zstd,
+                      :original_bytes,:stored_bytes,:sha
+                    )
+                """),
+                    {
+                        "task": task["id"],
+                        "company": task["company_id"],
+                        "endpoint": task["endpoint"],
+                        "path": item["path"],
+                        "context": json.dumps({"method": "GET", "params": item["params"]}),
+                        "status": response.status,
+                        "requested": response.requested_at,
+                        "received": response.received_at,
+                        "payload": encoded.json_text,
+                        "codec": encoded.codec,
+                        "payload_zstd": encoded.compressed,
+                        "original_bytes": encoded.original_bytes,
+                        "stored_bytes": encoded.stored_bytes,
+                        "sha": encoded.sha256_hex,
+                    },
+                )
+                archive_id = result.lastrowid
+                transition = await conn.execute(
+                    text("""
+                    UPDATE endpoint_tasks
+                    SET stage='project',raw_response_id=:archive,fetched_at=UTC_TIMESTAMP(6),
+                      lease_expires_at=TIMESTAMPADD(SECOND,:lease,UTC_TIMESTAMP(6))
+                    WHERE id=:id AND stage='fetch' AND status='running'
+                      AND lease_owner=:owner AND lease_version=:version
+                      AND lease_expires_at>UTC_TIMESTAMP(6)
+                """),
+                    {
+                        "archive": archive_id,
+                        "lease": settings.dbd_lease_seconds,
+                        "id": task["id"],
+                        "owner": task["lease_owner"],
+                        "version": task["lease_version"],
+                    },
+                )
+                if transition.rowcount != 1:
+                    raise RuntimeError("Lease changed while archiving task")
+                updated = dict(item)
+                updated["archive_id"] = archive_id
+                updated["encoded"] = encoded
+                updated_task = dict(task)
+                updated_task["stage"] = "project"
+                updated_task["raw_response_id"] = archive_id
+                updated["task"] = updated_task
+                archived.append(updated)
+
+        if archived:
+            PIPELINE_BATCH_SIZE.labels("archive").observe(len(archived))
+            ARCHIVE_BYTES.labels("original").inc(
+                sum(item["encoded"].original_bytes for item in archived)
+            )
+            ARCHIVE_BYTES.labels("stored").inc(
+                sum(item["encoded"].stored_bytes for item in archived)
+            )
+        return archived
+
+    async def archive(self, task, response, path, params):
+        archived = await self.archive_batch(
+            [{"task": task, "response": response, "path": path, "params": params}]
+        )
+        if not archived:
+            raise RuntimeError("Task lease lost before archive")
+        return archived[0]["archive_id"]
+
+    async def load_archive(self, archive_id):
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("SELECT * FROM response_archive WHERE id=:id"), {"id": archive_id}
+                )
+            ).mappings().first()
+        if row is None:
+            raise ValueError(f"Archive {archive_id} not found")
+        result = dict(row)
+        result["data"] = decode_payload(
+            payload=result.get("payload"),
+            payload_zstd=result.get("payload_zstd"),
+            codec=result.get("payload_codec"),
+        )
+        result["request_context"] = json.loads(result["request_context"])
+        return result
 
     async def mark_archive(self, archive_id, status, error=None):
         async with self.engine.begin() as conn:
