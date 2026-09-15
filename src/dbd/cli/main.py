@@ -170,6 +170,7 @@ def main():
     disc.add_argument("--concurrency", type=positive)
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
+    disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
     args = parser.parse_args()
     try:
         if args.command == "migrate":
@@ -240,6 +241,7 @@ def main():
                     seeds.extend(s.strip() for s in handle if s.strip() and not s.lstrip().startswith("#"))
             if any(len(s) < 3 for s in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
+            configure(args.metrics_port)
             with manager_lock() as conn:
                 command_discover(
                     seeds,
