@@ -237,13 +237,6 @@ class AsyncDbdClient:
                         raise TransientHttpError(f"HTTP {status}")
                     if status >= 400:
                         raise PermanentHttpError(f"HTTP {status}")
-                    if rate_key:
-                        endpoint_recovered, global_recovered = self.endpoint_rate.recover(rate_key)
-                        recovered = endpoint_recovered or global_recovered
-                    else:
-                        recovered = self.rate.recover()
-                        if recovered is not None:
-                            EFFECTIVE_RATE.set(recovered)
                     try:
                         data = self._decode(response, path, token)
                     except DbdTokenExpiredError:
@@ -262,6 +255,13 @@ class AsyncDbdClient:
                             body_sha256=sha256(body).hexdigest(),
                         )
                         raise
+                    if rate_key:
+                        endpoint_recovered, global_recovered = self.endpoint_rate.recover(rate_key)
+                        recovered = endpoint_recovered or global_recovered
+                    else:
+                        recovered = self.rate.recover()
+                        if recovered is not None:
+                            EFFECTIVE_RATE.set(recovered)
                     if recovered is not None:
                         log.info(
                             "rate_recovered",
