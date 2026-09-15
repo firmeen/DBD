@@ -11,7 +11,7 @@ import boto3
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from ..core.settings import Settings, settings
-from .archive_codec import EncodedPayload, decode_bytes, encoded_bytes
+from .archive_codec import EncodedPayload, encoded_bytes, restored_json_bytes
 
 
 @dataclass(frozen=True)
@@ -137,19 +137,26 @@ class S3ArchiveBackend:
         if not expected_digest or actual_digest != expected_digest:
             raise OSError("External archive ciphertext checksum mismatch")
         try:
-            plaintext = AESGCM(key).decrypt(
+            encoded_plaintext = AESGCM(key).decrypt(
                 bytes(nonce), ciphertext, object_key.encode("utf-8")
             )
         except Exception as exc:
             raise OSError("External archive authentication/decryption failed") from exc
-        expected_payload_digest = str(row.get("payload_sha256") or "")
-        if not expected_payload_digest or sha256(plaintext).hexdigest() != expected_payload_digest:
-            raise OSError("External archive plaintext checksum mismatch")
         codec = str(row.get("payload_codec") or "")
         if not codec.startswith("aesgcm+"):
             raise OSError(f"Unsupported external archive codec {codec!r}")
+        inner_codec = codec.split("+", 1)[1]
         try:
-            return decode_bytes(plaintext, codec.split("+", 1)[1])
+            serialized_json = restored_json_bytes(encoded_plaintext, inner_codec)
+        except Exception as exc:
+            raise OSError("External archive payload decode failed") from exc
+        expected_payload_digest = str(row.get("payload_sha256") or "")
+        if not expected_payload_digest or sha256(serialized_json).hexdigest() != expected_payload_digest:
+            raise OSError("External archive plaintext checksum mismatch")
+        try:
+            import orjson
+
+            return orjson.loads(serialized_json)
         except Exception as exc:
             raise OSError("External archive payload decode failed") from exc
 
