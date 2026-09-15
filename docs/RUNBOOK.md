@@ -1,213 +1,233 @@
 # Runbook
 
-How to take this from an empty database to a full collection, and what to do
-when something goes wrong. Configuration reference lives in `OPERATIONS.md`;
-design rationale lives in `ARCHITECTURE.md`.
+Operational path from an empty MySQL schema to a durable DBD collection. Current
+production scope is tabs 1-2: seven endpoints per company.
 
-## What is collected
+## 1. Prepare
 
-Two tabs of the DBD company page, seven endpoints per company:
+```powershell
+dbd-data check-db
+dbd-data migrate
+dbd-data --version
+```
+
+Back up the database before schema maintenance. Migrations are forward-only; the
+supported rollback is restore-from-backup.
+
+## 2. Discovery
+
+```powershell
+dbd-data discover
+dbd-data discover-status
+dbd-data master-status
+```
+
+With no explicit seeds, discovery upserts the current audited prefix set. It keeps
+existing checkpoints and includes the explicit `099` exception observed in prior
+production data. Search is substring-based, so overlap is normal and identities
+are deduplicated on `(jp_type_code, jp_no)`.
+
+### Search limits and splitting
+
+The upstream search endpoint returns 10 rows/page and allows at most 1000 pages per
+query. A bucket over 10,000 rows is split in this order:
+
+1. juristic-person type;
+2. province filter;
+3. business size.
+
+If a leaf still exceeds 10,000 after all dimensions are exhausted, it is marked
+failed rather than silently truncated.
+
+### Durable page handling
+
+The page-1 count request is archived. If the bucket is small enough to drain, that
+same response is linked as page 1 instead of issuing the request twice.
+
+Every page is archived before row normalization. Rows are normalized independently:
+
+- valid rows are committed;
+- invalid rows are stored in `discovery_rejections` with the original decoded row,
+  row index and safe error reason;
+- a page containing rejected rows is `partial`, not `done`;
+- retry re-fetches only pages not already `done` and resolves old quarantine rows
+  when the corrected page passes.
+
+A full discovery invocation exits non-zero while any of these blockers remain:
+failed buckets, partial pages, unresolved quarantine rows or known lossy splits.
+`--max-buckets` is intentionally a partial/trial run and does not apply that final
+completeness exit rule.
+
+### Coverage statement
+
+`discover-status` checks collected identities against registered seed prefixes and
+reports split-count mismatches. These checks are necessary but not sufficient for
+an “all companies” claim: an entity never returned by any search cannot appear in
+`discovery_sightings`. Final completeness therefore requires reconciliation with an
+authoritative external DBD population/count source.
+
+### Retry and refresh
+
+```powershell
+dbd-data discover-retry
+dbd-data discover-refresh
+dbd-data discover-refresh --bucket-id N
+```
+
+`discover-retry` reopens failed buckets. `discover-refresh` intentionally starts a
+new read of existing leaf buckets by removing their page checkpoints while keeping
+raw/archive evidence and company projections.
+
+Do **not** reset discovery merely to recover network errors. The queue/checkpoints
+are built for resume.
+
+## 3. Full tabs 1-2 campaign
+
+The accepted all-company scope includes every discovered status:
+
+```powershell
+dbd-data bulk --master --all-statuses --enqueue-only
+```
+
+Record the returned run ID. Resume **that exact run**:
+
+```powershell
+dbd-data bulk --run-id N --concurrency <MEASURED_CONCURRENCY> --rate <MEASURED_RATE>
+dbd-data bulk-status N
+dbd-data bulk-retry N
+```
+
+Do not use `bulk --master` again as a resume command; it creates a new refresh run.
+
+Default endpoint set:
 
 | Tab | Endpoints |
 | --- | --- |
-| 1 ข้อมูลนิติบุคคล | `profile`, `committees`, `committee_signs`, `transformations` |
-| 2 ข้อมูลงบการเงิน | `financial_submissions`, `financial_statements`, `industry_benchmark` |
+| 1 | `profile`, `committees`, `committee_signs`, `transformations` |
+| 2 | `financial_submissions`, `financial_statements`, `industry_benchmark` |
 
-Tabs 3 (การลงทุนจำแนกตามสัญชาติ) and 4 (ประวัติการเปลี่ยนแปลง) are implemented
-but not collected. Add them with `--only nationality,history` if ever needed.
+Tabs 3-4 stay available through `--only nationality,history`, but are outside the
+current 48-hour acceptance campaign.
 
-## Two phases
+### Operating-only mode
 
-```
-discover  ->  finds companies, writes a shallow profile for each  (~hours)
-bulk      ->  fills in depth for the companies found              (~days)
-```
+`dbd-data bulk --master` without `--all-statuses` filters on the latest observed
+`jpStatCode` stored in `company_master`, not a potentially stale shallow company
+projection. Only observed status `1` is selected. Unknown status is not guessed.
 
-Discovery is cheap per company because one search page carries ten complete
-records. Depth is expensive because it is one request per endpoint per company.
+This mode is useful for an operating-only product workload, but it is **not** the
+accepted all-company shortcut for the current campaign.
 
----
+## 4. Financial prerequisites
 
-## Phase 1: discovery
+Financial tasks wait for the profile task because fiscal-year metadata comes from
+that projection unless an explicit run fiscal year is supplied. If no submitted
+fiscal year exists, financial tasks become `not_available` with
+`no_submitted_fiscal_year`.
 
-```powershell
-dbd-data migrate
-dbd-data discover              # full pass; resumes if one is already underway
-dbd-data discover-status
-```
+`not_available` means confirmed source absence. Network errors, contract errors,
+quarantined search rows and companies never discovered do not count as unavailable.
 
-`discover` with no arguments starts a full pass when nothing is outstanding,
-and resumes otherwise. It is safe to interrupt and re-run.
+The old cross-company `industry_benchmark` pre-fetch skip is intentionally gone.
+The benchmark natural key includes `location_type` and `location_no`, which are not
+safely known from TSIC/year/size before the response. Natural-key freshness prevents
+stale overwrites after the full response scope is known.
 
-### How coverage is achieved
+## 5. Interruption and leases
 
-A Thai juristic person number is thirteen digits: `0` + two-digit registration
-province + serial. Search matches numbers as a substring, so a search for
-`0` + province returns everything whose number *starts* with it. Seeding one
-keyword per province therefore covers the whole registration space by
-construction — roughly 77 seeds.
+Only one API manager may operate on a database at a time. Bulk and discovery check
+that the same MySQL connection still owns the named lock. If ownership disappears,
+the manager fails instead of continuing without exclusivity.
 
-Two consequences worth understanding before reporting coverage:
+Ctrl+C returns leases owned by the process to pending. If the process dies, expired
+leases are recovered by maintenance. Lease owner, version and expiry are checked
+again inside the projection transaction, so a stale worker cannot commit after its
+lease is reclaimed.
 
-- **Overlap is expected.** Substring matching also returns companies that
-  merely contain the seed elsewhere. They are deduplicated on
-  `(jp_type_code, jp_no)`; duplicates cost requests, never correctness.
-- **Registration province is not current province.** A company that relocates
-  keeps its original number. Seeding is deliberately done on the number, not on
-  the `pvCodeList` filter, which matches the current address and would miss
-  relocated companies.
+## 6. Replay after contract fixes
 
-### Bucket splitting
-
-The API caps any one query at 10,000 rows (`itemsPerPage` is locked to 10 and
-`currentPage` stops at 1000). A larger bucket is split by jpType, then
-province, then business size, until every leaf fits.
-
-Each split records whether `SUM(children) == parent`. Read the delta, not just
-the flag: a difference of one or two rows is live data changing between counts,
-while a difference of thousands means the split is losing rows.
-
-### Verifying the pass
-
-```powershell
-dbd-data discover-status
-```
-
-Expect `coverage : every collected number matches a seeded prefix`. A
-`COVERAGE GAP` line means a company number was collected whose prefix no seed
-covers — the one way the seeding assumption can be wrong. Seed those prefixes
-explicitly:
-
-```powershell
-dbd-data discover 0XX 0YY
-```
-
-Note the limit of this check: it can only see numbers that *were* collected. It
-cannot detect a company never returned by any seed. For an external check,
-compare `discovery_sightings` against DBD's own published totals rather than
-treating the row count as proof.
-
----
-
-## Phase 2: depth
-
-```powershell
-dbd-data bulk --master              # companies still operating (default)
-dbd-data bulk --master --all-statuses   # include struck-off/liquidated/dissolved
-dbd-data bulk --run-id N            # resume a specific run
-dbd-data bulk-status                # progress
-dbd-data bulk-status N              # that run's failures
-dbd-data bulk-retry N               # requeue its failures
-```
-
-### Only operating companies, by default
-
-Measured over 222,888 discovered companies:
-
-| สถานะ | Share |
-| --- | ---: |
-| ร้าง (struck off) | 38.7% |
-| **ยังดำเนินกิจการอยู่ (operating)** | **38.2%** |
-| เสร็จการชำระบัญชี (liquidated) | 15.9% |
-| เลิก (dissolved) | 4.0% |
-| แปรสภาพ, อื่น ๆ | 3.2% |
-
-Roughly **62% of companies are no longer trading** and have no current filings
-to fetch. Status arrives free with discovery (`jpStatCode` is already in a
-search page), so they are filtered out before a task is created rather than
-requested and discarded — no request, no archive row, no projection.
-
-Pass `--all-statuses` when historical records matter, accepting ~2.6x the work.
-
-Progress is committed per task, so an interrupt costs at most the tasks in
-flight. Re-running is always safe.
-
-### Requests are avoided, not just throttled
-
-Three gates remove work before any HTTP happens:
-
-- a company that never filed financial statements skips all three financial
-  endpoints (`no_submitted_fiscal_year`);
-- an industry benchmark already fetched for the same TSIC/year/size in this run
-  is not fetched again (`benchmark_already_current`) — the endpoint is addressed
-  per company but answers about the whole industry group;
-- financial endpoints are not claimed until that company's profile is `done`,
-  because the fiscal year comes from the profile.
-
-Those appear as `not_available` in `bulk-status`. They are skips, not failures.
-
----
-
-## Scale and expectations
-
-At one million companies discovered, five requests per company (four
-unconditional plus financials where filed):
-
-| Scope | Companies | Requests | @10/s | @15/s | @20/s |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| discovery | — | ~250k | ~7 h | ~5 h | ~3.5 h |
-| depth, `--all-statuses` | 1,000,000 | ~5.0M | 5.8 d | 3.9 d | 2.9 d |
-| **depth, operating only (default)** | **382,000** | **~1.9M** | **2.2 d** | **1.5 d** | **1.1 d** |
-
-The status filter is what brings a full pass inside a couple of days without
-touching the request rate; going faster than that means raising
-`DBD_RATE_PER_SECOND`, which is bounded by a ceiling nobody has measured yet
-(see `VALIDATION.md`). Concurrency above the rate cap changes nothing.
-
-Rate is the only lever. Time is `requests ÷ rate`; raising `DBD_CONCURRENCY`
-above the rate cap changes nothing. Storage runs roughly 45-50 KB per company
-in `response_archive`, so plan tens of gigabytes and expect
-`financial_statement_items` in the hundreds of millions of rows.
-
-Depth is a multi-day campaign, not a single command. Run it as a sustained job
-and let the queue resume across interruptions — that is what it is for.
-
----
-
-## When something goes wrong
-
-**A run stopped.** Re-run the same command. Nothing needs unwinding.
-
-**Tasks stuck `running`.** Their leases expire and periodic maintenance
-recovers them. No manual step.
-
-**Many failures.** Inspect before retrying:
-
-```sql
-SELECT endpoint, last_error, COUNT(*)
-FROM endpoint_tasks WHERE run_id = :run AND status = 'failed'
-GROUP BY endpoint, last_error ORDER BY 3 DESC;
-```
-
-**A normalizer was wrong.** The decoded payload is archived before
-normalization, so reprocess without touching the network:
+A decoded endpoint response is archived before normalization. After correcting a
+normalizer:
 
 ```powershell
 dbd-data replay ARCHIVE_ID
 ```
 
-**429 or 503 from DBD.** The shared limiter lowers the rate on its own and does
-not retry into it. Leave it alone; do not raise concurrency to compensate.
+Replay does not contact DBD. Projection freshness is based on natural write keys:
 
-**Discovery buckets from an older version.** Buckets created before per-page
-checkpointing cannot be resumed correctly, because their progress was counted
-rather than recorded. Clear the bookkeeping and start a clean pass — company
-data is preserved:
+- statement: company + returned fiscal year;
+- submissions: whole company collection;
+- benchmark: TSIC + fiscal year + size + location type + location number;
+- other resources: company + endpoint collection.
+
+Older archives are therefore prevented from overwriting newer rows even when the
+old and new requests used different request scopes.
+
+Search pages use discovery retry, not endpoint replay.
+
+## 7. Failure inspection
+
+```sql
+SELECT endpoint, status, last_error, COUNT(*)
+FROM endpoint_tasks
+WHERE run_id = :run
+GROUP BY endpoint, status, last_error
+ORDER BY endpoint, status, COUNT(*) DESC;
+
+SELECT processing_status, error_code, endpoint, COUNT(*)
+FROM response_archive
+GROUP BY processing_status, error_code, endpoint
+ORDER BY COUNT(*) DESC;
+
+SELECT bucket_id, page_no, row_index, jp_type_code, jp_no,
+       error_code, error_message
+FROM discovery_rejections
+WHERE resolved_at IS NULL
+ORDER BY bucket_id, page_no, row_index;
+```
+
+Transport diagnostics intentionally report safe metadata only: stage, path,
+exception type, curl code where available and HTTP status. They never print auth
+tokens, cookies, encryption keys or whole response bodies.
+
+## 8. Discovery reset tool
+
+For genuinely incompatible historical checkpoint state only:
 
 ```powershell
-python scripts\reset_discovery.py           # dry run, shows what would change
+python scripts\reset_discovery.py
 python scripts\reset_discovery.py --apply
 ```
 
----
+Dry-run is default. `--apply` acquires the same manager lock before mutation and
+preserves company data, raw payloads, endpoint tasks and worker runs.
 
-## Before reporting results
+## 9. Capacity probe
 
-- Row counts in the thousands are partial runs, not results. Thailand has
-  roughly 1.9 million registered juristic persons.
-- `not_available` is a deliberate skip, not a gap in the data.
-- Coverage is provable by construction *given* the number format; the
-  `COVERAGE GAP` check tests that assumption against collected data, and an
-  external reconciliation is still the honest way to claim completeness.
-- Data is what DBD publishes for public service and, per their own notice,
-  cannot be used as a legal reference.
+Stop every collector first, then:
+
+```powershell
+python scripts\probe_capacity.py --collector-stopped --min-rate 5 --max-rate 25
+```
+
+The probe is profile-only and bounded. It reports admission/window throughput,
+HTTP latency, drain time and transport error breakdown. It is **not** a sustained
+full-endpoint benchmark and does not by itself prove a safe production rate or a
+48-hour ETA.
+
+## 10. 48-hour acceptance
+
+Start the campaign clock at a recorded timestamp and report discovery plus depth as
+one wall-clock campaign. Required evidence:
+
+- discovery has no failed/partial/quarantine/lossy blockers;
+- external population reconciliation is documented;
+- the exact all-status worker run is recorded;
+- no failed endpoint tasks remain after retry/replay policy is exhausted;
+- `not_available` counts are source-supported;
+- actual request mix, successful throughput, retry overhead, DB projection time
+  and remaining backlog are recorded;
+- total elapsed wall time is <= 48 hours.
+
+A short profile probe, queue benchmark or arithmetic extrapolation alone is not an
+acceptance result.

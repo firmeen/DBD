@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from curl_cffi import requests
+from curl_cffi.requests.exceptions import RequestException as RequestsError
 
 try:
     import truststore
@@ -14,6 +15,7 @@ try:
 except ImportError:  # pragma: no cover - optional dependency
     browser_cookie3 = None
 
+from ..core.exceptions import DbdAuthError
 from ..core.settings import settings
 
 HOME_URL = f"{settings.dbd_base_url}/"
@@ -21,12 +23,7 @@ WARMUP_PAGE_URL = f"{settings.dbd_base_url}/biztype/overview"
 
 
 def create_session() -> requests.Session:
-    """A curl_cffi session that TLS-fingerprints as Chrome.
-
-    Plain `requests` gets a 403 from DBD's WAF because its TLS handshake
-    doesn't look like a real browser. This is the fix that made the
-    company-profile endpoint work during exploration.
-    """
+    """A curl_cffi session that TLS-fingerprints as Chrome."""
     session = requests.Session(impersonate="chrome")
     session.headers.update(
         {
@@ -39,12 +36,7 @@ def create_session() -> requests.Session:
 
 
 def import_chrome_cookies(session: requests.Session, domain: str) -> bool:
-    """Fall back to the user's already-verified Chrome session on 403.
-
-    Same principle as the egp project: never bypass bot detection
-    programmatically, just reuse cookies from a browser session where a
-    human already passed it.
-    """
+    """Reuse cookies from a browser session where a human already passed the WAF."""
     if browser_cookie3 is None:
         return False
 
@@ -76,21 +68,41 @@ def _document_headers() -> dict:
     }
 
 
+def _curl_code(exc):
+    return getattr(exc, "code", None) or getattr(exc, "curl_code", None)
+
+
+def _get(session, url, *, headers, stage):
+    try:
+        return session.get(url, headers=headers, timeout=settings.request_timeout)
+    except RequestsError as exc:
+        code = _curl_code(exc)
+        suffix = f" curl={code}" if code is not None else ""
+        raise DbdAuthError(f"{stage} transport {type(exc).__name__}{suffix}") from None
+
+
+def _require_ok(response, stage):
+    if response.status_code >= 400:
+        raise DbdAuthError(f"{stage} failed: HTTP {response.status_code}")
+
+
 def warm_up(session: requests.Session) -> None:
-    """Visit the home page and a real page once, so the WAF issues its
-    baseline cookies before the anonymous-token endpoint is called.
-    Retries once with imported Chrome cookies on a 403.
-    """
-    response = session.get(HOME_URL, headers=_document_headers(), timeout=settings.request_timeout)
+    """Visit the home page and a real page once so the WAF can issue cookies."""
+    response = _get(session, HOME_URL, headers=_document_headers(), stage="warmup_home")
 
     if response.status_code == 403 and import_chrome_cookies(session, "datawarehouse.dbd.go.th"):
-        response = session.get(HOME_URL, headers=_document_headers(), timeout=settings.request_timeout)
+        response = _get(session, HOME_URL, headers=_document_headers(), stage="warmup_home_cookie_retry")
+    _require_ok(response, "warmup_home")
 
     page_headers = _document_headers()
     page_headers.update({"Referer": HOME_URL, "Sec-Fetch-Site": "same-origin"})
 
-    response = session.get(WARMUP_PAGE_URL, headers=page_headers, timeout=settings.request_timeout)
-
-    if response.status_code == 403:
-        import_chrome_cookies(session, "datawarehouse.dbd.go.th")
-        session.get(WARMUP_PAGE_URL, headers=page_headers, timeout=settings.request_timeout)
+    response = _get(session, WARMUP_PAGE_URL, headers=page_headers, stage="warmup_page")
+    if response.status_code == 403 and import_chrome_cookies(session, "datawarehouse.dbd.go.th"):
+        response = _get(
+            session,
+            WARMUP_PAGE_URL,
+            headers=page_headers,
+            stage="warmup_page_cookie_retry",
+        )
+    _require_ok(response, "warmup_page")

@@ -1,4 +1,5 @@
 """Probe measurement regression tests. No database or network calls."""
+
 import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
@@ -51,13 +52,30 @@ async def test_expired_window_sends_nothing():
     assert raw.calls == transport.budget.used == 0
 
 
+async def test_transport_error_keeps_exception_type_and_curl_code():
+    class CurlFailure(RuntimeError):
+        code = 28
+
+    class BrokenSession(Session):
+        async def request(self, *args, **kwargs):
+            self.calls += 1
+            raise CurlFailure("body-like detail must not be needed")
+
+    raw = BrokenSession()
+    transport = probe.TimedSession(raw, probe.Budget(10))
+    with pytest.raises(CurlFailure):
+        await transport.request("GET", "/")
+    assert transport.transport_errors == ["CurlFailure(curl=28)"]
+    assert "CurlFailure(curl=28)" in transport.stop_reason
+
+
 async def test_late_completions_are_not_counted_in_window(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(probe.time, "perf_counter", lambda: clock[0])
 
     class SlowSession(Session):
         async def request(self, *args, **kwargs):
-            clock[0] += .6
+            clock[0] += 0.6
             return await super().request(*args, **kwargs)
 
     transport = probe.TimedSession(SlowSession(), probe.Budget(10))
@@ -73,13 +91,15 @@ async def test_late_completions_are_not_counted_in_window(monkeypatch):
     assert result["success"] == 2
     assert result["drained"] == 1
     assert result["window_rps"] == 1
-    assert result["overall_rps"] == pytest.approx(2 / 1.2)
-    assert result["http_p95"] == pytest.approx(.6)
+    assert result["admission_rps"] == 2
+    assert result["drain_seconds"] == pytest.approx(0.2)
+    assert result["http_p95"] == pytest.approx(0.6)
+    assert "overall_rps" not in result
 
 
 def test_incomplete_repeats_cannot_qualify(capsys):
     probe.summarise(
-        [{"rate": 10, "clean": True, "overall_rps": 9}],
+        [{"rate": 10, "clean": True, "window_rps": 9}],
         SimpleNamespace(repeats=2, workload=None),
     )
     assert "inconclusive" in capsys.readouterr().out

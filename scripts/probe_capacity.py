@@ -10,6 +10,7 @@ import asyncio
 import math
 import sys
 import time
+from collections import Counter
 from contextvars import ContextVar
 from pathlib import Path
 
@@ -20,7 +21,7 @@ from dbd.client.endpoints.companies import profile_path  # noqa: E402
 from dbd.client.rate_limit import TokenBucket  # noqa: E402
 from dbd.contracts.company import normalize  # noqa: E402
 from dbd.core.settings import settings  # noqa: E402
-from dbd.runtime.locking import manager_lock  # noqa: E402
+from dbd.runtime.locking import assert_manager_lock, manager_lock  # noqa: E402
 from dbd.storage.mysql.engine import connect  # noqa: E402
 
 RAMP = (5, 8, 10, 12, 15, 20, 25, 30, 40, 50)
@@ -39,6 +40,13 @@ def pct(values, fraction):
         return 0.0
     ordered = sorted(values)
     return ordered[max(0, math.ceil(len(ordered) * fraction) - 1)]
+
+
+def _error_signature(exc) -> str:
+    code = getattr(exc, "code", None)
+    if code is None:
+        code = getattr(exc, "curl_code", None)
+    return f"{type(exc).__name__}(curl={code})" if code is not None else type(exc).__name__
 
 
 def measure_local(samples=60):
@@ -74,7 +82,6 @@ class Budget:
         self.used = 0
 
     def take(self):
-        # Event-loop-only reservation, with no await between check and increment.
         if self.used >= self.limit:
             raise AdmissionClosed()
         self.used += 1
@@ -82,6 +89,7 @@ class Budget:
 
 class TimedSession:
     """Probe-only transport adapter; times HTTP after limiter/auth admission."""
+
     def __init__(self, session, budget):
         self.session = session
         self.budget = budget
@@ -89,6 +97,8 @@ class TimedSession:
         self.stop_reason = None
         self.samples = []
         self.waits = []
+        self.inflight_tasks: set[asyncio.Task] = set()
+        self.transport_errors: list[str] = []
 
     def __getattr__(self, name):
         return getattr(self.session, name)
@@ -101,6 +111,9 @@ class TimedSession:
         offered = FETCH_STARTED.get()
         if offered is not None:
             self.waits.append(started - offered)
+        task = asyncio.current_task()
+        if task is not None:
+            self.inflight_tasks.add(task)
         status = "network_error"
         try:
             response = await self.session.request(*args, **kwargs)
@@ -108,11 +121,15 @@ class TimedSession:
             if status >= 400:
                 self.stop_reason = f"HTTP {status}; new admissions stopped"
             return response
-        except Exception:
-            self.stop_reason = "Transport error; new admissions stopped"
+        except Exception as exc:
+            signature = _error_signature(exc)
+            self.transport_errors.append(signature)
+            self.stop_reason = f"Transport {signature}; new admissions stopped"
             raise
         finally:
             self.samples.append((started, time.perf_counter(), status))
+            if task is not None:
+                self.inflight_tasks.discard(task)
 
 
 async def run_step(client, transport, targets, rate, seconds):
@@ -122,6 +139,7 @@ async def run_step(client, transport, targets, rate, seconds):
     transport.deadline = deadline
     offset = len(transport.samples)
     wait_offset = len(transport.waits)
+    transport_error_offset = len(transport.transport_errors)
     before = transport.budget.used
     completed, errors = [], []
     index = 0
@@ -142,33 +160,63 @@ async def run_step(client, transport, targets, rate, seconds):
                 completed.append(time.perf_counter())
             except AdmissionClosed:
                 return
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
-                errors.append(type(exc).__name__)
-                transport.stop_reason = transport.stop_reason or f"{type(exc).__name__}; admissions stopped"
+                errors.append(_error_signature(exc))
+                transport.stop_reason = transport.stop_reason or (
+                    f"{_error_signature(exc)}; admissions stopped"
+                )
                 return
 
     tasks = [asyncio.create_task(worker()) for _ in range(client.concurrency)]
     try:
-        await asyncio.gather(*tasks)
+        timeout = max(0.0, deadline - time.perf_counter())
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+
+        # At the deadline, cancel workers still waiting on limiter/semaphore/auth.
+        # Only workers whose transport request has already started are allowed to
+        # drain, so post-window time cannot include never-sent admissions.
+        draining = []
+        for task in pending:
+            if task in transport.inflight_tasks:
+                draining.append(task)
+            else:
+                task.cancel()
+        await asyncio.gather(*(task for task in pending if task not in draining), return_exceptions=True)
+        if draining:
+            await asyncio.gather(*draining, return_exceptions=True)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+
     elapsed = time.perf_counter() - start
     window = min(seconds, elapsed)
     samples = transport.samples[offset:]
     within = sum(t <= deadline for t in completed)
     http = [ended - began for began, ended, _ in samples]
+    sent = transport.budget.used - before
     full = elapsed >= seconds and not transport.stop_reason and transport.budget.used < transport.budget.limit
+    error_breakdown = Counter(errors)
+    error_breakdown.update(transport.transport_errors[transport_error_offset:])
     return {
-        "rate": rate, "full": full, "sent": transport.budget.used - before,
-        "success": len(completed), "drained": len(completed) - within,
+        "rate": rate,
+        "full": full,
+        "sent": sent,
+        "success": len(completed),
+        "drained": len(completed) - within,
         "window_rps": within / window if window else 0,
-        "overall_rps": len(completed) / elapsed if elapsed else 0,
-        "http_p50": pct(http, .5), "http_p95": pct(http, .95),
+        "admission_rps": sent / window if window else 0,
+        "drain_seconds": max(0.0, elapsed - seconds),
+        "http_p50": pct(http, .5),
+        "http_p95": pct(http, .95),
         "wait_p95": pct(transport.waits[wait_offset:], .95),
-        "errors": len(errors),
+        "errors": sum(error_breakdown.values()),
+        "error_breakdown": dict(error_breakdown),
         "limited": sum(status in (429, 503) for _, _, status in samples),
     }
 
@@ -200,12 +248,7 @@ async def measure_remote(args, lock_connection):
 
     async def check_lock():
         while not done.is_set():
-            def verify():
-                with lock_connection.cursor() as cur:
-                    cur.execute("SELECT IS_USED_LOCK(CONCAT(DATABASE(), ':dbd-api-manager')) = CONNECTION_ID() ok")
-                    if cur.fetchone()["ok"] != 1:
-                        raise RuntimeError("Manager lock lost")
-            await asyncio.to_thread(verify)
+            await asyncio.to_thread(assert_manager_lock, lock_connection)
             try:
                 await asyncio.wait_for(done.wait(), 2)
             except TimeoutError:
@@ -224,7 +267,10 @@ async def measure_remote(args, lock_connection):
                     return results
                 baseline = None
                 print("  wait-p95 includes limiter/semaphore/auth; HTTP times exclude that wait.")
-                print("  rate rep sent window/s overall/s HTTP-p50 HTTP-p95 wait-p95 late errors 429/503 verdict")
+                print(
+                    "  rate rep sent admit/s window/s HTTP-p50 HTTP-p95 wait-p95 "
+                    "drain-s late errors 429/503 verdict"
+                )
                 for rate in rates:
                     for repeat in range(1, args.repeats + 1):
                         if budget.limit - budget.used < rate * args.step_seconds:
@@ -241,13 +287,20 @@ async def measure_remote(args, lock_connection):
                         result["clean"] = verdict == "observed" and not result["errors"]
                         results.append(result)
                         print(
-                            f"  {rate:4} {repeat:3} {result['sent']:4} {result['window_rps']:8.2f}"
-                            f" {result['overall_rps']:9.2f} {result['http_p50']:8.3f}s"
-                            f" {result['http_p95']:8.3f}s {result['wait_p95']:8.3f}s {result['drained']:4}"
-                            f" {result['errors']:6} {result['limited']:7} {verdict}", flush=True
+                            f"  {rate:4} {repeat:3} {result['sent']:4} {result['admission_rps']:7.2f}"
+                            f" {result['window_rps']:8.2f} {result['http_p50']:8.3f}s"
+                            f" {result['http_p95']:8.3f}s {result['wait_p95']:8.3f}s"
+                            f" {result['drain_seconds']:7.3f} {result['drained']:4}"
+                            f" {result['errors']:6} {result['limited']:7} {verdict}",
+                            flush=True,
                         )
+                        if result["error_breakdown"]:
+                            print(f"       errors: {result['error_breakdown']}")
                         if transport.stop_reason or not result["clean"]:
-                            print(f"  STOP: {transport.stop_reason or verdict}. DBD's ceiling is NOT established.")
+                            print(
+                                f"  STOP: {transport.stop_reason or verdict}. "
+                                "DBD's ceiling is NOT established."
+                            )
                             return results
                         if baseline is None:
                             baseline = result["http_p95"]
@@ -271,13 +324,13 @@ def summarise(results, args):
     for rate in sorted({r["rate"] for r in results}):
         rows = [r for r in results if r["rate"] == rate]
         if len(rows) == args.repeats and all(r["clean"] for r in rows):
-            qualified.append((rate, min(r["overall_rps"] for r in rows)))
+            qualified.append((rate, min(r["window_rps"] for r in rows)))
     if not qualified:
         print("  No rate completed all repeats cleanly; result is inconclusive.")
         return
     rate, observed = qualified[-1]
     print(f"  Highest target completing all repeats: {rate}/s")
-    print(f"  Lowest overall successful throughput at that target: {observed:.2f}/s")
+    print(f"  Lowest in-window successful throughput at that target: {observed:.2f}/s")
     print("  Profiles only, without persistence. Not a sustained rate guarantee.")
     print("  No automatic rate/concurrency recommendation. Application settings were not changed.")
     if args.workload:
@@ -291,12 +344,19 @@ def summarise(results, args):
 def main():
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     parser.add_argument("--local-only", action="store_true")
-    parser.add_argument("--collector-stopped", action="store_true",
-                        help="Confirm all collectors stopped, including any that lost their DB lock")
+    parser.add_argument(
+        "--collector-stopped",
+        action="store_true",
+        help="Confirm all collectors stopped, including any that lost their DB lock",
+    )
     parser.add_argument("--min-rate", type=positive, default=5)
     parser.add_argument("--max-rate", type=positive, default=25)
-    parser.add_argument("--max-requests", type=positive, default=600,
-                        help="Endpoint budget including warm-up; excludes auth/session requests")
+    parser.add_argument(
+        "--max-requests",
+        type=positive,
+        default=600,
+        help="Endpoint budget including warm-up; excludes auth/session requests",
+    )
     parser.add_argument("--step-seconds", type=positive, default=20)
     parser.add_argument("--warmup-seconds", type=positive, default=5)
     parser.add_argument("--concurrency", type=positive, default=settings.dbd_concurrency)
@@ -308,7 +368,10 @@ def main():
     if args.concurrency > 256:
         parser.error("concurrency must be <= 256")
     if not args.local_only and not args.collector_stopped:
-        parser.error("Stop all collectors, then pass --collector-stopped; DB locks cannot detect old collectors that lost their lock")
+        parser.error(
+            "Stop all collectors, then pass --collector-stopped; "
+            "DB locks cannot detect old collectors that lost their lock"
+        )
     try:
         measure_local()
         if not args.local_only:
@@ -318,7 +381,8 @@ def main():
     except KeyboardInterrupt:
         parser.exit(130, "Interrupted. No application settings changed.\n")
     except Exception as exc:
-        parser.exit(1, f"Probe failed: {type(exc).__name__}. No application settings changed.\n")
+        detail = _error_signature(exc)
+        parser.exit(1, f"Probe failed: {detail}. No application settings changed.\n")
 
 
 if __name__ == "__main__":

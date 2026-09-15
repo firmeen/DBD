@@ -23,3 +23,13 @@ class ContractError(DbdError):
     This is the earliest possible signal that DBD changed a response shape,
     so it should fail loudly instead of silently writing nulls to MySQL.
     """
+
+
+class IdentityConflict(ContractError):
+    """Raised when a response or existing projection disagrees with task identity.
+
+    Identity conflicts are contract failures plus an operational master-state
+    transition: while the task still owns its lease, the worker marks the company
+    master row as `conflict` so future master scheduling excludes it until a human
+    resolves the source identity discrepancy.
+    """

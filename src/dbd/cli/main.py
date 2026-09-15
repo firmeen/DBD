@@ -5,9 +5,10 @@ import asyncio
 import json
 
 from ..contracts.identity import parse_code
+from ..core.exceptions import DbdError
 from ..core.settings import settings
 from ..core.telemetry import configure
-from ..runtime.locking import manager_lock
+from ..runtime.locking import assert_manager_lock, manager_lock
 from ..runtime.resources import endpoints
 from ..runtime.worker import STATUS_OPERATING, prepare, process
 from ..storage.mysql.async_engine import create_engine
@@ -35,6 +36,18 @@ def parts(value):
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
     return selected
+
+
+def safe_error(exc: BaseException) -> str:
+    """Expose our sanitized diagnostics without serializing third-party objects/bodies."""
+    if isinstance(exc, BaseExceptionGroup):
+        messages = list(dict.fromkeys(safe_error(child) for child in exc.exceptions))
+        return "; ".join(messages)[:1000]
+    if isinstance(exc, (DbdError, ValueError)):
+        return str(exc) or type(exc).__name__
+    if isinstance(exc, RuntimeError):
+        return (str(exc) or type(exc).__name__)[:500]
+    return type(exc).__name__
 
 
 async def worker_command(args, health=None):
@@ -74,6 +87,15 @@ async def worker_command(args, health=None):
                 fiscal_year=args.fiscal_year,
                 statuses=None if args.all_statuses else STATUS_OPERATING,
             )
+            if args.master:
+                population = await repo.master_population()
+                population["selected_scope"] = (
+                    population["eligible_all_statuses"]
+                    if args.all_statuses
+                    else population["eligible_operating"]
+                )
+                population["scope"] = "all_statuses" if args.all_statuses else "operating_only"
+                print(json.dumps({"master_population": population}, indent=2), flush=True)
         else:
             run = await repo.get_run(args.run_id)
             if args.only is not None and args.only != run["parts"].split(","):
@@ -148,6 +170,7 @@ def main():
     disc.add_argument("--concurrency", type=positive)
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
+    disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
     args = parser.parse_args()
     try:
         if args.command == "migrate":
@@ -163,8 +186,21 @@ def main():
             from ..storage.mysql.engine import connect
 
             with connect() as conn, conn.cursor() as cur:
-                cur.execute("SELECT identity_status,COUNT(*) n FROM company_master GROUP BY identity_status")
-                print(json.dumps(cur.fetchall(), indent=2))
+                cur.execute(
+                    """
+                    SELECT
+                      COUNT(*) AS total,
+                      COALESCE(SUM(identity_status='conflict'),0) AS conflicts,
+                      COALESCE(SUM(identity_status<>'conflict'),0) AS eligible_all_statuses,
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code='1'),0)
+                        AS eligible_operating,
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code IS NULL),0)
+                        AS unknown_status
+                    FROM company_master
+                    """
+                )
+                row = cur.fetchone()
+            print(json.dumps({key: int(value or 0) for key, value in row.items()}, indent=2))
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
                 with manager_lock():
@@ -174,16 +210,14 @@ def main():
         elif args.command in ("bulk", "fetch-company"):
             configure(args.metrics_port)
             with manager_lock() as conn:
-                asyncio.run(worker_command(args, health=lambda: conn.ping(reconnect=False)))
+                asyncio.run(worker_command(args, health=lambda: assert_manager_lock(conn)))
         elif args.command == "replay":
             from ..runtime.replay import replay_archive
 
             with manager_lock():
                 replay_archive(args.archive_id)
         elif args.command in ("discover-retry", "discover-refresh"):
-            from ..storage.mysql.repositories.discovery_repository import (
-                reset_discovery,
-            )
+            from ..storage.mysql.repositories.discovery_repository import reset_discovery
 
             with manager_lock():
                 reset_discovery(
@@ -207,12 +241,18 @@ def main():
                     seeds.extend(s.strip() for s in handle if s.strip() and not s.lstrip().startswith("#"))
             if any(len(s) < 3 for s in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
-            with manager_lock():
-                command_discover(seeds, args.type, args.concurrency, args.rate, args.max_buckets)
+            configure(args.metrics_port)
+            with manager_lock() as conn:
+                command_discover(
+                    seeds,
+                    args.type,
+                    args.concurrency,
+                    args.rate,
+                    args.max_buckets,
+                    health=lambda: assert_manager_lock(conn),
+                )
     except KeyboardInterrupt:
         print("Interrupted. Resume the same run; unfinished endpoint tasks remain recoverable.")
         raise SystemExit(130) from None
     except Exception as exc:
-        # Avoid credentials or HTTP bodies embedded in third-party exceptions.
-        message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-        parser.exit(1, f"dbd-data: {message}\n")
+        parser.exit(1, f"dbd-data: {safe_error(exc)}\n")

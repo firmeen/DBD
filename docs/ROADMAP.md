@@ -1,471 +1,162 @@
-# Future architecture direction
+# Roadmap
 
-This is the fuller, enterprise-shaped structure the project can grow into
-(`contracts/`, `domain/`, `pipelines/`, `services/`, `storage/mysql/repositories/`,
-`runtime/` checkpoint-and-resume, `observability/`, `jobs/`, alembic
-`migrations/`, `ops/docker`, a 5-tier `tests/` suite). It's kept here as a
-reference, not as the current state of the repo.
+Current runtime already has durable discovery, endpoint-level queueing, replay,
+leases, Alembic migrations, strict contracts, natural-key freshness and MySQL
+integration tests. This roadmap therefore starts **after** PR #1 hardening; it is
+not a description of missing basic architecture.
 
-The current build (see the top-level `README.md` and `docs/ARCHITECTURE.md`)
-deliberately implements only a slice of this: one client layer
-(session/auth/crypto), one contract, one pipeline, one repository — all for
-the `company_profile` endpoint, which is the only one verified working so
-far. Grow into the sections below as each concrete need shows up (a second
-endpoint, real bulk-volume ingestion that needs resume, multiple people
-touching the codebase who need enforced layering) rather than building them
-ahead of that need.
+## Principle
 
----
+Do not add infrastructure because it looks “enterprise”. Add the next component
+only when measured workload, correctness or operating evidence requires it.
 
-โครงสร้างที่ผมแนะนำคือแบบนี้:
+Priority order:
 
-```text
-dbd-data/
-│
-├── pyproject.toml
-├── uv.lock
-├── README.md
-├── .env.example
-├── .gitignore
-├── Makefile
-├── alembic.ini
-│
-├── config/
-│   ├── default.yaml
-│   ├── development.yaml
-│   ├── production.yaml
-│   └── logging.yaml
-│
-├── src/
-│   └── dbd/
-│       │
-│       ├── __init__.py
-│       │
-│       ├── bootstrap/
-│       │   ├── app.py
-│       │   ├── container.py
-│       │   └── lifecycle.py
-│       │
-│       ├── core/
-│       │   ├── settings.py
-│       │   ├── constants.py
-│       │   ├── exceptions.py
-│       │   ├── types.py
-│       │   ├── clock.py
-│       │   └── logging.py
-│       │
-│       ├── clients/
-│       │   └── dbd/
-│       │       ├── client.py
-│       │       ├── session.py
-│       │       ├── auth.py
-│       │       ├── crypto.py
-│       │       ├── transport.py
-│       │       ├── rate_limit.py
-│       │       ├── retry.py
-│       │       │
-│       │       └── endpoints/
-│       │           ├── commons.py
-│       │           ├── biztype.py
-│       │           ├── companies.py
-│       │           ├── financials.py
-│       │           └── search.py
-│       │
-│       ├── contracts/
-│       │   ├── common.py
-│       │   ├── biztype.py
-│       │   ├── company.py
-│       │   ├── financial.py
-│       │   └── envelope.py
-│       │
-│       ├── domain/
-│       │   ├── entities/
-│       │   │   ├── company.py
-│       │   │   ├── biztype.py
-│       │   │   └── financial.py
-│       │   │
-│       │   ├── value_objects/
-│       │   └── enums.py
-│       │
-│       ├── pipelines/
-│       │   ├── base.py
-│       │   │
-│       │   ├── biztype/
-│       │   │   ├── overview.py
-│       │   │   ├── profiles.py
-│       │   │   └── charts.py
-│       │   │
-│       │   ├── company/
-│       │   │   ├── discovery.py
-│       │   │   ├── profile.py
-│       │   │   ├── committees.py
-│       │   │   ├── transformations.py
-│       │   │   └── financials.py
-│       │   │
-│       │   └── orchestration.py
-│       │
-│       ├── services/
-│       │   ├── ingest_service.py
-│       │   ├── normalization_service.py
-│       │   ├── dedup_service.py
-│       │   └── reconciliation_service.py
-│       │
-│       ├── storage/
-│       │   └── mysql/
-│       │       ├── engine.py
-│       │       ├── session.py
-│       │       ├── transaction.py
-│       │       │
-│       │       ├── models/
-│       │       │   ├── raw.py
-│       │       │   ├── biztype.py
-│       │       │   ├── company.py
-│       │       │   ├── financial.py
-│       │       │   └── operations.py
-│       │       │
-│       │       ├── repositories/
-│       │       │   ├── biztype_repository.py
-│       │       │   ├── company_repository.py
-│       │       │   ├── financial_repository.py
-│       │       │   └── run_repository.py
-│       │       │
-│       │       └── bulk.py
-│       │
-│       ├── runtime/
-│       │   ├── run_context.py
-│       │   ├── checkpoint.py
-│       │   ├── progress.py
-│       │   ├── concurrency.py
-│       │   ├── shutdown.py
-│       │   └── heartbeat.py
-│       │
-│       ├── observability/
-│       │   ├── metrics.py
-│       │   ├── tracing.py
-│       │   ├── health.py
-│       │   └── audit.py
-│       │
-│       ├── jobs/
-│       │   ├── biztype_sync.py
-│       │   ├── company_sync.py
-│       │   └── full_sync.py
-│       │
-│       └── cli/
-│           ├── main.py
-│           ├── commands/
-│           │   ├── sync.py
-│           │   ├── inspect.py
-│           │   ├── retry.py
-│           │   └── status.py
-│           └── output.py
-│
-├── migrations/
-│   ├── env.py
-│   └── versions/
-│
-├── schemas/
-│   ├── api/
-│   │   ├── biztype/
-│   │   ├── company/
-│   │   └── financial/
-│   └── database/
-│
-├── tests/
-│   ├── unit/
-│   ├── integration/
-│   ├── contract/
-│   ├── e2e/
-│   ├── fixtures/
-│   └── snapshots/
-│
-├── scripts/
-│   ├── bootstrap_db.py
-│   ├── verify_environment.py
-│   ├── inspect_api.py
-│   └── backfill.py
-│
-├── ops/
-│   ├── docker/
-│   │   ├── Dockerfile
-│   │   └── docker-compose.yml
-│   ├── systemd/
-│   ├── monitoring/
-│   └── mysql/
-│       ├── init.sql
-│       └── tuning.sql
-│
-├── docs/
-│   ├── architecture.md
-│   ├── database.md
-│   ├── api-discovery.md
-│   ├── encryption.md
-│   ├── runbook.md
-│   └── recovery.md
-│
-└── var/                       # ignored by Git
-    ├── cache/
-    ├── checkpoints/
-    ├── raw/
-    ├── failed/
-    ├── logs/
-    └── tmp/
-```
+1. prove population completeness;
+2. prove source and local throughput;
+3. execute and measure the accepted campaign;
+4. then optimize the bottleneck that measurements actually identify.
 
-แกนสำคัญคือ **แบ่งตาม responsibility ไม่ใช่แบ่งตามชนิดไฟล์มั่ว ๆ** เช่น `api.py`, `database.py`, `utils.py`, `main.py` แล้วทุกอย่างกองอยู่ด้วยกัน ซึ่งตอนโปรเจกต์เล็กจะดูง่าย แต่พอขยายจะเริ่มหาไม่เจอว่าอะไรควรแก้ตรงไหน
+## R1 — Population reconciliation
 
-สำหรับ DBD โดยเฉพาะ ผมจะแยก `clients/dbd/` เป็นระบบ transport ชัดเจน เพราะตอนนี้เรารู้แล้วว่ามันไม่ใช่ HTTP ธรรมดา แต่เส้นทางจริงคือ:
+Goal: establish an independent denominator for “all companies”.
 
-```text
-HTTP
-  ↓
-session / cookies
-  ↓
-anonymous auth
-  ↓
-JWT access token
-  ↓
-encKey
-  ↓
-encrypted response envelope
-  ↓
-HKDF-SHA256
-  ↓
-AES-GCM
-  ↓
-decompression
-  ↓
-JSON
-```
+Deliverables:
 
-ดังนั้น `crypto.py` ไม่ควรปนกับ business logic, `auth.py` ไม่ควรปนกับ scraper และ endpoint เช่น `biztype.py` ไม่ควรรู้รายละเอียด AES-GCM เลย มันควรเรียกเพียงประมาณ:
+- authoritative DBD population/count source;
+- deterministic reconciliation report against `company_master`;
+- explicit categories for conflict, quarantine and unexplained missing identities;
+- preserved campaign timestamp/source version.
 
-```python
-result = await client.biztype.get_overview(...)
-```
+Exit criterion: no unexplained population gap.
 
-แล้วชั้น transport จัดการ authentication/decryption ให้ทั้งหมด
+## R2 — Clean hardened discovery campaign
 
-สิ่งที่ผมเพิ่มเหนือกว่าโครงสร้าง scraper แบบ Creden มากคือ **`contracts/`** เพราะ DBD เป็น external API ที่เราไม่ได้ควบคุม ถ้าวันหนึ่ง field `ostCnt` เปลี่ยนชื่อ, response schema เปลี่ยน หรือ envelope version จาก `kid=1` เปลี่ยน เราควร detect ได้ทันที ไม่ใช่รอให้ database พังทีหลัง
+Run migration 0004 and a fresh/resumed full discovery using current contracts and
+quarantine behavior.
 
-อีกตัวที่สำคัญมากคือ `pipelines/` โดย endpoint กับ pipeline ต้องเป็นคนละเรื่อง เช่น:
+Required evidence:
 
-```text
-endpoint
-    GET data
+- failed buckets = 0;
+- partial pages = 0;
+- unresolved rejections = 0;
+- known lossy partitions = 0;
+- observed prefix gaps reconciled;
+- R1 denominator matched.
 
-pipeline
-    GET
-     ↓
-    validate
-     ↓
-    normalize
-     ↓
-    deduplicate
-     ↓
-    persist
-     ↓
-    checkpoint
-```
+Do not reset checkpoints merely to hide failures.
 
-เพราะสุดท้ายคุณจะไม่ได้ดึงแค่หน้า overview แต่มีโอกาสกลายเป็น:
+## R3 — Representative capacity model
 
-```text
-BizType Discovery
-        ↓
-TSIC codes
-        ↓
-BizType Profile
-        ↓
-Company Discovery
-        ↓
-Company Profile
-        ↓
-Committees
-        ↓
-Financial Statements
-        ↓
-Historical Data
-```
+### Source-side
 
-`pipelines/company/` จึงสามารถโตได้โดยไม่กระทบ `clients/dbd/`
+Re-run `probe_capacity.py` with current transport diagnostics after stopping all
+collectors. Determine a conservative starting rate from successful throughput,
+latency and transport errors, not from configured target rate.
 
-ส่วน database ผมไม่อยากให้ Python ทำแบบ:
+### Local-side
 
-```python
-cursor.execute(...)
-```
+Build/extend a disposable-DB benchmark that exercises representative mixed endpoint
+projection, not only claim/finish queue operations. Use archived/synthetic contract-
+valid payloads without contacting DBD.
 
-กระจายอยู่ทุกไฟล์
+Measure:
 
-แต่บังคับให้ผ่าน:
+- projection rows/s;
+- DB connection/pool saturation;
+- queue claim/finish overhead;
+- archive/raw bytes written;
+- per-endpoint cost distribution.
 
-```text
-service
-   ↓
-repository
-   ↓
-bulk writer
-   ↓
-MySQL
-```
+Exit criterion: know whether current bottleneck is source, network, Python,
+projection SQL or storage.
 
-ทำให้ภายหลังเปลี่ยนจาก insert ทีละ row เป็น batch 5,000 rows, `ON DUPLICATE KEY UPDATE`, transaction batching หรือ staging-table strategy ได้โดย pipeline ไม่ต้องเปลี่ยน
+## R4 — Full all-status campaign
 
-และใน MySQL `dbd` ผมจะจัด table เป็น logical layer เช่น:
-
-```text
-raw_*       = เก็บ source payload / source representation ที่จำเป็น
-stg_*       = staging / normalize ชั่วคราว
-biz_*       = ข้อมูลประเภทธุรกิจ
-company_*   = ข้อมูลนิติบุคคล
-fin_*       = งบการเงิน
-ref_*       = reference/master
-ops_*       = run/checkpoint/job state
-audit_*     = audit/history
-```
-
-เช่น:
-
-```text
-ops_runs
-ops_checkpoints
-ops_failures
-
-ref_parameters
-ref_business_types
-
-biz_overview
-biz_overview_history
-biz_monthly_chart
-
-company_profile
-company_committee
-company_business
-company_transformation
-
-fin_statements
-fin_statement_items
-
-audit_source_changes
-```
-
-อีกจุดที่ควรเปลี่ยนจากโปรเจกต์ทดลองคือ **ไม่เก็บทุกอย่างลง `output/` แบบไฟล์ JSON กระจัดกระจาย** ใน production ข้อมูลหลักต้องอยู่ใน DB ส่วนไฟล์ใช้เฉพาะ forensic/debug/recovery แล้วไปอยู่:
-
-```text
-var/raw/
-var/failed/
-var/checkpoints/
-var/logs/
-```
-
-และทั้งหมดต้อง `.gitignore`
-
-โดยเฉพาะ DBD:
-
-```text
-JWT access token
-session cookie
-encKey
-browser cookie
-Authorization header
-```
-
-**ห้ามเขียนลง log / JSON / evidence file / database** โดยเด็ดขาด ตัว token ควรอยู่ใน memory และหมดอายุตาม session เท่านั้น
-
-อีกส่วนที่ผมให้ความสำคัญมากคือ `runtime/` เพราะ production ingestion ต้องสามารถ:
-
-```text
-Start
- ↓
-Run ID
- ↓
-Checkpoint
- ↓
-Fetch batch
- ↓
-Persist
- ↓
-Checkpoint
- ↓
-Crash / Ctrl+C / Network error
- ↓
-Restart
- ↓
-Resume from checkpoint
-```
-
-ไม่ใช่พังตอน 80% แล้วเริ่มตั้งแต่ศูนย์
-
-ดังนั้นในอนาคต CLI จะออกมาเป็นรูปแบบที่ดูเป็นระบบมาก เช่น:
+Create one immutable run:
 
 ```powershell
-python -m dbd sync biztype
-python -m dbd sync companies
-python -m dbd sync financials
-
-python -m dbd sync all --workers 8
-python -m dbd sync all --resume
-
-python -m dbd status
-python -m dbd retry failed
-
-python -m dbd inspect api
-python -m dbd inspect database
+dbd-data bulk --master --all-statuses --enqueue-only
 ```
 
-และไม่ควรต้องมี:
+Resume only that run ID with measured rate/concurrency.
 
-```text
-test.py
-test2.py
-dbd_test.py
-dbd_test_final.py
-dbd_new.py
-dbd_fixed.py
-```
+Record:
 
-อีกต่อไป
+- start timestamp;
+- master denominator;
+- endpoint-task total;
+- requests/retries/cooldowns;
+- page/new-identity rates;
+- endpoint outcomes;
+- archive/projection growth;
+- wall-clock duration.
 
-ภาพรวม architecture ที่ผมอยากให้ตัวนี้เป็นคือ:
+Exit criterion: accepted seven-endpoint data complete with no unexplained failed
+work and total campaign <=48 hours if that business target is still required.
 
-```text
-                         DBD DataWarehouse+
-                                │
-                         HTTP / Encrypted API
-                                │
-                                ▼
-┌──────────────────────────────────────────────────────┐
-│                   DBD Client Layer                   │
-│ Session │ Auth │ Retry │ Rate Limit │ Crypto │ HTTP │
-└───────────────────────────┬──────────────────────────┘
-                            │
-                            ▼
-┌──────────────────────────────────────────────────────┐
-│                    Contract Layer                    │
-│       Validation │ Schema │ Version Detection       │
-└───────────────────────────┬──────────────────────────┘
-                            │
-                            ▼
-┌──────────────────────────────────────────────────────┐
-│                   Pipeline Engine                    │
-│ Discover → Fetch → Normalize → Dedup → Validate     │
-└───────────────────────────┬──────────────────────────┘
-                            │
-              ┌─────────────┴─────────────┐
-              ▼                           ▼
-        Checkpoint                    Failure Queue
-              │                           │
-              └─────────────┬─────────────┘
-                            ▼
-┌──────────────────────────────────────────────────────┐
-│                    Storage Layer                     │
-│ Repository │ Transaction │ Bulk Upsert │ History    │
-└───────────────────────────┬──────────────────────────┘
-                            │
-                            ▼
-                          MySQL
-                            │
-       ┌────────────────────┼──────────────────┐
-       ▼                    ▼                  ▼
-      Core                History             Ops
-```
+## R5 — Storage lifecycle
+
+Only after a representative campaign, measure storage by source and endpoint.
+
+Then decide:
+
+- raw/archive retention period;
+- partitioning/archival tier;
+- compression/export strategy;
+- whether legacy `raw_responses` FK dependencies should be migrated so duplicate
+  payload storage can be reduced safely.
+
+No automatic deletion before a backup/restore and replay-retention policy exists.
+
+## R6 — Operational resilience
+
+Add evidence and automation around:
+
+- backup/restore drill;
+- campaign manifest/report artifact;
+- alert thresholds for stalled queue, lost lock, quarantine growth and rate
+  penalties;
+- documented conflict-resolution workflow;
+- schema/DB capacity alarms.
+
+## R7 — Safe request reduction
+
+Optimize only scopes that can be proven equivalent before HTTP.
+
+Candidates:
+
+- discovery seed-overlap reduction after set-equivalence measurement;
+- industry benchmark reservation only if full natural key, including location
+  scope, can be derived before request;
+- endpoint reuse based on explicit source version/freshness evidence.
+
+Rejected shortcut: dedupe from incomplete TSIC/year/size scope.
+
+## R8 — Scale-out only when one manager is insufficient
+
+Current MySQL named-lock architecture intentionally permits one API manager per
+database. Do not add Redis/Kafka/Kubernetes solely for architectural fashion.
+
+If measured workload proves one manager cannot meet the required campaign SLA,
+first design:
+
+- distributed global admission limiter;
+- globally safe work ownership;
+- source-friendly partition strategy;
+- idempotent natural-key projection guarantees across managers.
+
+Only then select external coordination infrastructure.
+
+## Explicit non-goals until evidence changes
+
+- bypassing DBD limits with multiple IPs/managers;
+- guessing missing identity digits;
+- treating contract failure as no-data;
+- deleting raw evidence to save space before measuring retention needs;
+- claiming complete population from search seeds alone;
+- claiming 48-hour capability from a short profile probe.
+
+`docs/EXECUTION_PLAN_TH.md` is the acceptance sequence. `docs/VALIDATION.md` records
+what has actually been measured. `docs/ARCHITECTURE.md` describes current runtime
+invariants.

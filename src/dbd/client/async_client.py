@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException as RequestsError
@@ -19,7 +20,7 @@ from tenacity import (
 
 from ..core.exceptions import DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
-from ..core.telemetry import LATENCY, REQUESTS
+from ..core.telemetry import EFFECTIVE_RATE, HTTP_RETRIES, LATENCY, REQUESTS, log
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
 from .rate_limit import TokenBucket
@@ -54,12 +55,21 @@ def retry_after(value: str | None) -> float:
             return 1.0
 
 
+def _curl_code(exc) -> object:
+    """Extract curl_cffi's numeric code when present without serializing the exception."""
+    code = getattr(exc, "code", None)
+    if code is not None:
+        return code
+    return getattr(exc, "curl_code", None)
+
+
 class AsyncDbdClient:
     def __init__(self, *, concurrency=None, rate_per_second=None, max_retries=None):
         self.concurrency = settings.dbd_concurrency if concurrency is None else concurrency
         if self.concurrency < 1:
             raise ValueError("concurrency must be positive")
         self.rate = TokenBucket(settings.dbd_rate_per_second if rate_per_second is None else rate_per_second)
+        EFFECTIVE_RATE.set(self.rate.rate)
         self.max_retries = settings.dbd_http_retries if max_retries is None else max_retries
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._auth = DbdAuth()
@@ -89,8 +99,6 @@ class AsyncDbdClient:
 
     async def _ensure_token(self, *, rejected=None, force=False):
         async with self._auth_lock:
-            # A rejected OLD token must not invalidate a refresh already done
-            # by another coroutine.
             if force or (rejected is not None and rejected == self._token):
                 self._auth.invalidate()
                 self._token = None
@@ -132,6 +140,7 @@ class AsyncDbdClient:
             with attempt:
                 if attempt.retry_state.attempt_number > 1:
                     self.retries_made += 1
+                    HTTP_RETRIES.inc()
                 async with self._semaphore:
                     await self.rate.acquire()
                     token = await self._ensure_token()
@@ -147,15 +156,33 @@ class AsyncDbdClient:
                                 headers=self._headers(token, referer),
                                 timeout=timeout or settings.request_timeout,
                             )
-                        except (RequestsError, TimeoutError):
+                        except (RequestsError, TimeoutError) as exc:
                             REQUESTS.labels("network_error").inc()
+                            log.warning(
+                                "http_transport_error",
+                                stage="request",
+                                path=path,
+                                exception_type=type(exc).__name__,
+                                curl_code=_curl_code(exc),
+                            )
                             raise
                     status = response.status_code
                     REQUESTS.labels(str(status)).inc()
                     if status in (429, 503):
                         self.rate_limit_hits += 1
-                        self.rate.slow_down()
-                        self.rate.cooldown(retry_after(response.headers.get("retry-after")))
+                        old_rate = self.rate.rate
+                        new_rate = self.rate.slow_down()
+                        EFFECTIVE_RATE.set(new_rate)
+                        cooldown = retry_after(response.headers.get("retry-after"))
+                        self.rate.cooldown(cooldown)
+                        log.warning(
+                            "rate_penalty",
+                            status=status,
+                            path=path,
+                            old_rate=old_rate,
+                            new_rate=new_rate,
+                            cooldown_seconds=cooldown,
+                        )
                     if status == 401:
                         await self._ensure_token(rejected=token)
                         raise TransientHttpError("HTTP 401")
@@ -170,6 +197,22 @@ class AsyncDbdClient:
                     except DbdTokenExpiredError:
                         await self._ensure_token(rejected=token)
                         raise
+                    except Exception as exc:
+                        body = response.content or b""
+                        log.warning(
+                            "http_decode_error",
+                            stage="decode",
+                            path=path,
+                            status=status,
+                            exception_type=type(exc).__name__,
+                            body_bytes=len(body),
+                            body_sha256=sha256(body).hexdigest(),
+                        )
+                        raise
+                    recovered = self.rate.recover()
+                    if recovered is not None:
+                        EFFECTIVE_RATE.set(recovered)
+                        log.info("rate_recovered", path=path, effective_rate=recovered)
                     return ApiResponse(
                         data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
                     )

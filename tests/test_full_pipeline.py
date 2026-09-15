@@ -21,7 +21,9 @@ class FullApi(FakeApi):
             result.data = [{"signSeq": 1, "signDescription": "Synthetic"}]
         elif "/nations/charts/" in path:
             result.data = {
-                "customChart": {"shareHistTHDps": [{"label": "2568", "shareAmt": "100", "sharePctVol": "0"}]}
+                "customChart": {
+                    "shareHistTHDps": [{"label": "2568", "shareAmt": "100", "sharePctVol": "0"}]
+                }
             }
         elif "/nations/" in path:
             result.data = [
@@ -32,7 +34,11 @@ class FullApi(FakeApi):
         elif "/capitals/" in path:
             result.data = [{"seqNo": 1, "newCapAmt": "100"}]
         elif "/mergers/" in path:
-            result.data = {"transformFroms": [{"transformSeqNo": 1, "transformFromJpNo": "0000000000001"}]}
+            result.data = {
+                "transformFroms": [
+                    {"transformSeqNo": 1, "transformFromJpNo": "0000000000001"}
+                ]
+            }
         elif "/fin/submit/" in path:
             result.data = [{"submitYear": "2568", "submitDate": [2026, 1, 1]}]
         elif "/fin/balancesheet/" in path:
@@ -60,20 +66,18 @@ class FullApi(FakeApi):
 
 
 async def test_all_endpoints_and_explicit_null_refresh(repo):
-    # Every implemented endpoint, not just the default selection: tabs 3-4 are
-    # excluded from DEFAULT_PARTS but still supported, and must keep projecting.
     resources = endpoints(list(PARTS))
     run, ids = await new_run(repo, resources)
     assert await process(repo, run, concurrency=4, client_factory=FullApi) == {"done": len(resources)}
     async with repo.engine.connect() as conn:
         amount = (
             await conn.execute(
-                text("SELECT amount FROM financial_statement_items WHERE jp_no=:no"), {"no": ids[0].jp_no}
+                text("SELECT amount FROM financial_statement_items WHERE jp_no=:no"),
+                {"no": ids[0].jp_no},
             )
         ).scalar()
         assert amount == Decimal("100.25")
 
-    # A true null from an authoritative profile clears the previous email.
     class Cleared(FullApi):
         async def fetch(self, *a, **kw):
             r = await super().fetch(*a, **kw)
@@ -86,7 +90,9 @@ async def test_all_endpoints_and_explicit_null_refresh(repo):
     assert await process(repo, followup, concurrency=1, client_factory=Cleared) == {"done": 1}
     async with repo.engine.connect() as conn:
         assert (
-            await conn.execute(text("SELECT email FROM companies WHERE jp_no=:no"), {"no": ids[0].jp_no})
+            await conn.execute(
+                text("SELECT email FROM companies WHERE jp_no=:no"), {"no": ids[0].jp_no}
+            )
         ).scalar() is None
 
 
@@ -107,22 +113,44 @@ async def test_bad_collection_does_not_delete_previous_rows(repo):
     async with repo.engine.connect() as conn:
         assert (
             await conn.execute(
-                text("SELECT COUNT(*) FROM company_committees WHERE jp_no=:no"), {"no": ids[0].jp_no}
+                text("SELECT COUNT(*) FROM company_committees WHERE jp_no=:no"),
+                {"no": ids[0].jp_no},
+            )
+        ).scalar() == 1
+
+
+async def test_malformed_transformations_do_not_clear_previous_rows(repo):
+    run, ids = await new_run(repo, ("transformations",))
+    assert await process(repo, run, concurrency=1, client_factory=FullApi) == {"done": 1}
+
+    class BadTransformation(FullApi):
+        async def fetch(self, *a, **kw):
+            r = await super().fetch(*a, **kw)
+            r.data = {"renamedDirections": []}
+            return r
+
+    followup = await repo.create_run("bad-transform-refresh", ["details"])
+    await repo.import_batch(followup, ids, ("transformations",))
+    await repo.ready(followup)
+    assert await process(repo, followup, concurrency=1, client_factory=BadTransformation) == {"failed": 1}
+    async with repo.engine.connect() as conn:
+        assert (
+            await conn.execute(
+                text("SELECT COUNT(*) FROM company_transformations WHERE jp_no=:no"),
+                {"no": ids[0].jp_no},
             )
         ).scalar() == 1
 
 
 class SharedIndustryApi(FakeApi):
-    """Every company reports the same TSIC/size, so they all share one benchmark scope."""
+    """Companies share TSIC/size but full benchmark scope is known only in the response."""
 
     benchmark_calls = 0
 
     async def fetch(self, method, path, **kwargs):
         result = await super().fetch(method, path, **kwargs)
         if "/info/" in path:
-            result.data.update(
-                submitFinYear="2568", submitObjCode="65110", businessSizeCode="L"
-            )
+            result.data.update(submitFinYear="2568", submitObjCode="65110", businessSizeCode="L")
         elif "/fin/basics/" in path:
             type(self).benchmark_calls += 1
             result.data = {
@@ -135,40 +163,36 @@ class SharedIndustryApi(FakeApi):
                 "assetsA": "100",
                 "assetsT": "1600",
             }
-        elif "/fin/" in path:
+        elif "/fin/submit/" in path:
             result.data = []
+        elif "/fin/balancesheet/" in path:
+            result.data = {"finStatementDailyDtos": []}
         return result
 
 
-async def test_industry_benchmark_fetched_once_per_scope(repo):
-    """The benchmark endpoint is addressed per company but answers per TSIC group.
-
-    Companies sharing a scope must not each issue the request: at a million
-    companies that is ~600k requests rewriting a few thousand identical rows.
-    """
+async def test_industry_benchmark_does_not_guess_scope_before_http(repo):
+    """TSIC/year/size alone must not suppress a request whose location scope is unknown."""
     SharedIndustryApi.benchmark_calls = 0
     run, _ = await new_run(repo, endpoints(["profile", "financials"]), count=5)
 
-    result = await process(repo, run, concurrency=1, client_factory=SharedIndustryApi)
+    result = await process(repo, run, concurrency=4, client_factory=SharedIndustryApi)
 
-    # 5 profiles + 5 submissions + 5 statements all still run; only the
-    # benchmark collapses to one request plus four skips.
-    assert SharedIndustryApi.benchmark_calls == 1, "benchmark scope fetched more than once"
-    assert result.get("not_available", 0) >= 4
+    assert SharedIndustryApi.benchmark_calls == 5
+    assert result.get("failed", 0) == 0
 
     async with repo.engine.connect() as conn:
-        # The data is still there - one row is what this scope has always produced.
         rows = (
             await conn.execute(
                 text(
                     "SELECT COUNT(*) FROM industry_benchmarks"
                     " WHERE submit_obj_code='65110' AND fiscal_year='2568'"
+                    " AND business_size_code='L' AND location_type='TH' AND location_no='00'"
                 )
             )
         ).scalar()
         assert rows == 1
 
-        skipped = (
+        unsafe_skips = (
             await conn.execute(
                 text(
                     "SELECT COUNT(*) FROM endpoint_tasks WHERE run_id=:run"
@@ -177,4 +201,4 @@ async def test_industry_benchmark_fetched_once_per_scope(repo):
                 {"run": run},
             )
         ).scalar()
-        assert skipped == 4
+        assert unsafe_skips == 0
