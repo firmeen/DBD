@@ -3,7 +3,7 @@ import pytest
 from dbd.client.rate_control import EndpointRateController, RedisPacer
 
 
-def test_endpoint_penalty_is_isolated_but_global_safety_also_backs_off():
+async def test_endpoint_penalty_is_isolated_but_global_safety_also_backs_off():
     controller = EndpointRateController(
         60,
         endpoint_rates={"profile": 30, "industry_benchmark": 10},
@@ -14,7 +14,7 @@ def test_endpoint_penalty_is_isolated_but_global_safety_also_backs_off():
     assert controller.effective_rate("committees") == 60
     assert controller.global_effective_rate() == 60
 
-    old_endpoint, new_endpoint, old_global, new_global = controller.penalize(
+    old_endpoint, new_endpoint, old_global, new_global = await controller.penalize(
         "industry_benchmark", 0
     )
     assert (old_endpoint, new_endpoint) == (10, 5)
