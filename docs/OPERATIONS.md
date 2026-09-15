@@ -20,7 +20,7 @@ Core controls:
 | `DBD_PROJECTION_WORKERS` | Projection consumers |
 | `DBD_LEASE_SECONDS` | Task lease duration |
 | `DBD_HTTP_RETRIES` | HTTP retries after the first attempt |
-| `DBD_MAX_TASK_ATTEMPTS` | Durable attempts before terminal failure |
+| `DBD_MAX_TASK_ATTEMPTS` | Independent durable retry ceiling for fetch and project stages |
 | `DBD_METRICS_PORT` | `0` disables; nonzero binds localhost |
 | `DBD_ENV_FILE` | Absolute alternative environment file |
 
@@ -59,6 +59,12 @@ Ctrl+C releases process-owned unfinished leases. Process death is recovered afte
 lease expiry. A project-stage task retains its archive reference and must resume
 from archive rather than source HTTP.
 
+`endpoint_tasks.attempts` is the fetch retry budget; `project_attempts` is the
+projection retry budget. `DBD_MAX_TASK_ATTEMPTS` applies independently to each stage.
+Once fetch crosses the durable archive boundary, exhaustion of `attempts` cannot
+prevent recovery of the archived project task. Generic retry resets only the failed
+stage's counter.
+
 ## Archive backend operations
 
 Default inline archive mode:
@@ -87,8 +93,8 @@ claiming work. Actual storage permission/network failure happens during upload a
 cannot advance a task to `project`.
 
 External objects are encrypted client-side with AES-256-GCM. Reads verify ciphertext
-SHA-256, AES-GCM authentication using object key as AAD, canonical plaintext SHA-256
-and payload decode before projection.
+SHA-256, AES-GCM authentication using object key as AAD, restore canonical serialized
+JSON bytes from the storage codec, verify payload SHA-256 and then parse JSON.
 
 ### Encryption-key rotation
 
@@ -122,8 +128,8 @@ policy after the database backup/commit safety window.
 ## Failure inspection
 
 ```sql
-SELECT t.id,t.stage,t.endpoint,t.status,t.attempts,t.last_error,t.raw_response_id,
-       m.jp_no,m.jp_type_code
+SELECT t.id,t.stage,t.endpoint,t.status,t.attempts,t.project_attempts,
+       t.last_error,t.raw_response_id,m.jp_no,m.jp_type_code
 FROM endpoint_tasks t
 JOIN company_master m USING(company_id)
 WHERE t.run_id=:run AND t.status='failed'
@@ -191,7 +197,8 @@ cost, retention and restore obligations that must be measured in canaries.
 ## Database safety and CI
 
 Back up MySQL before schema maintenance. Alembic migrations are additive/forward-only
-and automatic downgrade is disabled. Restore a backup to roll back.
+and automatic downgrade is disabled. V2 schema head is currently
+`0007_project_attempt_budget`; restore a backup to roll back.
 
 Local/CI integration tests require `DBD_INTEGRATION=1` and a database name beginning
 `dbd_test_`. Redis tests use a disposable Redis database. A green workflow on the
