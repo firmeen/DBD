@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException as RequestsError
@@ -192,6 +193,18 @@ class AsyncDbdClient:
                         data = self._decode(response, path, token)
                     except DbdTokenExpiredError:
                         await self._ensure_token(rejected=token)
+                        raise
+                    except Exception as exc:
+                        body = response.content or b""
+                        log.warning(
+                            "http_decode_error",
+                            stage="decode",
+                            path=path,
+                            status=status,
+                            exception_type=type(exc).__name__,
+                            body_bytes=len(body),
+                            body_sha256=sha256(body).hexdigest(),
+                        )
                         raise
                     recovered = self.rate.recover()
                     if recovered is not None:
