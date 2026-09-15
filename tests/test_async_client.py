@@ -5,7 +5,9 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from dbd.client import rate_limit
 from dbd.client.async_client import AsyncDbdClient
+from dbd.client.rate_limit import TokenBucket
 from dbd.core.exceptions import DbdTokenExpiredError
 
 
@@ -38,7 +40,7 @@ async def test_expired_token_and_concurrent_rejections_refresh_once():
     assert len(calls) == 1
 
 
-async def test_expiry_during_decryption_retries(monkeypatch):
+async def test_expiry_during_decryption_retries():
     c = client()
     c._ensure_token = AsyncMock(return_value="new")
     attempts = []
@@ -62,6 +64,27 @@ async def test_429_sets_shared_cooldown_before_retry():
     await c.fetch("GET", "/test")
     assert c.rate.rate == 500
     assert c.rate._cooldown_until > time.monotonic()
+
+
+def test_rate_recovers_gradually_and_never_exceeds_target(monkeypatch):
+    clock = [0.0]
+    monkeypatch.setattr(rate_limit.time, "monotonic", lambda: clock[0])
+    bucket = TokenBucket(20)
+    assert bucket.slow_down() == 10
+    assert bucket.recover() is None
+
+    clock[0] = 31
+    assert bucket.recover() == pytest.approx(12.5)
+    assert bucket.recover() is None
+
+    clock[0] = 62
+    assert bucket.recover() == pytest.approx(15.625)
+    clock[0] = 93
+    assert bucket.recover() == pytest.approx(19.53125)
+    clock[0] = 124
+    assert bucket.recover() == 20
+    clock[0] = 155
+    assert bucket.recover() is None
 
 
 async def test_403_is_not_retried():
