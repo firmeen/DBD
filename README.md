@@ -2,7 +2,8 @@
 
 MySQL-backed DBD DataWarehouse ingestion with durable discovery checkpoints,
 endpoint-level work queues, crash-safe leases, decoded response archives and
-replayable projections. No Redis, Supabase or external message broker is required.
+replayable projections. MySQL remains the durable source of truth. Redis is optional
+and is used only when multiple bulk worker processes must share one aggregate rate cap.
 
 ## Install
 
@@ -89,36 +90,76 @@ Discovery does not overwrite richer company projections. Instead it records the
 latest observed `jpStatCode` separately in `company_master` for scheduling, with a
 timestamp. This avoids relying on a potentially stale shallow `companies` row.
 
-## Bulk collection
+## Bulk collection — V2 staged pipeline
+
+Create one immutable all-status run:
 
 ```powershell
-# Target for the full tabs 1-2 campaign: all discovered statuses.
 dbd-data bulk --master --all-statuses --enqueue-only
+```
 
-# Resume the exact run created above.
-dbd-data bulk --run-id 2 --concurrency 32 --rate 10
+Record its run ID and resume that exact run. V2 decouples fetch, archive and
+projection with bounded queues. Archive persistence and transition to
+`stage=project` commit atomically, so a process restart can resume projection from
+the durable response without re-contacting DBD.
+
+```powershell
+# Bounded canary first.
+dbd-data bulk --run-id 2 --concurrency 32 --rate 20 --limit 2000 --metrics-port 9108
+
+# Inspect durable status and stage backlog.
 dbd-data bulk-status 2
+
+# Resume the same run after the canary.
+dbd-data bulk --run-id 2 --concurrency 32 --rate 20 --metrics-port 9108
+
 dbd-data bulk-retry 2
 ```
+
+Optional endpoint targets keep known-slower endpoints below the global ceiling:
+
+```powershell
+dbd-data bulk `
+  --run-id 2 `
+  --concurrency 48 `
+  --rate 40 `
+  --endpoint-rates "profile=20,committees=12,committee_signs=12,transformations=10,financial_submissions=10,financial_statements=12,industry_benchmark=8" `
+  --metrics-port 9108
+```
+
+The numbers above are examples, not recommended production rates. Measure the real
+seven-endpoint mix first. A 429/503 backs off the affected endpoint and the global
+adaptive safety layer, while healthy traffic recovers gradually toward configured
+ceilings.
 
 `--master` without `--all-statuses` selects only identities whose latest observed
 status is operating (`jpStatCode=1`). Unknown status is not guessed. The current
 all-company acceptance campaign uses `--all-statuses`.
 
 Input files are streamed in bounded batches and deduplicated in MySQL. `--limit`
-counts endpoint attempts, not companies. Endpoint selection and fiscal-year options
-are immutable when resuming a run. Creating another `--master` run is a refresh,
-not a resume; resume with `--run-id`.
+counts durable task claims in the invocation, not companies. Endpoint selection and
+fiscal-year options are immutable when resuming a run. Creating another `--master`
+run is a refresh, not a resume; resume with `--run-id`.
 
-One API manager per database is enforced with a MySQL named lock. Long-running
-bulk and discovery jobs verify that the same connection still owns the lock; loss
-of ownership stops the manager instead of silently permitting two collectors.
+### Optional distributed workers
 
-Concurrency and admission rate are separate controls. 429/503 responses reduce
-the shared effective rate and apply a shared cooldown; sustained healthy requests
-recover the effective rate gradually toward the configured target. Raising
-concurrency only helps until enough in-flight capacity exists to sustain the
-requested rate at the observed latency.
+Redis is required only for distributed worker mode. Every process must use the same
+MySQL database, existing run ID, Redis URL and rate key:
+
+```powershell
+$env:DBD_REDIS_URL = "redis://127.0.0.1:6379/0"
+$env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
+
+dbd-data bulk --run-id 2 --distributed --concurrency 32 --rate 40
+```
+
+`--distributed` cannot create a run. MySQL leases and `FOR UPDATE SKIP LOCKED`
+coordinate work ownership; Redis coordinates aggregate pacing. Do not use multiple
+keys, proxies, sessions or IP rotation to bypass upstream throttling.
+
+Concurrency and admission rate remain separate controls. More concurrency only
+helps until enough in-flight capacity exists to sustain the accepted rate at
+observed latency. It cannot raise an upstream rate limit.
 
 Ctrl+C returns owned unfinished leases to pending. A crashed worker is recovered
 when its lease expires. Lease owner/version/expiry fences stale writers.
@@ -126,16 +167,18 @@ when its lease expires. Lease owner/version/expiry fences stale writers.
 ## Projection correctness and replay
 
 Decoded endpoint payloads are committed to `response_archive` before
-normalization. Strict root-shape contracts prevent malformed transformation,
-nationality-history and benchmark payloads from being mistaken for legitimate
-empty data and clearing older projections.
+normalization. Large payloads may be serialized with `orjson` and compressed with
+zstd to reduce archive write/storage volume; legacy JSON archives remain readable.
+Strict root-shape contracts prevent malformed transformation, nationality-history
+and benchmark payloads from being mistaken for legitimate empty data and clearing
+older projections.
 
 ```powershell
 dbd-data replay ARCHIVE_ID
 ```
 
-Replay uses the same lease/projection path as live collection. Freshness is fenced
-by the **natural keys actually mutated**, not only by request scope:
+Replay uses the same projection correctness rules as live collection. Freshness is
+fenced by the **natural keys actually mutated**, not only by request scope:
 
 - financial statements: company + fiscal year;
 - submissions: the whole company collection;
@@ -160,14 +203,28 @@ Metrics bind only to localhost. Structured diagnostics include stage, safe reque
 path, exception type and curl code where available; they do not dump tokens,
 cookies, encryption keys or whole response bodies.
 
-`scripts/probe_capacity.py` is a bounded **profile-only** remote probe. It separates
-admission/window throughput from drain time and reports transport-error classes.
-It does not establish a sustainable full-pipeline ceiling or a 48-hour ETA by
-itself. Do not run it concurrently with a collector.
+`scripts/probe_capacity.py` remains the bounded **profile-only** diagnostic probe.
+For V2 capacity planning, stop every collector and use the real mixed workload:
+
+```powershell
+python scripts\probe_mixed_capacity.py `
+  --collector-stopped `
+  --min-rate 10 `
+  --max-rate 40 `
+  --concurrency 48 `
+  --companies 100 `
+  --repeats 2 `
+  --step-seconds 20 `
+  --max-requests 12000
+```
+
+Neither probe establishes a production ceiling or a 48-hour guarantee. The latter
+requires a persisted all-status campaign with real retries, DB work and endpoint mix.
 
 ## Validation
 
-GitHub Actions runs on Python 3.12 with disposable MySQL 8.4 (`dbd_test_ci`):
+GitHub Actions runs on Python 3.12 with disposable MySQL 8.4 (`dbd_test_ci`) and a
+disposable Redis service for distributed-rate integration coverage:
 
 ```text
 python -m compileall -q src scripts tests
@@ -182,6 +239,7 @@ after source, tests, migrations or documentation change.
 See:
 
 - `docs/ARCHITECTURE.md` — current design and invariants
+- `docs/HIGH_THROUGHPUT_V2.md` — V2 staging, rate control, distributed workers and tuning
 - `docs/RUNBOOK.md` — operating procedure
 - `docs/OPERATIONS.md` — configuration/failure handling
 - `docs/VALIDATION.md` — measured/proven vs unknown
@@ -197,5 +255,6 @@ See:
 
 Local integration tests require both `DBD_INTEGRATION=1` and a disposable database
 whose name begins `dbd_test_`. The guard deliberately refuses integration against
-the real data database. `scripts/benchmark_queue.py` uses the same disposable-name
+the real data database. Redis tests use `DBD_REDIS_TEST_URL` and must target a
+disposable Redis database. `scripts/benchmark_queue.py` uses the same disposable-name
 guard and never contacts DBD.
