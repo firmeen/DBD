@@ -98,6 +98,10 @@ def _error_signature(exc) -> str:
     return f"{type(exc).__name__}{suffix}"
 
 
+class AdmissionClosed(RuntimeError):
+    """Probe-only signal meaning the measurement window/budget closed before send."""
+
+
 class Budget:
     def __init__(self, limit):
         self.limit = limit
@@ -110,6 +114,44 @@ class Budget:
                 return False
             self.used += 1
             return True
+
+
+class TimedTransport:
+    """Wrap AsyncSession so the probe measures actual HTTP transport admissions.
+
+    Requests that reach the transport after the step deadline are rejected without
+    contacting DBD. Requests already inside the transport at the deadline are allowed
+    to drain, which avoids cancelling a real upstream request mid-flight.
+    """
+
+    def __init__(self, session, budget):
+        self.session = session
+        self.budget = budget
+        self.deadline = float("inf")
+        self.inflight_tasks: set[asyncio.Task] = set()
+        self.samples: list[tuple[float, float, int | str]] = []
+
+    def __getattr__(self, name):
+        return getattr(self.session, name)
+
+    async def request(self, *args, **kwargs):
+        if time.perf_counter() >= self.deadline:
+            raise AdmissionClosed()
+        if not await self.budget.take():
+            raise AdmissionClosed()
+        started = time.perf_counter()
+        task = asyncio.current_task()
+        if task is not None:
+            self.inflight_tasks.add(task)
+        status: int | str = "network_error"
+        try:
+            response = await self.session.request(*args, **kwargs)
+            status = response.status_code
+            return response
+        finally:
+            self.samples.append((started, time.perf_counter(), status))
+            if task is not None:
+                self.inflight_tasks.discard(task)
 
 
 def load_targets(limit: int) -> list[Target]:
@@ -135,7 +177,7 @@ def build_workload(targets: list[Target]) -> list[WorkItem]:
     return workload
 
 
-async def enrich_fiscal_years(client, targets, budget, concurrency):
+async def enrich_fiscal_years(client, targets, concurrency):
     queue = asyncio.Queue()
     for target in targets:
         queue.put_nowait(target)
@@ -149,8 +191,6 @@ async def enrich_fiscal_years(client, targets, budget, concurrency):
             except asyncio.QueueEmpty:
                 return
             try:
-                if not await budget.take():
-                    return
                 response = await client.fetch(
                     "GET",
                     request_path("profile", target.kind, target.number),
@@ -161,6 +201,8 @@ async def enrich_fiscal_years(client, targets, budget, concurrency):
                     raise ValueError("Response identity mismatch")
                 years = str(profile.submit_fin_year or "").split()
                 results.append(Target(target.kind, target.number, max(years) if years else None))
+            except AdmissionClosed:
+                return
             except Exception as exc:
                 errors.append(_error_signature(exc))
             finally:
@@ -174,28 +216,25 @@ async def enrich_fiscal_years(client, targets, budget, concurrency):
     return results
 
 
-async def run_step(client, workload, budget, target_rate, seconds, concurrency):
+async def run_step(client, transport, workload, target_rate, seconds, concurrency):
     start = time.perf_counter()
     deadline = start + seconds
+    transport.deadline = deadline
+    sample_offset = len(transport.samples)
+    budget_before = transport.budget.used
     next_index = 0
     index_lock = asyncio.Lock()
     completed = []
     durations = defaultdict(list)
     successes = Counter()
     errors = Counter()
-    admitted = 0
-    admitted_lock = asyncio.Lock()
 
     async def worker():
-        nonlocal next_index, admitted
+        nonlocal next_index
         while time.perf_counter() < deadline:
             async with index_lock:
                 item = workload[next_index % len(workload)]
                 next_index += 1
-            if not await budget.take():
-                return
-            async with admitted_lock:
-                admitted += 1
             path = request_path(item.endpoint, item.kind, item.number)
             params = {"fiscalYear": item.fiscal_year} if item.endpoint in FINANCIAL else None
             begun = time.perf_counter()
@@ -204,8 +243,9 @@ async def run_step(client, workload, budget, target_rate, seconds, concurrency):
                 ended = time.perf_counter()
                 durations[item.endpoint].append(ended - begun)
                 successes[item.endpoint] += 1
-                if ended <= deadline:
-                    completed.append(ended)
+                completed.append(ended)
+            except AdmissionClosed:
+                return
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
@@ -214,34 +254,58 @@ async def run_step(client, workload, budget, target_rate, seconds, concurrency):
 
     tasks = [asyncio.create_task(worker()) for _ in range(concurrency)]
     try:
-        await asyncio.sleep(seconds)
-        for task in tasks:
-            if not task.done():
+        timeout = max(0.0, deadline - time.perf_counter())
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+
+        # Workers already in the real transport are allowed to drain. Workers still
+        # waiting on an endpoint/global limiter are cancelled and therefore never
+        # become late HTTP admissions. TimedTransport also rejects any race crossing
+        # the deadline before the underlying session request starts.
+        draining = []
+        for task in pending:
+            if task in transport.inflight_tasks:
+                draining.append(task)
+            else:
                 task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await asyncio.gather(
+            *(task for task in pending if task not in draining), return_exceptions=True
+        )
+        if draining:
+            await asyncio.gather(*draining, return_exceptions=True)
+        if done:
+            await asyncio.gather(*done, return_exceptions=True)
     finally:
         for task in tasks:
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
 
-    elapsed = min(seconds, max(0.001, time.perf_counter() - start))
+    elapsed = time.perf_counter() - start
+    window = min(seconds, elapsed)
+    sent = transport.budget.used - budget_before
+    samples = transport.samples[sample_offset:]
+    within = sum(ended <= deadline for ended in completed)
+    drained = len(completed) - within
+    http_durations = [ended - begun for begun, ended, _ in samples]
     endpoint_stats = {
         endpoint: {"success": successes[endpoint], "p95": pct(durations[endpoint], 0.95)}
         for endpoint in DEFAULT_ENDPOINTS
     }
     return {
         "target_rate": target_rate,
-        "admitted": admitted,
-        "window_success": len(completed),
-        "window_rps": len(completed) / elapsed,
+        "admitted": sent,
+        "window_success": within,
+        "window_rps": within / window if window else 0.0,
+        "drained": drained,
+        "drain_seconds": max(0.0, elapsed - seconds),
+        "http_p95": pct(http_durations, 0.95),
         "errors": sum(errors.values()),
         "error_breakdown": {
             f"{endpoint}:{signature}": count
             for (endpoint, signature), count in sorted(errors.items())
         },
         "endpoint_stats": endpoint_stats,
-        "full": time.perf_counter() >= deadline and budget.used < budget.limit,
+        "full": elapsed >= seconds and transport.budget.used < transport.budget.limit,
     }
 
 
@@ -271,18 +335,18 @@ async def measure(args, lock_connection):
                 max_retries=0,
                 endpoint_rates=args.endpoint_rates,
             ) as client:
+                transport = TimedTransport(client._session, budget)
+                client._session = transport
                 print("MIXED ENDPOINT PROBE")
                 print(
                     f"  sample companies: {len(raw_targets)}; concurrency: {args.concurrency}; "
                     f"budget: {args.max_requests}"
                 )
-                # Profile warm-up is deliberately conservative. It discovers real
-                # financial years without persisting anything and fails on any error.
+                # Warm-up has no short measurement deadline but remains request-budget bounded.
+                transport.deadline = float("inf")
                 client.endpoint_rate.set_target_rate(min(10.0, float(args.min_rate)))
                 print("  warming profiles to obtain real submitted fiscal years...")
-                targets = await enrich_fiscal_years(
-                    client, raw_targets, budget, min(args.concurrency, 16)
-                )
+                targets = await enrich_fiscal_years(client, raw_targets, min(args.concurrency, 16))
                 workload = build_workload(targets)
                 financial = sum(1 for target in targets if target.fiscal_year)
                 print(
@@ -301,8 +365,8 @@ async def measure(args, lock_connection):
                             return results
                         result = await run_step(
                             client,
+                            transport,
                             workload,
-                            budget,
                             rate,
                             args.step_seconds,
                             args.concurrency,
@@ -313,8 +377,10 @@ async def measure(args, lock_connection):
                         print(
                             f"  rate={rate:>5g}/s rep={repeat} admitted={result['admitted']:>5} "
                             f"success={result['window_success']:>5} "
-                            f"window={result['window_rps']:.2f}/s errors={result['errors']} "
-                            f"verdict={'clean' if clean else 'STOP'}"
+                            f"window={result['window_rps']:.2f}/s "
+                            f"http-p95={result['http_p95']:.3f}s "
+                            f"drain={result['drain_seconds']:.3f}s late={result['drained']} "
+                            f"errors={result['errors']} verdict={'clean' if clean else 'STOP'}"
                         )
                         if result["error_breakdown"]:
                             print(f"    errors: {result['error_breakdown']}")
