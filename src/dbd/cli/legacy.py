@@ -131,7 +131,12 @@ def command_bulk_retry(run_id: int) -> None:
 
 
 def command_discover(
-    seeds: list[str], search_type: str, concurrency: int | None, rate: float | None, max_buckets: int | None
+    seeds: list[str],
+    search_type: str,
+    concurrency: int | None,
+    rate: float | None,
+    max_buckets: int | None,
+    health=None,
 ) -> None:
     import asyncio
 
@@ -144,6 +149,7 @@ def command_discover(
             concurrency=concurrency,
             rate=rate,
             max_buckets=max_buckets,
+            health=health,
         )
     )
 
@@ -166,27 +172,28 @@ def command_discover_status() -> None:
         f"({s['buckets_done']} done, {s['buckets_split']} split, "
         f"{s['buckets_open']} open, {s['buckets_failed']} failed)"
     )
+    print(
+        f"  partial pages    : {int(s.get('pages_partial') or 0):,}; "
+        f"unresolved rows: {int(s.get('unresolved_rejections') or 0):,}"
+    )
     if int(s["partitions_lossy"] or 0):
         print(
-            f"  NOTE: {s['partitions_lossy']} partition(s) where SUM(children) != parent."
-            " Check the delta before drawing conclusions: a row or two is usually"
-            " live data changing between counts, a large gap means the split is"
-            " losing rows. See section 15 of sql/reports/data_inventory.sql."
+            f"  BLOCKER: {s['partitions_lossy']} split partition(s) have SUM(children) != parent. "
+            "Completeness is not established until they are reconciled."
         )
 
-    # The province-prefix seed set covers every company number by construction.
-    # A prefix appearing in the data that no seed could have produced is the one
-    # symptom that the assumption is wrong, so it is checked rather than trusted.
+    # Observed prefix gaps are a useful negative check, not a proof that every
+    # company was discoverable through the chosen seeds.
     gaps = discovery.coverage_gaps()
     if gaps:
         print(
-            f"\n  COVERAGE GAP: {len(gaps)} company-number prefix(es) were collected that no"
-            " seed bucket covers:"
+            f"\n  COVERAGE GAP: {len(gaps)} observed company-number prefix(es) have no matching seed bucket:"
         )
         print(f"    {', '.join(gaps[:20])}{' ...' if len(gaps) > 20 else ''}")
         print("    Seed these prefixes explicitly: dbd-data discover " + " ".join(gaps[:5]))
     else:
-        print("  coverage         : every collected number matches a seeded prefix")
+        print("  observed prefixes: all currently seen prefixes have matching seeds")
+        print("  completeness      : still requires partition and population reconciliation")
 
 
 def main() -> None:
@@ -253,7 +260,6 @@ def main() -> None:
                 seeds += [
                     line.strip() for line in handle if line.strip() and not line.strip().startswith("#")
                 ]
-        # Resuming an existing run needs no seeds: pending buckets drive it.
         short = [s for s in seeds if len(s) < 3]
         if short:
             raise SystemExit(f"Seed keywords must be at least 3 characters: {short}")
