@@ -22,14 +22,8 @@ from ..storage.mysql.repositories.discovery_repository import (
     upsert_bucket,
 )
 
-# Split dimensions, applied in this order. jpType is first because the
-# reference implementation validated it as lossless on the observed data.
 JP_TYPES = ("0", "2", "3", "5", "7", "8", "9", "A")
 BUSINESS_SIZES = ("S", "M", "L")
-
-# 099 was observed in collected company numbers but is not represented by the
-# province-prefix seed list. Keep it explicit until an authoritative population
-# reconciliation proves a more general seed strategy.
 EXTRA_PREFIX_SEEDS = ("099",)
 
 
@@ -151,7 +145,10 @@ def coverage_gaps() -> list[str]:
 
 async def _count(client: AsyncDbdClient, bucket_id: int, filters: SearchFilters):
     """Fetch and archive page 1 once; it is reused if the bucket is drainable."""
-    from ..storage.mysql.repositories.discovery_repository import archive_search
+    from ..storage.mysql.repositories.discovery_repository import (
+        archive_search,
+        mark_search_archive,
+    )
 
     requested = _now()
     data = await client.post(
@@ -163,7 +160,11 @@ async def _count(client: AsyncDbdClient, bucket_id: int, filters: SearchFilters)
     archive_id = await asyncio.to_thread(
         archive_search, bucket_id, 1, filters, data, requested, link_page=False
     )
-    page = parse_search_response(data)
+    try:
+        page = parse_search_response(data)
+    except Exception as exc:
+        await asyncio.to_thread(mark_search_archive, archive_id, "invalid", type(exc).__name__)
+        raise
     return page, archive_id, data, requested
 
 
@@ -302,6 +303,8 @@ async def _process_bucket(
     *,
     verbose: bool,
 ) -> tuple[int, int]:
+    from ..storage.mysql.repositories.discovery_repository import mark_search_archive
+
     bucket_id = int(row["id"])
     filters = _filters_from_row(row)
 
@@ -311,20 +314,25 @@ async def _process_bucket(
     total_items = row["total_items"]
     pages_total = row["pages_total"]
     first_page = None
+    count_archive_id = None
 
     if total_items is None:
-        page, archive_id, data, requested = await _count(client, bucket_id, filters)
+        page, count_archive_id, data, requested = await _count(client, bucket_id, filters)
         total_items, pages_total = page.total_items, page.total_pages
-        first_page = (archive_id, data, requested)
+        first_page = (count_archive_id, data, requested)
         update_bucket(bucket_id, total_items=total_items, pages_total=pages_total, status="counted")
         if verbose:
             print(f"    totalItems={total_items:,} pages={pages_total}")
 
     if total_items == 0:
+        if count_archive_id is not None:
+            await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
         update_bucket(bucket_id, status="done")
         return 0, 0
 
     if total_items > MAX_ROWS_PER_QUERY:
+        if count_archive_id is not None:
+            await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
         children = _children_for(filters, provinces)
         if not children:
             update_bucket(
@@ -413,9 +421,6 @@ async def _run_work(
     if verbose:
         print(f"provinces available for splitting: {len(provinces)}")
 
-    # With no explicit seed, always upsert the current default seed set. This is
-    # idempotent and lets newly audited exceptions such as 099 join an existing
-    # checkpointed campaign without a reset.
     if not seeds:
         seeds = await province_seeds(client)
         if verbose:
@@ -436,9 +441,6 @@ async def _run_work(
                 break
             rows = rows[:remaining]
 
-        # Process a small bounded set of buckets concurrently. The HTTP client
-        # still owns the global semaphore/rate limiter, so this removes bucket
-        # head-of-line blocking without multiplying actual transport concurrency.
         bucket_parallelism = max(1, min(4, client.concurrency // 4 or 1, len(rows)))
         batch = rows[:bucket_parallelism]
 
