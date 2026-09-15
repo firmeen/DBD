@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+from ..core.exceptions import ContractError
 from .company import COLLECTION_NORMALIZERS
 from .financial import normalize_benchmark
-from ..core.exceptions import ContractError
 
 _TRANSFORMATION_KEYS = ("transformFroms", "transformTos", "mergerFroms", "mergerTos")
 _NATION_HISTORY_KEYS = ("shareHistTHDps", "shareHistOTDps")
