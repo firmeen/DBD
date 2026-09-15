@@ -101,6 +101,37 @@ Rate is the binding constraint, not concurrency: elapsed time is
 `requests ÷ rate`, so raising `DBD_CONCURRENCY` above the rate cap changes
 nothing.
 
+## Rate ceiling
+
+Not established. A first attempt produced misleading numbers and the method was
+corrected; the figures below are what can honestly be taken from it.
+
+Reliable:
+
+- **No rate limiting was observed.** Zero 429 and zero 503 responses at 5, 10
+  and 15 req/s. DBD did not refuse any request.
+- **The local database is not the constraint.** Write round trip p50 0.15 ms,
+  p95 0.36 ms.
+- **Latency is high and variable**: p50 1.7-4.3 s, p95 4.2-8.4 s, well above the
+  ~1.2 s seen in the earlier concurrency test. Either DBD was busier, or the
+  earlier figure was optimistic.
+
+Not reliable, and why:
+
+- The run reported "achieved only 6.3/s of 15/s" and called it strain. It was
+  not. Concurrency was sized as `rate × 2`, giving 30 in flight where
+  `rate × latency` needs about 79. The probe measured its own
+  under-provisioning.
+- Latency appeared to *fall* as the rate rose (4.33 s → 2.34 s → 1.67 s), which
+  is backwards. The first step was paying for TLS, DNS and the token handshake,
+  so the baseline was contaminated.
+- Steps were a fixed 40 requests. With multi-second latency a batch that small
+  finishes before throughput reaches steady state, so "achieved" mostly
+  reflected the tail latency of the last few requests.
+
+The probe now warms up before timing, sizes concurrency from observed latency,
+and measures over a fixed duration instead of a fixed count.
+
 ## Payload sizes
 
 Average `CHAR_LENGTH(raw_json)`, measured per endpoint:

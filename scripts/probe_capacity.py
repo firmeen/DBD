@@ -46,7 +46,9 @@ from dbd.core.settings import settings  # noqa: E402
 from dbd.storage.mysql.engine import connect  # noqa: E402
 
 RAMP = (5, 10, 15, 20, 25, 30, 40, 50)
-REQUESTS_PER_STEP = 40
+# Duration, not a request count: with multi-second latency a small fixed batch
+# finishes before throughput reaches steady state.
+STEP_SECONDS = 20.0
 
 # A step is considered strained, not merely slower, when it trips one of these.
 MIN_ACHIEVED_FRACTION = 0.75  # achieved/requested below this means saturation
@@ -118,6 +120,11 @@ def measure_local(samples: int = 60) -> float | None:
     per_endpoint_seconds = (write_p50 / 1000) * statements_per_endpoint
     ceiling = settings.db_pool_size / per_endpoint_seconds if per_endpoint_seconds else 0
 
+    # This is an upper bound from round-trip time alone. A real projection does
+    # far more than three trivial statements, so a huge figure here means only
+    # "the database is not the constraint", never an achievable rate.
+    ceiling = min(ceiling, 2000.0)
+
     print(f"  database          : {settings.db_name} on {settings.db_host}:{settings.db_port}")
     print(f"  read round trip   : p50 {read_p50:.2f} ms")
     print(f"  write round trip  : p50 {write_p50:.2f} ms   p95 {write_p95:.2f} ms")
@@ -155,34 +162,96 @@ def probe_targets(limit: int) -> list[tuple[str, str]]:
         return [(r["jp_type_code"], r["jp_no"]) for r in cur.fetchall()]
 
 
-async def run_step(rate: int, targets: list[tuple[str, str]], count: int) -> dict:
-    """One ramp step. Returns measurements; never raises for expected failures."""
+async def warm_up(targets: list[tuple[str, str]], count: int = 6) -> float:
+    """Pay the one-off costs before anything is timed, and measure real latency.
+
+    The first requests of a run also carry the TLS handshake, the anonymous
+    token handshake and DNS. Including them made an earlier version of this
+    probe report latency *falling* as the rate rose, which is backwards: the
+    first step was simply the one paying setup costs. Returns observed p95
+    latency, which is what decides how much concurrency each step needs.
+    """
     latencies: list[float] = []
-    errors = 0
-
-    # A fresh client each step: the shared limiter lowers its own rate after a
-    # 429, which would otherwise carry into the next step and hide the ceiling.
-    async with AsyncDbdClient(concurrency=max(2, rate * 2), rate_per_second=rate) as client:
-        started = time.perf_counter()
-
-        async def one(index: int):
-            nonlocal errors
+    async with AsyncDbdClient(concurrency=4, rate_per_second=4) as client:
+        for index in range(count):
             kind, number = targets[index % len(targets)]
             begin = time.perf_counter()
             try:
                 await client.fetch("GET", profile_path(kind, number))
                 latencies.append(time.perf_counter() - begin)
             except Exception:
+                pass
+
+    # Ignore the first result: it is the one that paid for the handshakes.
+    measured = latencies[1:] or latencies
+    return pct(measured, 0.95) if measured else 1.0
+
+
+def concurrency_for(rate: int, latency_p95: float) -> int:
+    """In-flight requests needed to actually sustain a rate.
+
+    Little's law: to complete `rate` per second when each takes `latency`
+    seconds, `rate * latency` must be in flight. An earlier version used
+    `rate * 2`, which at 15/s and ~5 s latency provided 30 where ~79 were
+    needed, so the probe measured its own under-provisioning and reported it
+    as DBD refusing to go faster.
+    """
+    needed = rate * max(latency_p95, 0.1) * 1.5  # headroom for the tail
+    return max(4, min(256, int(needed) + 1))
+
+
+async def run_step(rate: int, targets: list[tuple[str, str]], seconds: float, latency_p95: float) -> dict:
+    """Hold a rate for a fixed duration and measure what actually completes.
+
+    Duration-based rather than count-based: with multi-second latency a fixed
+    batch of 40 finishes before reaching steady state, so its "achieved rate"
+    mostly reflects the tail latency of the last few requests rather than
+    throughput.
+    """
+    latencies: list[float] = []
+    errors = 0
+    completed = 0
+    concurrency = concurrency_for(rate, latency_p95)
+
+    # A fresh client each step: the shared limiter lowers its own rate after a
+    # 429, which would otherwise carry into the next step and hide the ceiling.
+    async with AsyncDbdClient(concurrency=concurrency, rate_per_second=rate) as client:
+        deadline = time.perf_counter() + seconds
+        started = time.perf_counter()
+        index = 0
+        pending: set[asyncio.Task] = set()
+
+        async def one(kind: str, number: str):
+            nonlocal errors, completed
+            begin = time.perf_counter()
+            try:
+                await client.fetch("GET", profile_path(kind, number))
+                latencies.append(time.perf_counter() - begin)
+                completed += 1
+            except Exception:
                 errors += 1
 
-        await asyncio.gather(*(one(i) for i in range(count)))
-        elapsed = time.perf_counter() - started
+        # Offer work continuously; the token bucket decides when it is admitted.
+        while time.perf_counter() < deadline:
+            if len(pending) >= concurrency:
+                _, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+                continue
+            kind, number = targets[index % len(targets)]
+            index += 1
+            pending.add(asyncio.create_task(one(kind, number)))
 
-    achieved = (count - errors) / elapsed if elapsed else 0.0
+        issue_window = time.perf_counter() - started
+        if pending:
+            await asyncio.gather(*pending)
+
+    # Throughput is measured over the window in which work was being offered,
+    # not including the drain of requests still in flight when time ran out.
+    achieved = completed / issue_window if issue_window else 0.0
     return {
         "rate": rate,
+        "concurrency": concurrency,
         "achieved": achieved,
-        "elapsed": elapsed,
+        "elapsed": issue_window,
         "p50": pct(latencies, 0.50),
         "p95": pct(latencies, 0.95),
         "errors": errors,
@@ -204,12 +273,19 @@ async def measure_remote(max_rate: int, max_requests: int) -> dict | None:
         return None
 
     print(f"  probing with {len(targets)} company profiles already in the database")
-    print(f"  budget: {max_requests} requests, {REQUESTS_PER_STEP} per step\n")
-    print(f"  {'rate':>6} {'achieved':>9} {'p50':>8} {'p95':>8} {'429/503':>8} {'errors':>7}  verdict")
-    print("  " + "-" * 68)
+    print("  warming up (handshakes excluded from measurement)...", flush=True)
+
+    baseline_p95 = await warm_up(targets)
+    print(f"  baseline latency  : p95 {baseline_p95:.2f}s")
+    print(f"  budget            : {max_requests} requests, {STEP_SECONDS:g}s per step\n")
+
+    print(
+        f"  {'rate':>6} {'inflight':>9} {'achieved':>9} {'p50':>8} {'p95':>8}"
+        f" {'429/503':>8} {'errors':>7}  verdict"
+    )
+    print("  " + "-" * 82)
 
     spent = 0
-    baseline_p95 = None
     last_good = None
     stopped_by = None
 
@@ -217,37 +293,42 @@ async def measure_remote(max_rate: int, max_requests: int) -> dict | None:
         if rate > max_rate:
             stopped_by = f"reached --max-rate {max_rate}"
             break
-        if spent + REQUESTS_PER_STEP > max_requests:
+        # A step lasting STEP_SECONDS at this rate costs about rate*seconds.
+        if spent + rate * STEP_SECONDS > max_requests:
             stopped_by = f"reached --max-requests {max_requests}"
             break
 
-        result = await run_step(rate, targets, REQUESTS_PER_STEP)
+        result = await run_step(rate, targets, STEP_SECONDS, baseline_p95)
         spent += result["requests"]
 
-        if baseline_p95 is None:
-            baseline_p95 = result["p95"] or 0.001
-
+        attempted = max(1, result["requests"])
         reasons = []
         if result["rate_limited"]:
             reasons.append(f"{result['rate_limited']} rate-limit response(s)")
-        if result["errors"] / REQUESTS_PER_STEP > MAX_ERROR_FRACTION:
+        if result["errors"] / attempted > MAX_ERROR_FRACTION:
             reasons.append(f"{result['errors']} error(s)")
         if result["achieved"] < rate * MIN_ACHIEVED_FRACTION:
             reasons.append(f"achieved only {result['achieved']:.1f}/s of {rate}/s")
         if result["p95"] > baseline_p95 * MAX_LATENCY_INFLATION:
-            reasons.append(f"p95 {result['p95']:.2f}s vs baseline {baseline_p95:.2f}s")
+            reasons.append(f"p95 {result['p95']:.2f}s vs {baseline_p95:.2f}s baseline")
 
         verdict = "ok" if not reasons else "STRAIN: " + "; ".join(reasons)
         print(
-            f"  {rate:>6} {result['achieved']:>8.1f}/s {result['p50']:>7.2f}s {result['p95']:>7.2f}s"
+            f"  {rate:>6} {result['concurrency']:>9} {result['achieved']:>8.1f}/s"
+            f" {result['p50']:>7.2f}s {result['p95']:>7.2f}s"
             f" {result['rate_limited']:>8} {result['errors']:>7}  {verdict}"
         )
 
         if reasons:
             if result["rate_limited"]:
-                note("STOP", f"DBD returned rate-limit responses at {rate}/s - this is their ceiling.")
+                note("STOP", f"DBD returned rate-limit responses at {rate}/s - that is their ceiling.")
             else:
-                note("STOP", f"Strain at {rate}/s: {'; '.join(reasons)}")
+                note(
+                    "STOP",
+                    f"Could not sustain {rate}/s: {'; '.join(reasons)}."
+                    " No rate-limit response was returned, so this is a throughput limit"
+                    " (latency, network or DBD capacity), not an explicit refusal.",
+                )
             stopped_by = f"strain at {rate}/s"
             break
 
@@ -257,6 +338,9 @@ async def measure_remote(max_rate: int, max_requests: int) -> dict | None:
         await asyncio.sleep(2)
     else:
         stopped_by = "completed the ramp without strain"
+
+    if last_good and not any(level == "STOP" for level, _ in findings):
+        note("INFO", f"No rate-limit response at any tested rate, up to {last_good['rate']}/s.")
 
     print()
     if last_good is None:
@@ -306,22 +390,42 @@ def summarise(local: float | None, remote: dict | None, workload: int) -> None:
 
     # Recommend below the last clean rate, not at it: a rate that held for forty
     # requests has not been shown to hold for days.
+    current = settings.dbd_rate_per_second
     safe = remote["rate"] * 0.7
     if local:
         safe = min(safe, local * 0.8)
     safe = max(1.0, round(safe))
 
+    # Concurrency has to carry rate * latency in flight, or the rate cannot be
+    # reached no matter what the limiter allows.
+    suggested_concurrency = concurrency_for(int(safe), remote["p95"] or 1.0)
+
     print(f"  highest clean rate observed : {remote['rate']}/s")
     if local:
-        print(f"  local persistence ceiling   : ~{local:.0f}/s")
+        print(f"  local persistence ceiling   : ~{local:.0f}/s (upper bound; DB is not the constraint)")
+    print(f"  observed latency            : p50 {remote['p50']:.2f}s  p95 {remote['p95']:.2f}s")
     print(f"  recommended sustained rate  : {safe:g}/s   (margin applied)")
     print()
+
+    if safe < current:
+        # Recommending a slowdown is a real outcome, but it must be stated as
+        # one rather than dressed up as an improvement with negative savings.
+        note(
+            "WARN",
+            f"The probe sustained only {remote['rate']}/s cleanly, below the configured"
+            f" {current:g}/s. Either the current setting is already optimistic, or the probe"
+            " ran while DBD was slow. Re-run at a quieter time before lowering anything.",
+        )
+        print(f"  This is BELOW the configured {current:g}/s, so it is not an improvement.")
+        print("  Treat it as a signal to re-measure, not as a setting to apply.")
+        print()
+        return
+
     print("  Apply in .env:")
     print(f"    DBD_RATE_PER_SECOND={safe:g}")
-    print(f"    DBD_CONCURRENCY={max(8, int(safe * 2))}")
+    print(f"    DBD_CONCURRENCY={suggested_concurrency}")
     print()
 
-    current = settings.dbd_rate_per_second
     hours_now = workload / current / 3600
     hours_new = workload / safe / 3600
     print(f"  workload assumed: {workload:,} requests")
