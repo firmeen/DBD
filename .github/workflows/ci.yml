@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - "fix/**"
+      - "feat/**"
 
 permissions:
   contents: read
@@ -30,6 +31,15 @@ jobs:
           --health-interval=5s
           --health-timeout=5s
           --health-retries=20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
     env:
       DB_HOST: 127.0.0.1
       DB_PORT: 3306
@@ -38,6 +48,7 @@ jobs:
       DB_NAME: dbd_test_ci
       DBD_INTEGRATION: "1"
       DBD_METRICS_PORT: "0"
+      DBD_REDIS_TEST_URL: redis://127.0.0.1:6379/15
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
