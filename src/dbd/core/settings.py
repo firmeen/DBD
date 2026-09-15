@@ -47,6 +47,7 @@ class Settings(BaseSettings):
     dbd_archive_s3_region: str | None = None
     dbd_archive_encryption_key_b64: str | None = Field(None, repr=False)
     dbd_archive_encryption_key_id: str = "v1"
+    dbd_archive_decryption_keys: dict[str, str] = Field(default_factory=dict, repr=False)
     dbd_lease_seconds: int = Field(300, ge=30)
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
