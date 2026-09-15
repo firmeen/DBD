@@ -410,10 +410,14 @@ class WorkerRepository:
                 text("""
                 UPDATE endpoint_tasks
                 SET status='pending',lease_owner=NULL,lease_expires_at=NULL,
-                  attempts=IF(stage='fetch',GREATEST(attempts-1,0),attempts),
-                  project_attempts=IF(
-                    stage='project',GREATEST(project_attempts-1,0),project_attempts
-                  ),
+                  attempts=CASE
+                    WHEN stage='fetch' AND attempts>0 THEN attempts-1
+                    ELSE attempts
+                  END,
+                  project_attempts=CASE
+                    WHEN stage='project' AND project_attempts>0 THEN project_attempts-1
+                    ELSE project_attempts
+                  END,
                   available_at=UTC_TIMESTAMP(6)
                 WHERE lease_owner=:owner AND status='running'
             """),
