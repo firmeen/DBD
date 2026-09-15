@@ -81,7 +81,7 @@ raw/archive evidence and company projections.
 Do **not** reset discovery merely to recover network errors. The queue/checkpoints
 are built for resume.
 
-## 3. Full tabs 1-2 campaign
+## 3. Full tabs 1-2 campaign — V2
 
 The accepted all-company scope includes every discovered status:
 
@@ -89,7 +89,14 @@ The accepted all-company scope includes every discovered status:
 dbd-data bulk --master --all-statuses --enqueue-only
 ```
 
-Record the returned run ID. Resume **that exact run**:
+Record the returned run ID. Run a bounded persisted canary first:
+
+```powershell
+dbd-data bulk --run-id N --concurrency 32 --rate 20 --limit 2000 --metrics-port 9108
+dbd-data bulk-status N
+```
+
+Then resume **that exact run** using values supported by the mixed probe and canary:
 
 ```powershell
 dbd-data bulk --run-id N --concurrency <MEASURED_CONCURRENCY> --rate <MEASURED_RATE>
@@ -98,6 +105,14 @@ dbd-data bulk-retry N
 ```
 
 Do not use `bulk --master` again as a resume command; it creates a new refresh run.
+
+V2 separates fetch, durable archive and projection with bounded queues. The archive
+insert and task transition to `stage=project` are one transaction. Once that commit
+succeeds, crash recovery projects from the archive and does not repeat the upstream
+HTTP request.
+
+Optional endpoint-specific targets can be passed with `--endpoint-rates`. They are
+ceilings learned from measurement, not defaults supplied by the project.
 
 Default endpoint set:
 
@@ -118,6 +133,27 @@ projection. Only observed status `1` is selected. Unknown status is not guessed.
 This mode is useful for an operating-only product workload, but it is **not** the
 accepted all-company shortcut for the current campaign.
 
+### Optional distributed bulk workers
+
+Only use distributed mode after local mixed/persisted measurements show that the
+local process is the bottleneck rather than DBD itself. Run creation remains
+single-manager. Then configure one shared Redis rate namespace and join the existing
+run from each worker:
+
+```powershell
+$env:DBD_REDIS_URL = "redis://127.0.0.1:6379/0"
+$env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
+
+dbd-data bulk --run-id N --distributed --concurrency 32 --rate <MEASURED_RATE>
+```
+
+All workers must use the same MySQL database, run ID, Redis URL and rate key. MySQL
+leases plus `FOR UPDATE SKIP LOCKED` provide work ownership; Redis supplies the
+aggregate pacing ceiling. Do not create independent rate keys or rotate proxies,
+sessions or IPs to evade upstream throttling.
+
+See `docs/HIGH_THROUGHPUT_V2.md` for full tuning and safety details.
+
 ## 4. Financial prerequisites
 
 Financial tasks wait for the profile task because fiscal-year metadata comes from
@@ -133,21 +169,31 @@ The benchmark natural key includes `location_type` and `location_no`, which are 
 safely known from TSIC/year/size before the response. Natural-key freshness prevents
 stale overwrites after the full response scope is known.
 
-## 5. Interruption and leases
+## 5. Interruption, locks and leases
 
-Only one API manager may operate on a database at a time. Bulk and discovery check
-that the same MySQL connection still owns the named lock. If ownership disappears,
-the manager fails instead of continuing without exclusivity.
+Discovery, run creation and normal single-process bulk operation use one MySQL named
+manager lock. Long-running locked jobs verify that the same connection still owns
+that lock and fail if ownership disappears.
 
-Ctrl+C returns leases owned by the process to pending. If the process dies, expired
-leases are recovered by maintenance. Lease owner, version and expiry are checked
-again inside the projection transaction, so a stale worker cannot commit after its
-lease is reclaimed.
+`bulk --distributed` is the deliberate exception: workers join an already-created
+run without the singleton manager lock. They rely on row-level task leases/version
+fences for ownership and on a shared Redis pacing namespace for the aggregate
+admission ceiling.
+
+Ctrl+C returns leases owned by that process to pending. If a process dies, expired
+leases are recovered by maintenance. Stage and `raw_response_id` survive release or
+lease recovery. A project-stage task therefore resumes from the durable archive
+instead of repeating HTTP. Lease owner, version and expiry are checked again inside
+the projection transaction, so a stale worker cannot commit after its lease is
+reclaimed.
 
 ## 6. Replay after contract fixes
 
-A decoded endpoint response is archived before normalization. After correcting a
-normalizer:
+A decoded endpoint response is archived before normalization. V2 can store larger
+archives as zstd-compressed serialized payloads; replay transparently handles both
+legacy JSON and compressed rows.
+
+After correcting a normalizer:
 
 ```powershell
 dbd-data replay ARCHIVE_ID
@@ -168,11 +214,11 @@ Search pages use discovery retry, not endpoint replay.
 ## 7. Failure inspection
 
 ```sql
-SELECT endpoint, status, last_error, COUNT(*)
+SELECT stage, endpoint, status, last_error, COUNT(*)
 FROM endpoint_tasks
 WHERE run_id = :run
-GROUP BY endpoint, status, last_error
-ORDER BY endpoint, status, COUNT(*) DESC;
+GROUP BY stage, endpoint, status, last_error
+ORDER BY stage, endpoint, status, COUNT(*) DESC;
 
 SELECT processing_status, error_code, endpoint, COUNT(*)
 FROM response_archive
@@ -202,18 +248,35 @@ python scripts\reset_discovery.py --apply
 Dry-run is default. `--apply` acquires the same manager lock before mutation and
 preserves company data, raw payloads, endpoint tasks and worker runs.
 
-## 9. Capacity probe
+## 9. Capacity probes
 
-Stop every collector first, then:
+Stop every collector first. Profile-only diagnostic:
 
 ```powershell
 python scripts\probe_capacity.py --collector-stopped --min-rate 5 --max-rate 25
 ```
 
-The probe is profile-only and bounded. It reports admission/window throughput,
-HTTP latency, drain time and transport error breakdown. It is **not** a sustained
-full-endpoint benchmark and does not by itself prove a safe production rate or a
-48-hour ETA.
+For V2, use the real seven-endpoint request mix:
+
+```powershell
+python scripts\probe_mixed_capacity.py `
+  --collector-stopped `
+  --min-rate 10 `
+  --max-rate 40 `
+  --concurrency 48 `
+  --companies 100 `
+  --repeats 2 `
+  --step-seconds 20 `
+  --max-requests 12000
+```
+
+The mixed probe uses real profile data to obtain fiscal years, refuses late
+transport admissions at the measurement deadline, drains already-sent requests,
+and reports in-window throughput separately from drain time. It performs no archive
+or projection persistence.
+
+Neither probe by itself proves a safe production rate or a 48-hour ETA. Follow a
+clean mixed probe with a persisted bounded bulk canary.
 
 ## 10. 48-hour acceptance
 
@@ -225,9 +288,10 @@ one wall-clock campaign. Required evidence:
 - the exact all-status worker run is recorded;
 - no failed endpoint tasks remain after retry/replay policy is exhausted;
 - `not_available` counts are source-supported;
-- actual request mix, successful throughput, retry overhead, DB projection time
-  and remaining backlog are recorded;
+- actual request mix, successful throughput, retry overhead, DB archive/projection
+  throughput and remaining backlog are recorded;
 - total elapsed wall time is <= 48 hours.
 
-A short profile probe, queue benchmark or arithmetic extrapolation alone is not an
-acceptance result.
+For planning only, seven endpoints across `C` companies require at least
+`7*C/172800` successful operations/s before retry and operational margin. A short
+probe, queue benchmark or arithmetic extrapolation alone is not an acceptance result.
