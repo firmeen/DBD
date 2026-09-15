@@ -42,6 +42,10 @@ The current suite covers, among other cases:
 - batched `FOR UPDATE SKIP LOCKED` claims are disjoint across owners;
 - fetch response archive + `stage=project` creates a crash/restart boundary that can
   resume without another DBD HTTP request;
+- fetch and project retry budgets are independent through migration
+  `0007_project_attempt_budget`;
+- a response archived on the final allowed fetch attempt survives lease expiry and
+  resumes projection without another DBD request;
 - project backlog is drained before new fetch work;
 - JSON/zstd archive encoding and replay compatibility;
 - mixed-capacity probe workload construction, endpoint parsing and deadline/drain
@@ -52,13 +56,16 @@ The current suite covers, among other cases:
   workers using the same key;
 - external S3-compatible archives are encrypted client-side with AES-256-GCM;
 - external JSON and zstd payloads round-trip through encryption/decryption;
-- ciphertext tamper and canonical plaintext checksum mismatch are rejected;
+- ciphertext tamper and canonical serialized-payload checksum mismatch are rejected;
 - old archive key ids remain readable through the explicit decryption key ring while
   new objects use only the active key;
 - external archive MySQL rows retain reference/nonce/key/checksum metadata without
   retaining the decoded response body inline;
 - an externally archived project-stage task resumes from the object without DBD HTTP;
-- migration `0006_external_archive_backend` adopts already-applied DDL repeat-safely.
+- failed external PUT cannot create an archive reference/project-stage transition;
+- invalid external archive configuration fails before the DBD client is opened;
+- migrations `0005_high_throughput_pipeline`, `0006_external_archive_backend` and
+  `0007_project_attempt_budget` adopt already-applied DDL repeat-safely.
 
 ## V2 durable archive semantics
 
@@ -79,8 +86,9 @@ External reads verify:
 
 1. ciphertext SHA-256 against MySQL metadata;
 2. AES-GCM authentication using object key as AAD;
-3. canonical plaintext SHA-256;
-4. JSON/zstd decoding.
+3. restore canonical serialized JSON bytes from JSON/zstd;
+4. serialized-payload SHA-256;
+5. JSON decoding.
 
 Object/key/integrity/decode failure does not silently refetch DBD. The archive remains
 the recovery boundary.
@@ -89,6 +97,14 @@ Archive configuration is built before the bulk HTTP client opens or work is clai
 so an invalid backend/bucket/key shape fails before spending an upstream request.
 Remote object-store permission/network failure still occurs at upload time and follows
 the fetch-stage retry/failure policy without advancing to `project`.
+
+### Independent fetch/project attempts
+
+`endpoint_tasks.attempts` is the fetch-stage retry counter and
+`endpoint_tasks.project_attempts` is the projection-stage retry counter. Fetch
+exhaustion therefore cannot discard a response that has already crossed the durable
+archive boundary. Lease recovery uses the counter for the task's current stage, and
+`bulk-retry` resets only the failed stage's budget.
 
 ## Distributed rate semantics
 
