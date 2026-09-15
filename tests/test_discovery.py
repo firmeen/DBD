@@ -1,5 +1,3 @@
-import asyncio
-
 import pytest
 
 from dbd.client.endpoints.search import SearchFilters
