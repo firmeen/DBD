@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from hashlib import sha256
 
-from ....core.exceptions import ContractError
+from ....core.exceptions import ContractError, IdentityConflict
 from ....runtime.resources import normalize_resource
 from ..engine import connect, use_connection
 from .company_detail_repository import save_collection
@@ -128,7 +128,7 @@ def project(
         task["jp_no"],
         task["jp_type_code"],
     ):
-        raise ContractError("Response identity does not match requested company")
+        raise IdentityConflict("Response identity does not match requested company")
     nominal_outcome = "not_available" if normalized is None or normalized == [] else "done"
 
     with connect() as conn:
@@ -151,7 +151,7 @@ def project(
                 cur.execute("SELECT jp_type_code FROM companies WHERE jp_no=%s", (task["jp_no"],))
                 existing = cur.fetchone()
                 if existing and existing["jp_type_code"] != task["jp_type_code"]:
-                    raise ContractError("Identity conflicts with existing company projection")
+                    raise IdentityConflict("Identity conflicts with existing company projection")
 
                 keys = _write_keys(task, endpoint, normalized)
                 eligible = _eligible_write_keys(cur, keys, endpoint, requested_at)
