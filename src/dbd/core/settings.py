@@ -6,7 +6,7 @@ from pathlib import Path
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(os.environ.get("DBD_PROJECT_ROOT", Path(__file__).resolve().parents[3]))
 ENV_FILE = Path(os.environ.get("DBD_ENV_FILE", PROJECT_ROOT / ".env"))
 
 
@@ -28,13 +28,23 @@ class Settings(BaseSettings):
     dbd_request_delay_seconds: float = Field(0.5, ge=0)
     dbd_concurrency: int = Field(16, ge=1, le=256)
     dbd_rate_per_second: float = Field(10, gt=0, le=1000)
+    dbd_endpoint_rates: dict[str, float] = Field(default_factory=dict)
     dbd_count_timeout_seconds: int = Field(120, ge=1)
     dbd_write_batch_size: int = Field(100, ge=1, le=1000)
     dbd_queue_size: int = Field(64, ge=1, le=10000)
+    dbd_pipeline_queue_size: int = Field(512, ge=8, le=100000)
+    dbd_claim_batch_size: int = Field(64, ge=1, le=1000)
+    dbd_archive_batch_size: int = Field(32, ge=1, le=1000)
+    dbd_archive_workers: int = Field(2, ge=1, le=32)
+    dbd_projection_workers: int = Field(8, ge=1, le=128)
+    dbd_archive_compress: bool = True
+    dbd_archive_compress_threshold: int = Field(4096, ge=0, le=100000000)
     dbd_lease_seconds: int = Field(300, ge=30)
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
     dbd_metrics_port: int = Field(0, ge=0, le=65535)
+    dbd_redis_url: str | None = None
+    dbd_redis_rate_key: str = "dbd:global-rate"
 
 
 settings = Settings()
