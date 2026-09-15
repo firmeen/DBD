@@ -1,226 +1,280 @@
 # แผนดำเนินงาน DBD: ทุกบริษัทภายใน 48 ชั่วโมง
 
-วันที่สรุป: 15 กันยายน 2026
+อัปเดต: 15 กันยายน 2026
 
-เอกสารนี้รวบรวมเป้าหมาย หลักการดำเนินงาน ผลตรวจ ปัญหา ลำดับแก้ไข และเกณฑ์ตรวจรับจากการทบทวนโค้ด ฐานข้อมูลแบบอ่านอย่างเดียว และภาพผลรันของผู้ใช้ ตัวเลขเป็น snapshot ไม่ใช่สถานะปัจจุบันแบบ real-time
+เอกสารนี้แยกสถานะออกเป็นสองชั้นอย่างชัดเจน:
 
-## 1. เป้าหมายและขอบเขตที่ตกลง
+1. **Implementation readiness** — สิ่งที่แก้และตรวจได้ใน source/tests/CI
+2. **Live acceptance** — สิ่งที่ต้องพิสูจน์จาก DBD จริงและ campaign จริงก่อนกล่าวว่า “ครบทุกบริษัทภายใน 48 ชั่วโมง”
 
-- ทุกบริษัท ทุกสถานะ รวมบริษัทที่ปิดกิจการ ไม่ใช้ operating-only เป็นทางลัดลดเวลา
-- เก็บแท็บ 1–2: profile, committees, committee_signs, transformations, financial_submissions, financial_statements, industry_benchmark
-- รวม discovery และการเก็บรายละเอียดให้เสร็จภายใน 48 ชั่วโมง
-- แท็บ 3–4 (nationality/history) อยู่นอก scope รอบนี้
-- ข้อมูลที่ต้นทางไม่มีจริงต้องมีหลักฐาน/เหตุผล; failed, ไม่เคยค้นพบ และ schema error ไม่ใช่ not_available
-- ต้องตกลงจุดเริ่มนับ 48 ชั่วโมงก่อนวัดผลแต่ละ campaign และรายงานเวลาที่ใช้ไปแล้วแยกจากเวลาที่เหลือ
-- ขณะนี้ยังไม่มีหลักฐานรับรองว่าจะจบตามเวลา เป้าหมายนี้เป็นเกณฑ์ออกแบบและตรวจรับ ไม่ใช่คำรับรอง throughput
+ห้ามนำ implementation ที่เสร็จแล้วไปตีความว่า live target ผ่านแล้วโดยอัตโนมัติ
 
-## 2. หลักการจัดการงาน
+## 1. ขอบเขตที่ยืนยันแล้ว
 
-1. ผู้ใช้เป็นคนรัน scripts, tests, collector และ probe เท่านั้น Agent ไม่รันงานเหล่านี้แทนโดยอัตโนมัติ
-2. แก้เฉพาะปัญหาที่มีหลักฐานและอยู่ในขอบเขตที่ผู้ใช้อนุญาต ไม่ rewrite ระบบทั้งหมด
-3. รอบที่จัดทำเอกสารนี้ไม่แก้ application code; push probe/tests ที่แก้ไว้ก่อนหน้าและเอกสารนี้
-4. เก็บ checkpoint และ raw archive ไว้ ไม่ reset discovery เพื่อแก้ network error
-5. ไม่รัน probe กับ collector พร้อมกัน ต้องหยุด collector และรอ prompt ก่อน
-6. ไม่ใช้การเปิดหลาย manager, เปลี่ยน IP หรือหลบการจำกัดต้นทางเพื่อให้ถึง deadline
-7. ทดสอบการเขียนและโหลด DB บนฐาน disposable ชื่อ dbd_test_* ไม่ benchmark production ด้วยข้อมูลจำลอง
-8. ระบุเสมอว่าอะไรเป็น measured, inferred, assumed หรือ unknown และไม่เอาผล profile ไปแทนทุก endpoint
-9. ทุกการแก้ต้องมี acceptance criteria และผลรันของผู้ใช้ก่อนถือว่าปิดงาน
-10. การเปิดเผย error ต้องไม่พิมพ์ token, cookies, encryption keys หรือ response body ทั้งก้อน
+- เป้าหมาย campaign: ทุกบริษัทที่อยู่ใน authoritative population ทุกสถานะ รวมกิจการที่เลิก/ชำระบัญชี
+- default collection scope: แท็บ 1–2 จำนวน 7 endpoints
+  - `profile`
+  - `committees`
+  - `committee_signs`
+  - `transformations`
+  - `financial_submissions`
+  - `financial_statements`
+  - `industry_benchmark`
+- แท็บ 3–4 ยังรองรับในระบบแต่ไม่อยู่ใน acceptance รอบนี้
+- `not_available` ใช้เฉพาะกรณีที่ต้นทางไม่มีข้อมูลจริง เช่นไม่มี submitted fiscal year
+- network failure, schema/contract error, quarantine, identity conflict และบริษัทที่ไม่เคยถูกค้นพบ **ไม่ใช่** `not_available`
+- 48 ชั่วโมงนับ discovery + depth collection + retry/replay ที่จำเป็นเป็น wall-clock campaign เดียว
 
-## 3. ภาพล่าสุดบอกอะไร
+## 2. Implementation readiness — เสร็จแล้วใน PR #1
 
-### Probe ล่าสุด: concurrency 16, repeats 2, step 20 วินาที
+### P0: correctness / data-loss prevention
 
-| Target | รอบ | Window success/s | Overall/s ที่สคริปต์แสดง | HTTP p95 | Errors | 429/503 |
-| --- | --- | --- | --- | --- | --- | --- |
-| 20/s | 1 | 16.80 | 16.42 | 0.377 s | 0 | 0 |
-| 20/s | 2 | 16.30 | 15.94 | 0.442 s | 0 | 0 |
-| 25/s | 1 | 20.03 | 20.03 | 0.923 s | 6 | 0 |
+- [x] รองรับ observed type `A` ที่ `jpNo` 11–13 หลักโดยเก็บ string ตามต้นทางและไม่เติมเลขเดา
+- [x] numeric juristic types อื่นยัง strict 13 หลัก
+- [x] discovery normalize เป็นรายแถว: แถวดีถูกเก็บแม้มีแถวเสียอยู่หน้าเดียวกัน
+- [x] แถวเสียถูกเก็บ durable ใน `discovery_rejections`
+- [x] page ที่มี quarantine เป็น `partial` และไม่ถูกนับเป็น completed page
+- [x] retry เฉพาะ failed/partial page โดยไม่ดึง done page ใหม่
+- [x] malformed `transformations`, `nation_history`, `industry_benchmark` root shape fail เป็น contract error แทนการล้าง projection เก่า
+- [x] natural-key freshness fence ผ่าน `projection_write_state`
+  - statements: บริษัท + fiscal year ที่ response ส่งกลับจริง
+  - submissions: collection ทั้งบริษัท
+  - benchmark: TSIC + fiscal year + business size + location type + location number
+  - company resources อื่น: บริษัท + endpoint collection
+- [x] stale replay ต่าง request scope/ต่างบริษัทไม่ทับ natural-key row ที่ใหม่กว่า
+- [x] identity conflict ถูกบันทึก durable ที่ `company_master.identity_status='conflict'`
+- [x] conflict transition ถูก lease-fence และทำ task/master/archive ใน transaction เดียว
+- [x] generic `bulk-retry` ไม่ requeue `IdentityConflict` โดยอัตโนมัติ
 
-- 20/s ผ่านเกณฑ์ของ probe สองรอบ แต่ทำสำเร็จจริงในช่วงวัดประมาณ 16.3–16.8/s ไม่ใช่ 20/s
-- 25/s รอบนี้ incomplete เพราะ transport errors 6 ครั้ง; รอบก่อนก็เกิด transport errors ที่ระดับนี้ จึงเป็นอาการที่เกิดซ้ำและควรหาสาเหตุก่อนเพิ่ม rate
-- ไม่พบ 429/503 ไม่ได้แปลว่าต้นทางไม่มีการจำกัด; connection/stream อาจล้มได้โดยไม่มี response ดังกล่าว
-- ยังไม่มี exception subclass/curl code จึงไม่ทราบว่าเกิดจาก HTTP/2, timeout, DNS หรือสาเหตุอื่น
-- อัตรา 30 และ 40/s ยังไม่ได้ทดสอบ เพราะหยุดที่ 25/s
-- Budget 2,000 ไม่เพียงพอสำหรับแผนทั้งหมดที่สคริปต์ประเมิน 4,625 endpoint requests; รอบนี้ส่งจริง 924 แล้วหยุดจาก error ก่อนหมดงบ
-- Overall/s ยังรวมเวลารอ workers ที่ติด limiter หลัง deadline จึงยังมี bias ห้ามใช้เป็น ETA ที่ยืนยันแล้ว
-- ภาพก่อนหน้าของผู้ใช้แสดง probe regression tests 5 passed; Agent ไม่ได้รันซ้ำ และยังไม่มีผล full integration สำหรับการเปลี่ยนนี้
+### P0: discovery coverage / checkpoint safety
 
-### Discovery status ล่าสุดจากภาพ
+- [x] เพิ่ม audited seed `099`
+- [x] invalid/empty province response fail loud เป็น `ContractError`
+- [x] count request page 1 ถูก archive และ reuse เมื่อ bucket drain ได้
+- [x] split overflow ที่ไม่มี dimension เหลือ fail ชัดเจน ไม่ truncate เงียบ
+- [x] split validation บันทึก `partition_lossless`
+- [x] full discovery command จบ non-zero เมื่อยังมี failed bucket, partial page, unresolved rejection หรือ known lossy partition
+- [x] `--max-buckets` ถูกแยกเป็น trial/partial run และไม่แกล้งรายงาน full completeness
+- [x] discovery scheduling เติมงานต่อเนื่องแบบ bounded แทนรอทั้ง batch ใหญ่
+- [x] latest observed `jpStatCode` แยกเก็บใน `company_master` เพื่อไม่ใช้ shallow `companies` status ที่ stale
+- [x] `master-status` แสดง denominator: total, conflict, all-status eligible, operating eligible, unknown status
+
+### P0: runtime ownership / diagnostics
+
+- [x] manager lock ตรวจว่า connection เดิมยังเป็น owner จริง ไม่ใช่แค่ connection ยัง ping ได้
+- [x] bulk และ discovery ตรวจ lock health ระหว่าง long-running work
+- [x] destructive discovery reset ใช้ manager lock เดียวกัน
+- [x] transport/startup/decode diagnostics แสดงเฉพาะ safe metadata: stage, path, type, curl code/status/size/hash ตามกรณี
+- [x] ไม่ dump token, cookies, `encKey` หรือ response body ทั้งก้อน
+- [x] lost lease ไม่ถูกนับเป็น task success/failure metric ของ worker ที่เสีย ownership
+
+### P1: throughput control / measurement
+
+- [x] 429/503 ลด effective shared rate และใช้ shared cooldown
+- [x] healthy success ค่อย ๆ recover rate กลับหา target โดยไม่เกิน configured target
+- [x] probe หยุด admission ที่ deadline และแยก post-window drain
+- [x] probe แยก window throughput, admission rate, HTTP latency, wait latency และ transport error breakdown
+- [x] incomplete probe step ไม่ qualify เป็น rate recommendation
+- [x] probe ถูกระบุชัดว่า profile-only ไม่ใช่ full-pipeline ceiling
+- [x] เอา benchmark pre-HTTP skip ที่ใช้ scope ไม่ครบออก เพราะ location เป็นส่วนของ natural key แต่ยังไม่ทราบก่อน response
+
+### P2: observability / CI
+
+- [x] Prometheus HTTP attempts by status
+- [x] HTTP latency
+- [x] HTTP retries
+- [x] current effective admission rate
+- [x] endpoint task outcomes และ in-flight tasks
+- [x] discovery valid rows/page outcomes/new identities counters
+- [x] discovery bucket/page state, unresolved quarantine, uncounted buckets และ known remaining pages
+- [x] `discover --metrics-port` เปิด localhost metrics ระหว่างงานได้
+- [x] `discover-status` แสดง bucket backlog, page checkpoint และ quarantine state
+- [x] GitHub Actions ใช้ Python 3.12 + disposable MySQL 8.4 และรัน compile + Ruff + full pytest integration suite
+
+## 3. สิ่งที่จงใจไม่ทำเพราะยังพิสูจน์ความปลอดภัยไม่ได้
+
+### 3.1 Benchmark reservation ก่อน HTTP
+
+ไม่ dedupe benchmark จาก `TSIC/year/size` อย่างเดียว เพราะ persisted natural key ยังมี `location_type/location_no` ซึ่งยังไม่รู้ก่อน response การลด request แบบนั้นอาจทิ้ง regional benchmark ที่ถูกต้องได้
+
+จะกลับมาทำ reservation ได้เมื่อพิสูจน์ deterministic full scope จาก request input/profile ได้เท่านั้น
+
+### 3.2 ลด discovery seed overlap แบบเดา
+
+substring search ทำให้ seed overlap เป็นเรื่องปกติ การลบ seed เพื่อประหยัด request ทำได้ต่อเมื่อมี evidence ว่า coverage set ไม่ลดลง ห้าม optimize จากจำนวน duplicate อย่างเดียว
+
+### 3.3 Auto retention / ลบ raw data
+
+`response_archive` และ `raw_responses` ยังมีหน้าที่ต่างกันใน schema ปัจจุบัน โดย projection tables ยังมี FK ไป `raw_responses` จึงยังไม่สร้าง auto-delete policy จนกว่าจะวัด storage growth และตกลง replay/audit retention จริง
+
+## 4. Historical evidence ที่ใช้ประกอบ แต่ไม่ใช่ acceptance ปัจจุบัน
+
+### Discovery snapshot ก่อน hardening
 
 | รายการ | ค่า |
 | --- | ---: |
-| Unique companies | 240,597 |
-| Rows fetched | 285,929 |
-| Buckets ทั้งหมด | 9,101 |
-| Done | 628 |
-| Split | 191 |
-| Open | 8,261 |
-| Failed | 21 |
-| Prefix ที่พบแต่ไม่มี seed ตรงกัน | 099 |
+| unique identities | 240,597 |
+| rows fetched | 285,929 |
+| buckets | 9,101 |
+| done | 628 |
+| split | 191 |
+| open | 8,261 |
+| failed | 21 |
+| observed uncovered prefix | `099` |
 
-Rows fetched มากกว่า unique เพราะมีการพบซ้ำ จำนวน unique นี้คือ discovery sightings ไม่ใช่บริษัทที่เก็บ 7 endpoints ครบ และจำนวน bucket done/total ไม่ใช่เปอร์เซ็นต์เวลาที่เสร็จ เพราะขนาด bucket ต่างกันและ split เพิ่มงานได้
+ใน failed pages เดิมพบ type A 12 หลัก 37 แถว, 11 หลัก 1 แถว และมี valid neighboring rows 304 แถวที่เสียไปพร้อม page failure แบบเดิม ปัญหานี้เป็นเหตุผลของ row-level quarantine + type-A contract ใหม่
 
-Prefix 099 เป็นหลักฐานว่าชุด seed ที่ใช้ยังไม่มี keyword ตรงกับ prefix นี้ มีบางบริษัท 099 ถูกพบผ่าน substring อื่นแล้ว จึงไม่ได้หมายความว่าไม่เคยพบ 099 เลย แต่ไม่อาจรับรองว่าครบทุกบริษัทในกลุ่มนี้ การเพิ่ม seed ช่วยปิดช่องนี้แต่ไม่พิสูจน์ completeness ของทั้งฐาน
+### Remote profile probe snapshot ก่อน diagnostic hardening
 
-## 4. ข้อค้นพบก่อนหน้าและข้อแก้ไขคำอธิบาย
+| Target | Repeat | Window success/s | HTTP p95 | Transport errors | 429/503 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 20/s | 1 | 16.80 | 0.377 s | 0 | 0 |
+| 20/s | 2 | 16.30 | 0.442 s | 0 | 0 |
+| 25/s | 1 | 20.03 | 0.923 s | 6 | 0 |
 
-- Snapshot ก่อนหน้าพบ 35 failed pages จาก identity contract และ 5 จาก DNSError
-- ใน 35 หน้าพบ type A, jpNo 12 หลัก 37 แถว และ 11 หลัก 1 แถว; อีก 304 แถวผ่าน identity แต่ติดไปกับหน้าที่ failed ตัวเลขเป็นแถว ไม่ได้ dedupe บริษัท
-- ก่อนหน้านี้ discovery ทำได้ประมาณ 0.48 หน้า/s หลายชั่วโมง สอดคล้องกับ limiter floor 0.5 แต่ไม่ได้อ่าน effective rate ใน process โดยตรง
-- พบ process discovery ทำงานแต่ manager lock ไม่มี owner สองครั้ง; wait_timeout 8 ชั่วโมงเป็นสาเหตุที่เป็นไปได้ ไม่ใช่สาเหตุที่พิสูจน์ย้อนหลังแล้ว
-- HTTPError ตอนเริ่ม discover แสดงเพียง exception class ไม่มีข้อมูลพอระบุจุดล้ม แนวโน้มอยู่ช่วง session/auth/provinces ก่อนแสดง progress
-- แก้ความคลาดเคลื่อนใน PROJECT_REVIEW_TH.md: PermanentHttpError สืบทอด ValueError จึงเป็น terminal ใน worker อยู่แล้ว ไม่ต้องแก้เรื่อง retry ประเด็นนี้
-- ค่า local ceiling เดิมระดับ 18,277 หรือค่าที่ cap ไว้ 2,000 endpoints/s ไม่มี benchmark pipeline รองรับ; probe ล่าสุดยกเลิกข้ออ้างนั้นแล้ว
+ข้อสรุปที่อนุญาต:
 
-## 5. Backlog เรียงลำดับ
+- target 20/s ไม่ได้แปลว่าสำเร็จ 20 responses/s
+- 25/s เคยมี transport instability โดยไม่พบ 429/503
+- ต้อง probe ใหม่ด้วย diagnostic ปัจจุบันก่อนกำหนด production rate
 
-### P0 — ทำให้วัดผลและเริ่มงานต่อได้อย่างวินิจฉัยได้
+ข้อสรุปที่ **ห้าม** อ้างจาก snapshot นี้:
 
-- [ ] **Error diagnostics:** แสดง stage, exception subclass, curl code, HTTP status ถ้ามี และ request path ที่ไม่รวมข้อมูลลับ สำหรับ probe และ discovery startup
-  - ไฟล์: scripts/probe_capacity.py, src/dbd/cli/main.py, client/auth.py, client/async_client.py, client/session.py
-  - เกณฑ์ผ่าน: ผู้ใช้รันแล้วจำแนก 25/s transport errors และ startup HTTPError ได้โดยไม่ต้อง dump secrets; tests ครอบคลุมไม่มี response ด้วย
-- [ ] **Probe deadline/drain:** หยุดงานที่ยังไม่ส่งเมื่อหมดเวลา และแยกเวลารอ admission ออกจากการ drain HTTP ที่ส่งแล้ว
-  - ไฟล์: scripts/probe_capacity.py, tests/test_probe_capacity.py
-  - เกณฑ์ผ่าน: ไม่ส่ง HTTP หลัง deadline, budget ไม่เกิน, late success ไม่เพิ่ม window numerator, overall denominator ไม่รวมการรอ limiter ของงานที่ไม่เคยส่ง
-- [ ] **Probe representativeness:** เพิ่มผลจำนวน samples/duration/rate admission ที่เกิดจริง, error breakdown, fixed concurrency, การทดสอบซ้ำ และผลแบบบันทึกเปรียบเทียบได้
-  - เกณฑ์ผ่าน: incomplete step ไม่ถูกนำไปแนะนำ rate; short profile test ไม่อ้าง sustainable ceiling หรือ ETA ของทั้งระบบ
-- [ ] **Lock lifecycle:** discovery ต้องตรวจ lock ตลอดงานและหยุดเมื่อเสีย lock; reset script ต้องใช้ lock เดียวกัน
-  - ไฟล์: runtime/locking.py, cli/main.py, pipelines/discovery.py, scripts/reset_discovery.py
-  - เกณฑ์ผ่าน: connection loss หยุด manager และไม่เกิด silent concurrent managers; reset ขณะถือ lock ถูกปฏิเสธ
+- sustainable API ceiling
+- safe 30/40/50 requests/s
+- ETA ของ 7-endpoint pipeline
+- การรับรอง 48 ชั่วโมง
 
-### P0 — ทำให้เก็บครบและไม่ทำข้อมูลเสีย
+## 5. Request/workload model
 
-- [ ] **Seed 099 และ coverage audit:** ลงทะเบียน 099 โดยไม่ reset checkpoint เดิม; ตรวจ prefix อื่นและ reconciliation หลังจบ
-  - เกณฑ์ผ่าน: 099 ถูก drain ครบหรือมีข้อยกเว้นที่ระบุ; ไม่มีการอ้าง all-companies จาก prefix check อย่างเดียว
-- [ ] **Identity type A:** ตรวจรูปแบบที่ upstream ใช้จริงก่อนขยาย contract; ห้ามเติมศูนย์เดา
-  - ไฟล์: contracts/identity.py และ parsing company code/URL ที่เกี่ยวข้อง
-  - เกณฑ์ผ่าน: แถว 11/12 หลักที่ได้รับรองเก็บและเรียก endpoint ได้ตรง identity; ไม่ชน identity เดิม; ทบทวนสมมติฐาน seed
-- [ ] **Row quarantine:** เก็บแถวมีปัญหาและเหตุผลแยกจากแถวที่ดี พร้อมสถานะ partial ที่ยังไม่ถือว่าครบ
-  - ไฟล์: pipelines/discovery.py, repositories/discovery_repository.py และ schema ตามจำเป็น
-  - เกณฑ์ผ่าน: valid rows ไม่หายเพราะเพื่อนร่วมหน้า; unresolved rows ยังนับเป็น coverage gap
-- [ ] **Strict normalizers:** malformed transformations/nation-history roots ต้องไม่กลายเป็น [] และลบข้อมูลเดิม; benchmark ผิด shape ต้องไม่กลายเป็น not_available
-  - ไฟล์: contracts/company.py, contracts/financial.py, repositories/company_detail_repository.py
-  - เกณฑ์ผ่าน: schema errors คง projection เดิมและเก็บ archive; empty ที่ถูกต้องยังทำงานตาม semantics
-- [ ] **Freshness ตาม key ที่เขียนจริง:** ป้องกัน replay ต่าง request-year ทับ statements/submissions ใหม่ และ benchmark ของบริษัทหนึ่งทับ shared row ที่อีกบริษัทเขียนใหม่กว่า
-  - ไฟล์: repositories/projection_repository.py, financial_repository.py
-  - เกณฑ์ผ่าน: regression tests ต่างปีและ shared benchmark ต่างบริษัทผ่านใน MySQL
-- [ ] **All-status scheduling:** campaign ต้องใช้ --all-statuses; รายงาน identity conflicts/unknown แยก ไม่หายจาก denominator
-  - ไฟล์: runtime/worker.py, repositories/worker_repository.py, cli/main.py
-  - เกณฑ์ผ่าน: reconcile discovery identities กับ scheduled companies; แสดง excluded reasons ครบ
-
-### P1 — Throughput และงานซ้ำ
-
-- [ ] **Rate recovery:** เพิ่มการค่อย ๆ ฟื้น rate หลังช่วงปกติ โดยยังเคารพ cooldown/Retry-After; แสดง effective rate และเหตุการณ์ลด/ฟื้น
-  - ไฟล์: client/rate_limit.py, client/async_client.py, core/telemetry.py
-  - เกณฑ์ผ่าน: transient 429/503 ไม่ทำให้ติด 0.5 ตลอด process; ไม่เกิด retry storm
-- [ ] **Continuous discovery workers:** แทน batch barrier ที่รอ gather ทั้งกลุ่มด้วย bounded scheduling ต่อเนื่อง รวมงานข้าม bucket อย่างเหมาะสม
-  - เกณฑ์ผ่าน: หน้าช้าไม่ทำให้ช่องว่างงานส่วนอื่นเสียไป; checkpoint ยัง atomic; memory/DB writes มีขีดจำกัด
-- [ ] **Archive และ reuse count page:** count response ต้องถูก archive ก่อน normalize และ reuse หน้าแรกแทน fetch ซ้ำเมื่อทำได้อย่างถูกต้อง
-- [ ] **ลด seed overlap:** หาวิธีลด requests โดยพิสูจน์การครอบคลุม; dedupe หลัง fetch ไม่ได้ประหยัด HTTP; ห้ามเดาว่า prefix filters เป็น partition โดยไม่ทดสอบ
-- [ ] **Benchmark reservation:** dedupe ก่อน HTTP ด้วย full scope รวม location และ provenance/run_id; มี lease/recovery สำหรับ reservation
-  - เกณฑ์ผ่าน: concurrent workers ไม่ยิงซ้ำ scope เดียว; ไม่ใช้ benchmark คนละ location; shared data freshness ถูกต้อง
-- [ ] **Scheduling status freshness:** discovery INSERT IGNORE ไม่อัปเดตสถานะบริษัทเดิม; แยก discovery observation/status freshness จาก authoritative profile
-- [ ] **Queue/DB benchmark จริง:** ใช้ archived payload ที่หลากหลายบน disposable DB ผ่าน claim→archive→normalize→projection→commit และ queue หลายล้าน tasks
-  - วัด endpoint/s, per-endpoint latency, lock wait, pool wait, CPU/RAM/disk, EXPLAIN ของ claim/maintenance/progress
-  - เกณฑ์ผ่าน: DB ทำได้เกิน throughput เป้าหมายพร้อมข้อมูลถูกต้อง; ไม่สรุปจาก SELECT 1/temporary table
-
-### P2 — Operation, observability และเอกสาร
-
-- [ ] Discovery metrics: requests by status, effective rate, HTTP latency, new identities/s, pages/s, retries, remaining counted pages และ uncounted buckets
-- [ ] แยก not_available, reused benchmark, failed, partial, conflict และ stale replay skipped ในรายงาน
-- [ ] fail exit code/summary สำหรับ discovery campaign ที่ยังมี failure ตามนโยบายที่ชัด ไม่ให้ scheduler ตีความสำเร็จผิด
-- [ ] finish() ที่เสีย lease ต้องไม่เพิ่ม success metrics; conflict rejection ต้องมี durable workflow/status
-- [ ] province response/empty seed contract ต้อง fail ชัด ไม่ IndexError หรือจบเงียบ
-- [ ] วัด raw storage growth ทั้ง response_archive และ raw_responses ที่ซ้ำบางส่วน รวม indexes/facts/items; วาง retention หลังตกลง recovery requirements
-- [ ] backup/restore drill, scheduler, campaign manifest และ run IDs ที่ตามย้อนหลังได้
-- [ ] CI/unit/integration บน disposable MySQL; ไม่ถือว่าชุดทดสอบ 5 รายการครอบคลุมทั้งระบบ
-- [ ] ปรับ README/ROADMAP/VALIDATION/RUNBOOK: default 7 endpoints, all-status scope, search INSERT IGNORE, discover-refresh semantics, จำนวน tests และขอบเขต freshness guarantee
-
-## 6. แบบจำลอง 48 ชั่วโมง
-
-ใช้สูตร ไม่ใช้ workload hardcoded:
+ใช้เพื่อ scenario planning เท่านั้น:
 
 ```text
-R ≈ D + 4N + 2F + B + Q
-required_success_rate = R / seconds_remaining
-
-D = discovery page requests
-N = บริษัททั้งหมดใน scope
-F = บริษัทที่มีปีงบให้ดึง
-B = benchmark requests หลัง dedup
-Q = count probes, retries และ overhead requests ที่เกี่ยวข้อง
+R ≈ D + 4N + 2F + B + retry_overhead
 ```
 
-Snapshot root seeds 77 ตัวก่อนเพิ่ม 099 มีผลค้นหารวมประมาณ 5,522,274 รายการที่ซ้ำกัน ภายใต้ partition ที่ครบตามจำนวนเดิม คิดเป็นราว 552,228 page requests ก่อน overhead เป็น estimate ของแผนเดิม ไม่ใช่จำนวนบริษัทไม่ซ้ำหรือยอดครบถ้วนที่ยืนยันแล้ว
+- `D` = discovery requests
+- `N` = discovered companies
+- `F` = companies ที่ต้องเก็บ financial detail
+- `B` = benchmark requests
 
-| สมมติจำนวนบริษัท | Requests เมื่อคิด D + 4N ถึง D + 7N | เฉลี่ยที่ต้องได้ใน 48 ชม. |
-| --- | --- | --- |
-| 1 ล้าน | 4.55–7.55 ล้าน | 26–44/s |
-| 1.9 ล้าน | 8.15–13.85 ล้าน | 47–80/s |
+benchmark term ไม่สมมติ pre-HTTP dedupe แล้ว
 
-ไม่รวม Q และการเพิ่ม seed ใหม่ ตัวเลข 1/1.9 ล้านเป็น scenario ไม่ใช่ authoritative count ปัจจุบัน อัตราที่ probe ล่าสุดทำได้ประมาณ 16/s ยังต่ำกว่าช่วงที่ scenario เหล่านี้ต้องการ แต่ห้ามแปลงตรงเป็น ETA ทั้งระบบเพราะ endpoint mix และ DB ยังไม่วัด
+ตัวอย่าง scenario เดิม:
 
-หาก measured sustainable rate ต่ำกว่าที่ต้องการ ต้องลด R ด้วยการตัดงานซ้ำที่พิสูจน์ได้ ใช้แหล่งข้อมูล bulk ที่ได้รับอนุญาตหากมี หรือปรับเวลา/ขอบเขตโดยตกลงกับผู้ใช้ ห้ามลด coverage เงียบ ๆ เพื่อให้ตัวเลขจบในเวลา
+- 1.0M companies: ประมาณ 4.55M–7.55M requests → ต้องเฉลี่ย ~26–44 successful requests/s ใน 48h
+- 1.9M companies: ประมาณ 8.15M–13.85M requests → ~47–80/s
 
-## 7. ลำดับปฏิบัติสำหรับผู้ใช้
+ตัวเลขนี้ไม่ใช่ authoritative workload และไม่ใช่ production recommendation
 
-### ระหว่างที่ยังไม่แก้ backlog
+## 6. Live acceptance ที่ยังต้องทำ
 
-1. หยุด probe และ collector ทุกตัวก่อนเปลี่ยนโหมด; รอ prompt หลัง Ctrl+C
-2. ดูสถานะ (ไม่เรียก DBD):
+### Gate A — authoritative population reconciliation
+
+ต้องมี external DBD source/count/dataset ที่ใช้เป็น denominator อิสระจาก search campaign แล้วบันทึก:
+
+```text
+authoritative population = X
+unique discovered eligible identities = Y
+known conflicts/quarantine exclusions = Z
+unexplained missing = X - reconciled set
+```
+
+`coverage_gaps()==[]` หรือทุก observed prefix มี seed **ไม่ใช่** proof ว่าครบทุกบริษัท เพราะ entity ที่ search ไม่เคยคืนจะไม่ปรากฏใน sightings
+
+### Gate B — clean discovery campaign
+
+หลัง migrate และ deploy hardening แล้ว:
 
 ```powershell
+dbd-data discover --metrics-port 9108
 dbd-data discover-status
+dbd-data master-status
 ```
 
-3. หากพร้อม resume หลังพักจาก probe ให้เพิ่ม seed ที่พบว่าขาดโดยไม่ reset:
+เกณฑ์ผ่าน:
+
+- failed buckets = 0
+- partial pages = 0
+- unresolved quarantines = 0
+- lossy partitions = 0
+- observed prefix gaps = 0 หรือมี reconciliation ที่อธิบายได้
+- authoritative population reconciliation ผ่าน Gate A
+
+### Gate C — capacity measurement
+
+หยุด collectors ทั้งหมดก่อน:
 
 ```powershell
-dbd-data discover 099 --rate 5 --concurrency 8
+python scripts\probe_capacity.py --collector-stopped --min-rate 5 --max-rate 25
 ```
 
-คำสั่งนี้ลงทะเบียน 099 แล้วทำ pending buckets ทั้งหมดตามลำดับของระบบ ไม่ได้ทำเฉพาะ 099 หรือให้ 099 มี priority ทันที หากเกิด HTTPError เดิมซ้ำ ให้หยุดการลองซ้ำถี่และทำ error diagnostics ก่อน
+ใช้ผลใหม่เพื่อกำหนด initial rate/concurrency โดยต้องดู transport error class/curl code, p95 latency, admission throughput และ drain ไม่ใช้ configured target เป็น successful throughput
 
-4. หลังแก้ identity contract แล้ว จึง requeue failed buckets ขณะไม่มี collector ทำงาน:
+ถ้าจะยืนยัน local DB/queue ceiling ต้อง benchmark mixed endpoint projection บน disposable `dbd_test_*`; queue-only synthetic benchmark ไม่แทน projection workload จริง
 
-```powershell
-dbd-data discover-retry
-dbd-data discover --rate 5 --concurrency 8
-```
-
-การ retry ก่อนแก้ type A มีแนวโน้มล้มซ้ำ; --rate 5 เป็นค่าลองกลับมาเริ่มแบบโหลดต่ำ ไม่ใช่ค่าที่พิสูจน์ sustained แล้ว
-
-### หลังแก้ P0 และยืนยัน discovery
-
-5. ผู้ใช้รัน unit tests ที่เกี่ยวข้อง แล้ว integration บน dbd_test_* พร้อมผลตรวจที่ตกลง
-6. วัด local pipeline; วัด remote แบบแยก collector, rate คงที่, ทำซ้ำ/ช่วงยาวขึ้น และหยุดเมื่อ errors กลับมา ห้ามตีความไม่มี 429 เป็นใบอนุญาตเพิ่มโหลดไม่จำกัด
-7. บันทึก workload/อัตราที่วัด/เวลาที่เหลือ และตัดสินว่า 48 ชั่วโมง feasible หรือไม่
-8. เมื่อพร้อมสร้างงานรายละเอียดทุกสถานะ:
+### Gate D — create one immutable all-status run
 
 ```powershell
 dbd-data bulk --master --all-statuses --enqueue-only
 ```
 
-จด run ID ที่คำสั่งแสดง จากนั้นเริ่ม run นั้นด้วย rate/concurrency ที่ผ่านการวัด ห้ามเรียก --master ซ้ำเพื่อ resume เพราะเป็นการสร้าง refresh run ใหม่
+บันทึก `RUN_ID`, campaign start timestamp, master denominator และ endpoint task count
 
-```text
-dbd-data bulk --run-id <RUN_ID> --rate <MEASURED_RATE> --concurrency <MEASURED_CONCURRENCY>
-dbd-data bulk-status <RUN_ID>
+resume ด้วย run เดิมเท่านั้น:
+
+```powershell
+dbd-data bulk --run-id <RUN_ID> --rate <MEASURED_RATE> --concurrency <MEASURED_CONCURRENCY> --metrics-port 9108
 ```
 
-ค่าภายใน <> เป็น placeholder ไม่ใช่คำสั่งพร้อมรัน ไม่มีการกำหนด production rate ใหม่จากภาพระยะสั้นนี้
+ห้าม `--master` ซ้ำเพื่อ resume เพราะจะสร้าง refresh run ใหม่
 
-## 8. นิยามว่าเสร็จ
+### Gate E — final depth acceptance
 
-- Discovery ครบตามขอบเขตที่ตรวจสอบได้ ไม่มี unresolved failed/partial/oversized leaf ที่ถูกซ่อน
-- Coverage ตรวจทั้ง seeds, partition และแหล่งยอดอ้างอิงที่เหมาะสม; prefix gap เป็นศูนย์อย่างเดียวไม่พอ
-- ทุก identity ใน scope ถูก schedule หรือมี exclusion ที่ผู้ใช้ยอมรับและเห็นจำนวนชัดเจน
-- ทุก endpoint task มีผลสำเร็จหรือไม่มีข้อมูลจริง/reused ที่ตรวจ provenance ได้; ไม่มีคิวค้างหรือ failed ที่ถูกนับเป็นสำเร็จ
-- ข้อมูลผ่าน identity/shape/freshness checks และตัวอย่าง reconciliation กับต้นทาง
-- เวลา campaign ทั้งหมดไม่เกิน 48 ชั่วโมงตามจุดเริ่มที่ตกลง; หากไม่ผ่าน รายงานตรงพร้อมเหตุและแผนแก้
-- มีผล tests, throughput, errors, storage และรายการข้อจำกัดแนบกับ run
+ก่อนประกาศเสร็จ:
 
-## 9. สถานะการส่งมอบรอบนี้
+- pending/running/retry_wait = 0
+- failed = 0 ยกเว้น identity conflicts ที่แยกเป็น explicit unresolved governance blocker
+- `not_available` มี source-supported reason
+- replay/stale skip ตรวจได้จาก archive/state
+- endpoint coverage ตรงกับ accepted seven-endpoint scope
+- ไม่มี unresolved discovery blocker จาก Gate B
 
-ส่งโค้ด probe ที่แก้ไว้ก่อนหน้าและ regression tests พร้อมเอกสารนี้ ไม่มีการแก้ collector, rate limiter, identity contract หรือข้อ P0/P1 อื่นในรอบจัดทำแผน ข้อที่เป็น checkbox ยังเป็นงานคงค้าง ไม่ใช่สิ่งที่ทำเสร็จแล้ว
+### Gate F — 48-hour acceptance
+
+วัดจาก agreed campaign start ถึง Gate E สำเร็จ โดยรวม:
+
+- discovery
+- API retry/cooldown
+- DB projection
+- queue overhead
+- replay/recovery ที่จำเป็น
+
+ผ่านเมื่อ wall-clock <= 48 ชั่วโมงเท่านั้น
+
+profile probe, queue benchmark หรือสูตร extrapolation อย่างเดียวไม่ผ่าน Gate F
+
+## 7. งาน operational ที่ยังต้องมี evidence ก่อน production sign-off
+
+- [ ] authoritative population source + reconciliation report
+- [ ] clean live discovery rerun หลัง migration 0004
+- [ ] live probe ใหม่เพื่อระบุ transport error cause และ safe initial rate
+- [ ] mixed-endpoint DB/queue performance benchmark ที่ representative
+- [ ] full all-status end-to-end campaign
+- [ ] backup/restore drill
+- [ ] วัด raw/archive storage growth แล้วกำหนด retention/partition policy
+
+รายการนี้ไม่ได้แปลว่า source code PR ยัง incomplete; เป็น **external/live acceptance evidence** ที่ไม่สามารถสร้างอย่างถูกต้องจาก static code หรือ CI disposable database ได้
+
+## 8. Definition of done ของ PR นี้
+
+PR พร้อม review/merge เมื่อ:
+
+1. compile ผ่าน
+2. Ruff ผ่าน
+3. full pytest รวม disposable MySQL integration ผ่าน
+4. migration apply ซ้ำได้
+5. docs ไม่อ้าง behavior เก่าหรือ claim throughput/completeness เกินหลักฐาน
+6. PR diff self-review แล้วไม่มี unresolved review thread/check failure
+
+หลัง merge จึงเริ่ม Live Acceptance Gates A–F ตามลำดับ ไม่ย้อนกลับไปใช้ assumption เก่าที่ถูกยกเลิกในเอกสารนี้
