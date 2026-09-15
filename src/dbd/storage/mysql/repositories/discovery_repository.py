@@ -146,11 +146,34 @@ def save_page(
                 written = len(profiles)
                 cur.executemany(
                     """
-                    INSERT INTO company_master(jp_no,jp_type_code,first_seen_at,last_seen_at)
-                    VALUES (%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at))
+                    INSERT INTO company_master(
+                        jp_no,jp_type_code,observed_jp_stat_code,observed_status_at,
+                        first_seen_at,last_seen_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE
+                        last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),
+                        observed_jp_stat_code=IF(
+                            VALUES(observed_jp_stat_code) IS NULL,
+                            observed_jp_stat_code,
+                            VALUES(observed_jp_stat_code)
+                        ),
+                        observed_status_at=IF(
+                            VALUES(observed_jp_stat_code) IS NULL,
+                            observed_status_at,
+                            VALUES(observed_status_at)
+                        )
                     """,
-                    [(p.jp_no, p.jp_type_code, requested_at, requested_at) for p in profiles],
+                    [
+                        (
+                            p.jp_no,
+                            p.jp_type_code,
+                            p.jp_stat_code,
+                            requested_at if p.jp_stat_code is not None else None,
+                            requested_at,
+                            requested_at,
+                        )
+                        for p in profiles
+                    ],
                 )
 
                 cur.executemany(
@@ -203,12 +226,7 @@ def completed_pages(bucket_id):
 
 
 def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=True):
-    """Archive decoded search payload before row normalization.
-
-    Count probes use link_page=False. If that probe later becomes a drainable
-    page 1, link_search_page() reuses the same archive instead of issuing HTTP
-    a second time.
-    """
+    """Archive decoded search payload before row normalization."""
     payload = json.dumps(data, ensure_ascii=False, default=str)
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -244,6 +262,17 @@ def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=Tr
         return archive_id
 
 
+def mark_search_archive(archive_id: int, status: str, error: str | None = None) -> None:
+    if status not in {"processed", "invalid", "failed"}:
+        raise ValueError("Unsupported search archive status")
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE response_archive SET processing_status=%s,error_code=%s WHERE id=%s",
+            (status, error, archive_id),
+        )
+        conn.commit()
+
+
 def link_search_page(bucket_id, page_no, archive_id):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -255,7 +284,6 @@ def link_search_page(bucket_id, page_no, archive_id):
 
 
 def _replace_rejections(cur, bucket_id, page_no, rejections, requested):
-    # A retry supersedes unresolved observations from the previous copy of this page.
     cur.execute(
         """
         UPDATE discovery_rejections SET resolved_at=UTC_TIMESTAMP(6)
@@ -394,7 +422,6 @@ def reset_discovery(refresh=False, bucket_id=None):
     with connect() as conn, conn.cursor() as cur:
         if refresh:
             parameters = (bucket_id,) if bucket_id else ()
-            # Keep split parents; refreshing all leaves preserves partition structure.
             cur.execute(
                 "UPDATE discovery_buckets SET status='pending',total_items=NULL,pages_total=NULL,"
                 "pages_done=0,rows_seen=0,last_error=NULL,partition_lossless=NULL "
