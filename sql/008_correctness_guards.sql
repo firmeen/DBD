@@ -1,6 +1,11 @@
 -- Correctness guards added after the durable worker/discovery schema.
 -- Forward-only and data-preserving: no existing projection rows are deleted.
 
+ALTER TABLE company_master
+  ADD COLUMN observed_jp_stat_code VARCHAR(4) NULL AFTER identity_status,
+  ADD COLUMN observed_status_at DATETIME(6) NULL AFTER observed_jp_stat_code,
+  ADD KEY idx_master_observed_status (observed_jp_stat_code, company_id);
+
 ALTER TABLE discovery_pages
   MODIFY COLUMN status ENUM('pending','done','failed','partial') NOT NULL DEFAULT 'pending',
   ADD COLUMN rejected_rows INT UNSIGNED NOT NULL DEFAULT 0 AFTER rows_written;
