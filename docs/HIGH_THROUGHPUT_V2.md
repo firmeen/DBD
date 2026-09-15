@@ -33,6 +33,8 @@ relational projections + terminal task acknowledgement
 
 A fetched response must become durably recoverable before the task advances from `fetch` to `project`. Inline MySQL archives commit payload + stage transition in one transaction. External archives upload the encrypted blob first, then commit object reference + stage transition in one MySQL transaction. Restart/recovery projects from the archive and must not contact DBD again for that task.
 
+Fetch and projection have independent durable retry budgets. `attempts` records fetch-stage leases; `project_attempts` records project-stage work. A response archived on the final allowed fetch attempt therefore still enters `stage=project` with an independent projection budget. A crash after archive commit but before projection cannot convert that durable response back into source HTTP work.
+
 ## Required migrations
 
 ```powershell
@@ -41,7 +43,7 @@ dbd-data migrate
 dbd-data --version
 ```
 
-V2 currently uses `0005_high_throughput_pipeline` and `0006_external_archive_backend`.
+V2 currently uses `0005_high_throughput_pipeline`, `0006_external_archive_backend` and `0007_project_attempt_budget`.
 
 ## Local single-manager mode
 
@@ -167,8 +169,9 @@ External replay/recovery checks, in order:
 
 1. ciphertext SHA-256 from MySQL metadata;
 2. AES-GCM authentication using object key as AAD;
-3. canonical plaintext SHA-256;
-4. JSON/zstd decoding.
+3. restore JSON bytes from JSON/zstd storage codec;
+4. canonical serialized-payload SHA-256;
+5. JSON decode.
 
 Failure at any step is an archive/project failure and never silently falls back to a DBD refetch.
 
@@ -193,6 +196,7 @@ Failure at any step is an archive/project failure and never silently falls back 
 | `DBD_ARCHIVE_BATCH_SIZE` | 32 | responses handled per archive batch |
 | `DBD_ARCHIVE_WORKERS` | 2 | archive consumers |
 | `DBD_PROJECTION_WORKERS` | 8 | relational projection consumers |
+| `DBD_MAX_TASK_ATTEMPTS` | 3 | independent durable retry ceiling for fetch and project stages |
 | `DBD_ARCHIVE_COMPRESS` | true | enable zstd for sufficiently large payloads |
 | `DBD_ARCHIVE_COMPRESS_THRESHOLD` | 4096 | minimum serialized bytes before zstd |
 | `DBD_ARCHIVE_BACKEND` | `mysql` | `mysql` or encrypted `s3` |
@@ -231,8 +235,9 @@ Real admission must account for retries, auth, discovery, DB work, object-store 
 
 ## Failure and restart guarantees
 
-- Fetch-stage network/HTTP failures use bounded retry/task retry policy.
-- A committed project-stage task resumes from durable archive without another DBD request.
+- Fetch-stage network/HTTP failures use the fetch retry budget.
+- Once the durable archive boundary commits, source fetch attempts no longer limit recovery; projection uses its independent retry budget.
+- A response archived on the last fetch attempt can still recover/project without another DBD request.
 - Inline JSON/zstd and encrypted external archives are replayable.
 - Missing object/key/checksum/decryption/decode failures do not trigger silent DBD refetch.
 - Lease owner/version is checked before archive transition and projection acknowledgement.
