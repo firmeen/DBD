@@ -1,7 +1,7 @@
 import json
-from decimal import Decimal
 from uuid import uuid4
 
+from ..storage.archive_codec import decode_payload
 from ..storage.mysql.engine import connect
 from ..storage.mysql.repositories.projection_repository import project
 
@@ -28,19 +28,30 @@ def replay_archive(archive_id):
                 raise ValueError("Task still has a worker lease; wait for recovery")
             cur.execute(
                 """
-                UPDATE endpoint_tasks SET status='running',lease_owner=%s,lease_version=lease_version+1,
+                UPDATE endpoint_tasks SET status='running',stage='project',raw_response_id=%s,
+                  lease_owner=%s,lease_version=lease_version+1,
                   lease_expires_at=TIMESTAMPADD(MINUTE,10,UTC_TIMESTAMP(6)) WHERE id=%s
             """,
-                (owner, task["id"]),
+                (archive_id, owner, task["id"]),
             )
         conn.commit()
-    task.update(lease_owner=owner, lease_version=task["lease_version"] + 1)
+    task.update(
+        stage="project",
+        raw_response_id=archive_id,
+        lease_owner=owner,
+        lease_version=task["lease_version"] + 1,
+    )
     context = json.loads(raw["request_context"])
+    payload = decode_payload(
+        payload=raw.get("payload"),
+        payload_zstd=raw.get("payload_zstd"),
+        codec=raw.get("payload_codec"),
+    )
     try:
         status = project(
             task,
             archive_id,
-            json.loads(raw["payload"], parse_float=Decimal),
+            payload,
             raw["requested_at"],
             raw["request_path"],
             (context.get("params") or {}).get("fiscalYear", ""),
