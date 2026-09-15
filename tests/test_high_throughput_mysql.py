@@ -8,6 +8,7 @@ from sqlalchemy import text
 
 from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
+from dbd.core.settings import settings
 from dbd.runtime.worker import process
 
 pytestmark = pytest.mark.integration
@@ -83,7 +84,7 @@ async def test_archived_fetch_resumes_projection_without_http(repo):
         row = (
             await conn.execute(
                 text("""
-                SELECT stage,status,raw_response_id,fetched_at
+                SELECT stage,status,raw_response_id,fetched_at,attempts,project_attempts
                 FROM endpoint_tasks WHERE id=:id
             """),
                 {"id": task["id"]},
@@ -93,14 +94,20 @@ async def test_archived_fetch_resumes_projection_without_http(repo):
         assert row["status"] == "running"
         assert row["raw_response_id"] == archive_id
         assert row["fetched_at"] is not None
+        assert row["attempts"] == 1
+        assert row["project_attempts"] == 0
 
     # Simulate an orderly process stop after HTTP/archive but before projection.
-    # The durable stage must remain `project`; only the lease returns to pending.
+    # The durable stage remains `project`; release must not undo the completed
+    # fetch attempt or spend projection retry budget that never started.
     await repo.release("first-process")
     async with repo.engine.connect() as conn:
         row = (
             await conn.execute(
-                text("SELECT stage,status,raw_response_id FROM endpoint_tasks WHERE id=:id"),
+                text("""
+                SELECT stage,status,raw_response_id,attempts,project_attempts
+                FROM endpoint_tasks WHERE id=:id
+            """),
                 {"id": task["id"]},
             )
         ).mappings().one()
@@ -108,6 +115,8 @@ async def test_archived_fetch_resumes_projection_without_http(repo):
             "stage": "project",
             "status": "pending",
             "raw_response_id": archive_id,
+            "attempts": 1,
+            "project_attempts": 0,
         }
 
     loaded = await repo.load_archive(archive_id)
@@ -116,6 +125,83 @@ async def test_archived_fetch_resumes_projection_without_http(repo):
     result = await process(repo, run, concurrency=2, client_factory=NoFetchApi)
     assert result == {"done": 1}
     assert NoFetchApi.calls == 0
+
+
+async def test_last_fetch_attempt_archive_survives_crash_before_projection(repo):
+    """Exhausted fetch budget must not quarantine already archived project work."""
+    NoFetchApi.calls = 0
+    run, identities = await new_run(repo)
+    task = await repo.claim(run, "crashed-fetcher")
+    identity = identities[0]
+
+    # Model a successful HTTP response occurring on the final allowed fetch attempt.
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text("UPDATE endpoint_tasks SET attempts=:max WHERE id=:id"),
+            {"max": settings.dbd_max_task_attempts, "id": task["id"]},
+        )
+    task["attempts"] = settings.dbd_max_task_attempts
+
+    timestamp = datetime.now(timezone.utc).replace(tzinfo=None)
+    response = ApiResponse(
+        {
+            "jpNo": identity.jp_no,
+            "jpTypeCode": identity.jp_type_code,
+            "jpName": "Final Fetch Attempt Co",
+            "submitFinYear": None,
+        },
+        200,
+        timestamp,
+        timestamp,
+    )
+    archive_id = await repo.archive(task, response, "/synthetic/profile", None)
+
+    # Model a hard process crash after the archive/stage commit and before the
+    # projector begins. Expire the lease without calling orderly release().
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text("""
+                UPDATE endpoint_tasks
+                SET lease_expires_at=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6))
+                WHERE id=:id
+            """),
+            {"id": task["id"]},
+        )
+    await repo.maintain(run)
+
+    async with repo.engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("""
+                SELECT stage,status,raw_response_id,attempts,project_attempts,last_error
+                FROM endpoint_tasks WHERE id=:id
+            """),
+                {"id": task["id"]},
+            )
+        ).mappings().one()
+        assert row["stage"] == "project"
+        assert row["status"] == "pending"
+        assert row["raw_response_id"] == archive_id
+        assert row["attempts"] == settings.dbd_max_task_attempts
+        assert row["project_attempts"] == 0
+        assert row["last_error"] == "lease_expired"
+
+    result = await process(repo, run, concurrency=2, client_factory=NoFetchApi)
+    assert result == {"done": 1}
+    assert NoFetchApi.calls == 0
+
+    async with repo.engine.connect() as conn:
+        row = (
+            await conn.execute(
+                text("SELECT status,attempts,project_attempts FROM endpoint_tasks WHERE id=:id"),
+                {"id": task["id"]},
+            )
+        ).mappings().one()
+        assert row == {
+            "status": "done",
+            "attempts": settings.dbd_max_task_attempts,
+            "project_attempts": 1,
+        }
 
 
 async def test_project_backlog_is_claimed_without_fetch_stage(repo):
