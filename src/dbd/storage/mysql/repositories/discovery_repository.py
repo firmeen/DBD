@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from hashlib import sha256
 
 from ....client.endpoints.search import SearchFilters
+from ....core.telemetry import DISCOVERY_PAGE_RESULTS, DISCOVERY_VALID_ROWS, observe_discovery
 from ..engine import connect, use_connection
 from .company_repository import company_upsert_sql, company_values
 from .raw_repository import insert_raw_response
@@ -76,6 +77,11 @@ def update_bucket(bucket_id: int, **fields) -> None:
                 (*fields.values(), _now(), bucket_id),
             )
         conn.commit()
+
+    # Bucket transitions are infrequent enough to refresh durable backlog gauges
+    # without adding a database-wide COUNT to every search page.
+    if "status" in fields:
+        observe_discovery(discovery_summary())
 
 
 def get_bucket(bucket_id: int) -> dict | None:
@@ -216,7 +222,9 @@ def discovery_summary() -> dict:
               (SELECT COUNT(*) FROM discovery_pages WHERE status='partial') AS pages_partial,
               (SELECT COUNT(*) FROM discovery_rejections WHERE resolved_at IS NULL)
                  AS unresolved_rejections,
-              (SELECT COALESCE(SUM(GREATEST(pages_total-pages_done,0)),0)
+              (SELECT COALESCE(SUM(
+                    GREATEST(CAST(pages_total AS SIGNED)-CAST(pages_done AS SIGNED),0)
+                 ),0)
                  FROM discovery_buckets
                  WHERE pages_total IS NOT NULL AND status IN ('counted','draining','failed'))
                  AS remaining_counted_pages,
@@ -383,6 +391,8 @@ def finish_page(bucket_id, page_no, archive_id, profiles, data, requested, rejec
                     ),
                 )
             conn.commit()
+            DISCOVERY_VALID_ROWS.inc(written)
+            DISCOVERY_PAGE_RESULTS.labels(status).inc()
             return written
         except BaseException:
             conn.rollback()
@@ -402,6 +412,7 @@ def fail_page(bucket_id, page_no, error):
             (error, bucket_id, page_no),
         )
         conn.commit()
+    DISCOVERY_PAGE_RESULTS.labels("failed").inc()
 
 
 def page_progress(bucket_id):
