@@ -175,9 +175,9 @@ ruff check .
 pytest -q
 ```
 
-At PR #1 head `58ab1b01d972c0a708fe6964f36acd85129fef5e`, CI reported
-**50 passed** with compile and Ruff both successful. The final PR head must be
-validated again after documentation or code changes.
+The pull request's latest GitHub Actions run is the authoritative validation record
+for its current head. Do not reuse a test count or commit SHA from an older head
+after source, tests, migrations or documentation change.
 
 See:
 
