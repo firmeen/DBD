@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 
 from curl_cffi import requests
+from curl_cffi.requests.exceptions import RequestException as RequestsError
 
 from ..core.exceptions import DbdAuthError
 from ..core.settings import settings
@@ -10,18 +11,11 @@ from .crypto import decode_jwt_payload
 from .session import WARMUP_PAGE_URL, import_chrome_cookies, warm_up
 
 REFRESH_URL = f"{settings.dbd_base_url}/api/refresh"
-
-# Refresh a bit before actual expiry so an in-flight request never races the token dying.
 _EXPIRY_SAFETY_MARGIN_SECONDS = 15
 
 
 class DbdAuth:
-    """Owns the anonymous-token lifecycle for one session.
-
-    One instance is meant to live for the duration of a CLI run (or one
-    ingestion batch) so multiple company fetches reuse the same token
-    instead of re-authenticating per request.
-    """
+    """Owns the anonymous-token lifecycle for one session."""
 
     def __init__(self) -> None:
         self._token: str | None = None
@@ -31,7 +25,6 @@ class DbdAuth:
     def get_token(self, session: requests.Session) -> str:
         if self._token and time.time() < self._expires_at - _EXPIRY_SAFETY_MARGIN_SECONDS:
             return self._token
-
         return self._refresh(session)
 
     def invalidate(self) -> None:
@@ -53,7 +46,14 @@ class DbdAuth:
         }
 
         for attempt in range(1, settings.dbd_max_auth_attempts + 1):
-            response = session.post(REFRESH_URL, headers=headers, timeout=settings.request_timeout)
+            try:
+                response = session.post(REFRESH_URL, headers=headers, timeout=settings.request_timeout)
+            except RequestsError as exc:
+                code = getattr(exc, "code", None) or getattr(exc, "curl_code", None)
+                suffix = f" curl={code}" if code is not None else ""
+                raise DbdAuthError(
+                    f"auth_refresh transport {type(exc).__name__}{suffix} path=/api/refresh"
+                ) from None
 
             if response.status_code == 403:
                 import_chrome_cookies(session, "datawarehouse.dbd.go.th")
@@ -73,7 +73,6 @@ class DbdAuth:
             if response.ok and data.get("idToken"):
                 token = data["idToken"]
                 claims = decode_jwt_payload(token)
-
                 self._token = token
                 self._expires_at = float(claims.get("exp", time.time() + 60))
                 return token
@@ -82,10 +81,12 @@ class DbdAuth:
                 time.sleep(1)
                 continue
 
-            raise DbdAuthError(f"Authentication failed: HTTP {response.status_code}")
+            raise DbdAuthError(
+                f"auth_refresh failed: HTTP {response.status_code} path=/api/refresh"
+            )
 
         raise DbdAuthError(
-            f"Unable to obtain a DBD access token after {settings.dbd_max_auth_attempts} attempts"
+            f"auth_refresh exhausted after {settings.dbd_max_auth_attempts} attempts path=/api/refresh"
         )
 
 
