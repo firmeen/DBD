@@ -257,6 +257,29 @@ class WorkerRepository:
             )
 
     @transaction_retry
+    async def mark_identity_conflict(self, task) -> bool:
+        """Mark master conflict only while this exact task lease is still valid."""
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                UPDATE company_master m
+                JOIN endpoint_tasks t ON t.company_id=m.company_id
+                SET m.identity_status='conflict'
+                WHERE t.id=:id
+                  AND t.status='running'
+                  AND t.lease_owner=:owner
+                  AND t.lease_version=:version
+                  AND t.lease_expires_at>UTC_TIMESTAMP(6)
+            """),
+                {
+                    "id": task["id"],
+                    "owner": task["lease_owner"],
+                    "version": task["lease_version"],
+                },
+            )
+            return result.rowcount == 1
+
+    @transaction_retry
     async def finish(self, task, status, error=None):
         async with self.engine.begin() as conn:
             result = await conn.execute(
