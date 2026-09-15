@@ -10,7 +10,7 @@ from ..client.endpoints.companies import (
     get_collection,
     split_company_code,
 )
-from ..contracts.company import COLLECTION_NORMALIZERS
+from ..contracts.strict import normalize_collection
 from ..storage.mysql.repositories.company_detail_repository import (
     RESOURCES,
     save_collection,
@@ -24,7 +24,7 @@ def run_one(client: DbdClient, company_code: str, resource: str) -> tuple[int, i
     requested_at = datetime.now(timezone.utc).replace(tzinfo=None)
     raw_data = get_collection(client, resource, company_code)
 
-    rows = COLLECTION_NORMALIZERS[resource](raw_data)
+    rows = normalize_collection(resource, raw_data)
     body_sha256 = sha256(json.dumps(raw_data, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
     return save_collection(
