@@ -351,9 +351,13 @@ class WorkerRepository:
         async with self.engine.begin() as conn:
             result = await conn.execute(
                 text("""
-                UPDATE endpoint_tasks SET status='pending',attempts=0,last_error=NULL,finished_at=NULL,
-                    available_at=UTC_TIMESTAMP(6)
-                WHERE run_id=:id AND status='failed' AND COALESCE(last_error,'')<>'IdentityConflict'
+                UPDATE endpoint_tasks t
+                JOIN company_master m ON m.company_id=t.company_id
+                SET t.status='pending',t.attempts=0,t.last_error=NULL,t.finished_at=NULL,
+                    t.available_at=UTC_TIMESTAMP(6)
+                WHERE t.run_id=:id AND t.status='failed'
+                  AND m.identity_status<>'conflict'
+                  AND COALESCE(t.last_error,'')<>'IdentityConflict'
             """),
                 {"id": run_id},
             )
