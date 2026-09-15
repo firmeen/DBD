@@ -166,16 +166,22 @@ def command_discover_status() -> None:
     s = discovery.summary()
     print("\ndiscovery so far:")
     print(f"  unique companies : {int(s['unique_companies']):,}")
-    print(f"  rows fetched     : {int(s['rows_fetched']):,}")
+    print(f"  rows fetched      : {int(s['rows_fetched']):,}")
     print(
-        f"  buckets          : {s['buckets']} total "
+        f"  buckets           : {s['buckets']} total "
         f"({s['buckets_done']} done, {s['buckets_split']} split, "
         f"{s['buckets_open']} open, {s['buckets_failed']} failed)"
     )
     print(
-        f"  partial pages    : {int(s.get('pages_partial') or 0):,}; "
-        f"unresolved rows: {int(s.get('unresolved_rejections') or 0):,}"
+        f"  bucket backlog    : {int(s.get('buckets_uncounted') or 0):,} uncounted; "
+        f"{int(s.get('remaining_counted_pages') or 0):,} known pages remaining"
     )
+    print(
+        f"  page checkpoints  : {int(s.get('pages_done') or 0):,} done, "
+        f"{int(s.get('pages_failed') or 0):,} failed, "
+        f"{int(s.get('pages_partial') or 0):,} partial"
+    )
+    print(f"  quarantined rows  : {int(s.get('unresolved_rejections') or 0):,} unresolved")
     if int(s["partitions_lossy"] or 0):
         print(
             f"  BLOCKER: {s['partitions_lossy']} split partition(s) have SUM(children) != parent. "
@@ -192,8 +198,8 @@ def command_discover_status() -> None:
         print(f"    {', '.join(gaps[:20])}{' ...' if len(gaps) > 20 else ''}")
         print("    Seed these prefixes explicitly: dbd-data discover " + " ".join(gaps[:5]))
     else:
-        print("  observed prefixes: all currently seen prefixes have matching seeds")
-        print("  completeness      : still requires partition and population reconciliation")
+        print("  observed prefixes : all currently seen prefixes have matching seeds")
+        print("  completeness       : still requires partition and population reconciliation")
 
 
 def main() -> None:
