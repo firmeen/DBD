@@ -7,11 +7,8 @@ from ..client.endpoints.financials import (
     submissions_path,
 )
 from ..contracts.company import COLLECTION_NORMALIZERS, normalize
-from ..contracts.financial import (
-    normalize_benchmark,
-    normalize_statements,
-    normalize_submissions,
-)
+from ..contracts.financial import normalize_statements, normalize_submissions
+from ..contracts.strict import normalize_collection, normalize_industry_benchmark
 
 # Grouped by the tab each endpoint appears on in the DBD web UI, left to right:
 #   1 ข้อมูลนิติบุคคล            profile + details
@@ -73,5 +70,5 @@ def normalize_resource(endpoint: str, payload):
     if endpoint == "financial_statements":
         return normalize_statements(payload)
     if endpoint == "industry_benchmark":
-        return normalize_benchmark(payload)
-    return COLLECTION_NORMALIZERS[endpoint](payload)
+        return normalize_industry_benchmark(payload)
+    return normalize_collection(endpoint, payload)
