@@ -24,22 +24,22 @@ def test_correctness_migration_adopts_existing_objects():
         assert cur.fetchone()["version_num"] == "0004_correctness_guards"
         cur.execute(
             """
-            SELECT column_name FROM information_schema.columns
+            SELECT column_name AS name FROM information_schema.columns
             WHERE table_schema=DATABASE() AND table_name='company_master'
               AND column_name IN ('observed_jp_stat_code','observed_status_at')
             ORDER BY column_name
             """
         )
-        assert [row["column_name"] for row in cur.fetchall()] == [
+        assert [row["name"] for row in cur.fetchall()] == [
             "observed_jp_stat_code",
             "observed_status_at",
         ]
         cur.execute(
             """
-            SELECT column_name FROM information_schema.statistics
+            SELECT column_name AS name FROM information_schema.statistics
             WHERE table_schema=DATABASE() AND table_name='discovery_sightings'
               AND index_name='PRIMARY'
             ORDER BY seq_in_index
             """
         )
-        assert [row["column_name"] for row in cur.fetchall()] == ["jp_type_code", "jp_no"]
+        assert [row["name"] for row in cur.fetchall()] == ["jp_type_code", "jp_no"]
