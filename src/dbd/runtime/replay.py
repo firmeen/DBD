@@ -1,6 +1,7 @@
 import json
 from uuid import uuid4
 
+from ..storage.archive_backend import build_archive_backend
 from ..storage.archive_codec import decode_payload
 from ..storage.mysql.engine import connect
 from ..storage.mysql.repositories.projection_repository import project
@@ -41,13 +42,23 @@ def replay_archive(archive_id):
         lease_owner=owner,
         lease_version=task["lease_version"] + 1,
     )
-    context = json.loads(raw["request_context"])
-    payload = decode_payload(
-        payload=raw.get("payload"),
-        payload_zstd=raw.get("payload_zstd"),
-        codec=raw.get("payload_codec"),
-    )
     try:
+        context = json.loads(raw["request_context"])
+        backend_name = raw.get("payload_backend") or "mysql"
+        if backend_name == "mysql":
+            payload = decode_payload(
+                payload=raw.get("payload"),
+                payload_zstd=raw.get("payload_zstd"),
+                codec=raw.get("payload_codec"),
+            )
+        else:
+            backend = build_archive_backend()
+            if backend is None or backend.backend_name != backend_name:
+                raise OSError(
+                    f"Archive {archive_id} requires backend {backend_name!r}, which is not configured"
+                )
+            payload = backend.load(raw)
+
         status = project(
             task,
             archive_id,
