@@ -170,7 +170,6 @@ def project(
                 ]
                 should_write = bool(normalized_for_write)
             elif keys and len(eligible) != len(keys):
-                # Non-statement resources mutate one natural collection/row.
                 should_write = False
 
             if should_write:
@@ -206,10 +205,25 @@ def project(
                     if endpoint == "profile":
                         cur.execute(
                             """
-                            UPDATE company_master SET identity_status='verified',last_verified_at=%s
+                            UPDATE company_master
+                            SET identity_status='verified',
+                                last_verified_at=%s,
+                                observed_jp_stat_code=IF(
+                                    %s IS NULL, observed_jp_stat_code, %s
+                                ),
+                                observed_status_at=IF(
+                                    %s IS NULL, observed_status_at, %s
+                                )
                             WHERE company_id=%s
                             """,
-                            (requested_at, task["company_id"]),
+                            (
+                                requested_at,
+                                normalized_for_write.jp_stat_code,
+                                normalized_for_write.jp_stat_code,
+                                normalized_for_write.jp_stat_code,
+                                requested_at,
+                                task["company_id"],
+                            ),
                         )
 
             outcome = nominal_outcome if should_write else "stale_skipped"
@@ -223,7 +237,6 @@ def project(
                     archive_id,
                     outcome,
                 )
-                # stale_skipped is a projection outcome, not a task terminal state.
                 task_status = "not_available" if outcome == "not_available" else "done"
                 cur.execute(
                     """
