@@ -1,8 +1,13 @@
 """Mixed-capacity probe regression tests. No database or network calls."""
 
+import asyncio
 import importlib.util
 import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
 
 spec = importlib.util.spec_from_file_location(
     "probe_mixed_capacity",
@@ -39,3 +44,55 @@ def test_probe_endpoint_rate_parser_and_429_signature():
         pass
 
     assert probe._error_signature(Limited("HTTP 429")) == "Limited[429]"
+
+
+class FakeSession:
+    def __init__(self, delay=0):
+        self.delay = delay
+        self.calls = 0
+
+    async def request(self, *args, **kwargs):
+        self.calls += 1
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        return SimpleNamespace(status_code=200)
+
+
+async def test_timed_transport_refuses_late_admission_without_network_call():
+    session = FakeSession()
+    budget = probe.Budget(10)
+    transport = probe.TimedTransport(session, budget)
+    transport.deadline = time.perf_counter() - 0.001
+
+    with pytest.raises(probe.AdmissionClosed):
+        await transport.request("GET", "https://example.invalid")
+
+    assert session.calls == 0
+    assert budget.used == 0
+
+
+async def test_timed_transport_budget_counts_actual_transport_admissions():
+    session = FakeSession()
+    budget = probe.Budget(1)
+    transport = probe.TimedTransport(session, budget)
+
+    response = await transport.request("GET", "https://example.invalid")
+    assert response.status_code == 200
+    with pytest.raises(probe.AdmissionClosed):
+        await transport.request("GET", "https://example.invalid")
+
+    assert session.calls == 1
+    assert budget.used == 1
+    assert len(transport.samples) == 1
+
+
+async def test_timed_transport_tracks_real_inflight_request_until_drained():
+    session = FakeSession(delay=0.03)
+    budget = probe.Budget(2)
+    transport = probe.TimedTransport(session, budget)
+
+    task = asyncio.create_task(transport.request("GET", "https://example.invalid"))
+    await asyncio.sleep(0.005)
+    assert task in transport.inflight_tasks
+    await task
+    assert task not in transport.inflight_tasks
