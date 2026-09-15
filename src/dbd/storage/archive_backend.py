@@ -106,6 +106,9 @@ class S3ArchiveBackend:
             stored_bytes=len(ciphertext),
         )
 
+    def delete(self, object_key: str) -> None:
+        self.client.delete_object(Bucket=self.bucket, Key=object_key)
+
     def load(self, row: Mapping[str, object]):
         object_key = str(row.get("payload_object_key") or "")
         if not object_key:
