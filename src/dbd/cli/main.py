@@ -5,6 +5,7 @@ import asyncio
 import json
 
 from ..contracts.identity import parse_code
+from ..core.exceptions import DbdError
 from ..core.settings import settings
 from ..core.telemetry import configure
 from ..runtime.locking import assert_manager_lock, manager_lock
@@ -35,6 +36,20 @@ def parts(value):
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
     return selected
+
+
+def safe_error(exc: BaseException) -> str:
+    """Expose our sanitized diagnostics without serializing third-party objects/bodies."""
+    if isinstance(exc, BaseExceptionGroup):
+        messages = list(dict.fromkeys(safe_error(child) for child in exc.exceptions))
+        return "; ".join(messages)[:1000]
+    if isinstance(exc, (DbdError, ValueError)):
+        return str(exc) or type(exc).__name__
+    if isinstance(exc, RuntimeError):
+        # RuntimeError is used for local manager/lease invariants; keep messages
+        # short and never include request/response objects.
+        return (str(exc) or type(exc).__name__)[:500]
+    return type(exc).__name__
 
 
 async def worker_command(args, health=None):
@@ -74,6 +89,15 @@ async def worker_command(args, health=None):
                 fiscal_year=args.fiscal_year,
                 statuses=None if args.all_statuses else STATUS_OPERATING,
             )
+            if args.master:
+                population = await repo.master_population()
+                population["selected_scope"] = (
+                    population["eligible_all_statuses"]
+                    if args.all_statuses
+                    else population["eligible_operating"]
+                )
+                population["scope"] = "all_statuses" if args.all_statuses else "operating_only"
+                print(json.dumps({"master_population": population}, indent=2), flush=True)
         else:
             run = await repo.get_run(args.run_id)
             if args.only is not None and args.only != run["parts"].split(","):
@@ -160,11 +184,12 @@ def main():
 
             command_check_db()
         elif args.command == "master-status":
-            from ..storage.mysql.engine import connect
-
-            with connect() as conn, conn.cursor() as cur:
-                cur.execute("SELECT identity_status,COUNT(*) n FROM company_master GROUP BY identity_status")
-                print(json.dumps(cur.fetchall(), indent=2))
+            engine = create_engine()
+            repo = WorkerRepository(engine)
+            try:
+                print(json.dumps(awaitable_result(asyncio.run(repo.master_population())), indent=2))
+            finally:
+                asyncio.run(engine.dispose())
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
                 with manager_lock():
@@ -218,6 +243,9 @@ def main():
         print("Interrupted. Resume the same run; unfinished endpoint tasks remain recoverable.")
         raise SystemExit(130) from None
     except Exception as exc:
-        # Avoid credentials or HTTP bodies embedded in third-party exceptions.
-        message = str(exc) if isinstance(exc, ValueError) else type(exc).__name__
-        parser.exit(1, f"dbd-data: {message}\n")
+        parser.exit(1, f"dbd-data: {safe_error(exc)}\n")
+
+
+def awaitable_result(value):
+    """Identity helper kept outside argparse branches to make master-status testable."""
+    return value
