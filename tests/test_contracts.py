@@ -10,6 +10,7 @@ from dbd.contracts.company import (
     normalize_nations,
 )
 from dbd.contracts.identity import parse_code
+from dbd.contracts.strict import normalize_collection, normalize_industry_benchmark
 from dbd.core.exceptions import ContractError
 from dbd.runtime.worker import code_batches
 
@@ -23,10 +24,24 @@ def test_identity_never_coerces_or_loses_leading_zero(bad):
 def test_type_letter_and_full_url():
     assert parse_code("A0107556000051").jp_type_code == "A"
     assert (
-        parse_code("https://datawarehouse.dbd.go.th/company/profile/70107556000051").jp_no == "0107556000051"
+        parse_code("https://datawarehouse.dbd.go.th/company/profile/70107556000051").jp_no
+        == "0107556000051"
     )
     with pytest.raises(ContractError):
         parse_code("17010755600005199")
+
+
+def test_observed_type_a_short_identities_are_preserved_exactly():
+    for jp_no in ("12345678901", "123456789012", "1234567890123"):
+        parsed = parse_code("A" + jp_no)
+        assert parsed.jp_type_code == "A"
+        assert parsed.jp_no == jp_no
+        assert parsed.code == "A" + jp_no
+
+    # The exception is evidence-based and type-specific; ordinary juristic
+    # types remain strict 13-digit identifiers.
+    with pytest.raises(ContractError):
+        parse_code("7" + "1" * 12)
 
 
 @pytest.mark.parametrize("payload", [["bad"], [{"unexpected": "shape"}], {"contents": []}])
@@ -39,11 +54,32 @@ def test_empty_collection_remains_valid():
     assert normalize_committees([]) == []
 
 
+def test_strict_root_contracts_distinguish_empty_from_malformed():
+    assert normalize_collection(
+        "transformations",
+        {"transformFroms": [], "transformTos": [], "mergerFroms": [], "mergerTos": []},
+    ) == []
+    with pytest.raises(ContractError):
+        normalize_collection("transformations", {"renamedCollections": []})
+
+    assert normalize_collection(
+        "nation_history", {"customChart": {"shareHistTHDps": [], "shareHistOTDps": []}}
+    ) == []
+    with pytest.raises(ContractError):
+        normalize_collection("nation_history", {"customChart": {"renamed": []}})
+
+    assert normalize_industry_benchmark(None) is None
+    with pytest.raises(ContractError):
+        normalize_industry_benchmark({})
+    with pytest.raises(ContractError):
+        normalize_industry_benchmark({"submitObjCode": "65110"})
+
+
 def test_nationality_summary_is_not_a_malformed_country():
-    data = [{'ntCode':'TH'}, {'ntCode':None,'nationality':{'ntCode':'WORLD2'}}]
+    data = [{"ntCode": "TH"}, {"ntCode": None, "nationality": {"ntCode": "WORLD2"}}]
     assert len(normalize_nations(data)) == 1
     with pytest.raises(ContractError):
-        normalize_nations([{'ntCode':None,'nationality':{'ntCode':'UNKNOWN'}}])
+        normalize_nations([{"ntCode": None, "nationality": {"ntCode": "UNKNOWN"}}])
 
 
 def test_dates_nested_shape_and_precision():
@@ -81,11 +117,7 @@ def test_code_import_is_streamed_and_strict(tmp_path):
 
 
 def test_default_parts_cover_tabs_one_and_two_only():
-    """Tabs 3-4 stay implemented but are not collected by default.
-
-    Each endpoint left in the default costs one request per company, so at a
-    million companies the four dropped ones are ~4M requests and ~4 days.
-    """
+    """Tabs 3-4 stay implemented but are not collected by default."""
     from dbd.runtime.resources import DEFAULT_PARTS, PARTS, endpoints
 
     default = endpoints(list(DEFAULT_PARTS))
@@ -100,10 +132,7 @@ def test_default_parts_cover_tabs_one_and_two_only():
         "industry_benchmark",
     )
 
-    # Tab 3 (nationality) and tab 4 (history) must not sneak back into a default run.
     dropped = {"nations", "nation_history", "name_history", "capital_history"}
     assert dropped.isdisjoint(default)
-
-    # ...but must still be reachable, because the code and tables were kept.
     assert set(endpoints(["nationality", "history"])) == dropped
     assert dropped <= set(endpoints(list(PARTS)))
