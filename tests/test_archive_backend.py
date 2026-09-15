@@ -31,12 +31,13 @@ def key_b64(byte=7):
     return base64.urlsafe_b64encode(bytes([byte]) * 32).decode("ascii")
 
 
-def backend(client, key=7):
+def backend(client, key=7, key_id="v1", decryption_keys=None):
     return S3ArchiveBackend(
         bucket="archive-test",
         prefix="dbd/test",
         encryption_key_b64=key_b64(key),
-        key_id="v1",
+        key_id=key_id,
+        decryption_keys=decryption_keys,
         client=client,
     )
 
@@ -48,6 +49,7 @@ def row_from_external(external):
         "payload_nonce": external.nonce,
         "payload_key_id": external.key_id,
         "payload_cipher_sha256": external.cipher_sha256,
+        "payload_sha256": external.payload_sha256,
         "payload_codec": external.codec,
     }
 
@@ -87,8 +89,18 @@ def test_ciphertext_tamper_is_rejected_before_decryption():
     key = ("archive-test", external.object_key)
     client.objects[key]["body"] += b"tampered"
 
-    with pytest.raises(OSError, match="checksum mismatch"):
+    with pytest.raises(OSError, match="ciphertext checksum mismatch"):
         store.load(row_from_external(external))
+
+
+def test_plaintext_checksum_mismatch_is_rejected_after_authentication():
+    client = FakeS3()
+    store = backend(client)
+    external = store.store(encode_payload({"ok": True}), endpoint="profile", task_id=1)
+    row = row_from_external(external) | {"payload_sha256": "0" * 64}
+
+    with pytest.raises(OSError, match="plaintext checksum mismatch"):
+        store.load(row)
 
 
 def test_wrong_key_id_is_rejected_without_exposing_key_material():
@@ -99,6 +111,24 @@ def test_wrong_key_id_is_rejected_without_exposing_key_material():
 
     with pytest.raises(OSError, match="not available"):
         store.load(row)
+
+
+def test_new_active_key_can_read_archives_from_previous_key_ring():
+    client = FakeS3()
+    old_store = backend(client, key=7, key_id="v1")
+    payload = {"rotation": "keeps-old-archives-readable"}
+    external = old_store.store(encode_payload(payload), endpoint="profile", task_id=8)
+
+    new_store = backend(
+        client,
+        key=8,
+        key_id="v2",
+        decryption_keys={"v1": key_b64(7)},
+    )
+
+    assert new_store.load(row_from_external(external)) == payload
+    new_external = new_store.store(encode_payload({"new": True}), endpoint="profile", task_id=9)
+    assert new_external.key_id == "v2"
 
 
 def test_encryption_key_must_be_exactly_256_bits():
