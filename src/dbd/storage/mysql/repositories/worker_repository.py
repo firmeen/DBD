@@ -50,7 +50,7 @@ class WorkerRepository:
             sql = (
                 "SELECT * FROM worker_runs WHERE id=:id"
                 if run_id
-                else ("SELECT * FROM worker_runs WHERE status='ready' ORDER BY id DESC LIMIT 1")
+                else "SELECT * FROM worker_runs WHERE status='ready' ORDER BY id DESC LIMIT 1"
             )
             row = (await conn.execute(text(sql), {"id": run_id})).mappings().first()
             if row is None:
@@ -94,30 +94,45 @@ class WorkerRepository:
                 ON DUPLICATE KEY UPDATE id=id
             """),
                 [
-                    {"run": run_id, "company": company_id, "endpoint": e}
+                    {"run": run_id, "company": company_id, "endpoint": endpoint}
                     for company_id in ids
-                    for e in resources
+                    for endpoint in resources
                 ],
             )
 
+    async def master_population(self):
+        """Return explicit scheduling denominators and exclusion reasons."""
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                    SELECT
+                      COUNT(*) AS total,
+                      COALESCE(SUM(identity_status='conflict'),0) AS conflicts,
+                      COALESCE(SUM(identity_status<>'conflict'),0) AS eligible_all_statuses,
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code='1'),0)
+                        AS eligible_operating,
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code IS NULL),0)
+                        AS unknown_status
+                    FROM company_master
+                    """)
+                )
+            ).mappings().one()
+            return {key: int(value or 0) for key, value in row.items()}
+
     @transaction_retry
     async def enqueue_master(self, run_id, resources, after_id, batch_size, statuses=None):
-        """Enqueue discovered companies, optionally restricted by juristic status.
+        """Enqueue discovered companies, optionally restricted by latest observed status.
 
-        Status arrives free with discovery (`jpStatCode` is one of the fields a
-        search page already returns), so filtering here costs nothing and removes
-        the work before any request exists. It matters: in the collected data only
-        about 38% of companies are still operating, the rest being struck off,
-        liquidated or dissolved, and those hold no current filings to fetch.
+        Discovery updates company_master.observed_jp_stat_code every time a valid
+        search/profile observation carries a status. This avoids filtering from the
+        `companies` projection, which discovery intentionally INSERT IGNOREs and can
+        therefore contain an older status than the latest discovery observation.
         """
         clause = ""
         params = {"after": after_id, "size": batch_size}
         if statuses:
-            # Join to companies because status lives on the projection, not on
-            # the identity table. Companies never projected have no status yet
-            # and are left out rather than guessed at.
-            clause = " AND EXISTS (SELECT 1 FROM companies c WHERE c.jp_no=m.jp_no" \
-                     " AND c.jp_stat_code IN :statuses)"
+            clause = " AND m.observed_jp_stat_code IN :statuses"
             params["statuses"] = tuple(statuses)
 
         query = text(
@@ -135,20 +150,24 @@ class WorkerRepository:
                     INSERT INTO endpoint_tasks(run_id,company_id,endpoint)
                     VALUES (:run,:company,:endpoint) ON DUPLICATE KEY UPDATE id=id
                 """),
-                    [{"run": run_id, "company": i, "endpoint": e} for i in ids for e in resources],
+                    [
+                        {"run": run_id, "company": company_id, "endpoint": endpoint}
+                        for company_id in ids
+                        for endpoint in resources
+                    ],
                 )
             return ids[-1] if ids else None
 
     async def ready(self, run_id):
         async with self.engine.begin() as conn:
             await conn.execute(
-                text("UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"), {"id": run_id}
+                text("UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"),
+                {"id": run_id},
             )
 
     @transaction_retry
     async def maintain(self, run_id):
         async with self.engine.begin() as conn:
-            # Reclaim only expired leases, never another live worker's tasks.
             await conn.execute(
                 text("""
                 UPDATE endpoint_tasks SET status=IF(attempts>=:max,'failed','pending'),
@@ -157,7 +176,6 @@ class WorkerRepository:
             """),
                 {"run": run_id, "max": settings.dbd_max_task_attempts},
             )
-            # Failed prerequisites are explicit terminal failures, not hanging tasks.
             await conn.execute(
                 text("""
                 UPDATE endpoint_tasks t JOIN endpoint_tasks p
@@ -174,8 +192,6 @@ class WorkerRepository:
     async def claim(self, run_id, owner):
         async with self.engine.begin() as conn:
             row = None
-            # Equality on run/status follows idx_task_claim in index order.
-            # Do not join/lock the master or run row while searching a large queue.
             for status in ("pending", "retry_wait"):
                 row = (
                     (
@@ -223,7 +239,9 @@ class WorkerRepository:
             )
             task.update(metadata)
             task.update(
-                lease_owner=owner, lease_version=task["lease_version"] + 1, attempts=task["attempts"] + 1
+                lease_owner=owner,
+                lease_version=task["lease_version"] + 1,
+                attempts=task["attempts"] + 1,
             )
             return task
 
@@ -304,7 +322,8 @@ class WorkerRepository:
                 {"id": run_id},
             )
             await conn.execute(
-                text("UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"), {"id": run_id}
+                text("UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"),
+                {"id": run_id},
             )
             return result.rowcount
 
@@ -338,47 +357,6 @@ class WorkerRepository:
                 text("UPDATE response_archive SET processing_status=:status,error_code=:error WHERE id=:id"),
                 {"status": status, "error": error, "id": archive_id},
             )
-
-    async def benchmark_covered(self, task, year):
-        """True when this company's industry benchmark was already fetched in this run.
-
-        /fin/basics is addressed per company but answers about the company's whole
-        TSIC group, and industry_benchmarks is keyed by
-        (submit_obj_code, fiscal_year, business_size_code, location_type, location_no)
-        with no company column. Every company sharing that scope therefore rewrites
-        one row with identical values. Fetching once per scope per run keeps the data
-        identical while removing the repeat requests.
-
-        Scoped to the current run so a later refresh still re-reads the figures
-        instead of trusting an old row forever.
-        """
-        async with self.engine.connect() as conn:
-            row = (
-                await conn.execute(
-                    text("""
-                SELECT 1
-                FROM companies c
-                JOIN worker_runs r
-                  ON r.id = :run_id
-                JOIN industry_benchmarks b
-                  ON b.submit_obj_code = c.submit_obj_code
-                 AND b.fiscal_year = :year
-                 AND b.business_size_code <=> c.business_size_code
-                 AND b.last_seen_at >= r.created_at
-                WHERE c.jp_no = :no
-                  AND c.jp_type_code = :kind
-                  AND c.submit_obj_code IS NOT NULL
-                LIMIT 1
-            """),
-                    {
-                        "no": task["jp_no"],
-                        "kind": task["jp_type_code"],
-                        "year": year,
-                        "run_id": task["run_id"],
-                    },
-                )
-            ).first()
-            return row is not None
 
     async def fiscal_year(self, task):
         if task["fiscal_year"]:
