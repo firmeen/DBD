@@ -45,12 +45,31 @@ def encode_payload(payload, *, compress: bool = True, threshold: int = 4096) -> 
     )
 
 
+def encoded_bytes(encoded: EncodedPayload) -> bytes:
+    if encoded.codec == "zstd":
+        if encoded.compressed is None:
+            raise ValueError("zstd payload has no compressed bytes")
+        return bytes(encoded.compressed)
+    if encoded.codec == "json":
+        return encoded.json_text.encode("utf-8")
+    raise ValueError(f"Unsupported archive codec {encoded.codec!r}")
+
+
+def decode_bytes(raw: bytes, codec: str):
+    if codec == "zstd":
+        raw = zstd.ZstdDecompressor().decompress(raw)
+    elif codec != "json":
+        raise ValueError(f"Unsupported archive codec {codec!r}")
+    return orjson.loads(raw)
+
+
 def decode_payload(*, payload: str | None, payload_zstd: bytes | None, codec: str | None):
     if codec == "zstd":
         if not payload_zstd:
             raise ValueError("Compressed archive row has no payload_zstd")
-        raw = zstd.ZstdDecompressor().decompress(bytes(payload_zstd))
-        return orjson.loads(raw)
+        return decode_bytes(bytes(payload_zstd), "zstd")
+    if codec not in (None, "json"):
+        raise ValueError(f"Unsupported inline archive codec {codec!r}")
     if payload is None:
         raise ValueError("JSON archive row has no payload")
-    return orjson.loads(payload)
+    return decode_bytes(payload.encode("utf-8"), "json")
