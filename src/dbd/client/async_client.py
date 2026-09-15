@@ -78,9 +78,8 @@ class AsyncDbdClient:
         if self.concurrency < 1:
             raise ValueError("concurrency must be positive")
         global_rate = settings.dbd_rate_per_second if rate_per_second is None else rate_per_second
-        # Legacy/global-only callers (discovery and the profile capacity probe) retain
-        # the original adaptive limiter. Bulk V2 passes rate_key and uses the
-        # endpoint-aware controller below.
+        # Discovery/global-only callers retain the original limiter. Bulk V2 passes
+        # rate_key and uses the endpoint-aware controller with a global safety layer.
         self.rate = TokenBucket(global_rate)
         self.endpoint_rate = EndpointRateController(
             global_rate,
@@ -205,12 +204,19 @@ class AsyncDbdClient:
                         self.rate_limit_hits += 1
                         cooldown = retry_after(response.headers.get("retry-after"))
                         if rate_key:
-                            old_rate, new_rate = self.endpoint_rate.penalize(rate_key, cooldown)
+                            (
+                                old_rate,
+                                new_rate,
+                                old_global_rate,
+                                new_global_rate,
+                            ) = self.endpoint_rate.penalize(rate_key, cooldown)
                         else:
                             old_rate = self.rate.rate
                             new_rate = self.rate.slow_down()
                             self.rate.cooldown(cooldown)
                             EFFECTIVE_RATE.set(new_rate)
+                            old_global_rate = old_rate
+                            new_global_rate = new_rate
                         log.warning(
                             "rate_penalty",
                             status=status,
@@ -218,6 +224,8 @@ class AsyncDbdClient:
                             endpoint=rate_key,
                             old_rate=old_rate,
                             new_rate=new_rate,
+                            old_global_rate=old_global_rate,
+                            new_global_rate=new_global_rate,
                             cooldown_seconds=cooldown,
                         )
                     if status == 401:
@@ -229,6 +237,13 @@ class AsyncDbdClient:
                         raise TransientHttpError(f"HTTP {status}")
                     if status >= 400:
                         raise PermanentHttpError(f"HTTP {status}")
+                    if rate_key:
+                        endpoint_recovered, global_recovered = self.endpoint_rate.recover(rate_key)
+                        recovered = endpoint_recovered or global_recovered
+                    else:
+                        recovered = self.rate.recover()
+                        if recovered is not None:
+                            EFFECTIVE_RATE.set(recovered)
                     try:
                         data = self._decode(response, path, token)
                     except DbdTokenExpiredError:
@@ -247,18 +262,15 @@ class AsyncDbdClient:
                             body_sha256=sha256(body).hexdigest(),
                         )
                         raise
-                    if rate_key:
-                        recovered = self.endpoint_rate.recover(rate_key)
-                    else:
-                        recovered = self.rate.recover()
-                        if recovered is not None:
-                            EFFECTIVE_RATE.set(recovered)
                     if recovered is not None:
                         log.info(
                             "rate_recovered",
                             path=path,
                             endpoint=rate_key,
                             effective_rate=recovered,
+                            global_effective_rate=(
+                                self.endpoint_rate.global_effective_rate() if rate_key else self.rate.rate
+                            ),
                         )
                     return ApiResponse(
                         data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
