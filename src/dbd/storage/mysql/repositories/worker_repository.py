@@ -174,7 +174,12 @@ class WorkerRepository:
         async with self.engine.begin() as conn:
             await conn.execute(
                 text("""
-                UPDATE endpoint_tasks SET status=IF(attempts>=:max,'failed','pending'),
+                UPDATE endpoint_tasks
+                SET status=IF(
+                      (stage='fetch' AND attempts>=:max)
+                      OR (stage='project' AND project_attempts>=:max),
+                      'failed','pending'
+                    ),
                     lease_owner=NULL,lease_expires_at=NULL,last_error='lease_expired'
                 WHERE run_id=:run AND status='running' AND lease_expires_at<UTC_TIMESTAMP(6)
             """),
@@ -196,8 +201,9 @@ class WorkerRepository:
     async def claim_batch(self, run_id, owner, *, stage="fetch", limit=None):
         """Claim a bounded batch while preserving lease/version fencing.
 
-        Stage `project` is durable work whose HTTP response is already archived;
-        reclaiming it after a crash therefore never contacts DBD again.
+        Fetch and project use independent retry budgets. Stage `project` is durable
+        work whose HTTP response is already archived, so reclaiming it after a crash
+        never consumes another upstream request or depends on exhausted fetch attempts.
         """
         if stage not in ("fetch", "project"):
             raise ValueError("stage must be fetch or project")
@@ -205,6 +211,7 @@ class WorkerRepository:
         if limit < 1:
             return []
 
+        attempt_column = "attempts" if stage == "fetch" else "project_attempts"
         claimed: list[dict] = []
         async with self.engine.begin() as conn:
             for status in ("pending", "retry_wait"):
@@ -221,10 +228,11 @@ class WorkerRepository:
                 rows = (
                     await conn.execute(
                         text(
-                            """
+                            f"""
                             SELECT t.* FROM endpoint_tasks t
                             WHERE t.run_id=:run AND t.stage=:stage AND t.status=:status
-                              AND t.available_at<=UTC_TIMESTAMP(6) AND t.attempts<:max_attempts
+                              AND t.available_at<=UTC_TIMESTAMP(6)
+                              AND t.{attempt_column}<:max_attempts
                             """
                             + dependency
                             + """
@@ -246,12 +254,15 @@ class WorkerRepository:
                 return []
 
             ids = [task["id"] for task in claimed]
-            update = text("""
-                UPDATE endpoint_tasks SET status='running',attempts=attempts+1,
+            update = text(
+                f"""
+                UPDATE endpoint_tasks SET status='running',
+                  {attempt_column}={attempt_column}+1,
                   lease_owner=:owner,lease_version=lease_version+1,
                   lease_expires_at=TIMESTAMPADD(SECOND,:lease,UTC_TIMESTAMP(6))
                 WHERE id IN :ids
-            """).bindparams(bindparam("ids", expanding=True))
+                """
+            ).bindparams(bindparam("ids", expanding=True))
             await conn.execute(
                 update,
                 {"owner": owner, "lease": settings.dbd_lease_seconds, "ids": ids},
@@ -270,11 +281,9 @@ class WorkerRepository:
             metadata = {row["id"]: row for row in metadata_rows}
             for task in claimed:
                 task.update(metadata[task["id"]])
-                task.update(
-                    lease_owner=owner,
-                    lease_version=task["lease_version"] + 1,
-                    attempts=task["attempts"] + 1,
-                )
+                task["lease_owner"] = owner
+                task["lease_version"] = task["lease_version"] + 1
+                task[attempt_column] = task[attempt_column] + 1
 
         PIPELINE_BATCH_SIZE.labels(f"claim_{stage}").observe(len(claimed))
         return claimed
@@ -285,6 +294,42 @@ class WorkerRepository:
 
     async def claim_project_batch(self, run_id, owner, limit=None):
         return await self.claim_batch(run_id, owner, stage="project", limit=limit)
+
+    @transaction_retry
+    async def begin_project_attempt(self, task):
+        """Count projection work only when the projector actually begins it.
+
+        Fresh fetches transition to stage=project while retaining their fetch lease.
+        Keeping project_attempts at zero across that durable transition means a crash
+        after archive commit but before projection does not consume project retry budget.
+        """
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                UPDATE endpoint_tasks
+                SET project_attempts=project_attempts+1
+                WHERE id=:id AND stage='project' AND status='running'
+                  AND lease_owner=:owner AND lease_version=:version
+                  AND lease_expires_at>UTC_TIMESTAMP(6)
+                  AND project_attempts<:max_attempts
+            """),
+                {
+                    "id": task["id"],
+                    "owner": task["lease_owner"],
+                    "version": task["lease_version"],
+                    "max_attempts": settings.dbd_max_task_attempts,
+                },
+            )
+            if result.rowcount != 1:
+                return None
+            return int(
+                (
+                    await conn.execute(
+                        text("SELECT project_attempts FROM endpoint_tasks WHERE id=:id"),
+                        {"id": task["id"]},
+                    )
+                ).scalar_one()
+            )
 
     @transaction_retry
     async def heartbeat(self, owner):
@@ -333,6 +378,11 @@ class WorkerRepository:
 
     @transaction_retry
     async def finish(self, task, status, error=None):
+        attempt_count = (
+            task.get("project_attempts", 0)
+            if task.get("stage") == "project"
+            else task["attempts"]
+        )
         async with self.engine.begin() as conn:
             result = await conn.execute(
                 text("""
@@ -345,7 +395,7 @@ class WorkerRepository:
                 {
                     "status": status,
                     "error": error,
-                    "delay": min(300, 5 * 2 ** task["attempts"]),
+                    "delay": min(300, 5 * 2 ** attempt_count),
                     "id": task["id"],
                     "owner": task["lease_owner"],
                     "version": task["lease_version"],
@@ -358,9 +408,14 @@ class WorkerRepository:
         async with self.engine.begin() as conn:
             await conn.execute(
                 text("""
-                UPDATE endpoint_tasks SET status='pending',lease_owner=NULL,lease_expires_at=NULL,
-                  attempts=GREATEST(attempts-1,0),available_at=UTC_TIMESTAMP(6)
-                  WHERE lease_owner=:owner AND status='running'
+                UPDATE endpoint_tasks
+                SET status='pending',lease_owner=NULL,lease_expires_at=NULL,
+                  attempts=IF(stage='fetch',GREATEST(attempts-1,0),attempts),
+                  project_attempts=IF(
+                    stage='project',GREATEST(project_attempts-1,0),project_attempts
+                  ),
+                  available_at=UTC_TIMESTAMP(6)
+                WHERE lease_owner=:owner AND status='running'
             """),
                 {"owner": owner},
             )
@@ -418,8 +473,10 @@ class WorkerRepository:
                 text("""
                 UPDATE endpoint_tasks t
                 JOIN company_master m ON m.company_id=t.company_id
-                SET t.status='pending',t.attempts=0,t.last_error=NULL,t.finished_at=NULL,
-                    t.available_at=UTC_TIMESTAMP(6)
+                SET t.status='pending',
+                    t.attempts=IF(t.stage='fetch',0,t.attempts),
+                    t.project_attempts=IF(t.stage='project',0,t.project_attempts),
+                    t.last_error=NULL,t.finished_at=NULL,t.available_at=UTC_TIMESTAMP(6)
                 WHERE t.run_id=:id AND t.status='failed'
                   AND m.identity_status<>'conflict'
                   AND COALESCE(t.last_error,'')<>'IdentityConflict'
@@ -591,6 +648,7 @@ class WorkerRepository:
                 updated_task = dict(task)
                 updated_task["stage"] = "project"
                 updated_task["raw_response_id"] = archive_id
+                updated_task.setdefault("project_attempts", 0)
                 updated["task"] = updated_task
                 archived.append(updated)
 
