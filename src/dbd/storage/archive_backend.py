@@ -22,6 +22,7 @@ class ExternalArchivePayload:
     nonce: bytes
     key_id: str
     cipher_sha256: str
+    payload_sha256: str
     original_bytes: int
     stored_bytes: int
 
@@ -42,9 +43,9 @@ class S3ArchiveBackend:
 
     MySQL remains the metadata/source-of-truth boundary. The blob is written first;
     only after a successful PUT may the caller commit the archive metadata and move
-    the endpoint task to project stage. A failed DB transaction can therefore leave
-    an unreferenced object, but it cannot create a committed row that points at an
-    object which was never uploaded.
+    the endpoint task to project stage. The active key encrypts new objects; a
+    read-only decryption key ring allows older key ids to remain replayable during
+    rotation without using an old key for new writes.
     """
 
     backend_name = "s3"
@@ -56,6 +57,7 @@ class S3ArchiveBackend:
         prefix: str,
         encryption_key_b64: str,
         key_id: str,
+        decryption_keys: Mapping[str, str] | None = None,
         endpoint_url: str | None = None,
         region_name: str | None = None,
         client=None,
@@ -68,6 +70,11 @@ class S3ArchiveBackend:
         self.prefix = prefix.strip("/")
         self.key_id = key_id
         self._key = _decode_key(encryption_key_b64)
+        self._keys = {
+            str(old_key_id): _decode_key(old_key)
+            for old_key_id, old_key in (decryption_keys or {}).items()
+        }
+        self._keys[self.key_id] = self._key
         self.client = client or boto3.client(
             "s3",
             endpoint_url=endpoint_url,
@@ -102,6 +109,7 @@ class S3ArchiveBackend:
             nonce=nonce,
             key_id=self.key_id,
             cipher_sha256=cipher_digest,
+            payload_sha256=encoded.sha256_hex,
             original_bytes=encoded.original_bytes,
             stored_bytes=len(ciphertext),
         )
@@ -114,7 +122,8 @@ class S3ArchiveBackend:
         if not object_key:
             raise OSError("External archive row has no object key")
         stored_key_id = str(row.get("payload_key_id") or "")
-        if stored_key_id != self.key_id:
+        key = self._keys.get(stored_key_id)
+        if key is None:
             raise OSError(
                 f"Archive key id {stored_key_id!r} is not available in this process"
             )
@@ -128,11 +137,14 @@ class S3ArchiveBackend:
         if not expected_digest or actual_digest != expected_digest:
             raise OSError("External archive ciphertext checksum mismatch")
         try:
-            plaintext = AESGCM(self._key).decrypt(
+            plaintext = AESGCM(key).decrypt(
                 bytes(nonce), ciphertext, object_key.encode("utf-8")
             )
         except Exception as exc:
             raise OSError("External archive authentication/decryption failed") from exc
+        expected_payload_digest = str(row.get("payload_sha256") or "")
+        if not expected_payload_digest or sha256(plaintext).hexdigest() != expected_payload_digest:
+            raise OSError("External archive plaintext checksum mismatch")
         codec = str(row.get("payload_codec") or "")
         if not codec.startswith("aesgcm+"):
             raise OSError(f"Unsupported external archive codec {codec!r}")
@@ -158,6 +170,7 @@ def build_archive_backend(config: Settings = settings):
         prefix=config.dbd_archive_s3_prefix,
         encryption_key_b64=config.dbd_archive_encryption_key_b64,
         key_id=config.dbd_archive_encryption_key_id,
+        decryption_keys=config.dbd_archive_decryption_keys,
         endpoint_url=config.dbd_archive_s3_endpoint_url,
         region_name=config.dbd_archive_s3_region,
     )
