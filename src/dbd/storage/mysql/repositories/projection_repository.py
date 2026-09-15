@@ -4,7 +4,7 @@ import json
 from datetime import datetime
 from hashlib import sha256
 
-from ....core.exceptions import ContractError, IdentityConflict
+from ....core.exceptions import IdentityConflict
 from ....runtime.resources import normalize_resource
 from ..engine import connect, use_connection
 from .company_detail_repository import save_collection
