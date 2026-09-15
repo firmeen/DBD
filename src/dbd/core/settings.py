@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -39,6 +40,13 @@ class Settings(BaseSettings):
     dbd_projection_workers: int = Field(8, ge=1, le=128)
     dbd_archive_compress: bool = True
     dbd_archive_compress_threshold: int = Field(4096, ge=0, le=100000000)
+    dbd_archive_backend: Literal["mysql", "s3"] = "mysql"
+    dbd_archive_s3_bucket: str | None = None
+    dbd_archive_s3_prefix: str = "dbd/response-archive"
+    dbd_archive_s3_endpoint_url: str | None = None
+    dbd_archive_s3_region: str | None = None
+    dbd_archive_encryption_key_b64: str | None = Field(None, repr=False)
+    dbd_archive_encryption_key_id: str = "v1"
     dbd_lease_seconds: int = Field(300, ge=30)
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
