@@ -66,6 +66,8 @@
 - [x] project backlog ถูก drain ก่อนสร้าง DBD request ใหม่
 - [x] inline MySQL archive + `stage=project` commit transaction เดียว
 - [x] crash หลัง durable boundary resume จาก archive โดยไม่ยิง DBD ซ้ำ
+- [x] แยก fetch retry budget (`attempts`) กับ projection retry budget (`project_attempts`)
+- [x] response ที่ archive สำเร็จบน fetch attempt สุดท้ายยัง recover projection ได้โดยไม่ refetch DBD
 - [x] projection worker แยกจาก HTTP acquisition และยังรักษา natural-key transaction fence
 
 ### Rate / distributed control
@@ -93,6 +95,7 @@
 - [x] `orjson` serialization + optional zstd
 - [x] migration `0005_high_throughput_pipeline`
 - [x] migration `0006_external_archive_backend`
+- [x] migration `0007_project_attempt_budget`
 - [x] default inline MySQL archive ยังใช้งานได้โดยไม่ต้อง Redis/S3
 - [x] optional S3-compatible external archive
 - [x] client-side AES-256-GCM encryption ก่อน PUT
@@ -101,7 +104,7 @@
 - [x] upload สำเร็จก่อน MySQL จึง commit reference + `stage=project`
 - [x] failed PUT สร้าง project-stage task/archive reference ไม่ได้
 - [x] external restart/replay load จาก object store โดยไม่ refetch DBD
-- [x] ciphertext SHA + AES-GCM auth/AAD + plaintext SHA + codec decode integrity chain
+- [x] ciphertext SHA + AES-GCM auth/AAD + restored serialized-payload SHA + decode integrity chain
 - [x] active-key write + old-key decryption ring รองรับ key rotation
 - [x] invalid archive backend/key config fail ก่อนเปิด DBD client/claim work
 
@@ -109,8 +112,9 @@
 
 - [x] stage backlog, queue depth, batch-size, archive bytes, global/endpoint rate metrics
 - [x] GitHub Actions ใช้ Python 3.12 + disposable MySQL 8.4 + Redis
-- [x] migration partial-DDL adoption ถูก test
+- [x] migration partial-DDL adoption ถูก test ถึง migration 0007
 - [x] external archive happy path + failed PUT + crash resume ถูก test
+- [x] final-fetch-attempt -> archive -> crash -> project recovery ถูก integration test
 - [x] Redis cross-process penalty/recovery ถูก integration test
 
 ## 4. สิ่งที่ยังจงใจไม่ optimize แบบเดา
@@ -304,8 +308,8 @@ PR พร้อม review/merge เมื่อ:
 1. compile ผ่านบน exact current head
 2. Ruff ผ่าน
 3. full pytest รวม MySQL + Redis integration ผ่าน
-4. migration 0005/0006 apply/re-adopt ผ่าน
-5. raw-first crash recovery และ negative archive paths ผ่าน
+4. migration 0005/0006/0007 apply/re-adopt ผ่าน
+5. raw-first crash recovery, final-fetch-attempt recovery และ negative archive paths ผ่าน
 6. docs ไม่ claim throughput/completeness เกิน evidence
 7. PR diff self-review แล้วไม่มี unresolved review thread/check failure
 
