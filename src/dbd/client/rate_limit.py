@@ -7,15 +7,17 @@ from aiolimiter import AsyncLimiter
 
 
 class TokenBucket:
-    """One manager-wide paced limiter, with shared adaptive cooldown."""
+    """One manager-wide paced limiter with shared cooldown and conservative recovery."""
 
     def __init__(self, rate_per_second: float, burst=None):
         if rate_per_second <= 0:
             raise ValueError("rate_per_second must be positive")
-        self.rate = float(rate_per_second)
+        self.target_rate = float(rate_per_second)
+        self.rate = self.target_rate
         self._limiter = AsyncLimiter(1, 1 / self.rate)
         self._lock = asyncio.Lock()
         self._cooldown_until = 0.0
+        self._last_penalty = 0.0
 
     async def acquire(self):
         # Serializing admission lets a changed limiter/cooldown affect queued
@@ -32,7 +34,29 @@ class TokenBucket:
     def cooldown(self, seconds):
         self._cooldown_until = max(self._cooldown_until, time.monotonic() + seconds)
 
-    def slow_down(self, factor=0.5, floor=0.5):
-        self.rate = min(self.rate, max(floor, self.rate * factor))
+    def _set_rate(self, value: float) -> float:
+        self.rate = float(value)
         self._limiter = AsyncLimiter(1, 1 / self.rate)
         return self.rate
+
+    def slow_down(self, factor=0.5, floor=0.5):
+        self._last_penalty = time.monotonic()
+        return self._set_rate(min(self.rate, max(floor, self.rate * factor)))
+
+    def recover(self, factor=1.25, step=0.5, quiet_seconds=30.0):
+        """Increase effective rate slowly after a quiet period with no new penalty.
+
+        Recovery never exceeds the user/configured target and advances at most
+        once per quiet window. This avoids a permanent 0.5 req/s floor after one
+        transient 429/503 without creating an immediate retry/admission storm.
+        """
+        if self.rate >= self.target_rate:
+            return None
+        now = time.monotonic()
+        if now < self._cooldown_until or now - self._last_penalty < quiet_seconds:
+            return None
+        new_rate = min(self.target_rate, max(self.rate + step, self.rate * factor))
+        if new_rate <= self.rate:
+            return None
+        self._last_penalty = now
+        return self._set_rate(new_rate)
