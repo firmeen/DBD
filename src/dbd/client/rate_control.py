@@ -10,6 +10,13 @@ from ..core.telemetry import ENDPOINT_EFFECTIVE_RATE, EFFECTIVE_RATE
 from .rate_limit import TokenBucket
 
 
+def _positive_rate(value: float) -> float:
+    value = float(value)
+    if value <= 0 or not math.isfinite(value):
+        raise ValueError("rate_per_second must be a finite positive number")
+    return value
+
+
 class RedisPacer:
     """Redis-backed global request pacer shared by independent worker processes.
 
@@ -32,11 +39,9 @@ return wait_ms
 """
 
     def __init__(self, url: str, key: str, rate_per_second: float):
-        if rate_per_second <= 0 or not math.isfinite(rate_per_second):
-            raise ValueError("rate_per_second must be a finite positive number")
         self.url = url
         self.key = key
-        self.rate = float(rate_per_second)
+        self.rate = _positive_rate(rate_per_second)
         self.target_rate = self.rate
         self._redis: Redis | None = None
 
@@ -49,6 +54,10 @@ return wait_ms
         if self._redis is not None:
             await self._redis.aclose()
             self._redis = None
+
+    def set_rate(self, value: float) -> float:
+        self.rate = self.target_rate = _positive_rate(value)
+        return self.rate
 
     async def acquire(self) -> None:
         if self._redis is None:
@@ -75,14 +84,10 @@ class EndpointRateController:
         redis_url: str | None = None,
         redis_key: str = "dbd:global-rate",
     ):
-        if global_rate <= 0 or not math.isfinite(global_rate):
-            raise ValueError("global_rate must be a finite positive number")
-        self.target_rate = float(global_rate)
+        self.target_rate = _positive_rate(global_rate)
         self._endpoint_targets = {
-            str(key): float(value) for key, value in (endpoint_rates or {}).items()
+            str(key): _positive_rate(value) for key, value in (endpoint_rates or {}).items()
         }
-        if any(value <= 0 or not math.isfinite(value) for value in self._endpoint_targets.values()):
-            raise ValueError("endpoint rates must be finite positive numbers")
         self._global = (
             RedisPacer(redis_url, redis_key, self.target_rate)
             if redis_url
@@ -99,13 +104,31 @@ class EndpointRateController:
         if isinstance(self._global, RedisPacer):
             await self._global.close()
 
+    def _target_for(self, endpoint: str) -> float:
+        return min(self.target_rate, self._endpoint_targets.get(endpoint, self.target_rate))
+
     def _bucket(self, endpoint: str) -> TokenBucket:
         bucket = self._endpoints.get(endpoint)
         if bucket is None:
-            target = self._endpoint_targets.get(endpoint, self.target_rate)
-            bucket = self._endpoints[endpoint] = TokenBucket(target)
+            bucket = self._endpoints[endpoint] = TokenBucket(self._target_for(endpoint))
             ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(bucket.rate)
         return bucket
+
+    def set_target_rate(self, value: float) -> float:
+        """Retarget a probe/controller cleanly without mutating private limiter state."""
+        self.target_rate = _positive_rate(value)
+        if isinstance(self._global, RedisPacer):
+            self._global.set_rate(self.target_rate)
+        else:
+            self._global.target_rate = self.target_rate
+            self._global._set_rate(self.target_rate)
+        EFFECTIVE_RATE.set(self.target_rate)
+        for endpoint, bucket in self._endpoints.items():
+            target = self._target_for(endpoint)
+            bucket.target_rate = target
+            bucket._set_rate(target)
+            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(target)
+        return self.target_rate
 
     async def acquire(self, endpoint: str) -> None:
         await self._global.acquire()
