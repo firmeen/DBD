@@ -13,7 +13,7 @@ TASKS = Counter("dbd_tasks_total", "Endpoint task outcomes", ["endpoint", "statu
 IN_FLIGHT = Gauge("dbd_tasks_in_flight", "Tasks owned by this process")
 
 DISCOVERY_NEW_IDENTITIES = Counter(
-    "dbd_discovery_new_identities_total", "New unique identities first observed by discovery"
+    "dbd_discovery_new_identities_total", "New unique identities first observed during this process"
 )
 DISCOVERY_VALID_ROWS = Counter(
     "dbd_discovery_valid_rows_total", "Valid search rows committed by discovery"
@@ -41,11 +41,25 @@ DISCOVERY_UNCOUNTED_BUCKETS = Gauge(
 )
 
 log = structlog.get_logger("dbd")
+_last_discovery_identities: int | None = None
 
 
 def observe_discovery(summary: dict) -> None:
-    """Publish one low-cardinality snapshot from discovery_summary()."""
-    DISCOVERY_IDENTITIES.set(int(summary.get("unique_companies") or 0))
+    """Publish one low-cardinality durable discovery snapshot.
+
+    The first snapshot establishes a process baseline. Later increases feed a
+    counter, so Prometheus `rate(dbd_discovery_new_identities_total[...])` reports
+    newly discovered identities without running an expensive COUNT after every
+    search page.
+    """
+    global _last_discovery_identities
+
+    identities = int(summary.get("unique_companies") or 0)
+    if _last_discovery_identities is not None and identities > _last_discovery_identities:
+        DISCOVERY_NEW_IDENTITIES.inc(identities - _last_discovery_identities)
+    _last_discovery_identities = identities
+    DISCOVERY_IDENTITIES.set(identities)
+
     for status, key in (
         ("done", "buckets_done"),
         ("split", "buckets_split"),
