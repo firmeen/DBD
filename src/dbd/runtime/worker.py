@@ -72,6 +72,12 @@ async def _finish_if_owned(repo, task, status, error=None) -> bool:
     return finished
 
 
+def _attempt_count(task) -> int:
+    if task.get("stage") == "project":
+        return int(task.get("project_attempts", 0))
+    return int(task["attempts"])
+
+
 async def _fail_task(repo, task, exc, archive_id=None) -> None:
     if isinstance(exc, IdentityConflict):
         code = type(exc).__name__
@@ -89,7 +95,8 @@ async def _fail_task(repo, task, exc, archive_id=None) -> None:
         return
 
     terminal = isinstance(exc, (ContractError, DbdForbiddenError, DbdAuthError, ValueError, TypeError))
-    status = "failed" if terminal or task["attempts"] >= settings.dbd_max_task_attempts else "retry_wait"
+    exhausted = _attempt_count(task) >= settings.dbd_max_task_attempts
+    status = "failed" if terminal or exhausted else "retry_wait"
     code = type(exc).__name__
     if archive_id:
         await repo.mark_archive(
@@ -201,7 +208,7 @@ async def process(
                 )
                 for task in project_batch:
                     IN_FLIGHT.inc()
-                    await project_queue.put({"task": task})
+                    await project_queue.put({"task": task, "project_attempt_started": True})
                 claimed_attempts += len(project_batch)
 
             if limit is not None and claimed_attempts >= limit:
@@ -312,6 +319,20 @@ async def process(
             try:
                 if not archive_id:
                     raise ValueError("Project-stage task has no raw_response_id")
+
+                # A freshly archived task retains its fetch lease and reaches this
+                # queue without a project-stage claim. Count the projection attempt
+                # only when projection actually begins. Reclaimed project backlog was
+                # already incremented atomically by claim_project_batch().
+                if not item.get("project_attempt_started"):
+                    project_attempts = await repo.begin_project_attempt(task)
+                    if project_attempts is None:
+                        raise LeaseLost("Lease lost before projection attempt")
+                    task = dict(task)
+                    task["project_attempts"] = project_attempts
+                    item["task"] = task
+                    item["project_attempt_started"] = True
+
                 if "response" in item:
                     payload = item["response"].data
                     requested_at = item["response"].requested_at
