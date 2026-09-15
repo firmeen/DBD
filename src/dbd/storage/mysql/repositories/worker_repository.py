@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from datetime import datetime, timezone
 
@@ -14,7 +15,10 @@ from tenacity import (
 
 from ....core.settings import settings
 from ....core.telemetry import ARCHIVE_BYTES, PIPELINE_BATCH_SIZE
+from ...archive_backend import build_archive_backend
 from ...archive_codec import decode_payload, encode_payload
+
+_AUTO_BACKEND = object()
 
 
 def deadlock(exc):
@@ -35,8 +39,15 @@ def now():
 
 
 class WorkerRepository:
-    def __init__(self, engine):
+    def __init__(self, engine, archive_backend=_AUTO_BACKEND):
         self.engine = engine
+        self._archive_backend = archive_backend
+
+    @property
+    def archive_backend(self):
+        if self._archive_backend is _AUTO_BACKEND:
+            self._archive_backend = build_archive_backend()
+        return self._archive_backend
 
     async def create_run(self, source, parts, fiscal_year=None):
         async with self.engine.begin() as conn:
@@ -423,26 +434,62 @@ class WorkerRepository:
             return result.rowcount
 
     async def archive_batch(self, items):
-        """Archive decoded responses and durably advance tasks to project stage.
+        """Archive responses and durably advance tasks to project stage.
 
-        The transaction commits the raw archive and the stage transition together.
-        Once this returns, a crash can resume from response_archive without another
-        network request.
+        Inline MySQL archives preserve the original V2 atomic transaction. With an
+        external backend, encrypted objects are uploaded first; MySQL then commits
+        the object reference and fetch->project transition together. This ordering
+        can create an unreferenced object after a DB failure, but never a committed
+        archive row that references an object which was never uploaded.
         """
         if not items:
             return []
-        prepared = []
+
+        encoded_items = []
         for item in items:
             encoded = encode_payload(
                 item["response"].data,
                 compress=settings.dbd_archive_compress,
                 threshold=settings.dbd_archive_compress_threshold,
             )
-            prepared.append((item, encoded))
+            encoded_items.append((item, encoded))
+
+        backend = self.archive_backend
+        prepared = []
+        if backend is None:
+            prepared = [(item, encoded, None) for item, encoded in encoded_items]
+        else:
+            uploads = await asyncio.gather(
+                *(
+                    asyncio.to_thread(
+                        backend.store,
+                        encoded,
+                        endpoint=item["task"]["endpoint"],
+                        task_id=item["task"]["id"],
+                    )
+                    for item, encoded in encoded_items
+                ),
+                return_exceptions=True,
+            )
+            failures = [result for result in uploads if isinstance(result, BaseException)]
+            if failures:
+                successful = [result for result in uploads if not isinstance(result, BaseException)]
+                await asyncio.gather(
+                    *(
+                        asyncio.to_thread(backend.delete, result.object_key)
+                        for result in successful
+                    ),
+                    return_exceptions=True,
+                )
+                raise failures[0]
+            prepared = [
+                (item, encoded, external)
+                for (item, encoded), external in zip(encoded_items, uploads, strict=True)
+            ]
 
         archived = []
         async with self.engine.begin() as conn:
-            for item, encoded in prepared:
+            for item, encoded, external in prepared:
                 task = item["task"]
                 owned = (
                     await conn.execute(
@@ -462,17 +509,45 @@ class WorkerRepository:
                 ).first()
                 if owned is None:
                     continue
+
                 response = item["response"]
+                if external is None:
+                    archive_values = {
+                        "payload": encoded.json_text,
+                        "codec": encoded.codec,
+                        "backend": "mysql",
+                        "object_key": None,
+                        "nonce": None,
+                        "key_id": None,
+                        "cipher_sha": None,
+                        "payload_zstd": encoded.compressed,
+                        "stored_bytes": encoded.stored_bytes,
+                    }
+                else:
+                    archive_values = {
+                        "payload": "",
+                        "codec": external.codec,
+                        "backend": external.backend,
+                        "object_key": external.object_key,
+                        "nonce": external.nonce,
+                        "key_id": external.key_id,
+                        "cipher_sha": external.cipher_sha256,
+                        "payload_zstd": None,
+                        "stored_bytes": external.stored_bytes,
+                    }
+
                 result = await conn.execute(
                     text("""
                     INSERT INTO response_archive(
                       task_id,company_id,endpoint,request_path,request_context,
-                      http_status,requested_at,received_at,payload,payload_codec,payload_zstd,
-                      payload_original_bytes,payload_stored_bytes,payload_sha256
+                      http_status,requested_at,received_at,payload,payload_codec,payload_backend,
+                      payload_object_key,payload_nonce,payload_key_id,payload_cipher_sha256,
+                      payload_zstd,payload_original_bytes,payload_stored_bytes,payload_sha256
                     ) VALUES (
                       :task,:company,:endpoint,:path,:context,
-                      :status,:requested,:received,:payload,:codec,:payload_zstd,
-                      :original_bytes,:stored_bytes,:sha
+                      :status,:requested,:received,:payload,:codec,:backend,
+                      :object_key,:nonce,:key_id,:cipher_sha,
+                      :payload_zstd,:original_bytes,:stored_bytes,:sha
                     )
                 """),
                     {
@@ -484,12 +559,9 @@ class WorkerRepository:
                         "status": response.status,
                         "requested": response.requested_at,
                         "received": response.received_at,
-                        "payload": encoded.json_text,
-                        "codec": encoded.codec,
-                        "payload_zstd": encoded.compressed,
                         "original_bytes": encoded.original_bytes,
-                        "stored_bytes": encoded.stored_bytes,
                         "sha": encoded.sha256_hex,
+                        **archive_values,
                     },
                 )
                 archive_id = result.lastrowid
@@ -515,20 +587,34 @@ class WorkerRepository:
                 updated = dict(item)
                 updated["archive_id"] = archive_id
                 updated["encoded"] = encoded
+                updated["stored_bytes"] = archive_values["stored_bytes"]
                 updated_task = dict(task)
                 updated_task["stage"] = "project"
                 updated_task["raw_response_id"] = archive_id
                 updated["task"] = updated_task
                 archived.append(updated)
 
+        # A lease may be lost while an external PUT is in flight. Once the DB
+        # transaction above completed successfully, an upload with no archive row
+        # is definitely unreferenced and is safe to delete best-effort.
+        if backend is not None:
+            archived_task_ids = {item["task"]["id"] for item in archived}
+            unused = [
+                external.object_key
+                for item, _, external in prepared
+                if external is not None and item["task"]["id"] not in archived_task_ids
+            ]
+            await asyncio.gather(
+                *(asyncio.to_thread(backend.delete, key) for key in unused),
+                return_exceptions=True,
+            )
+
         if archived:
             PIPELINE_BATCH_SIZE.labels("archive").observe(len(archived))
             ARCHIVE_BYTES.labels("original").inc(
                 sum(item["encoded"].original_bytes for item in archived)
             )
-            ARCHIVE_BYTES.labels("stored").inc(
-                sum(item["encoded"].stored_bytes for item in archived)
-            )
+            ARCHIVE_BYTES.labels("stored").inc(sum(item["stored_bytes"] for item in archived))
         return archived
 
     async def archive(self, task, response, path, params):
@@ -549,11 +635,20 @@ class WorkerRepository:
         if row is None:
             raise ValueError(f"Archive {archive_id} not found")
         result = dict(row)
-        result["data"] = decode_payload(
-            payload=result.get("payload"),
-            payload_zstd=result.get("payload_zstd"),
-            codec=result.get("payload_codec"),
-        )
+        backend_name = result.get("payload_backend") or "mysql"
+        if backend_name == "mysql":
+            result["data"] = decode_payload(
+                payload=result.get("payload"),
+                payload_zstd=result.get("payload_zstd"),
+                codec=result.get("payload_codec"),
+            )
+        else:
+            backend = self.archive_backend
+            if backend is None or backend.backend_name != backend_name:
+                raise OSError(
+                    f"Archive {archive_id} requires backend {backend_name!r}, which is not configured"
+                )
+            result["data"] = await asyncio.to_thread(backend.load, result)
         result["request_context"] = json.loads(result["request_context"])
         return result
 
