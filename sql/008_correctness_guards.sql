@@ -5,6 +5,11 @@ ALTER TABLE discovery_pages
   MODIFY COLUMN status ENUM('pending','done','failed','partial') NOT NULL DEFAULT 'pending',
   ADD COLUMN rejected_rows INT UNSIGNED NOT NULL DEFAULT 0 AFTER rows_written;
 
+-- Discovery identity is the same composite identity used by company_master.
+ALTER TABLE discovery_sightings
+  DROP PRIMARY KEY,
+  ADD PRIMARY KEY (jp_type_code, jp_no);
+
 CREATE TABLE IF NOT EXISTS discovery_rejections (
   id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
   bucket_id BIGINT UNSIGNED NOT NULL,
