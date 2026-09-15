@@ -12,6 +12,15 @@ EFFECTIVE_RATE = Gauge(
 TASKS = Counter("dbd_tasks_total", "Endpoint task outcomes", ["endpoint", "status"])
 IN_FLIGHT = Gauge("dbd_tasks_in_flight", "Tasks owned by this process")
 
+DISCOVERY_NEW_IDENTITIES = Counter(
+    "dbd_discovery_new_identities_total", "New unique identities first observed by discovery"
+)
+DISCOVERY_VALID_ROWS = Counter(
+    "dbd_discovery_valid_rows_total", "Valid search rows committed by discovery"
+)
+DISCOVERY_PAGE_RESULTS = Counter(
+    "dbd_discovery_page_results_total", "Discovery page processing outcomes", ["status"]
+)
 DISCOVERY_IDENTITIES = Gauge(
     "dbd_discovery_unique_identities", "Unique identities observed by discovery"
 )
