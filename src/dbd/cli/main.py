@@ -46,8 +46,6 @@ def safe_error(exc: BaseException) -> str:
     if isinstance(exc, (DbdError, ValueError)):
         return str(exc) or type(exc).__name__
     if isinstance(exc, RuntimeError):
-        # RuntimeError is used for local manager/lease invariants; keep messages
-        # short and never include request/response objects.
         return (str(exc) or type(exc).__name__)[:500]
     return type(exc).__name__
 
@@ -184,12 +182,24 @@ def main():
 
             command_check_db()
         elif args.command == "master-status":
-            engine = create_engine()
-            repo = WorkerRepository(engine)
-            try:
-                print(json.dumps(awaitable_result(asyncio.run(repo.master_population())), indent=2))
-            finally:
-                asyncio.run(engine.dispose())
+            from ..storage.mysql.engine import connect
+
+            with connect() as conn, conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT
+                      COUNT(*) AS total,
+                      COALESCE(SUM(identity_status='conflict'),0) AS conflicts,
+                      COALESCE(SUM(identity_status<>'conflict'),0) AS eligible_all_statuses,
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code='1'),0)
+                        AS eligible_operating,
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code IS NULL),0)
+                        AS unknown_status
+                    FROM company_master
+                    """
+                )
+                row = cur.fetchone()
+            print(json.dumps({key: int(value or 0) for key, value in row.items()}, indent=2))
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
                 with manager_lock():
@@ -244,8 +254,3 @@ def main():
         raise SystemExit(130) from None
     except Exception as exc:
         parser.exit(1, f"dbd-data: {safe_error(exc)}\n")
-
-
-def awaitable_result(value):
-    """Identity helper kept outside argparse branches to make master-status testable."""
-    return value
