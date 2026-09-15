@@ -9,13 +9,14 @@ from dbd.runtime.worker import process
 pytestmark = pytest.mark.integration
 
 
-async def test_profile_identity_conflict_marks_master_and_archive(repo):
-    class WrongIdentity(FakeApi):
-        async def fetch(self, *args, **kwargs):
-            response = await super().fetch(*args, **kwargs)
-            response.data["jpNo"] = str(int(response.data["jpNo"]) + 1).zfill(13)
-            return response
+class WrongIdentity(FakeApi):
+    async def fetch(self, *args, **kwargs):
+        response = await super().fetch(*args, **kwargs)
+        response.data["jpNo"] = str(int(response.data["jpNo"]) + 1).zfill(13)
+        return response
 
+
+async def test_profile_identity_conflict_marks_master_and_archive(repo):
     run, identities = await new_run(repo, ("profile",))
     result = await process(repo, run, concurrency=1, client_factory=WrongIdentity)
 
@@ -48,6 +49,16 @@ async def test_profile_identity_conflict_marks_master_and_archive(repo):
     assert master == "conflict"
     assert task == "IdentityConflict"
     assert archive == ("invalid", "IdentityConflict")
+
+
+async def test_generic_retry_does_not_requeue_identity_conflict(repo):
+    run, _ = await new_run(repo, ("profile",))
+    assert await process(repo, run, concurrency=1, client_factory=WrongIdentity) == {"failed": 1}
+    assert (await repo.get_run(run))["status"] == "failed"
+
+    assert await repo.retry_failed(run) == 0
+    assert await repo.progress(run) == {"failed": 1}
+    assert (await repo.get_run(run))["status"] == "failed"
 
 
 async def test_stale_lease_cannot_mark_master_conflict(repo):
