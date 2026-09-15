@@ -7,7 +7,7 @@ from uuid import uuid4
 
 from ..client.async_client import AsyncDbdClient
 from ..contracts.identity import parse_code
-from ..core.exceptions import ContractError, DbdAuthError, DbdForbiddenError
+from ..core.exceptions import ContractError, DbdAuthError, DbdForbiddenError, IdentityConflict
 from ..core.settings import settings
 from ..core.telemetry import IN_FLIGHT, TASKS, log
 from ..storage.mysql.repositories.projection_repository import LeaseLost, project
@@ -94,6 +94,24 @@ async def handle_task(repo, client, task, writes):
         raise
     except LeaseLost:
         log.warning("lease_lost", task_id=task["id"])
+    except IdentityConflict as exc:
+        code = type(exc).__name__
+        finished = await repo.finish_identity_conflict(task, archive_id, code)
+        if finished:
+            TASKS.labels(task["endpoint"], "conflict").inc()
+            log.warning(
+                "identity_conflict",
+                task_id=task["id"],
+                company_id=task["company_id"],
+                endpoint=task["endpoint"],
+                error_code=code,
+            )
+        else:
+            log.warning(
+                "lease_lost_before_conflict_finish",
+                task_id=task["id"],
+                endpoint=task["endpoint"],
+            )
     except Exception as exc:
         terminal = isinstance(exc, (ContractError, DbdForbiddenError, DbdAuthError, ValueError, TypeError))
         status = "failed" if terminal or task["attempts"] >= settings.dbd_max_task_attempts else "retry_wait"
