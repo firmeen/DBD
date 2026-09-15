@@ -352,14 +352,16 @@ class WorkerRepository:
             result = await conn.execute(
                 text("""
                 UPDATE endpoint_tasks SET status='pending',attempts=0,last_error=NULL,finished_at=NULL,
-                    available_at=UTC_TIMESTAMP(6) WHERE run_id=:id AND status='failed'
+                    available_at=UTC_TIMESTAMP(6)
+                WHERE run_id=:id AND status='failed' AND COALESCE(last_error,'')<>'IdentityConflict'
             """),
                 {"id": run_id},
             )
-            await conn.execute(
-                text("UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"),
-                {"id": run_id},
-            )
+            if result.rowcount:
+                await conn.execute(
+                    text("UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"),
+                    {"id": run_id},
+                )
             return result.rowcount
 
     async def archive(self, task, response, path, params):
