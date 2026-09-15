@@ -55,12 +55,22 @@ def encoded_bytes(encoded: EncodedPayload) -> bytes:
     raise ValueError(f"Unsupported archive codec {encoded.codec!r}")
 
 
-def decode_bytes(raw: bytes, codec: str):
+def restored_json_bytes(raw: bytes, codec: str) -> bytes:
+    """Return the canonical serialized JSON bytes represented by an archive codec.
+
+    `payload_sha256` is intentionally the digest of these uncompressed bytes for
+    both inline and external archives. Compression/encryption therefore does not
+    change the content-integrity identity used across storage backends.
+    """
     if codec == "zstd":
-        raw = zstd.ZstdDecompressor().decompress(raw)
-    elif codec != "json":
-        raise ValueError(f"Unsupported archive codec {codec!r}")
-    return orjson.loads(raw)
+        return zstd.ZstdDecompressor().decompress(raw)
+    if codec == "json":
+        return raw
+    raise ValueError(f"Unsupported archive codec {codec!r}")
+
+
+def decode_bytes(raw: bytes, codec: str):
+    return orjson.loads(restored_json_bytes(raw, codec))
 
 
 def decode_payload(*, payload: str | None, payload_zstd: bytes | None, codec: str | None):
