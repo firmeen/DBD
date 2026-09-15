@@ -51,13 +51,31 @@ async def test_profile_identity_conflict_marks_master_and_archive(repo):
     assert archive == ("invalid", "IdentityConflict")
 
 
-async def test_generic_retry_does_not_requeue_identity_conflict(repo):
+async def test_generic_retry_quarantines_every_failed_task_for_conflicted_identity(repo):
     run, _ = await new_run(repo, ("profile",))
     assert await process(repo, run, concurrency=1, client_factory=WrongIdentity) == {"failed": 1}
     assert (await repo.get_run(run))["status"] == "failed"
 
+    # Simulate another endpoint already failed for the same company before the
+    # identity conflict became durable. Generic retry must leave both failures
+    # quarantined, not only the task whose own error string is IdentityConflict.
+    async with repo.engine.begin() as conn:
+        company_id = (
+            await conn.execute(
+                text("SELECT company_id FROM endpoint_tasks WHERE run_id=:run LIMIT 1"),
+                {"run": run},
+            )
+        ).scalar_one()
+        await conn.execute(
+            text("""
+            INSERT INTO endpoint_tasks(run_id,company_id,endpoint,status,last_error,finished_at)
+            VALUES (:run,:company,'committees','failed','previous_endpoint_failure',UTC_TIMESTAMP(6))
+            """),
+            {"run": run, "company": company_id},
+        )
+
     assert await repo.retry_failed(run) == 0
-    assert await repo.progress(run) == {"failed": 1}
+    assert await repo.progress(run) == {"failed": 2}
     assert (await repo.get_run(run))["status"] == "failed"
 
 
