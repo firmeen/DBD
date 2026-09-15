@@ -209,7 +209,7 @@ class AsyncDbdClient:
                                 new_rate,
                                 old_global_rate,
                                 new_global_rate,
-                            ) = self.endpoint_rate.penalize(rate_key, cooldown)
+                            ) = await self.endpoint_rate.penalize(rate_key, cooldown)
                         else:
                             old_rate = self.rate.rate
                             new_rate = self.rate.slow_down()
@@ -256,7 +256,9 @@ class AsyncDbdClient:
                         )
                         raise
                     if rate_key:
-                        endpoint_recovered, global_recovered = self.endpoint_rate.recover(rate_key)
+                        endpoint_recovered, global_recovered = await self.endpoint_rate.recover(
+                            rate_key
+                        )
                         recovered = endpoint_recovered or global_recovered
                     else:
                         recovered = self.rate.recover()
