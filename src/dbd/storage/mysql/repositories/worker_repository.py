@@ -257,27 +257,39 @@ class WorkerRepository:
             )
 
     @transaction_retry
-    async def mark_identity_conflict(self, task) -> bool:
-        """Mark master conflict only while this exact task lease is still valid."""
+    async def finish_identity_conflict(self, task, archive_id=None, error="IdentityConflict") -> bool:
+        """Atomically persist conflict state and fail the task while lease-owned."""
         async with self.engine.begin() as conn:
             result = await conn.execute(
                 text("""
-                UPDATE company_master m
-                JOIN endpoint_tasks t ON t.company_id=m.company_id
-                SET m.identity_status='conflict'
-                WHERE t.id=:id
-                  AND t.status='running'
-                  AND t.lease_owner=:owner
-                  AND t.lease_version=:version
-                  AND t.lease_expires_at>UTC_TIMESTAMP(6)
+                UPDATE endpoint_tasks
+                SET status='failed',last_error=:error,lease_owner=NULL,lease_expires_at=NULL,
+                    finished_at=UTC_TIMESTAMP(6)
+                WHERE id=:id AND status='running' AND lease_owner=:owner AND lease_version=:version
+                  AND lease_expires_at>UTC_TIMESTAMP(6)
             """),
                 {
+                    "error": error,
                     "id": task["id"],
                     "owner": task["lease_owner"],
                     "version": task["lease_version"],
                 },
             )
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                return False
+            await conn.execute(
+                text("UPDATE company_master SET identity_status='conflict' WHERE company_id=:company"),
+                {"company": task["company_id"]},
+            )
+            if archive_id is not None:
+                await conn.execute(
+                    text("""
+                    UPDATE response_archive SET processing_status='invalid',error_code=:error
+                    WHERE id=:archive
+                """),
+                    {"archive": archive_id, "error": error},
+                )
+            return True
 
     @transaction_retry
     async def finish(self, task, status, error=None):
