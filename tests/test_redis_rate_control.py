@@ -18,6 +18,7 @@ async def test_two_redis_pacers_share_one_global_schedule():
     await first.open()
     await second.open()
     try:
+        await first.clear_state()
         started = time.perf_counter()
         await asyncio.gather(first.acquire(), second.acquire())
         elapsed = time.perf_counter() - started
@@ -27,7 +28,34 @@ async def test_two_redis_pacers_share_one_global_schedule():
         assert elapsed >= 0.06
         assert await first._redis.exists(key) == 1
     finally:
-        if first._redis is not None:
-            await first._redis.delete(key)
+        await first.clear_state()
+        await first.close()
+        await second.close()
+
+
+async def test_penalty_and_cooldown_are_shared_across_processes():
+    key = "dbd:test-adaptive-rate:" + uuid4().hex
+    first = RedisPacer(REDIS_URL, key, 10)
+    second = RedisPacer(REDIS_URL, key, 10)
+    await first.open()
+    await second.open()
+    try:
+        await first.clear_state()
+        old_rate, new_rate = await first.penalize(0.08)
+        assert (old_rate, new_rate) == (10, 5)
+
+        started = time.perf_counter()
+        observed = await second.acquire()
+        elapsed = time.perf_counter() - started
+        assert observed == 5
+        assert second.rate == 5
+        assert elapsed >= 0.05
+
+        recovered = await second.recover(quiet_seconds=0)
+        assert recovered == pytest.approx(6.25)
+        observed_by_first = await first.acquire()
+        assert observed_by_first == pytest.approx(6.25)
+    finally:
+        await first.clear_state()
         await first.close()
         await second.close()
