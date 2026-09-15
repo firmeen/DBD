@@ -199,18 +199,28 @@ def discovery_summary() -> dict:
         cur.execute(
             """
             SELECT
-              (SELECT COUNT(*) FROM discovery_sightings)                          AS unique_companies,
-              (SELECT COUNT(*) FROM discovery_buckets)                            AS buckets,
-              (SELECT COUNT(*) FROM discovery_buckets WHERE status='done')        AS buckets_done,
-              (SELECT COUNT(*) FROM discovery_buckets WHERE status='split')       AS buckets_split,
-              (SELECT COUNT(*) FROM discovery_buckets WHERE status='failed')      AS buckets_failed,
+              (SELECT COUNT(*) FROM discovery_sightings) AS unique_companies,
+              (SELECT COUNT(*) FROM discovery_buckets) AS buckets,
+              (SELECT COUNT(*) FROM discovery_buckets WHERE status='done') AS buckets_done,
+              (SELECT COUNT(*) FROM discovery_buckets WHERE status='split') AS buckets_split,
+              (SELECT COUNT(*) FROM discovery_buckets WHERE status='failed') AS buckets_failed,
               (SELECT COUNT(*) FROM discovery_buckets
-                 WHERE status IN ('pending','counted','draining'))                AS buckets_open,
-              (SELECT COUNT(*) FROM discovery_buckets WHERE partition_lossless=0) AS partitions_lossy,
-              (SELECT COUNT(*) FROM discovery_pages WHERE status='partial')       AS pages_partial,
+                 WHERE status IN ('pending','counted','draining')) AS buckets_open,
+              (SELECT COUNT(*) FROM discovery_buckets
+                 WHERE total_items IS NULL AND status IN ('pending','counted','draining'))
+                 AS buckets_uncounted,
+              (SELECT COUNT(*) FROM discovery_buckets WHERE partition_lossless=0)
+                 AS partitions_lossy,
+              (SELECT COUNT(*) FROM discovery_pages WHERE status='done') AS pages_done,
+              (SELECT COUNT(*) FROM discovery_pages WHERE status='failed') AS pages_failed,
+              (SELECT COUNT(*) FROM discovery_pages WHERE status='partial') AS pages_partial,
               (SELECT COUNT(*) FROM discovery_rejections WHERE resolved_at IS NULL)
-                                                                                   AS unresolved_rejections,
-              (SELECT COALESCE(SUM(rows_seen),0) FROM discovery_buckets)          AS rows_fetched
+                 AS unresolved_rejections,
+              (SELECT COALESCE(SUM(GREATEST(pages_total-pages_done,0)),0)
+                 FROM discovery_buckets
+                 WHERE pages_total IS NOT NULL AND status IN ('counted','draining','failed'))
+                 AS remaining_counted_pages,
+              (SELECT COALESCE(SUM(rows_seen),0) FROM discovery_buckets) AS rows_fetched
             """
         )
         return cur.fetchone()
@@ -262,17 +272,6 @@ def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=Tr
         return archive_id
 
 
-def mark_search_archive(archive_id: int, status: str, error: str | None = None) -> None:
-    if status not in {"processed", "invalid", "failed"}:
-        raise ValueError("Unsupported search archive status")
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            "UPDATE response_archive SET processing_status=%s,error_code=%s WHERE id=%s",
-            (status, error, archive_id),
-        )
-        conn.commit()
-
-
 def link_search_page(bucket_id, page_no, archive_id):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -283,7 +282,17 @@ def link_search_page(bucket_id, page_no, archive_id):
         conn.commit()
 
 
+def mark_search_archive(archive_id, status, error=None):
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE response_archive SET processing_status=%s,error_code=%s WHERE id=%s",
+            (status, error, archive_id),
+        )
+        conn.commit()
+
+
 def _replace_rejections(cur, bucket_id, page_no, rejections, requested):
+    # A retry supersedes unresolved observations from the previous copy of this page.
     cur.execute(
         """
         UPDATE discovery_rejections SET resolved_at=UTC_TIMESTAMP(6)
