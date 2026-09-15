@@ -19,13 +19,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from dbd.client.async_client import AsyncDbdClient  # noqa: E402
 from dbd.contracts.company import normalize  # noqa: E402
-from dbd.core.settings import settings  # noqa: E402
 from dbd.runtime.locking import assert_manager_lock, manager_lock  # noqa: E402
 from dbd.runtime.resources import FINANCIAL, PARTS, request_path  # noqa: E402
 from dbd.storage.mysql.engine import connect  # noqa: E402
 
 RAMP = (10, 15, 20, 25, 30, 40, 50, 60, 75, 100)
-DEFAULT_ENDPOINTS = tuple(endpoint for part in ("profile", "details", "financials") for endpoint in PARTS[part])
+DEFAULT_ENDPOINTS = tuple(
+    endpoint for part in ("profile", "details", "financials") for endpoint in PARTS[part]
+)
 
 
 @dataclass(frozen=True)
@@ -130,9 +131,7 @@ def build_workload(targets: list[Target]) -> list[WorkItem]:
         for endpoint in DEFAULT_ENDPOINTS:
             if endpoint in FINANCIAL and not target.fiscal_year:
                 continue
-            workload.append(
-                WorkItem(endpoint, target.kind, target.number, target.fiscal_year)
-            )
+            workload.append(WorkItem(endpoint, target.kind, target.number, target.fiscal_year))
     return workload
 
 
@@ -161,9 +160,7 @@ async def enrich_fiscal_years(client, targets, budget, concurrency):
                 if (profile.jp_type_code, profile.jp_no) != (target.kind, target.number):
                     raise ValueError("Response identity mismatch")
                 years = str(profile.submit_fin_year or "").split()
-                results.append(
-                    Target(target.kind, target.number, max(years) if years else None)
-                )
+                results.append(Target(target.kind, target.number, max(years) if years else None))
             except Exception as exc:
                 errors.append(_error_signature(exc))
             finally:
@@ -203,9 +200,7 @@ async def run_step(client, workload, budget, target_rate, seconds, concurrency):
             params = {"fiscalYear": item.fiscal_year} if item.endpoint in FINANCIAL else None
             begun = time.perf_counter()
             try:
-                await client.fetch(
-                    "GET", path, params=params, rate_key=item.endpoint
-                )
+                await client.fetch("GET", path, params=params, rate_key=item.endpoint)
                 ended = time.perf_counter()
                 durations[item.endpoint].append(ended - begun)
                 successes[item.endpoint] += 1
@@ -231,12 +226,8 @@ async def run_step(client, workload, budget, target_rate, seconds, concurrency):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     elapsed = min(seconds, max(0.001, time.perf_counter() - start))
-    error_total = sum(errors.values())
     endpoint_stats = {
-        endpoint: {
-            "success": successes[endpoint],
-            "p95": pct(durations[endpoint], 0.95),
-        }
+        endpoint: {"success": successes[endpoint], "p95": pct(durations[endpoint], 0.95)}
         for endpoint in DEFAULT_ENDPOINTS
     }
     return {
@@ -244,7 +235,7 @@ async def run_step(client, workload, budget, target_rate, seconds, concurrency):
         "admitted": admitted,
         "window_success": len(completed),
         "window_rps": len(completed) / elapsed,
-        "errors": error_total,
+        "errors": sum(errors.values()),
         "error_breakdown": {
             f"{endpoint}:{signature}": count
             for (endpoint, signature), count in sorted(errors.items())
@@ -285,6 +276,9 @@ async def measure(args, lock_connection):
                     f"  sample companies: {len(raw_targets)}; concurrency: {args.concurrency}; "
                     f"budget: {args.max_requests}"
                 )
+                # Profile warm-up is deliberately conservative. It discovers real
+                # financial years without persisting anything and fails on any error.
+                client.endpoint_rate.set_target_rate(min(10.0, float(args.min_rate)))
                 print("  warming profiles to obtain real submitted fiscal years...")
                 targets = await enrich_fiscal_years(
                     client, raw_targets, budget, min(args.concurrency, 16)
@@ -301,18 +295,7 @@ async def measure(args, lock_connection):
                 results = []
                 for rate in rates:
                     for repeat in range(1, args.repeats + 1):
-                        # Recreate target rates for each step while retaining one authenticated session.
-                        client.endpoint_rate.target_rate = float(rate)
-                        client.endpoint_rate._global.target_rate = float(rate)
-                        if hasattr(client.endpoint_rate._global, "_set_rate"):
-                            client.endpoint_rate._global._set_rate(rate)
-                        elif hasattr(client.endpoint_rate._global, "rate"):
-                            client.endpoint_rate._global.rate = float(rate)
-                        for bucket in client.endpoint_rate._endpoints.values():
-                            bucket.target_rate = min(bucket.target_rate, float(rate))
-                            if bucket.rate > rate:
-                                bucket._set_rate(rate)
-
+                        client.endpoint_rate.set_target_rate(rate)
                         if budget.limit - budget.used < rate * args.step_seconds:
                             print("  STOP: request budget cannot cover the next full step")
                             return results
