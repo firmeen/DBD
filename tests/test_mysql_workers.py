@@ -16,7 +16,6 @@ pytestmark = pytest.mark.integration
 
 async def new_run(repo, resources=("profile",), count=1):
     run = await repo.create_run("test-" + uuid4().hex, ["profile"])
-    # Distinct synthetic registration numbers, only in the disposable DB.
     start = int(uuid4().hex[:10], 16)
     ids = [parse_code("7" + str(start + i).zfill(13)) for i in range(count)]
     await repo.import_batch(run, ids, resources)
@@ -72,7 +71,12 @@ class FakeApi:
         try:
             await asyncio.sleep(0.02)
             kind, number = path.split("/")[-2:]
-            payload = {"jpNo": number, "jpTypeCode": kind, "jpName": "Synthetic", "submitFinYear": None}
+            payload = {
+                "jpNo": number,
+                "jpTypeCode": kind,
+                "jpName": "Synthetic",
+                "submitFinYear": None,
+            }
             dt = datetime.now(timezone.utc).replace(tzinfo=None)
             return ApiResponse(payload, 200, dt, dt)
         finally:
@@ -88,7 +92,8 @@ async def test_concurrent_manager_persists_and_skips_unavailable_financials(repo
         n = (
             await conn.execute(
                 text(
-                    "SELECT COUNT(*) FROM response_archive a JOIN endpoint_tasks t ON t.id=a.task_id WHERE t.run_id=:run AND a.processing_status='processed'"
+                    "SELECT COUNT(*) FROM response_archive a JOIN endpoint_tasks t ON t.id=a.task_id "
+                    "WHERE t.run_id=:run AND a.processing_status='processed'"
                 ),
                 {"run": run},
             )
@@ -110,7 +115,8 @@ async def test_invalid_payload_archived_without_projection(repo):
         row = (
             await conn.execute(
                 text(
-                    "SELECT a.processing_status FROM response_archive a JOIN endpoint_tasks t ON t.id=a.task_id WHERE t.run_id=:run"
+                    "SELECT a.processing_status FROM response_archive a JOIN endpoint_tasks t ON t.id=a.task_id "
+                    "WHERE t.run_id=:run"
                 ),
                 {"run": run},
             )
@@ -135,23 +141,16 @@ async def test_cancellation_returns_leases(repo):
     assert await repo.progress(run) == {"pending": 3}
 
 
-async def test_enqueue_master_filters_by_status(repo):
-    """Dead companies must never reach the queue.
-
-    Status arrives free with discovery, so filtering costs nothing and removes
-    the requests before they exist. About 62% of collected companies are struck
-    off, liquidated or dissolved and hold no current filings.
-    """
+async def test_enqueue_master_filters_by_latest_observed_status(repo):
     run = await repo.create_run("status-filter-" + uuid4().hex, ["profile"])
     start = int(uuid4().hex[:10], 16)
     operating = parse_code("7" + str(start).zfill(13))
     struck_off = parse_code("7" + str(start + 1).zfill(13))
 
-    # Registers both identities in company_master; this run is not the one under test.
     await repo.import_batch(run, [operating, struck_off], ("profile",))
 
-    # The projection carries the status; give one of each. companies.latest_raw_response_id
-    # is a real foreign key, so a raw row has to exist first.
+    # Deliberately make the legacy companies projection disagree with the latest
+    # observation. Scheduling must follow company_master.observed_jp_stat_code.
     async with repo.engine.begin() as conn:
         raw_id = (
             await conn.execute(
@@ -164,7 +163,10 @@ async def test_enqueue_master_filters_by_status(repo):
             )
         ).lastrowid
 
-        for identity, code in ((operating, "1"), (struck_off, "8")):
+        for identity, observed, stale_projection in (
+            (operating, "1", "8"),
+            (struck_off, "8", "1"),
+        ):
             await conn.execute(
                 text("""
                 INSERT INTO companies (jp_no, jp_type_code, jp_stat_code,
@@ -172,7 +174,20 @@ async def test_enqueue_master_filters_by_status(repo):
                 VALUES (:no, :kind, :stat, :raw, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
                 ON DUPLICATE KEY UPDATE jp_stat_code = VALUES(jp_stat_code)
             """),
-                {"no": identity.jp_no, "kind": identity.jp_type_code, "stat": code, "raw": raw_id},
+                {
+                    "no": identity.jp_no,
+                    "kind": identity.jp_type_code,
+                    "stat": stale_projection,
+                    "raw": raw_id,
+                },
+            )
+            await conn.execute(
+                text("""
+                UPDATE company_master
+                SET observed_jp_stat_code=:observed, observed_status_at=UTC_TIMESTAMP(6)
+                WHERE jp_type_code=:kind AND jp_no=:no
+            """),
+                {"observed": observed, "kind": identity.jp_type_code, "no": identity.jp_no},
             )
 
     filtered = await repo.create_run("filtered-" + uuid4().hex, ["profile"])
@@ -194,4 +209,8 @@ async def test_enqueue_master_filters_by_status(repo):
         )
 
     assert operating.jp_no in queued
-    assert struck_off.jp_no not in queued, "a struck-off company was queued for collection"
+    assert struck_off.jp_no not in queued
+
+    population = await repo.master_population()
+    assert population["eligible_all_statuses"] >= 2
+    assert population["eligible_operating"] >= 1
