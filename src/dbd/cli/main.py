@@ -7,7 +7,7 @@ import json
 from ..contracts.identity import parse_code
 from ..core.settings import settings
 from ..core.telemetry import configure
-from ..runtime.locking import manager_lock
+from ..runtime.locking import assert_manager_lock, manager_lock
 from ..runtime.resources import endpoints
 from ..runtime.worker import STATUS_OPERATING, prepare, process
 from ..storage.mysql.async_engine import create_engine
@@ -174,16 +174,14 @@ def main():
         elif args.command in ("bulk", "fetch-company"):
             configure(args.metrics_port)
             with manager_lock() as conn:
-                asyncio.run(worker_command(args, health=lambda: conn.ping(reconnect=False)))
+                asyncio.run(worker_command(args, health=lambda: assert_manager_lock(conn)))
         elif args.command == "replay":
             from ..runtime.replay import replay_archive
 
             with manager_lock():
                 replay_archive(args.archive_id)
         elif args.command in ("discover-retry", "discover-refresh"):
-            from ..storage.mysql.repositories.discovery_repository import (
-                reset_discovery,
-            )
+            from ..storage.mysql.repositories.discovery_repository import reset_discovery
 
             with manager_lock():
                 reset_discovery(
@@ -207,8 +205,15 @@ def main():
                     seeds.extend(s.strip() for s in handle if s.strip() and not s.lstrip().startswith("#"))
             if any(len(s) < 3 for s in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
-            with manager_lock():
-                command_discover(seeds, args.type, args.concurrency, args.rate, args.max_buckets)
+            with manager_lock() as conn:
+                command_discover(
+                    seeds,
+                    args.type,
+                    args.concurrency,
+                    args.rate,
+                    args.max_buckets,
+                    health=lambda: assert_manager_lock(conn),
+                )
     except KeyboardInterrupt:
         print("Interrupted. Resume the same run; unfinished endpoint tasks remain recoverable.")
         raise SystemExit(130) from None
