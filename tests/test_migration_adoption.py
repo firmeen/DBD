@@ -6,7 +6,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0006_external_archive_backend"
+HEAD = "0007_project_attempt_budget"
 
 
 def test_correctness_migration_adopts_existing_objects():
@@ -115,3 +115,24 @@ def test_external_archive_migration_adopts_existing_objects():
             "payload_nonce",
             "payload_object_key",
         ]
+
+
+def test_project_attempt_migration_adopts_existing_column():
+    """0007 remains safe when the column exists but Alembic metadata lagged."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE alembic_version SET version_num='0006_external_archive_backend'")
+        conn.commit()
+
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='endpoint_tasks'
+              AND column_name='project_attempts'
+            """
+        )
+        assert [row["name"] for row in cur.fetchall()] == ["project_attempts"]
