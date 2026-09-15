@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 from redis.asyncio import Redis
 
-from ..core.telemetry import ENDPOINT_EFFECTIVE_RATE, EFFECTIVE_RATE
+from ..core.telemetry import EFFECTIVE_RATE, ENDPOINT_EFFECTIVE_RATE
 from .rate_limit import TokenBucket
 
 
@@ -65,12 +65,14 @@ return wait_ms
 
 
 class EndpointRateController:
-    """Global cap plus independent adaptive endpoint limiters.
+    """Global safety cap plus independent adaptive endpoint limiters.
 
-    Local endpoint buckets react to endpoint-specific 429/503 responses. When Redis
-    is configured, the global cap is shared across processes and every explicitly
-    configured endpoint target also receives its own shared Redis pacer. Therefore
-    an endpoint target is an aggregate cap, not a per-machine multiplier.
+    Every request passes both a global local adaptive bucket and an endpoint-local
+    adaptive bucket. With Redis configured, requests additionally pass shared Redis
+    pacers for the aggregate global cap and every explicitly configured endpoint cap.
+    A 429/503 penalizes the affected endpoint and the process-wide global safety
+    bucket, preventing other endpoints from immediately replacing the rejected load.
+    Explicit Redis caps remain stable coordination ceilings across processes.
     """
 
     def __init__(
@@ -87,10 +89,9 @@ class EndpointRateController:
         }
         self._redis_url = redis_url
         self._redis_key = redis_key
-        self._global = (
-            RedisPacer(redis_url, redis_key, self.target_rate)
-            if redis_url
-            else TokenBucket(self.target_rate)
+        self._global_local = TokenBucket(self.target_rate)
+        self._global_shared = (
+            RedisPacer(redis_url, redis_key, self.target_rate) if redis_url else None
         )
         self._shared_endpoints: dict[str, RedisPacer] = {}
         if redis_url:
@@ -103,19 +104,19 @@ class EndpointRateController:
                 for endpoint, target in self._endpoint_targets.items()
             }
         self._endpoints: dict[str, TokenBucket] = {}
-        EFFECTIVE_RATE.set(self.target_rate)
+        EFFECTIVE_RATE.set(self._global_local.rate)
 
     async def open(self) -> None:
-        if isinstance(self._global, RedisPacer):
-            await self._global.open()
+        if self._global_shared is not None:
+            await self._global_shared.open()
         for pacer in self._shared_endpoints.values():
             await pacer.open()
 
     async def close(self) -> None:
         for pacer in self._shared_endpoints.values():
             await pacer.close()
-        if isinstance(self._global, RedisPacer):
-            await self._global.close()
+        if self._global_shared is not None:
+            await self._global_shared.close()
 
     def _target_for(self, endpoint: str) -> float:
         return min(self.target_rate, self._endpoint_targets.get(endpoint, self.target_rate))
@@ -128,14 +129,13 @@ class EndpointRateController:
         return bucket
 
     def set_target_rate(self, value: float) -> float:
-        """Retarget a probe/controller cleanly without mutating private limiter state."""
+        """Retarget a probe/controller and reset adaptive state to the new ceiling."""
         self.target_rate = _positive_rate(value)
-        if isinstance(self._global, RedisPacer):
-            self._global.set_rate(self.target_rate)
-        else:
-            self._global.target_rate = self.target_rate
-            self._global._set_rate(self.target_rate)
-        EFFECTIVE_RATE.set(self.target_rate)
+        self._global_local.target_rate = self.target_rate
+        self._global_local._set_rate(self.target_rate)
+        if self._global_shared is not None:
+            self._global_shared.set_rate(self.target_rate)
+        EFFECTIVE_RATE.set(self._global_local.rate)
         for endpoint, pacer in self._shared_endpoints.items():
             pacer.set_rate(self._target_for(endpoint))
         for endpoint, bucket in self._endpoints.items():
@@ -146,28 +146,41 @@ class EndpointRateController:
         return self.target_rate
 
     async def acquire(self, endpoint: str) -> None:
-        # Wait on the adaptive/local endpoint gate first so a slow endpoint does
-        # not reserve a global Redis slot that it cannot use yet.
+        # Endpoint admission happens before global admission so a deliberately slow
+        # endpoint does not reserve a scarce global slot while waiting locally.
         await self._bucket(endpoint).acquire()
         shared_endpoint = self._shared_endpoints.get(endpoint)
         if shared_endpoint is not None:
             await shared_endpoint.acquire()
-        await self._global.acquire()
+        await self._global_local.acquire()
+        if self._global_shared is not None:
+            await self._global_shared.acquire()
 
-    def penalize(self, endpoint: str, cooldown_seconds: float) -> tuple[float, float]:
-        bucket = self._bucket(endpoint)
-        old_rate = bucket.rate
-        new_rate = bucket.slow_down()
-        bucket.cooldown(cooldown_seconds)
-        ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(new_rate)
-        return old_rate, new_rate
+    def penalize(self, endpoint: str, cooldown_seconds: float) -> tuple[float, float, float, float]:
+        endpoint_bucket = self._bucket(endpoint)
+        old_endpoint = endpoint_bucket.rate
+        new_endpoint = endpoint_bucket.slow_down()
+        endpoint_bucket.cooldown(cooldown_seconds)
+        ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(new_endpoint)
 
-    def recover(self, endpoint: str) -> float | None:
-        bucket = self._bucket(endpoint)
-        recovered = bucket.recover()
-        if recovered is not None:
-            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(recovered)
-        return recovered
+        old_global = self._global_local.rate
+        new_global = self._global_local.slow_down()
+        self._global_local.cooldown(cooldown_seconds)
+        EFFECTIVE_RATE.set(new_global)
+        return old_endpoint, new_endpoint, old_global, new_global
+
+    def recover(self, endpoint: str) -> tuple[float | None, float | None]:
+        endpoint_bucket = self._bucket(endpoint)
+        endpoint_recovered = endpoint_bucket.recover()
+        if endpoint_recovered is not None:
+            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_recovered)
+        global_recovered = self._global_local.recover()
+        if global_recovered is not None:
+            EFFECTIVE_RATE.set(global_recovered)
+        return endpoint_recovered, global_recovered
 
     def effective_rate(self, endpoint: str) -> float:
         return self._bucket(endpoint).rate
+
+    def global_effective_rate(self) -> float:
+        return self._global_local.rate
