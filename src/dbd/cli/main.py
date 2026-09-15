@@ -9,7 +9,7 @@ from ..core.settings import settings
 from ..core.telemetry import configure
 from ..runtime.locking import manager_lock
 from ..runtime.resources import endpoints
-from ..runtime.worker import prepare, process
+from ..runtime.worker import STATUS_OPERATING, prepare, process
 from ..storage.mysql.async_engine import create_engine
 from ..storage.mysql.repositories.worker_repository import WorkerRepository
 
@@ -67,7 +67,12 @@ async def worker_command(args, health=None):
             await repo.ready(run_id)
         elif args.file or args.master:
             run_id = await prepare(
-                repo, file=args.file, master=args.master, parts=args.only, fiscal_year=args.fiscal_year
+                repo,
+                file=args.file,
+                master=args.master,
+                parts=args.only,
+                fiscal_year=args.fiscal_year,
+                statuses=None if args.all_statuses else STATUS_OPERATING,
             )
         else:
             run = await repo.get_run(args.run_id)
@@ -124,6 +129,12 @@ def main():
             source.add_argument("--run-id", type=positive)
             p.add_argument("--limit", type=positive, help="Maximum endpoint attempts in this invocation")
             p.add_argument("--enqueue-only", action="store_true")
+            p.add_argument(
+                "--all-statuses",
+                action="store_true",
+                help="Include struck-off, liquidated and dissolved companies"
+                " (default: only companies still operating)",
+            )
     for name in ("bulk-status", "bulk-retry"):
         p = sub.add_parser(name)
         p.add_argument("run_id", type=positive, nargs="?" if name.endswith("status") else None)

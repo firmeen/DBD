@@ -4,7 +4,7 @@ import json
 from datetime import datetime, timezone
 from hashlib import sha256
 
-from sqlalchemy import text
+from sqlalchemy import bindparam, text
 from sqlalchemy.exc import OperationalError
 from tenacity import (
     retry,
@@ -101,19 +101,34 @@ class WorkerRepository:
             )
 
     @transaction_retry
-    async def enqueue_master(self, run_id, resources, after_id, batch_size):
+    async def enqueue_master(self, run_id, resources, after_id, batch_size, statuses=None):
+        """Enqueue discovered companies, optionally restricted by juristic status.
+
+        Status arrives free with discovery (`jpStatCode` is one of the fields a
+        search page already returns), so filtering here costs nothing and removes
+        the work before any request exists. It matters: in the collected data only
+        about 38% of companies are still operating, the rest being struck off,
+        liquidated or dissolved, and those hold no current filings to fetch.
+        """
+        clause = ""
+        params = {"after": after_id, "size": batch_size}
+        if statuses:
+            # Join to companies because status lives on the projection, not on
+            # the identity table. Companies never projected have no status yet
+            # and are left out rather than guessed at.
+            clause = " AND EXISTS (SELECT 1 FROM companies c WHERE c.jp_no=m.jp_no" \
+                     " AND c.jp_stat_code IN :statuses)"
+            params["statuses"] = tuple(statuses)
+
+        query = text(
+            "SELECT m.company_id FROM company_master m WHERE m.company_id>:after"
+            " AND m.identity_status<>'conflict'" + clause + " ORDER BY m.company_id LIMIT :size"
+        )
+        if statuses:
+            query = query.bindparams(bindparam("statuses", expanding=True))
+
         async with self.engine.begin() as conn:
-            ids = list(
-                (
-                    await conn.execute(
-                        text("""
-                SELECT company_id FROM company_master WHERE company_id>:after
-                AND identity_status<>'conflict' ORDER BY company_id LIMIT :size
-            """),
-                        {"after": after_id, "size": batch_size},
-                    )
-                ).scalars()
-            )
+            ids = list((await conn.execute(query, params)).scalars())
             if ids:
                 await conn.execute(
                     text("""

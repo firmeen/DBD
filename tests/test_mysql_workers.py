@@ -133,3 +133,65 @@ async def test_cancellation_returns_leases(repo):
     with pytest.raises(asyncio.CancelledError):
         await task
     assert await repo.progress(run) == {"pending": 3}
+
+
+async def test_enqueue_master_filters_by_status(repo):
+    """Dead companies must never reach the queue.
+
+    Status arrives free with discovery, so filtering costs nothing and removes
+    the requests before they exist. About 62% of collected companies are struck
+    off, liquidated or dissolved and hold no current filings.
+    """
+    run = await repo.create_run("status-filter-" + uuid4().hex, ["profile"])
+    start = int(uuid4().hex[:10], 16)
+    operating = parse_code("7" + str(start).zfill(13))
+    struck_off = parse_code("7" + str(start + 1).zfill(13))
+
+    # Registers both identities in company_master; this run is not the one under test.
+    await repo.import_batch(run, [operating, struck_off], ("profile",))
+
+    # The projection carries the status; give one of each. companies.latest_raw_response_id
+    # is a real foreign key, so a raw row has to exist first.
+    async with repo.engine.begin() as conn:
+        raw_id = (
+            await conn.execute(
+                text("""
+                INSERT INTO raw_responses (jp_type_code, jp_no, endpoint, request_path,
+                                           requested_at, http_status, response_body_sha256, raw_json)
+                VALUES ('7', :no, 'profile', '/test', UTC_TIMESTAMP(6), 200, REPEAT('0', 64), '{}')
+            """),
+                {"no": operating.jp_no},
+            )
+        ).lastrowid
+
+        for identity, code in ((operating, "1"), (struck_off, "8")):
+            await conn.execute(
+                text("""
+                INSERT INTO companies (jp_no, jp_type_code, jp_stat_code,
+                                       latest_raw_response_id, first_seen_at, last_seen_at)
+                VALUES (:no, :kind, :stat, :raw, UTC_TIMESTAMP(6), UTC_TIMESTAMP(6))
+                ON DUPLICATE KEY UPDATE jp_stat_code = VALUES(jp_stat_code)
+            """),
+                {"no": identity.jp_no, "kind": identity.jp_type_code, "stat": code, "raw": raw_id},
+            )
+
+    filtered = await repo.create_run("filtered-" + uuid4().hex, ["profile"])
+    after = 0
+    while (after := await repo.enqueue_master(filtered, ("profile",), after, 500, ("1",))) is not None:
+        pass
+
+    async with repo.engine.connect() as conn:
+        queued = set(
+            (
+                await conn.execute(
+                    text("""
+                    SELECT m.jp_no FROM endpoint_tasks t JOIN company_master m USING (company_id)
+                    WHERE t.run_id = :run
+                """),
+                    {"run": filtered},
+                )
+            ).scalars()
+        )
+
+    assert operating.jp_no in queued
+    assert struck_off.jp_no not in queued, "a struck-off company was queued for collection"

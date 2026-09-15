@@ -92,12 +92,32 @@ treating the row count as proof.
 ## Phase 2: depth
 
 ```powershell
-dbd-data bulk --master              # enqueue every discovered company, then work it
+dbd-data bulk --master              # companies still operating (default)
+dbd-data bulk --master --all-statuses   # include struck-off/liquidated/dissolved
 dbd-data bulk --run-id N            # resume a specific run
 dbd-data bulk-status                # progress
 dbd-data bulk-status N              # that run's failures
 dbd-data bulk-retry N               # requeue its failures
 ```
+
+### Only operating companies, by default
+
+Measured over 222,888 discovered companies:
+
+| สถานะ | Share |
+| --- | ---: |
+| ร้าง (struck off) | 38.7% |
+| **ยังดำเนินกิจการอยู่ (operating)** | **38.2%** |
+| เสร็จการชำระบัญชี (liquidated) | 15.9% |
+| เลิก (dissolved) | 4.0% |
+| แปรสภาพ, อื่น ๆ | 3.2% |
+
+Roughly **62% of companies are no longer trading** and have no current filings
+to fetch. Status arrives free with discovery (`jpStatCode` is already in a
+search page), so they are filtered out before a task is created rather than
+requested and discarded — no request, no archive row, no projection.
+
+Pass `--all-statuses` when historical records matter, accepting ~2.6x the work.
 
 Progress is committed per task, so an interrupt costs at most the tasks in
 flight. Re-running is always safe.
@@ -120,12 +140,19 @@ Those appear as `not_available` in `bulk-status`. They are skips, not failures.
 
 ## Scale and expectations
 
-At one million companies, with `DBD_RATE_PER_SECOND=10`:
+At one million companies discovered, five requests per company (four
+unconditional plus financials where filed):
 
-| Phase | Requests | Time |
-| --- | ---: | ---: |
-| discovery | ~250k (incl. overlap) | ~7 h |
-| depth (7 endpoints) | ~5M | ~6 days |
+| Scope | Companies | Requests | @10/s | @15/s | @20/s |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| discovery | — | ~250k | ~7 h | ~5 h | ~3.5 h |
+| depth, `--all-statuses` | 1,000,000 | ~5.0M | 5.8 d | 3.9 d | 2.9 d |
+| **depth, operating only (default)** | **382,000** | **~1.9M** | **2.2 d** | **1.5 d** | **1.1 d** |
+
+The status filter is what brings a full pass inside a couple of days without
+touching the request rate; going faster than that means raising
+`DBD_RATE_PER_SECOND`, which is bounded by a ceiling nobody has measured yet
+(see `VALIDATION.md`). Concurrency above the rate cap changes nothing.
 
 Rate is the only lever. Time is `requests ÷ rate`; raising `DBD_CONCURRENCY`
 above the rate cap changes nothing. Storage runs roughly 45-50 KB per company

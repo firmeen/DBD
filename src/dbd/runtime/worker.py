@@ -32,7 +32,14 @@ def code_batches(path: str, size: int):
             yield batch
 
 
-async def prepare(repo, *, file=None, master=False, parts=None, fiscal_year=None):
+# jp_stat_code values, from /commons and confirmed against collected data.
+# Only "1" describes a company that is still operating and therefore still
+# filing; the rest are struck off, liquidated, dissolved or already transformed
+# into another entity, and hold no current data worth a request.
+STATUS_OPERATING = ("1",)
+
+
+async def prepare(repo, *, file=None, master=False, parts=None, fiscal_year=None, statuses=None):
     resources = endpoints(list(parts or DEFAULT_PARTS))
     run_id = await repo.create_run(
         str(Path(file).resolve()) if file else "company_master",
@@ -45,7 +52,9 @@ async def prepare(repo, *, file=None, master=False, parts=None, fiscal_year=None
     elif master:
         after = 0
         while (
-            after := await repo.enqueue_master(run_id, resources, after, settings.dbd_write_batch_size)
+            after := await repo.enqueue_master(
+                run_id, resources, after, settings.dbd_write_batch_size, statuses
+            )
         ) is not None:
             pass
     else:
