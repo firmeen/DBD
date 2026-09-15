@@ -13,6 +13,7 @@ from ..client.endpoints.search import (
     parse_search_response,
 )
 from ..contracts.company import normalize
+from ..core.exceptions import ContractError
 from ..core.settings import settings
 from ..storage.mysql.repositories.discovery_repository import (
     discovery_summary,
@@ -22,11 +23,14 @@ from ..storage.mysql.repositories.discovery_repository import (
 )
 
 # Split dimensions, applied in this order. jpType is first because the
-# reference implementation validated it as lossless (the eight type counts
-# summed exactly to the unfiltered parent count), whereas numeric-prefix
-# splitting provably is not.
+# reference implementation validated it as lossless on the observed data.
 JP_TYPES = ("0", "2", "3", "5", "7", "8", "9", "A")
 BUSINESS_SIZES = ("S", "M", "L")
+
+# 099 was observed in collected company numbers but is not represented by the
+# province-prefix seed list. Keep it explicit until an authoritative population
+# reconciliation proves a more general seed strategy.
+EXTRA_PREFIX_SEEDS = ("099",)
 
 
 @dataclass
@@ -102,43 +106,31 @@ def _children_for(filters: SearchFilters, provinces: list[str]) -> list[SearchFi
 async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
     data = await client.get("/api/v1/commons/provinces")
     if not isinstance(data, list):
-        return []
-    return [str(r["pvCode"]) for r in data if isinstance(r, dict) and r.get("pvCode")]
+        raise ContractError("Province response must be a JSON array")
+    provinces = [str(r["pvCode"]) for r in data if isinstance(r, dict) and r.get("pvCode")]
+    if not provinces:
+        raise ContractError("Province response contains no usable pvCode values")
+    return provinces
 
 
 async def province_seeds(client: AsyncDbdClient) -> list[str]:
-    """The seed set that provably covers every company.
+    """Return the current registration-prefix seeds plus audited exceptions.
 
-    A Thai juristic person number is thirteen digits beginning with "0" followed
-    by the two-digit province code of *registration*. Verified against every row
-    already collected: all 13 digits long, all starting with "0", and every
-    distinct three-digit prefix is "0" + a code from /commons/provinces.
-
-    Search matches a number as a substring, so a search for "0" + province
-    necessarily returns every company whose number *starts* with it. Seeding one
-    keyword per province therefore covers the whole registration space by
-    construction - no reconciliation against an external total required - using
-    about 77 seeds rather than the 1,000 that blind three-digit enumeration
-    would need.
-
-    Substring matching also returns companies that merely contain the seed
-    elsewhere. Those are harmless duplicates: they are deduplicated on
-    (jp_type_code, jp_no), and they can only add coverage, never remove it.
-
-    Note this is the registration province, which is not always the company's
-    current address province - a company that moves keeps its original number.
-    That is exactly why seeding is done on the number and not on the pvCodeList
-    filter, which matches the current address and would miss relocated companies.
+    Province prefixes cover the known 13-digit registration-number format, but
+    they are not treated as proof of the whole population: type A shorter IDs,
+    future formats and live search behavior require reconciliation separately.
     """
     provinces = await fetch_provinces(client)
-    return sorted({f"0{str(pv).zfill(2)}" for pv in provinces if str(pv).strip()})
+    return sorted(
+        {f"0{str(pv).zfill(2)}" for pv in provinces if str(pv).strip()} | set(EXTRA_PREFIX_SEEDS)
+    )
 
 
 def coverage_gaps() -> list[str]:
-    """Company-number prefixes that no completed seed bucket could have produced.
+    """Observed company-number prefixes that have no matching seed bucket.
 
-    A non-empty result means the seed set did not actually cover the data, which
-    is the one way this strategy can fail silently.
+    Zero observed gaps is necessary but not sufficient proof of completeness;
+    companies never returned by any search cannot appear in this query.
     """
     from ..storage.mysql.engine import connect
 
@@ -157,66 +149,148 @@ def coverage_gaps() -> list[str]:
         return [row["prefix"] for row in cur.fetchall()]
 
 
-async def _count(client: AsyncDbdClient, filters: SearchFilters) -> tuple[int, int]:
-    """Page 1 doubles as the count probe, so nothing is wasted."""
+async def _count(client: AsyncDbdClient, bucket_id: int, filters: SearchFilters):
+    """Fetch and archive page 1 once; it is reused if the bucket is drainable."""
+    from ..storage.mysql.repositories.discovery_repository import archive_search
+
+    requested = _now()
     data = await client.post(
         SEARCH_PATH,
         filters.payload(page=1),
         referer=SEARCH_REFERER,
         timeout=settings.dbd_count_timeout_seconds,
     )
+    archive_id = await asyncio.to_thread(
+        archive_search, bucket_id, 1, filters, data, requested, link_page=False
+    )
     page = parse_search_response(data)
-    return page.total_items, page.total_pages
+    return page, archive_id, data, requested
 
 
-async def _drain_bucket(client, bucket_id, filters, pages_total, start_page, *, verbose):
-    from ..core.exceptions import ContractError
+def _normalize_rows(rows: list[dict]) -> tuple[list, list[dict]]:
+    profiles = []
+    rejections = []
+    for row_index, row in enumerate(rows):
+        try:
+            profiles.append(normalize(row))
+        except ContractError as exc:
+            rejections.append(
+                {
+                    "row_index": row_index,
+                    "payload": row,
+                    "error_code": type(exc).__name__,
+                    "error_message": str(exc),
+                }
+            )
+    return profiles, rejections
+
+
+async def _drain_bucket(
+    client,
+    bucket_id,
+    filters,
+    pages_total,
+    start_page,
+    *,
+    verbose,
+    first_page=None,
+):
     from ..storage.mysql.repositories.discovery_repository import (
         archive_search,
         completed_pages,
         fail_page,
         finish_page,
+        link_search_page,
         page_progress,
     )
 
     update_bucket(bucket_id, status="draining", last_error=None)
     completed = await asyncio.to_thread(completed_pages, bucket_id)
-    # Never derive a page number from a count of successful concurrent requests.
     pages = [p for p in range(1, pages_total + 1) if p not in completed]
 
     async def one_page(page_no):
         try:
-            requested = _now()
-            data = await client.post(SEARCH_PATH, filters.payload(page=page_no), referer=SEARCH_REFERER)
-            archive_id = await asyncio.to_thread(archive_search, bucket_id, page_no, filters, data, requested)
+            if page_no == 1 and first_page is not None:
+                archive_id, data, requested = first_page
+                await asyncio.to_thread(link_search_page, bucket_id, page_no, archive_id)
+            else:
+                requested = _now()
+                data = await client.post(
+                    SEARCH_PATH, filters.payload(page=page_no), referer=SEARCH_REFERER
+                )
+                archive_id = await asyncio.to_thread(
+                    archive_search, bucket_id, page_no, filters, data, requested
+                )
+
             page = parse_search_response(data)
             if page.current_page != page_no or (not page.rows and page.total_items > 0):
                 raise ContractError("Search page number or empty-page contract mismatch")
-            profiles = [normalize(row) for row in page.rows]
+            profiles, rejections = _normalize_rows(page.rows)
             return await asyncio.to_thread(
-                finish_page, bucket_id, page_no, archive_id, profiles, data, requested
+                finish_page,
+                bucket_id,
+                page_no,
+                archive_id,
+                profiles,
+                data,
+                requested,
+                rejections,
             )
         except Exception as exc:
             await asyncio.to_thread(fail_page, bucket_id, page_no, type(exc).__name__)
             return None
 
     fetched = written = 0
-    for offset in range(0, len(pages), client.concurrency):
-        results = await asyncio.gather(*(one_page(p) for p in pages[offset : offset + client.concurrency]))
-        fetched += sum(r is not None for r in results)
-        written += sum(r for r in results if r is not None)
+    iterator = iter(pages)
+    in_flight: set[asyncio.Task] = set()
+
+    def fill():
+        while len(in_flight) < client.concurrency:
+            try:
+                page_no = next(iterator)
+            except StopIteration:
+                return
+            in_flight.add(asyncio.create_task(one_page(page_no)))
+
+    fill()
+    while in_flight:
+        done, in_flight = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
+        for task in done:
+            result = task.result()
+            if result is not None:
+                fetched += 1
+                written += result
+        fill()
         progress = await asyncio.to_thread(page_progress, bucket_id)
-        update_bucket(bucket_id, pages_done=progress["done"], rows_seen=progress["rows"])
+        update_bucket(
+            bucket_id,
+            pages_done=progress["done"],
+            rows_seen=progress["rows"] + progress["rejected"],
+        )
         if verbose:
-            print(f"    pages {progress['done']}/{pages_total}, rows {progress['rows']}")
+            print(
+                f"    pages {progress['done']}/{pages_total}, partial {progress['partial']}, "
+                f"rows {progress['rows']}, quarantined {progress['rejected']}"
+            )
+
     progress = await asyncio.to_thread(page_progress, bucket_id)
-    complete = progress["done"] == pages_total and progress["failed"] == 0
+    complete = (
+        progress["done"] == pages_total
+        and progress["failed"] == 0
+        and progress["partial"] == 0
+    )
+    if complete:
+        error = None
+    elif progress["partial"]:
+        error = "One or more pages contain quarantined rows; fix the contract and run discover-retry"
+    else:
+        error = "One or more pages failed; run discover-retry"
     update_bucket(
         bucket_id,
         status="done" if complete else "failed",
         pages_done=progress["done"],
-        rows_seen=progress["rows"],
-        last_error=None if complete else "One or more pages failed; run discover-retry",
+        rows_seen=progress["rows"] + progress["rejected"],
+        last_error=error,
     )
     return fetched, written
 
@@ -236,9 +310,12 @@ async def _process_bucket(
 
     total_items = row["total_items"]
     pages_total = row["pages_total"]
+    first_page = None
 
     if total_items is None:
-        total_items, pages_total = await _count(client, filters)
+        page, archive_id, data, requested = await _count(client, bucket_id, filters)
+        total_items, pages_total = page.total_items, page.total_pages
+        first_page = (archive_id, data, requested)
         update_bucket(bucket_id, total_items=total_items, pages_total=pages_total, status="counted")
         if verbose:
             print(f"    totalItems={total_items:,} pages={pages_total}")
@@ -250,11 +327,13 @@ async def _process_bucket(
     if total_items > MAX_ROWS_PER_QUERY:
         children = _children_for(filters, provinces)
         if not children:
-            # Out of split dimensions: this bucket cannot be fully read.
             update_bucket(
                 bucket_id,
                 status="failed",
-                last_error=f"{total_items} rows exceeds the {MAX_ROWS_PER_QUERY} ceiling and no split dimension remains",
+                last_error=(
+                    f"{total_items} rows exceeds the {MAX_ROWS_PER_QUERY} ceiling "
+                    "and no split dimension remains"
+                ),
             )
             return 0, 0
 
@@ -266,23 +345,23 @@ async def _process_bucket(
             print(f"    too large -> split into {len(children)} child bucket(s)")
         return 0, 0
 
-    return await _drain_bucket(client, bucket_id, filters, pages_total, 1, verbose=verbose)
+    return await _drain_bucket(
+        client,
+        bucket_id,
+        filters,
+        pages_total,
+        1,
+        verbose=verbose,
+        first_page=first_page,
+    )
 
 
 def validate_splits(verbose: bool = True) -> int:
-    """Record, for every split bucket, whether SUM(children) == parent.
-
-    A mismatch does not stop ingestion, but it means that partition is not
-    lossless and coverage below it cannot be claimed as complete.
-    """
+    """Record, for every split bucket, whether SUM(children) == parent."""
     from ..storage.mysql.engine import connect
 
     checked = 0
     with connect() as conn, conn.cursor() as cur:
-        # A partition can only be judged once every child has been counted.
-        # Comparing against a partial sum would report a perfectly good split
-        # as lossy, which would discredit the one guarantee this check exists
-        # to provide.
         cur.execute(
             """
             SELECT p.id, p.total_items,
@@ -314,16 +393,76 @@ def validate_splits(verbose: bool = True) -> int:
 
         if verbose and not lossless:
             delta = children - parent_total
-            # The counts are taken at different moments against live data, so a
-            # delta of a row or two usually means a registration changed between
-            # the parent count and the child counts, not a broken partition.
-            # A large delta means the split really is losing or duplicating rows.
             print(
                 f"  bucket {row['id']}: SUM(children)={children:,} vs parent={parent_total:,} "
-                f"(delta {delta:+,})"
+                f"(delta {delta:+,}); completeness is blocked until reconciled"
             )
 
     return checked
+
+
+async def _run_work(
+    client,
+    seeds,
+    search_type,
+    max_buckets,
+    verbose,
+) -> DiscoveryResult:
+    buckets_processed = pages_fetched = companies_written = 0
+    provinces = await fetch_provinces(client)
+    if verbose:
+        print(f"provinces available for splitting: {len(provinces)}")
+
+    # With no explicit seed, always upsert the current default seed set. This is
+    # idempotent and lets newly audited exceptions such as 099 join an existing
+    # checkpointed campaign without a reset.
+    if not seeds:
+        seeds = await province_seeds(client)
+        if verbose:
+            print(f"seeding/resuming from {len(seeds)} audited prefixes")
+
+    for seed in seeds:
+        upsert_bucket(SearchFilters(keyword=seed, search_type=search_type))
+
+    while True:
+        rows = pending_buckets(limit=25)
+        if not rows:
+            break
+        if max_buckets is not None:
+            remaining = max_buckets - buckets_processed
+            if remaining <= 0:
+                if verbose:
+                    print(f"stopping at --max-buckets={max_buckets}")
+                break
+            rows = rows[:remaining]
+
+        # Process a small bounded set of buckets concurrently. The HTTP client
+        # still owns the global semaphore/rate limiter, so this removes bucket
+        # head-of-line blocking without multiplying actual transport concurrency.
+        bucket_parallelism = max(1, min(4, client.concurrency // 4 or 1, len(rows)))
+        batch = rows[:bucket_parallelism]
+
+        async def process_one(row):
+            try:
+                pages, written = await _process_bucket(client, row, provinces, verbose=verbose)
+                return pages, written
+            except Exception as exc:
+                update_bucket(
+                    int(row["id"]),
+                    status="failed",
+                    last_error=f"{type(exc).__name__}: {str(exc)[:300]}",
+                )
+                if verbose:
+                    print(f"    bucket {row['id']} FAILED: {type(exc).__name__}: {str(exc)[:120]}")
+                return 0, 0
+
+        results = await asyncio.gather(*(process_one(row) for row in batch))
+        buckets_processed += len(batch)
+        pages_fetched += sum(pages for pages, _ in results)
+        companies_written += sum(written for _, written in results)
+
+    validate_splits(verbose)
+    return DiscoveryResult(buckets_processed, pages_fetched, companies_written, client.requests_made)
 
 
 async def run(
@@ -334,62 +473,47 @@ async def run(
     rate: float | None = None,
     max_buckets: int | None = None,
     verbose: bool = True,
+    health=None,
 ) -> DiscoveryResult:
-    """Enumerate companies from seed keywords, splitting oversized buckets.
-
-    One search page carries ten complete company profiles โ€” the same field set
-    the per-company profile endpoint returns โ€” so this writes full company rows
-    rather than only a list of registration numbers.
-    """
-    buckets_processed = pages_fetched = companies_written = 0
+    """Enumerate companies with durable page checkpoints and explicit partial state."""
+    stop = asyncio.Event()
 
     async with AsyncDbdClient(concurrency=concurrency, rate_per_second=rate) as client:
-        provinces = await fetch_provinces(client)
-        if verbose:
-            print(f"provinces available for splitting: {len(provinces)}")
-
-        if not seeds and not pending_buckets(limit=1):
-            # Nothing given and nothing outstanding: start a full pass from the
-            # province-prefix cover, which is complete by construction. With work
-            # still pending this stays a plain resume, and explicit seeds are
-            # still honoured for probing a single bucket.
-            seeds = await province_seeds(client)
-            if verbose:
-                print(f"seeding from province prefixes: {len(seeds)} seeds ({seeds[0]}..{seeds[-1]})")
-
-        for seed in seeds:
-            upsert_bucket(SearchFilters(keyword=seed, search_type=search_type))
-
-        while True:
-            rows = pending_buckets(limit=25)
-            if not rows:
-                break
-
-            for row in rows:
-                if max_buckets is not None and buckets_processed >= max_buckets:
-                    if verbose:
-                        print(f"stopping at --max-buckets={max_buckets}")
-                    validate_splits(verbose)
-                    return DiscoveryResult(
-                        buckets_processed, pages_fetched, companies_written, client.requests_made
-                    )
-
+        async def monitor_health():
+            if health is None:
+                await stop.wait()
+                return
+            while not stop.is_set():
+                await asyncio.to_thread(health)
                 try:
-                    pages, written = await _process_bucket(client, row, provinces, verbose=verbose)
-                except Exception as exc:
-                    update_bucket(int(row["id"]), status="failed", last_error=f"{type(exc).__name__}: {exc}")
-                    if verbose:
-                        print(f"    bucket {row['id']} FAILED: {type(exc).__name__}: {str(exc)[:120]}")
-                    buckets_processed += 1
-                    continue
+                    await asyncio.wait_for(stop.wait(), 2)
+                except TimeoutError:
+                    pass
 
-                buckets_processed += 1
-                pages_fetched += pages
-                companies_written += written
+        async def work():
+            try:
+                return await _run_work(client, seeds, search_type, max_buckets, verbose)
+            finally:
+                stop.set()
 
-        validate_splits(verbose)
+        async with asyncio.TaskGroup() as group:
+            group.create_task(monitor_health())
+            task = group.create_task(work())
 
-    return DiscoveryResult(buckets_processed, pages_fetched, companies_written, client.requests_made)
+    result = task.result()
+    status = discovery_summary()
+    blockers = []
+    if int(status.get("buckets_failed") or 0):
+        blockers.append(f"{status['buckets_failed']} failed bucket(s)")
+    if int(status.get("pages_partial") or 0):
+        blockers.append(f"{status['pages_partial']} partial page(s)")
+    if int(status.get("unresolved_rejections") or 0):
+        blockers.append(f"{status['unresolved_rejections']} quarantined row(s)")
+    if int(status.get("partitions_lossy") or 0):
+        blockers.append(f"{status['partitions_lossy']} lossy partition(s)")
+    if blockers and max_buckets is None:
+        raise ContractError("Discovery incomplete: " + ", ".join(blockers))
+    return result
 
 
 def summary() -> dict:
