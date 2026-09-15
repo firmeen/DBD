@@ -5,21 +5,23 @@ measurements and from assumptions that still need production evidence.
 
 ## Current CI evidence
 
-PR #1 head before the final documentation pass:
+The authoritative validation record is the **latest GitHub Actions run for the
+current PR head**. The workflow runs:
 
 ```text
-commit 58ab1b01d972c0a708fe6964f36acd85129fef5e
-python -m compileall -q src scripts tests   PASS
-ruff check .                                PASS
-pytest -q                                   50 passed in 7.24s
+python -m compileall -q src scripts tests
+ruff check .
+pytest -q
 ```
 
-The workflow runs on Python 3.12 with a disposable MySQL 8.4 service using
+on Python 3.12 with a disposable MySQL 8.4 service using
 `DB_NAME=dbd_test_ci` and `DBD_INTEGRATION=1`. Integration tests therefore apply
 Alembic migrations to a real MySQL server and exercise queue/projection behavior;
 they are not mocks of SQL semantics.
 
-The final PR head must rerun this workflow after documentation/code changes.
+Do not copy a pass count or commit SHA from an older PR head into this document.
+Any source, migration, test or documentation commit creates a new head and must be
+validated by that head's workflow before the PR is considered ready.
 
 ## Correctness guarantees covered by tests
 
@@ -46,7 +48,9 @@ The current suite covers, among other cases:
 - shared industry benchmark freshness across different companies;
 - all 11 implemented endpoints still project when explicitly requested;
 - default endpoint scope remains tabs 1-2 only;
-- migration repeatability on a disposable MySQL database.
+- identity conflicts become durable master/task/archive state and are excluded from generic retry;
+- migration repeatability on disposable MySQL, including replay of revision 0004 when
+  DDL objects already exist but Alembic metadata still points to revision 0003.
 
 ## Identity format: corrected statement
 
