@@ -26,7 +26,7 @@ class ProgressLine:
     enabled: bool = True
 
     def __post_init__(self) -> None:
-        self._last_render = 0.0
+        self._last_render: float | None = None
         self._last_width = 0
         self._closed = False
 
@@ -41,7 +41,11 @@ class ProgressLine:
         if not self.enabled or self._closed:
             return
         now = time.monotonic()
-        if not force and now - self._last_render < self.interval:
+        if (
+            not force
+            and self._last_render is not None
+            and now - self._last_render < self.interval
+        ):
             return
         self._last_render = now
         percent = (100.0 * current / total) if total > 0 else 0.0
