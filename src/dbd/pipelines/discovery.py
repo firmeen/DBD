@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
@@ -15,6 +16,7 @@ from ..client.endpoints.search import (
 from ..contracts.company import normalize
 from ..core.exceptions import ContractError
 from ..core.settings import settings
+from ..runtime.collection_fabric import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
     discovery_summary,
     pending_buckets,
@@ -33,6 +35,33 @@ class DiscoveryResult:
     pages_fetched: int
     companies_written: int
     requests_made: int
+
+
+@dataclass
+class _BatchController:
+    """Tiny closed-loop controller for DB microbatch pressure.
+
+    HTTP admission remains governed by AsyncDbdClient's adaptive rate controller.
+    This controller changes DB batch size from queue pressure so projection can
+    absorb bursts without making the network workers wait on one page at a time.
+    """
+
+    size: int
+    minimum: int
+    maximum: int
+
+    @classmethod
+    def build(cls, concurrency: int) -> _BatchController:
+        configured = max(1, int(settings.dbd_archive_batch_size))
+        maximum = max(configured, min(64, max(8, concurrency * 2)))
+        return cls(size=min(configured, maximum), minimum=1, maximum=maximum)
+
+    def observe(self, queue_depth: int, queue_capacity: int, persist_seconds: float) -> None:
+        pressure = queue_depth / max(1, queue_capacity)
+        if pressure >= 0.70:
+            self.size = min(self.maximum, max(self.size + 1, int(self.size * 1.5)))
+        elif pressure <= 0.15 and persist_seconds >= 0.75:
+            self.size = max(self.minimum, self.size // 2)
 
 
 def _now() -> datetime:
@@ -108,12 +137,7 @@ async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
 
 
 async def province_seeds(client: AsyncDbdClient) -> list[str]:
-    """Return the current registration-prefix seeds plus audited exceptions.
-
-    Province prefixes cover the known 13-digit registration-number format, but
-    they are not treated as proof of the whole population: type A shorter IDs,
-    future formats and live search behavior require reconciliation separately.
-    """
+    """Return the current registration-prefix seeds plus audited exceptions."""
     provinces = await fetch_provinces(client)
     return sorted(
         {f"0{str(pv).zfill(2)}" for pv in provinces if str(pv).strip()} | set(EXTRA_PREFIX_SEEDS)
@@ -121,11 +145,7 @@ async def province_seeds(client: AsyncDbdClient) -> list[str]:
 
 
 def coverage_gaps() -> list[str]:
-    """Observed company-number prefixes that have no matching seed bucket.
-
-    Zero observed gaps is necessary but not sufficient proof of completeness;
-    companies never returned by any search cannot appear in this query.
-    """
+    """Observed company-number prefixes that have no matching seed bucket."""
     from ..storage.mysql.engine import connect
 
     with connect() as conn, conn.cursor() as cur:
@@ -145,10 +165,7 @@ def coverage_gaps() -> list[str]:
 
 async def _count(client: AsyncDbdClient, bucket_id: int, filters: SearchFilters):
     """Fetch and archive page 1 once; it is reused if the bucket is drainable."""
-    from ..storage.mysql.repositories.discovery_repository import (
-        archive_search,
-        mark_search_archive,
-    )
+    from ..storage.mysql.repositories.discovery_repository import archive_search, mark_search_archive
 
     requested = _now()
     data = await client.post(
@@ -195,84 +212,143 @@ async def _drain_bucket(
     *,
     verbose,
     first_page=None,
+    master_cache: dict[tuple[str, str], str] | None = None,
 ):
-    from ..storage.mysql.repositories.discovery_repository import (
-        archive_search,
-        completed_pages,
-        fail_page,
-        finish_page,
-        link_search_page,
-        page_progress,
-    )
+    from ..storage.mysql.repositories.discovery_batch_repository import persist_page_batch
+    from ..storage.mysql.repositories.discovery_repository import completed_pages, fail_page, page_progress
 
+    del start_page  # completion checkpoints, not a numeric cursor, define resume work.
     update_bucket(bucket_id, status="draining", last_error=None)
     completed = await asyncio.to_thread(completed_pages, bucket_id)
     pages = [p for p in range(1, pages_total + 1) if p not in completed]
+    if not pages:
+        progress = await asyncio.to_thread(page_progress, bucket_id)
+        update_bucket(
+            bucket_id,
+            status="done" if progress["done"] == pages_total else "failed",
+            pages_done=progress["done"],
+            rows_seen=progress["rows"] + progress["rejected"],
+            last_error=None if progress["done"] == pages_total else "Discovery page state incomplete",
+        )
+        return 0, 0
 
-    async def one_page(page_no):
+    cache = master_cache if master_cache is not None else {}
+    page_queue: asyncio.Queue[int] = asyncio.Queue()
+    for page_no in pages:
+        page_queue.put_nowait(page_no)
+    result_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=max(8, client.concurrency * 2))
+    workers_done = asyncio.Event()
+    controller = _BatchController.build(client.concurrency)
+    fetched = 0
+    written = 0
+    next_progress_at = 0.0
+
+    async def fetch_one(page_no: int) -> dict | None:
         try:
+            archive_id = None
             if page_no == 1 and first_page is not None:
                 archive_id, data, requested = first_page
-                await asyncio.to_thread(link_search_page, bucket_id, page_no, archive_id)
             else:
                 requested = _now()
                 data = await client.post(
-                    SEARCH_PATH, filters.payload(page=page_no), referer=SEARCH_REFERER
-                )
-                archive_id = await asyncio.to_thread(
-                    archive_search, bucket_id, page_no, filters, data, requested
+                    SEARCH_PATH,
+                    filters.payload(page=page_no),
+                    referer=SEARCH_REFERER,
                 )
 
             page = parse_search_response(data)
             if page.current_page != page_no or (not page.rows and page.total_items > 0):
                 raise ContractError("Search page number or empty-page contract mismatch")
             profiles, rejections = _normalize_rows(page.rows)
-            return await asyncio.to_thread(
-                finish_page,
-                bucket_id,
-                page_no,
-                archive_id,
-                profiles,
-                data,
-                requested,
-                rejections,
-            )
+
+            projection_profiles = []
+            for profile in profiles:
+                fingerprint = master_fingerprint(profile)
+                key = (profile.jp_type_code, profile.jp_no)
+                if cache.get(key) == fingerprint:
+                    continue
+                cache[key] = fingerprint
+                projection_profiles.append(profile)
+
+            return {
+                "bucket_id": bucket_id,
+                "page_no": page_no,
+                "filters": filters,
+                "data": data,
+                "requested": requested,
+                "archive_id": archive_id,
+                "profiles": profiles,
+                "projection_profiles": projection_profiles,
+                "rejections": rejections,
+            }
         except Exception as exc:
             await asyncio.to_thread(fail_page, bucket_id, page_no, type(exc).__name__)
             return None
 
-    fetched = written = 0
-    iterator = iter(pages)
-    in_flight: set[asyncio.Task] = set()
-
-    def fill():
-        while len(in_flight) < client.concurrency:
+    async def page_worker():
+        while True:
             try:
-                page_no = next(iterator)
-            except StopIteration:
+                page_no = page_queue.get_nowait()
+            except asyncio.QueueEmpty:
                 return
-            in_flight.add(asyncio.create_task(one_page(page_no)))
+            try:
+                result = await fetch_one(page_no)
+                if result is not None:
+                    await result_queue.put(result)
+            finally:
+                page_queue.task_done()
 
-    fill()
-    while in_flight:
-        done, in_flight = await asyncio.wait(in_flight, return_when=asyncio.FIRST_COMPLETED)
-        for task in done:
-            result = task.result()
-            if result is not None:
-                fetched += 1
-                written += result
-        fill()
-        progress = await asyncio.to_thread(page_progress, bucket_id)
-        update_bucket(
-            bucket_id,
-            pages_done=progress["done"],
-            rows_seen=progress["rows"] + progress["rejected"],
-        )
-        if verbose:
-            print(
-                f"    pages {progress['done']}/{pages_total}, partial {progress['partial']}, "
-                f"rows {progress['rows']}, quarantined {progress['rejected']}"
-            )
+    async def fetch_all():
+        worker_count = min(client.concurrency, max(1, len(pages)))
+        async with asyncio.TaskGroup() as group:
+            for _ in range(worker_count):
+                group.create_task(page_worker())
+        workers_done.set()
+
+    async def writer():
+        nonlocal fetched, written, next_progress_at
+        while not workers_done.is_set() or not result_queue.empty():
+            try:
+                first = await asyncio.wait_for(result_queue.get(), 0.05)
+            except TimeoutError:
+                continue
+            batch = [first]
+            while len(batch) < controller.size:
+                try:
+                    batch.append(result_queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            started = time.monotonic()
+            try:
+                outcomes = await asyncio.to_thread(persist_page_batch, batch)
+            finally:
+                for _ in batch:
+                    result_queue.task_done()
+            elapsed = time.monotonic() - started
+            fetched += len(outcomes)
+            written += sum(int(outcome["written"]) for outcome in outcomes)
+            controller.observe(result_queue.qsize(), result_queue.maxsize, elapsed)
+
+            now = time.monotonic()
+            if now >= next_progress_at:
+                progress = await asyncio.to_thread(page_progress, bucket_id)
+                update_bucket(
+                    bucket_id,
+                    pages_done=progress["done"],
+                    rows_seen=progress["rows"] + progress["rejected"],
+                )
+                if verbose:
+                    print(
+                        f"    pages {progress['done']}/{pages_total}, partial {progress['partial']}, "
+                        f"rows {progress['rows']}, quarantined {progress['rejected']}, "
+                        f"db-batch {controller.size}, backlog {result_queue.qsize()}"
+                    )
+                next_progress_at = now + 1.0
+
+    async with asyncio.TaskGroup() as group:
+        group.create_task(fetch_all())
+        group.create_task(writer())
 
     progress = await asyncio.to_thread(page_progress, bucket_id)
     complete = (
@@ -302,6 +378,7 @@ async def _process_bucket(
     provinces: list[str],
     *,
     verbose: bool,
+    master_cache: dict[tuple[str, str], str] | None = None,
 ) -> tuple[int, int]:
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
@@ -361,6 +438,7 @@ async def _process_bucket(
         1,
         verbose=verbose,
         first_page=first_page,
+        master_cache=master_cache,
     )
 
 
@@ -418,6 +496,7 @@ async def _run_work(
 ) -> DiscoveryResult:
     buckets_processed = pages_fetched = companies_written = 0
     provinces = await fetch_provinces(client)
+    master_cache: dict[tuple[str, str], str] = {}
     if verbose:
         print(f"provinces available for splitting: {len(provinces)}")
 
@@ -446,7 +525,13 @@ async def _run_work(
 
         async def process_one(row):
             try:
-                pages, written = await _process_bucket(client, row, provinces, verbose=verbose)
+                pages, written = await _process_bucket(
+                    client,
+                    row,
+                    provinces,
+                    verbose=verbose,
+                    master_cache=master_cache,
+                )
                 return pages, written
             except Exception as exc:
                 update_bucket(
@@ -481,6 +566,7 @@ async def run(
     stop = asyncio.Event()
 
     async with AsyncDbdClient(concurrency=concurrency, rate_per_second=rate) as client:
+
         async def monitor_health():
             if health is None:
                 await stop.wait()
@@ -516,7 +602,3 @@ async def run(
     if blockers and max_buckets is None:
         raise ContractError("Discovery incomplete: " + ", ".join(blockers))
     return result
-
-
-def summary() -> dict:
-    return discovery_summary()
