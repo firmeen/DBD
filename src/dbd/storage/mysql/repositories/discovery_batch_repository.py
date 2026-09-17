@@ -46,6 +46,40 @@ def _replace_rejections(cur, bucket_id, page_no, rejections, requested):
         )
 
 
+def _aggregate_sightings(prepared: list[tuple[dict, int]]) -> list[tuple]:
+    """Collapse duplicate observations inside one DB microbatch without changing audit semantics."""
+    aggregate: dict[tuple[str, str], dict] = {}
+    for record, _archive_id in prepared:
+        requested = record["requested"]
+        for profile in record["profiles"]:
+            key = (profile.jp_type_code, profile.jp_no)
+            item = aggregate.get(key)
+            if item is None:
+                aggregate[key] = {
+                    "jp_no": profile.jp_no,
+                    "jp_type_code": profile.jp_type_code,
+                    "first_bucket_id": record["bucket_id"],
+                    "times_seen": 1,
+                    "first_seen_at": requested,
+                    "last_seen_at": requested,
+                }
+            else:
+                item["times_seen"] += 1
+                item["first_seen_at"] = min(item["first_seen_at"], requested)
+                item["last_seen_at"] = max(item["last_seen_at"], requested)
+    return [
+        (
+            item["jp_no"],
+            item["jp_type_code"],
+            item["first_bucket_id"],
+            item["times_seen"],
+            item["first_seen_at"],
+            item["last_seen_at"],
+        )
+        for item in aggregate.values()
+    ]
+
+
 def persist_page_batch(records: list[dict]) -> list[dict]:
     """Commit many Search pages while preserving one checkpoint/archive per page."""
     if not records:
@@ -101,7 +135,6 @@ def persist_page_batch(records: list[dict]) -> list[dict]:
 
                 company_rows = []
                 master_rows = []
-                sighting_rows = []
                 for record, archive_id in prepared:
                     requested = record["requested"]
                     for profile in record.get("projection_profiles", record["profiles"]):
@@ -120,16 +153,6 @@ def persist_page_batch(records: list[dict]) -> list[dict]:
                                 requested,
                             )
                         )
-                    sighting_rows.extend(
-                        (
-                            profile.jp_no,
-                            profile.jp_type_code,
-                            record["bucket_id"],
-                            requested,
-                            requested,
-                        )
-                        for profile in record["profiles"]
-                    )
 
                 if company_rows:
                     insert_company = (
@@ -157,10 +180,7 @@ def persist_page_batch(records: list[dict]) -> list[dict]:
                             VALUES(observed_jp_stat_code) IS NULL,
                             observed_status_at,VALUES(observed_status_at)
                           ),
-                          change_mask=IF(
-                            company_master.master_hash <=> VALUES(master_hash),
-                            0,127
-                          ),
+                          change_mask=IF(company_master.master_hash <=> VALUES(master_hash),0,127),
                           last_master_changed_at=IF(
                             company_master.master_hash <=> VALUES(master_hash),
                             company_master.last_master_changed_at,VALUES(last_master_changed_at)
@@ -172,14 +192,17 @@ def persist_page_batch(records: list[dict]) -> list[dict]:
                         master_rows,
                     )
 
+                sighting_rows = _aggregate_sightings(prepared)
                 if sighting_rows:
-                    # Coverage remains durable, but repeat observations no longer
-                    # force a hot-path update for every overlapping bucket.
                     cur.executemany(
                         """
-                        INSERT IGNORE INTO discovery_sightings(
-                          jp_no,jp_type_code,first_bucket_id,first_seen_at,last_seen_at
-                        ) VALUES (%s,%s,%s,%s,%s)
+                        INSERT INTO discovery_sightings(
+                          jp_no,jp_type_code,first_bucket_id,times_seen,first_seen_at,last_seen_at
+                        ) VALUES (%s,%s,%s,%s,%s,%s)
+                        ON DUPLICATE KEY UPDATE
+                          times_seen=times_seen+VALUES(times_seen),
+                          first_seen_at=LEAST(first_seen_at,VALUES(first_seen_at)),
+                          last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at))
                         """,
                         sighting_rows,
                     )
