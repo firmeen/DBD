@@ -31,6 +31,15 @@ async def test_campaign_stop_and_worker_heartbeat_are_shared():
         workers = await second.workers()
         assert workers[0]["status"] == "draining"
 
+        # Simulate the long-lived workers set expiring while the process remains
+        # active. A heartbeat must rebuild membership, otherwise status reports
+        # would show zero workers after a 24h campaign.
+        await first._client().delete(first.workers_key)
+        assert await second.workers() == []
+        await first.heartbeat_worker(worker, status="active", ttl_seconds=5)
+        workers = await second.workers()
+        assert [item["worker_id"] for item in workers] == ["worker-a"]
+
         await first.unregister_worker(worker)
         assert await second.workers() == []
     finally:
