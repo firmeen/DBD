@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import math
 import os
 import subprocess
 import sys
@@ -135,6 +134,7 @@ def _next_worker_target(
 ) -> int:
     """Compatibility helper for one immediate autoscale decision."""
     controller = AutoscaleController(minimum, maximum, worker_concurrency)
+    controller.low_pressure_observations = _AUTOSCALE_LOW_PRESSURE_OBSERVATIONS - 1
     return controller.target(
         pending=pending,
         running=0,
@@ -261,6 +261,10 @@ def _request_stop(redis: Redis, run_id: int, reason: str) -> None:
     )
 
 
+def _stop_requested(redis: Redis, run_id: int) -> bool:
+    return bool(redis.exists(f"{_campaign_key(run_id)}:stop"))
+
+
 def _request_worker_drain(redis: Redis, run_id: int, worker_id: str, reason: str) -> None:
     redis.set(
         f"{_campaign_key(run_id)}:worker:{worker_id}:drain",
@@ -306,7 +310,7 @@ def _registered_worker_states(redis: Redis, run_id: int) -> list[dict]:
             continue
         try:
             result.append(json.loads(value))
-        except (TypeError, ValueError, json.JSONDecodeError):
+        except (TypeError, ValueError):
             result.append({"worker_id": worker_id, "status": "unknown"})
     if stale:
         redis.srem(f"{_campaign_key(run_id)}:workers", *stale)
@@ -377,7 +381,7 @@ def _read_runtime_state(redis: Redis, run_id: int) -> dict | None:
         return None
     try:
         value = json.loads(raw)
-    except (TypeError, ValueError, json.JSONDecodeError):
+    except (TypeError, ValueError):
         return None
     return value if isinstance(value, dict) else None
 
@@ -419,16 +423,39 @@ def _terminate_workers(workers: list[WorkerProcess]) -> None:
         _close_worker_handle(worker)
 
 
-def _request_local_drain(redis: Redis, run_id: int, workers: list[WorkerProcess], reason: str) -> None:
+def _request_local_drain(
+    redis: Redis,
+    run_id: int,
+    workers: list[WorkerProcess],
+    reason: str,
+) -> int:
+    requested = 0
     for worker in workers:
         if worker.process.poll() is None and not worker.draining:
             try:
                 _request_worker_drain(redis, run_id, worker.worker_id, reason)
                 worker.draining = True
+                requested += 1
             except Exception:
                 # If Redis itself is unavailable, durable MySQL leases still make
-                # abrupt process loss recoverable. The caller decides whether to force-stop.
+                # abrupt process loss recoverable. The caller may force-stop locally.
                 pass
+    return requested
+
+
+def _drain_or_terminate_local(
+    redis: Redis,
+    run_id: int,
+    workers: list[WorkerProcess],
+    reason: str,
+) -> None:
+    live = [worker for worker in workers if worker.process.poll() is None]
+    if not live:
+        return
+    already_draining = sum(worker.draining for worker in live)
+    requested = _request_local_drain(redis, run_id, live, reason)
+    if requested + already_draining < len(live):
+        _terminate_workers(live)
 
 
 def supervise_campaign(
@@ -467,6 +494,7 @@ def supervise_campaign(
     graceful_stop = False
     exit_code = 0
     lease_acquired = False
+    supervisor_error = False
     next_lease_refresh = 0.0
     next_state_write = 0.0
     progress = ProgressLine(f"CAMPAIGN {run_id}", interval=0.75)
@@ -529,6 +557,10 @@ def supervise_campaign(
             done = state.get("done", 0) + state.get("not_available", 0)
             active_work = pending + running
 
+            if _stop_requested(redis, run_id) and not graceful_stop:
+                graceful_stop = True
+                progress.event("campaign stop requested: draining workers without claiming new work")
+
             survivors: list[WorkerProcess] = []
             for worker in children:
                 code = worker.process.poll()
@@ -568,6 +600,7 @@ def supervise_campaign(
                     f"available fleet capacity {effective_maximum} fell below minimum {minimum}"
                 )
                 exit_code = 2
+                _drain_or_terminate_local(redis, run_id, children, "capacity_exhausted")
                 break
 
             target = len(active_live)
@@ -602,10 +635,15 @@ def supervise_campaign(
                         f"({len(active_live) + 1}->{len(active_live)})"
                     )
 
-            # Fixed fleets and autoscaled fleets both repair capacity after an
-            # exhausted/drained slot, but never above the reduced effective maximum.
+            # Both fixed and autoscaled fleets repair the configured floor after
+            # ordinary exits, but never above the reduced post-failure maximum.
             required_floor = min(minimum, effective_maximum)
-            while active_work and len(active_live) < required_floor and len(live) < effective_maximum:
+            while (
+                active_work
+                and not graceful_stop
+                and len(active_live) < required_floor
+                and len(live) < effective_maximum
+            ):
                 worker = spawn_worker()
                 children.append(worker)
                 active_live.append(worker)
@@ -670,6 +708,9 @@ def supervise_campaign(
                 break
 
             if not live and active_work:
+                if graceful_stop:
+                    exit_code = 130
+                    break
                 progress.event("all local workers stopped while work remains")
                 exit_code = 2
                 break
@@ -716,16 +757,59 @@ def supervise_campaign(
             exit_code = 130
 
     except Exception:
+        supervisor_error = True
         # A supervisor must never silently leave its local fleet claiming new work.
-        # Ask every local child to drain before propagating the control-plane error.
-        _request_local_drain(redis, run_id, children, "supervisor_failure")
+        # Prefer graceful per-worker drain; force-stop only if Redis cannot carry it.
+        _drain_or_terminate_local(redis, run_id, children, "supervisor_failure")
+        progress.close(message=f"Campaign {run_id} supervisor failed; local workers are stopping")
         raise
 
     finally:
         for worker in children:
             _close_worker_handle(worker)
+
         if lease_acquired:
+            try:
+                snapshot = _task_progress(run_id)
+                remaining = snapshot.get("pending", 0) + snapshot.get("retry_wait", 0) + snapshot.get("running", 0)
+                if supervisor_error:
+                    runtime_status = "supervisor_error"
+                elif exit_code == 130:
+                    runtime_status = "paused"
+                elif exit_code == 2:
+                    runtime_status = "capacity_exhausted"
+                elif remaining == 0 and snapshot.get("failed", 0):
+                    runtime_status = "completed_with_failures"
+                elif remaining == 0:
+                    runtime_status = "completed"
+                else:
+                    runtime_status = "stopped"
+                _write_runtime_state(
+                    redis,
+                    run_id,
+                    supervisor_pid=os.getpid(),
+                    status=runtime_status,
+                    autoscale=autoscale,
+                    workers_initial=initial_workers,
+                    workers_min=minimum,
+                    workers_max=maximum,
+                    exhausted_capacity=exhausted_capacity,
+                    worker_concurrency=worker_concurrency,
+                    worker_rate=worker_rate,
+                    rate_mode=rate_mode,
+                    rate_ceiling=plan.ceiling,
+                    pending=snapshot.get("pending", 0) + snapshot.get("retry_wait", 0),
+                    running=snapshot.get("running", 0),
+                    done=snapshot.get("done", 0) + snapshot.get("not_available", 0),
+                    failed=snapshot.get("failed", 0),
+                    total=snapshot.get("total", 0),
+                )
+                if remaining == 0 and not supervisor_error:
+                    _clear_stop(redis, run_id)
+            except Exception:
+                pass
             _release_supervisor_lease(redis, run_id, token)
+
         try:
             redis.close()
         except Exception:
@@ -774,7 +858,7 @@ def campaign_status(run_id: int) -> dict:
             state["effective_rate"] = _effective_rate(
                 redis, settings.dbd_redis_rate_key, settings.dbd_rate_per_second
             )
-            state["stop_requested"] = bool(redis.exists(f"{_campaign_key(run_id)}:stop"))
+            state["stop_requested"] = _stop_requested(redis, run_id)
             state["supervisor_active"] = bool(redis.exists(_supervisor_lease_key(run_id)))
             runtime = _read_runtime_state(redis, run_id)
             if runtime is not None:
