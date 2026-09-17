@@ -42,6 +42,12 @@ class CampaignCoordinator:
     def workers_key(self) -> str:
         return f"{self.base_key}:workers"
 
+    def worker_key(self, worker_id: str) -> str:
+        return f"{self.base_key}:worker:{worker_id}"
+
+    def worker_drain_key(self, worker_id: str) -> str:
+        return f"{self.base_key}:worker:{worker_id}:drain"
+
     async def open(self) -> None:
         if self._redis is None:
             self._redis = Redis.from_url(self.url, decode_responses=True)
@@ -76,6 +82,22 @@ class CampaignCoordinator:
     async def stop_requested(self) -> bool:
         return bool(await self._client().exists(self.stop_key))
 
+    async def request_worker_drain(
+        self,
+        worker_id: str,
+        reason: str = "autoscale",
+        *,
+        ttl_seconds: int = 3600,
+    ) -> None:
+        await self._client().set(
+            self.worker_drain_key(worker_id),
+            json.dumps({"reason": reason, "requested_at": time.time()}),
+            ex=ttl_seconds,
+        )
+
+    async def worker_drain_requested(self, identity: WorkerIdentity) -> bool:
+        return bool(await self._client().exists(self.worker_drain_key(identity.worker_id)))
+
     async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> None:
         now = time.time()
         payload = {
@@ -88,9 +110,9 @@ class CampaignCoordinator:
             "heartbeat_at": now,
             "status": "active",
         }
-        key = f"{self.base_key}:worker:{identity.worker_id}"
         client = self._client()
-        await client.set(key, json.dumps(payload), ex=ttl_seconds)
+        await client.delete(self.worker_drain_key(identity.worker_id))
+        await client.set(self.worker_key(identity.worker_id), json.dumps(payload), ex=ttl_seconds)
         await client.sadd(self.workers_key, identity.worker_id)
         await client.expire(self.workers_key, 86400)
 
@@ -101,7 +123,7 @@ class CampaignCoordinator:
         status: str = "active",
         ttl_seconds: int = 30,
     ) -> None:
-        key = f"{self.base_key}:worker:{identity.worker_id}"
+        key = self.worker_key(identity.worker_id)
         client = self._client()
         raw = await client.get(key)
         payload = json.loads(raw) if raw else {
@@ -127,13 +149,16 @@ class CampaignCoordinator:
             return False
         try:
             client = self._client()
-            await client.delete(f"{self.base_key}:worker:{identity.worker_id}")
+            await client.delete(
+                self.worker_key(identity.worker_id),
+                self.worker_drain_key(identity.worker_id),
+            )
             await client.srem(self.workers_key, identity.worker_id)
             return True
         except Exception:
-            # Heartbeat keys have TTLs, so failed cleanup self-heals. Swallowing
-            # here preserves the original worker failure while MySQL remains the
-            # authoritative lease/work source.
+            # Heartbeat/drain keys have TTLs, so failed cleanup self-heals.
+            # Swallowing here preserves the original worker failure while MySQL
+            # remains the authoritative lease/work source.
             return False
 
     async def workers(self) -> list[dict]:
@@ -141,7 +166,7 @@ class CampaignCoordinator:
         ids = sorted(await client.smembers(self.workers_key))
         if not ids:
             return []
-        values = await client.mget([f"{self.base_key}:worker:{worker_id}" for worker_id in ids])
+        values = await client.mget([self.worker_key(worker_id) for worker_id in ids])
         result = []
         for value in values:
             if value:
