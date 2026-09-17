@@ -66,7 +66,7 @@ async def test_429_sets_shared_cooldown_before_retry():
     assert c.rate._cooldown_until > time.monotonic()
 
 
-async def test_endpoint_429_penalizes_endpoint_and_global_safety_layer():
+async def test_endpoint_429_penalizes_endpoint_without_global_collapse():
     c = client()
     c.endpoint_rate.acquire = AsyncMock()
     c._session.request.side_effect = [response(429, {"retry-after": "0"}), response()]
@@ -76,6 +76,25 @@ async def test_endpoint_429_penalizes_endpoint_and_global_safety_layer():
     assert c.rate.rate == 1000
     assert c.endpoint_rate.effective_rate("profile") == 500
     assert c.endpoint_rate.effective_rate("committees") == 1000
+    assert c.endpoint_rate.global_effective_rate() == 1000
+
+
+async def test_distinct_endpoint_pressure_escalates_global_safety_layer():
+    c = client()
+    c.endpoint_rate.acquire = AsyncMock()
+    c._session.request.side_effect = [
+        response(429, {"retry-after": "0"}),
+        response(),
+        response(429, {"retry-after": "0"}),
+        response(),
+    ]
+
+    await c.fetch("GET", "/profile", rate_key="profile")
+    assert c.endpoint_rate.global_effective_rate() == 1000
+
+    await c.fetch("GET", "/committees", rate_key="committees")
+    assert c.endpoint_rate.effective_rate("profile") == 500
+    assert c.endpoint_rate.effective_rate("committees") == 500
     assert c.endpoint_rate.global_effective_rate() == 500
 
 
