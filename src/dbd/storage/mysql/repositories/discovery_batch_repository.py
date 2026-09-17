@@ -7,6 +7,7 @@ from ....core.telemetry import DISCOVERY_PAGE_RESULTS, DISCOVERY_VALID_ROWS, PIP
 from ....runtime.delta import MASTER_HASH_VERSION, master_fingerprint
 from ..engine import connect
 from .company_repository import company_upsert_sql, company_values
+from .discovery_repository import assert_bucket_lease
 
 
 def _replace_rejections(cur, bucket_id, page_no, rejections, requested):
@@ -81,7 +82,7 @@ def _aggregate_sightings(prepared: list[tuple[dict, int]]) -> list[tuple]:
 
 
 def persist_page_batch(records: list[dict]) -> list[dict]:
-    """Commit many Search pages while preserving one checkpoint/archive per page."""
+    """Commit Search pages only while their distributed bucket lease is still current."""
     if not records:
         return []
 
@@ -89,6 +90,18 @@ def persist_page_batch(records: list[dict]) -> list[dict]:
     with connect() as conn:
         try:
             with conn.cursor() as cur:
+                checked_leases = set()
+                for record in records:
+                    owner = record.get("lease_owner")
+                    if owner is None:
+                        continue
+                    version = record.get("lease_version")
+                    key = (int(record["bucket_id"]), owner, int(version))
+                    if key in checked_leases:
+                        continue
+                    assert_bucket_lease(cur, key[0], owner, key[2])
+                    checked_leases.add(key)
+
                 prepared = []
                 for record in records:
                     archive_id = record.get("archive_id")
