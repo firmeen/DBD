@@ -211,6 +211,12 @@ def _force_kill_worker(worker: WorkerProcess) -> None:
 
 
 def _terminate_workers(workers: list[WorkerProcess]) -> None:
+    if os.name == "nt":
+        for worker in workers:
+            _force_kill_worker(worker)
+            _close_worker_handle(worker)
+        return
+
     for worker in workers:
         if worker.process.poll() is None:
             worker.process.terminate()
