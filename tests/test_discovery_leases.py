@@ -13,6 +13,7 @@ from dbd.storage.mysql.repositories.discovery_repository import (
     update_bucket,
     upsert_bucket,
 )
+from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
 
 pytestmark = pytest.mark.integration
 
@@ -79,6 +80,46 @@ def test_stale_discovery_worker_cannot_mutate_or_persist_reclaimed_bucket() -> N
         status="done",
     )
     assert get_bucket(bucket_id)["status"] == "done"
+
+
+def test_split_is_atomic_and_rejects_stale_worker() -> None:
+    parent = SearchFilters("split-" + uuid4().hex)
+    bucket_id = upsert_bucket(parent)
+    _set_lease(bucket_id, "worker-b", 4)
+    child = SearchFilters(
+        keyword=parent.keyword,
+        search_type=parent.search_type,
+        jp_types=["2"],
+    )
+
+    with pytest.raises(DiscoveryLeaseLost):
+        split_bucket(
+            bucket_id,
+            [child],
+            1,
+            lease_owner="worker-a",
+            lease_version=3,
+        )
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM discovery_buckets WHERE parent_id=%s", (bucket_id,))
+        assert cur.fetchone()["n"] == 0
+
+    child_ids = split_bucket(
+        bucket_id,
+        [child],
+        1,
+        lease_owner="worker-b",
+        lease_version=4,
+    )
+    assert len(child_ids) == 1
+    assert get_bucket(bucket_id)["status"] == "split"
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT parent_id,depth,status FROM discovery_buckets WHERE id=%s", (child_ids[0],))
+        created = cur.fetchone()
+    assert int(created["parent_id"]) == bucket_id
+    assert int(created["depth"]) == 1
+    assert created["status"] == "pending"
 
 
 def test_release_is_fenced_by_lease_version_even_for_same_owner() -> None:
