@@ -231,6 +231,14 @@ def _campaign_command(args) -> None:
         return
     if not settings.dbd_redis_url:
         raise ValueError("campaign requires DBD_REDIS_URL")
+
+    minimum = args.workers if args.workers_min is None else args.workers_min
+    maximum = args.workers if args.workers_max is None else args.workers_max
+    if minimum > maximum:
+        raise ValueError("--workers-min cannot exceed --workers-max")
+    if not minimum <= args.workers <= maximum:
+        raise ValueError("--workers must be within --workers-min and --workers-max")
+
     if args.campaign_command == "start":
         with manager_lock() as conn:
             run_id = asyncio.run(_prepare_campaign(args))
