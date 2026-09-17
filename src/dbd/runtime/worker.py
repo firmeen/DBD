@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from pathlib import Path
 from uuid import uuid4
@@ -17,6 +18,7 @@ from ..core.telemetry import (
     log,
 )
 from ..storage.mysql.repositories.projection_repository import LeaseLost, project
+from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
 
@@ -137,33 +139,34 @@ async def process(
     endpoint_rates=None,
     distributed=False,
 ):
-    """Run the V2 staged pipeline: claim -> fetch -> archive -> project.
-
-    HTTP acquisition and projection are deliberately decoupled. Archive commit and
-    transition to stage=project are atomic, so a crash after acquisition resumes
-    from response_archive and does not consume another upstream request.
-    """
+    """Run staged claim -> fetch -> archive -> project with graceful fleet draining."""
     fetch_workers = concurrency if concurrency is not None else settings.dbd_concurrency
     if not 1 <= fetch_workers <= 256 or (limit is not None and limit < 1):
         raise ValueError("Concurrency must be 1..256 and limit must be positive")
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed workers require DBD_REDIS_URL for one shared global rate cap")
 
-    # Validate backend selection, bucket/key settings and encryption-key shape before
-    # opening an HTTP client or claiming work. A configuration defect must not spend
-    # an upstream DBD request before the collector knows it can durably archive it.
     _ = repo.archive_backend
 
     projection_workers = min(settings.dbd_projection_workers, settings.db_pool_size)
     archive_workers = settings.dbd_archive_workers
-    owner = uuid4().hex
+    owner = os.environ.get("DBD_WORKER_ID") or uuid4().hex
     stop = asyncio.Event()
+    drain_requested = asyncio.Event()
     fetch_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     archive_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     project_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     writes = asyncio.Semaphore(projection_workers)
     claimed_attempts = 0
     maintenance_at = 0.0
+    coordinator = None
+    identity = None
+
+    if distributed:
+        coordinator = CampaignCoordinator(settings.dbd_redis_url, run_id)
+        await coordinator.open()
+        identity = WorkerIdentity(owner, int(run_id), os.getpid())
+        await coordinator.register_worker(identity)
 
     def queue_metrics():
         PIPELINE_QUEUE_DEPTH.labels("fetch").set(fetch_queue.qsize())
@@ -175,6 +178,12 @@ async def process(
             if health:
                 await asyncio.to_thread(health)
             await repo.heartbeat(owner)
+            if coordinator is not None and identity is not None:
+                if await coordinator.stop_requested():
+                    drain_requested.set()
+                await coordinator.heartbeat_worker(
+                    identity, status="draining" if drain_requested.is_set() else "active"
+                )
             try:
                 await asyncio.wait_for(stop.wait(), min(10, settings.dbd_lease_seconds / 3))
             except TimeoutError:
@@ -187,19 +196,27 @@ async def process(
                 await repo.maintain(run_id)
                 maintenance_at = time.monotonic() + 5
 
-            remaining = None if limit is None else max(0, limit - claimed_attempts)
-            if remaining == 0:
-                if await repo.owner_running(owner) == 0:
+            if drain_requested.is_set():
+                if (
+                    await repo.owner_running(owner) == 0
+                    and fetch_queue.empty()
+                    and archive_queue.empty()
+                    and project_queue.empty()
+                ):
                     stop.set()
                     return
                 await asyncio.sleep(0.05)
+                continue
+
+            remaining = None if limit is None else max(0, limit - claimed_attempts)
+            if remaining == 0:
+                drain_requested.set()
                 continue
 
             batch_limit = settings.dbd_claim_batch_size
             if remaining is not None:
                 batch_limit = min(batch_limit, remaining)
 
-            # Projection backlog first: it is already durable and costs no DBD request.
             project_room = project_queue.maxsize - project_queue.qsize()
             project_batch = []
             if project_room > 0:
@@ -236,8 +253,8 @@ async def process(
 
             progress = await repo.progress(run_id)
             if not any(progress.get(status, 0) for status in ("pending", "running", "retry_wait")):
-                stop.set()
-                return
+                drain_requested.set()
+                continue
             await asyncio.sleep(0.1)
 
     async def fetcher(client):
@@ -299,8 +316,6 @@ async def process(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                # No stage transition commits when archive_batch rolls back. Each
-                # fetch-stage task remains lease-owned and can be retried safely.
                 for item in batch:
                     await _fail_task(repo, item["task"], exc)
                     IN_FLIGHT.dec()
@@ -319,11 +334,6 @@ async def process(
             try:
                 if not archive_id:
                     raise ValueError("Project-stage task has no raw_response_id")
-
-                # A freshly archived task retains its fetch lease and reaches this
-                # queue without a project-stage claim. Count the projection attempt
-                # only when projection actually begins. Reclaimed project backlog was
-                # already incremented atomically by claim_project_batch().
                 if not item.get("project_attempt_started"):
                     project_attempts = await repo.begin_project_attempt(task)
                     if project_attempts is None:
@@ -343,7 +353,7 @@ async def process(
                     payload = archive["data"]
                     requested_at = archive["requested_at"]
                     path = archive["request_path"]
-                    params = (archive["request_context"].get("params") or {})
+                    params = archive["request_context"].get("params") or {}
                 scope = params.get("fiscalYear", "")
                 async with writes:
                     outcome = await asyncio.to_thread(
@@ -386,6 +396,9 @@ async def process(
         stop.set()
         await repo.release(owner)
         queue_metrics()
+        if coordinator is not None and identity is not None:
+            await coordinator.unregister_worker(identity)
+            await coordinator.close()
 
     await repo.close_if_complete(run_id)
     return await repo.progress(run_id)
