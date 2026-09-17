@@ -163,7 +163,7 @@ def command_discover(
 def command_discover_status() -> None:
     from ..pipelines import discovery
 
-    s = discovery.summary()
+    s = discovery.discovery_summary()
     print("\ndiscovery so far:")
     print(f"  unique companies : {int(s['unique_companies']):,}")
     print(f"  rows fetched      : {int(s['rows_fetched']):,}")
