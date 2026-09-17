@@ -66,6 +66,20 @@ async def test_429_sets_shared_cooldown_before_retry():
     assert c.rate._cooldown_until > time.monotonic()
 
 
+async def test_endpoint_429_penalizes_endpoint_and_global_safety_layer():
+    c = client()
+    c.endpoint_rate.acquire = AsyncMock()
+    c._session.request.side_effect = [response(429, {"retry-after": "0"}), response()]
+
+    await c.fetch("GET", "/profile", rate_key="profile")
+
+    # The legacy limiter is not used for keyed V2 traffic.
+    assert c.rate.rate == 1000
+    assert c.endpoint_rate.effective_rate("profile") == 500
+    assert c.endpoint_rate.effective_rate("committees") == 1000
+    assert c.endpoint_rate.global_effective_rate() == 500
+
+
 def test_rate_recovers_gradually_and_never_exceeds_target(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(rate_limit.time, "monotonic", lambda: clock[0])

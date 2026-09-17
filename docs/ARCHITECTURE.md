@@ -3,191 +3,215 @@
 ## Ownership and dependencies
 
 - `cli/`: arguments, commands, exit policy and manager-lock boundaries.
-- `client/`: browser-like session/auth, crypto, retries and adaptive paced admission.
-- `contracts/`: identity and root-shape validation plus pure normalization.
-- `runtime/`: endpoint definitions, streaming imports, leased consumers and replay.
-- `pipelines/`: discovery orchestration and pre-0.2 compatibility pipelines.
-- `storage/mysql/`: async queue/archive path, sync projection path, migrations and
-  repositories.
+- `client/`: browser-like session/auth, crypto, retries and adaptive admission.
+- `contracts/`: identity/root-shape validation and pure normalization.
+- `runtime/`: endpoint definitions, staged bulk orchestration and replay.
+- `pipelines/`: discovery orchestration and compatibility pipelines.
+- `storage/mysql/`: durable queue/archive metadata, projections and migrations.
+- `storage/archive_codec.py`: deterministic JSON/zstd archive encoding.
+- `storage/archive_backend.py`: optional client-side encrypted S3-compatible payload storage.
 - `core/`: validated settings, exceptions and low-cardinality telemetry.
 
-The default collection scope is tabs 1-2: seven endpoints. Tabs 3-4 remain
-implemented and test-covered but are opt-in.
+Default collection scope is tabs 1-2: seven endpoints. Tabs 3-4 remain opt-in.
 
-## One manager, two bounded DB paths
+## V2 staged bulk path
 
-The queue/archive path uses SQLAlchemy asyncio + asyncmy. Existing projection SQL
-uses the synchronous PyMySQL path in bounded threads. A ContextVar binds nested
-projection repositories to the outer transaction so their apparent commits become
-no-ops until the projection transaction decides to commit.
+```text
+endpoint_tasks
+  -> batch claim + lease/version fence
+  -> bounded fetch queue
+  -> async DBD HTTP + endpoint/global admission
+  -> bounded archive queue
+  -> durable archive boundary
+  -> stage=project
+  -> bounded project queue
+  -> strict normalization + natural-key freshness
+  -> projection + terminal acknowledgement
+```
 
-The manager owns no more endpoint consumers than the configured queue/concurrency
-bounds. Projection writes are separately limited by `DB_POOL_SIZE`. Identity import
-and master scheduling are paged; a million identities are never required in one
-Python set/list.
+Fetch and projection are intentionally decoupled so local database work does not
+have to complete inside the HTTP acquisition loop. Queue sizes are bounded so a
+fast producer cannot create unbounded memory growth.
 
-A MySQL connection-scoped named lock enforces one API manager per configured
-database. Long-running bulk/discovery operations verify that the **same connection**
-still owns the lock. Losing the connection/lock is a terminal manager-health error,
-not permission to continue collecting without exclusivity.
+Project backlog is scheduled before new fetch work because it is already durable and
+requires no additional DBD request.
+
+## Durable task lifecycle
+
+`endpoint_tasks` deduplicates `(run_id, company_id, endpoint)` and has two durable
+pipeline stages: `fetch` and `project`.
+
+```text
+fetch/pending -> fetch/running
+              -> project/running -> done | not_available | retry_wait | failed
+```
+
+Claims use `FOR UPDATE SKIP LOCKED`, increment attempts and lease version, and record
+owner/expiry. Heartbeat only extends leases still owned and unexpired. Expired leases
+are recovered by maintenance. Owner + version + expiry is checked again before archive
+transition and projection commit, fencing stale workers.
+
+Projection and terminal acknowledgement commit in the same outer transaction. HTTP
+delivery is at-least-once before the durable archive boundary, while project-stage
+recovery is archive-first and must not refetch upstream.
+
+## Archive durability boundary
+
+### Inline MySQL
+
+The encoded payload and `stage=project/raw_response_id` transition commit in one
+MySQL transaction.
+
+### External encrypted object storage
+
+The encoded payload is uploaded first, encrypted client-side with AES-256-GCM. MySQL
+then commits archive metadata/object reference and `stage=project` together. This
+ordering prefers an encrypted orphan after an ambiguous DB failure over a committed
+reference to an object that was never uploaded.
+
+External archive metadata includes backend, object key, nonce, key id, ciphertext
+SHA-256, canonical plaintext SHA-256, codec and size metadata. The decoded response
+body is not stored inline for external rows.
+
+External reads verify ciphertext SHA, AES-GCM authentication with object key as AAD,
+plaintext SHA and JSON/zstd decode before projection. Missing/corrupt/unreadable
+archive data never silently falls back to DBD refetch.
+
+New objects use the active encryption key/id. A read-only decryption key ring keeps
+retained archives from older key ids replayable during rotation.
+
+Archive backend/key-shape configuration is validated before the bulk HTTP client
+opens or claims work. Remote object-store permission/network failures remain runtime
+archive failures and cannot advance a task to `project`.
+
+## Database paths
+
+Queue/archive metadata uses SQLAlchemy asyncio + asyncmy. Existing projection SQL
+uses synchronous PyMySQL in bounded threads. A ContextVar binds nested projection
+repositories to the outer transaction so apparent nested commits become no-ops until
+the projection transaction decides to commit.
+
+Projection concurrency is bounded by both configured projection workers and DB pool
+size. Identity import/master scheduling are paged; million-row populations are not
+materialized in one Python collection.
+
+## Manager and distributed ownership
+
+Discovery, run creation and ordinary single-process bulk use a MySQL
+connection-scoped named manager lock. Long-running locked operations verify that the
+same connection still owns it; lock loss is terminal.
+
+Distributed bulk is a deliberate exception after run creation. Multiple processes
+join the same run without the singleton manager lock and coordinate task ownership
+through row leases/version fencing. Redis coordinates aggregate admission.
+
+## HTTP/auth/rate path
+
+The V2 bulk request path is:
+
+```text
+concurrency semaphore
+  -> endpoint local adaptive gate
+  -> optional shared endpoint Redis gate
+  -> global local adaptive gate
+  -> optional shared global Redis gate
+  -> token ensure/refresh
+  -> curl_cffi request
+  -> status penalty/cooldown
+  -> decrypt/wrapper decode
+  -> healthy recovery
+```
+
+401/token expiry refreshes through one auth lock. 403 is terminal. 429/503 penalizes
+the endpoint and global safety layer.
+
+In distributed mode Redis stores the aggregate schedule plus effective-rate,
+cooldown and last-penalty state. A 429/503 seen by one process therefore constrains
+other workers using the same namespace rather than only the process that received
+it. Healthy decoded responses recover gradually toward the configured target.
+
+Redis is a coordination/safety mechanism, not a rate-limit bypass.
 
 ## Identity model
 
 `company_master.company_id` is the internal stable identity. Source identity is
 unique on `(jp_type_code, jp_no)`.
 
-Numeric types require 13-digit registration strings. Production evidence showed
-that type `A` can be 11-13 digits, so those strings are preserved exactly rather
-than padded by assumption.
+Numeric types require 13-digit strings. Production evidence showed type `A` can be
+11-13 digits, so those strings are preserved exactly rather than padded.
 
 Legacy projection tables still key many rows by `jp_no`; projection rejects a type
-conflict before writing those tables. Identity-conflict resolution remains a data
-governance decision rather than an automatic merge.
+conflict before writing them. Identity conflicts remain durable quarantine state.
 
-`company_master.observed_jp_stat_code` and `observed_status_at` hold the latest
-status observation used for scheduling. This is separate from the richer
-`companies` projection because discovery intentionally does not overwrite an
-existing authoritative company profile with a shallow search row.
-
-## Task lifecycle
-
-`endpoint_tasks` deduplicates `(run_id, company_id, endpoint)`.
-
-```text
-pending -> running -> done | not_available | retry_wait | failed
-```
-
-Claim uses `FOR UPDATE SKIP LOCKED`, increments attempts and lease version, and
-records owner/expiry. Heartbeat only extends leases still owned and unexpired.
-Expired leases are recovered by maintenance. Lease owner + version + expiry is
-checked again under row lock before projection, fencing stale workers.
-
-Projection and endpoint-task acknowledgement commit in the same outer transaction.
-A process can therefore deliver a request more than once, but an old lease cannot
-successfully acknowledge after ownership has moved.
-
-HTTP retries handle transient transport/status/token errors. Durable task retries
-handle exhausted HTTP attempts and persistence failures. Both are finite.
-
-## HTTP/auth/rate path
-
-The async request path is:
-
-```text
-shared semaphore
-  -> paced TokenBucket
-  -> token ensure/refresh
-  -> curl_cffi request
-  -> status classification/cooldown
-  -> decrypt/wrapper decode
-  -> normalize/project
-```
-
-401/token expiry refreshes through a single auth lock. 403 is terminal. 429/503
-reduce the effective process rate and apply shared cooldown. Healthy successes
-recover the effective rate gradually toward the configured target.
-
-Diagnostics expose safe stage/path/type/curl-code/status metadata and never dump
-credentials or complete response bodies.
+Latest scheduling status lives in `company_master.observed_jp_stat_code` /
+`observed_status_at`, separate from the richer company projection.
 
 ## Discovery architecture
 
-Discovery is a durable search-plan engine rather than a simple crawler:
-
 ```text
-seed -> bucket count/archive -> split if oversized -> per-page archive
-     -> row normalization -> valid-row projection + quarantine -> checkpoint
+seed -> bucket count/archive -> split if oversized -> page archive
+     -> row normalization -> valid projection + quarantine -> checkpoint
 ```
 
-The search backend exposes 10 rows/page and at most 1000 pages/query. Oversized
-buckets are split by juristic type, province then business size. Exhausting those
-dimensions while still over the cap is a hard failure.
+Search exposes 10 rows/page and at most 1000 pages/query. Oversized buckets split by
+juristic type, province then business size. An exhausted leaf still above the cap is
+a hard failure.
 
-The count request archives page 1. For a drainable bucket the same archive is
-linked to page 1, avoiding an unnecessary duplicate request.
+Count page 1 can be reused as page 1. Normalization is row-granular: valid neighbors
+survive rejected rows, rejected rows are durable, and a page remains `partial` until
+resolved. A normal full discovery is incomplete while failed buckets, partial pages,
+unresolved quarantine or known lossy split partitions remain.
 
-Each page is checkpointed independently. Normalization is row-granular:
+Seed/prefix checks describe observed rows only and cannot prove external population
+completeness.
 
-- valid rows are persisted immediately;
-- bad rows are recorded in `discovery_rejections`;
-- the page becomes `partial` while any row remains rejected;
-- retries re-fetch only non-done pages and resolve prior quarantine observations
-  when the page later passes.
+## Replay and evidence
 
-A normal full discovery run is incomplete while failed buckets, partial pages,
-unresolved quarantines or known lossy split partitions remain.
+`response_archive` is the durable endpoint evidence boundary before normalization.
+Payload bytes may be inline or externally encrypted; MySQL keeps archive/request/task
+metadata either way.
 
-Seed/prefix checks operate only on observed rows. They cannot prove the upstream
-search returned every legal entity; final population completeness is an external
-reconciliation problem.
+Legacy `raw_responses` remains because projection tables still retain historical
+foreign keys to it.
 
-## Raw evidence and replay
+Endpoint replay uses the archive without network access. Search-page correction uses
+discovery retry instead.
 
-`response_archive` stores decoded runtime payloads before normalization together
-with request context and processing status. Search pages and endpoint responses use
-the same durable evidence principle.
+## Natural-key freshness
 
-Legacy `raw_responses` remains because projection tables still hold foreign keys to
-it. Some payload data is therefore intentionally stored twice until a future
-migration removes that dependency.
+`company_endpoint_state` records request-scope observability. It is not the write
+fence because request scope and mutated natural keys can differ.
 
-Endpoint replay uses the same projection/lease path without a network request.
-Search-page correction uses discovery retry instead.
-
-## Two freshness models
-
-`company_endpoint_state` is request-scope observability: company + endpoint + scope
-records which request/archive was most recently accepted for that scope.
-
-It is **not** sufficient as the write fence because request scope and mutated rows
-are not always identical. `projection_write_state` therefore fences the natural
-keys actually written:
+`projection_write_state` fences actual write keys:
 
 - profile/details collections: company + endpoint;
 - submissions: whole company collection;
-- financial statements: company + each returned fiscal year;
-- industry benchmark: TSIC + fiscal year + business size + location type +
-  location number.
+- statements: company + each returned fiscal year;
+- benchmark: TSIC + fiscal year + business size + location type + location number.
 
-The projection transaction locks these write keys before mutation. Older responses
-can still be archived and acknowledged as stale, but cannot overwrite newer
-natural-key state. This also protects shared benchmark rows across companies.
+Projection locks these keys before mutation. Older responses can be archived and
+acknowledged stale but cannot overwrite newer natural-key state, including shared
+benchmark rows across companies.
 
 ## Collection safety
 
-Replace-on-refresh is allowed only after root-shape validation. Strict contracts
-specifically prevent malformed transformation, nation-history and benchmark roots
-from being interpreted as legitimate empty/no-data responses.
-
-Explicit empty collections in a valid shape remain meaningful and may clear the
-current collection. Profile explicit null remains authoritative; absent fields do
-not erase existing values.
-
-## Financial model
-
-`financial_statements` stores one header per company/year and
-`financial_statement_items` stores a tall item-code table. A single upstream
-response may contain multiple fiscal years; each returned year is fenced
-independently.
-
-`financial_submissions` is a replace-all company collection, so its natural write
-key is the entire company submission set.
-
-`industry_benchmarks` is shared industry/location data, not a company-owned table.
-The former TSIC/year/size pre-HTTP skip was removed because location fields are part
-of the persisted key but cannot be safely inferred before the response.
+Replace-on-refresh is allowed only after strict root-shape validation. Malformed
+transformation, nation-history and benchmark roots cannot masquerade as legitimate
+empty/no-data responses. Explicit valid empty collections can clear current data;
+profile explicit null remains authoritative while absent fields do not erase data.
 
 ## Deliberate boundaries
 
-- one manager per database, not a distributed global limiter across databases;
-- no exactly-once claim for live HTTP delivery;
+- no exactly-once claim for pre-archive live HTTP delivery;
 - no claim that seed coverage alone proves the complete DBD population;
-- no claim that a short profile probe equals sustainable mixed-endpoint capacity;
-- no automatic destructive downgrade;
-- no external broker required for the current single-manager architecture;
-- no automatic long-term raw-data retention policy yet.
+- no claim that a short probe equals sustainable seven-endpoint capacity;
+- no automatic destructive migration downgrade;
+- Redis is optional and used only for distributed pacing coordination;
+- external object storage is optional and does not replace MySQL task/archive metadata;
+- object retention/orphan cleanup is an explicit operational policy, not automatic deletion;
+- production 48-hour acceptance, authoritative population reconciliation and backup/restore drills require live evidence.
 
-The current correctness model is intentionally conservative: unknown status is not
-guessed, malformed data is quarantined/failed rather than converted to absence, and
-request-saving optimizations are accepted only when their full natural scope is
-provable before HTTP.
+The correctness model remains conservative: unknown status is not guessed, malformed
+data is quarantined/failed rather than converted to absence, project-stage archive
+failure never silently becomes a new upstream fetch, and request-saving optimizations
+are accepted only when their full natural scope is provable before HTTP.

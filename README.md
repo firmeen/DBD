@@ -1,8 +1,10 @@
 # dbd-data
 
 MySQL-backed DBD DataWarehouse ingestion with durable discovery checkpoints,
-endpoint-level work queues, crash-safe leases, decoded response archives and
-replayable projections. No Redis, Supabase or external message broker is required.
+endpoint-level work queues, crash-safe leases, replayable response archives and
+natural-key-fenced projections. MySQL remains the durable metadata/source-of-truth
+boundary. Redis and S3-compatible object storage are optional scale features; neither
+is required for the default single-process/MySQL deployment.
 
 ## Install
 
@@ -13,10 +15,10 @@ port **3307**.
 .\scripts\bootstrap.ps1 -Dev -InstallCommand
 ```
 
-The installer adds this checkout's `.venv\Scripts` to the user PATH. Restart the
-terminal application after the first installation. Configuration is read from the
-checkout's `.env`; set `DBD_ENV_FILE` to an absolute file to use another config.
-Shell environment variables override the file. Never commit credentials.
+Configuration is read from the checkout's `.env`; set `DBD_ENV_FILE` to an absolute
+file to use another config. Shell environment variables override the file. Never
+commit database passwords, Redis credentials, object-store credentials or archive
+encryption keys.
 
 ```powershell
 dbd-data --version
@@ -24,9 +26,8 @@ dbd-data check-db
 dbd-data migrate
 ```
 
-Migrations require schema privileges. Runtime collection needs normal DML
-privileges. Migrations are forward-only and data-preserving; restore a backup to
-roll back.
+Migrations require schema privileges. Runtime collection needs normal DML privileges.
+Migrations are forward-only and data-preserving; restore a backup to roll back.
 
 ## Current collection scope
 
@@ -40,24 +41,16 @@ The default production scope is tabs 1-2, **seven endpoints per company**:
 - `financial_statements`
 - `industry_benchmark`
 
-Tabs 3-4 remain implemented but are not collected by default. Request them
-explicitly with `--only nationality,history`.
+Tabs 3-4 remain implemented but are not collected by default. Request them explicitly
+with `--only nationality,history`.
 
-Financial endpoints depend on a successfully projected profile. A confirmed lack
-of submitted fiscal years is `not_available`; a transport failure, schema change,
+Financial endpoints depend on a successfully projected profile. A confirmed lack of
+submitted fiscal years is `not_available`; a transport failure, schema change,
 quarantined row or unseen company is not.
 
 DBD identities remain strings. Numeric juristic-person types are strict 13-digit
 registration numbers. Observed type `A` records may contain 11-13 digits and are
 preserved exactly as returned; the collector does not invent leading zeros.
-
-## Fetch one company
-
-```powershell
-dbd-data fetch-company 70107556000051 --concurrency 4 --rate 5
-dbd-data fetch-company 70107556000051 --only profile
-dbd-data fetch-company 70107556000051 --only financials --fiscal-year 2568
-```
 
 ## Discovery
 
@@ -69,105 +62,180 @@ dbd-data discover-refresh
 dbd-data master-status
 ```
 
-Discovery uses audited registration-prefix seeds, including the explicitly
-observed `099` exception, and splits oversized search buckets by legal type,
-province and business size. The API limit is 10 rows/page and 1000 pages/query.
+Discovery uses audited registration-prefix seeds, including the observed `099`
+exception, and splits oversized search buckets by legal type, province and business
+size. Valid rows are persisted even when another row on the same page fails contract
+validation; rejected rows are quarantined in `discovery_rejections` and the page
+remains `partial` until a later retry resolves it.
 
-The page-1 count response is archived and reused when the bucket is drainable.
-Every search page is checkpointed by `(bucket_id, page_no)`. Valid rows are
-persisted even when another row on the page fails contract validation; rejected
-rows are stored in `discovery_rejections`, and the page remains `partial` until a
-later retry resolves it. A full discovery command exits non-zero when failed
-buckets, partial pages, unresolved rejections or known lossy partitions remain.
+`discover-status` can prove internal seed/sighting consistency and expose observed
+prefix gaps. It cannot prove that upstream search returned every juristic person.
+A complete-population claim still requires reconciliation against an authoritative
+external population/count source.
 
-`discover-status` can prove that collected identities match registered seeds and
-can expose observed prefix gaps. It **cannot** prove that the upstream search
-returned every juristic person. A complete-population claim still requires
-reconciliation against an authoritative external population/count source.
+## Bulk collection — V2 staged pipeline
 
-Discovery does not overwrite richer company projections. Instead it records the
-latest observed `jpStatCode` separately in `company_master` for scheduling, with a
-timestamp. This avoids relying on a potentially stale shallow `companies` row.
-
-## Bulk collection
+Create one immutable all-status run:
 
 ```powershell
-# Target for the full tabs 1-2 campaign: all discovered statuses.
 dbd-data bulk --master --all-statuses --enqueue-only
+```
 
-# Resume the exact run created above.
-dbd-data bulk --run-id 2 --concurrency 32 --rate 10
+Record its run ID and resume that exact run. V2 decouples fetch, archive and
+projection with bounded queues. A fetched response must become durably recoverable
+before its task transitions to `stage=project`, so restart can resume projection
+without re-contacting DBD.
+
+```powershell
+# Bounded canary first.
+dbd-data bulk --run-id 2 --concurrency 32 --rate 20 --limit 2000 --metrics-port 9108
+
+# Inspect durable status and stage backlog.
 dbd-data bulk-status 2
+
+# Resume the same run after the canary.
+dbd-data bulk --run-id 2 --concurrency 32 --rate 20 --metrics-port 9108
+
 dbd-data bulk-retry 2
 ```
+
+Optional endpoint targets keep known-slower endpoints below the global ceiling:
+
+```powershell
+dbd-data bulk `
+  --run-id 2 `
+  --concurrency 48 `
+  --rate 40 `
+  --endpoint-rates "profile=20,committees=12,committee_signs=12,transformations=10,financial_submissions=10,financial_statements=12,industry_benchmark=8" `
+  --metrics-port 9108
+```
+
+These are examples, not recommended production rates. A 429/503 backs off the
+affected endpoint and global safety layer. Healthy decoded responses recover
+conservatively toward configured ceilings.
 
 `--master` without `--all-statuses` selects only identities whose latest observed
 status is operating (`jpStatCode=1`). Unknown status is not guessed. The current
 all-company acceptance campaign uses `--all-statuses`.
 
-Input files are streamed in bounded batches and deduplicated in MySQL. `--limit`
-counts endpoint attempts, not companies. Endpoint selection and fiscal-year options
-are immutable when resuming a run. Creating another `--master` run is a refresh,
-not a resume; resume with `--run-id`.
+### Optional distributed workers
 
-One API manager per database is enforced with a MySQL named lock. Long-running
-bulk and discovery jobs verify that the same connection still owns the lock; loss
-of ownership stops the manager instead of silently permitting two collectors.
+Redis is required only for distributed worker mode. Every process must use the same
+MySQL database, existing run ID, Redis URL and rate namespace:
 
-Concurrency and admission rate are separate controls. 429/503 responses reduce
-the shared effective rate and apply a shared cooldown; sustained healthy requests
-recover the effective rate gradually toward the configured target. Raising
-concurrency only helps until enough in-flight capacity exists to sustain the
-requested rate at the observed latency.
+```powershell
+$env:DBD_REDIS_URL = "redis://127.0.0.1:6379/0"
+$env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
 
-Ctrl+C returns owned unfinished leases to pending. A crashed worker is recovered
-when its lease expires. Lease owner/version/expiry fences stale writers.
+dbd-data bulk --run-id 2 --distributed --concurrency 32 --rate 40
+```
+
+MySQL leases and `FOR UPDATE SKIP LOCKED` coordinate work ownership. Redis coordinates
+aggregate pacing **and shared adaptive backoff/cooldown/recovery**, so a 429/503 seen
+by one process constrains the fleet using the same namespace. Do not use independent
+keys, proxies, sessions or IP rotation to bypass upstream throttling.
+
+## Archive storage
+
+The default is inline MySQL archive storage with optional zstd compression:
+
+```powershell
+$env:DBD_ARCHIVE_BACKEND = "mysql"
+```
+
+For very large campaigns, V2 can instead store response bodies in S3-compatible
+object storage while MySQL retains archive metadata and the durable task reference.
+External blobs are optionally zstd-compressed first and then encrypted client-side
+with **AES-256-GCM** before upload. The database stores object key, nonce, key id and
+checksums; it does not store the external row's decoded response body inline.
+
+```powershell
+$env:DBD_ARCHIVE_BACKEND = "s3"
+$env:DBD_ARCHIVE_S3_BUCKET = "dbd-response-archive"
+$env:DBD_ARCHIVE_S3_PREFIX = "production/response-archive"
+$env:DBD_ARCHIVE_S3_REGION = "ap-southeast-1"
+$env:DBD_ARCHIVE_ENCRYPTION_KEY_B64 = "<base64-encoded-32-byte-key>"
+$env:DBD_ARCHIVE_ENCRYPTION_KEY_ID = "v2"
+```
+
+For MinIO/another S3-compatible service, set `DBD_ARCHIVE_S3_ENDPOINT_URL`. boto3 uses
+its normal credential chain; prefer an IAM role/workload identity rather than copying
+cloud credentials into the application config.
+
+Key rotation is supported for reads. New writes always use the active key/id above;
+older key ids can remain replayable through a protected JSON map:
+
+```powershell
+$env:DBD_ARCHIVE_DECRYPTION_KEYS = '{"v1":"<old-base64-key>"}'
+```
+
+Archive backend/key validation happens before opening the DBD HTTP client, so invalid
+archive configuration cannot consume upstream requests. External upload completes
+before MySQL commits the archive reference + `stage=project` transition. A failed
+upload therefore cannot create a project-stage task. A database failure after an
+upload may leave an unreferenced encrypted object, which is safer than committing a
+reference to an object that never existed and can be handled by retention/orphan
+maintenance.
+
+Backup/restore for external archives requires **all three**: MySQL metadata backup,
+object-store data, and the required encryption key ids/keys. See
+`docs/HIGH_THROUGHPUT_V2.md` for the full operational contract.
 
 ## Projection correctness and replay
-
-Decoded endpoint payloads are committed to `response_archive` before
-normalization. Strict root-shape contracts prevent malformed transformation,
-nationality-history and benchmark payloads from being mistaken for legitimate
-empty data and clearing older projections.
 
 ```powershell
 dbd-data replay ARCHIVE_ID
 ```
 
-Replay uses the same lease/projection path as live collection. Freshness is fenced
-by the **natural keys actually mutated**, not only by request scope:
+Replay never contacts DBD. It can transparently read legacy JSON, zstd-compressed
+MySQL archives, and configured encrypted external archives. External ciphertext SHA,
+AES-GCM authentication and canonical plaintext SHA are checked before projection.
+Missing object/key/decryption/integrity failures fail the project/replay path rather
+than silently refetching upstream.
+
+Freshness is fenced by the **natural keys actually mutated**, not only by request
+scope:
 
 - financial statements: company + fiscal year;
-- submissions: the whole company collection;
+- submissions: whole company collection;
 - industry benchmark: TSIC + fiscal year + size + location type + location number;
 - other company resources: company + endpoint collection.
 
-Therefore an older replay from another request year or another company sharing a
-benchmark cannot overwrite a newer natural-key projection. The old
-`company_endpoint_state` remains for request-scope observability.
+An older replay therefore cannot overwrite a newer natural-key projection even when
+request scopes differ or companies share a benchmark scope.
 
-The previous cross-company benchmark pre-skip was removed because location fields
-are part of the persisted natural key but are not known safely before the HTTP
-response. Correctness takes precedence over an unproven request-saving heuristic.
-
-## Monitoring and diagnostics
+## Monitoring and capacity validation
 
 ```powershell
 dbd-data bulk --run-id 2 --metrics-port 9108
 ```
 
-Metrics bind only to localhost. Structured diagnostics include stage, safe request
-path, exception type and curl code where available; they do not dump tokens,
-cookies, encryption keys or whole response bodies.
+Metrics bind only to localhost. Structured diagnostics include safe stage/path/error
+metadata and do not dump tokens, cookies, encryption keys or whole response bodies.
 
-`scripts/probe_capacity.py` is a bounded **profile-only** remote probe. It separates
-admission/window throughput from drain time and reports transport-error classes.
-It does not establish a sustainable full-pipeline ceiling or a 48-hour ETA by
-itself. Do not run it concurrently with a collector.
+For V2 capacity planning, stop every collector and use the mixed seven-endpoint probe:
+
+```powershell
+python scripts\probe_mixed_capacity.py `
+  --collector-stopped `
+  --min-rate 10 `
+  --max-rate 40 `
+  --concurrency 48 `
+  --companies 100 `
+  --repeats 2 `
+  --step-seconds 20 `
+  --max-requests 12000
+```
+
+The probe stops admission at the measurement deadline and drains only requests already
+on transport. It does not persist responses and does not establish a production
+ceiling or 48-hour guarantee. Those require a persisted bounded canary and the final
+immutable all-status campaign.
 
 ## Validation
 
-GitHub Actions runs on Python 3.12 with disposable MySQL 8.4 (`dbd_test_ci`):
+GitHub Actions runs on Python 3.12 with disposable MySQL 8.4 (`dbd_test_ci`) and Redis
+for distributed-rate integration coverage:
 
 ```text
 python -m compileall -q src scripts tests
@@ -176,16 +244,16 @@ pytest -q
 ```
 
 The pull request's latest GitHub Actions run is the authoritative validation record
-for its current head. Do not reuse a test count or commit SHA from an older head
-after source, tests, migrations or documentation change.
+for its current head. Do not reuse a test count or SHA from an older head.
 
 See:
 
 - `docs/ARCHITECTURE.md` — current design and invariants
+- `docs/HIGH_THROUGHPUT_V2.md` — V2 staging, Redis, archive backends and tuning
 - `docs/RUNBOOK.md` — operating procedure
 - `docs/OPERATIONS.md` — configuration/failure handling
 - `docs/VALIDATION.md` — measured/proven vs unknown
-- `docs/EXECUTION_PLAN_TH.md` — 48-hour acceptance plan and remaining external validation
+- `docs/EXECUTION_PLAN_TH.md` — 48-hour acceptance plan and remaining live validation
 
 ## Development
 
@@ -195,7 +263,7 @@ See:
 .\.venv\Scripts\python.exe -m ruff check .
 ```
 
-Local integration tests require both `DBD_INTEGRATION=1` and a disposable database
-whose name begins `dbd_test_`. The guard deliberately refuses integration against
-the real data database. `scripts/benchmark_queue.py` uses the same disposable-name
+Local integration tests require `DBD_INTEGRATION=1` and a disposable database whose
+name begins `dbd_test_`. Redis tests use `DBD_REDIS_TEST_URL` and must target a
+disposable Redis database. `scripts/benchmark_queue.py` uses the same disposable-name
 guard and never contacts DBD.

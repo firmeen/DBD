@@ -143,9 +143,13 @@ async def test_old_benchmark_from_other_company_cannot_overwrite_shared_scope(re
     second = synthetic_identity(1)
     newer = datetime(2026, 9, 15, 7, 0, 0)
     older = newer - timedelta(hours=3)
+    # Benchmark natural keys are intentionally shared across companies. Use a
+    # unique synthetic TSIC here so this integration test is isolated from other
+    # tests that persist benchmark rows in the same session-scoped database.
+    submit_obj_code = str(10000 + int(uuid4().hex[:8], 16) % 90000)
 
     scope = {
-        "submitObjCode": "65110",
+        "submitObjCode": submit_obj_code,
         "fiscalYear": "2568",
         "businessSizeCode": "L",
         "locationType": "TH",
@@ -183,10 +187,11 @@ async def test_old_benchmark_from_other_company_cannot_overwrite_shared_scope(re
                     SELECT b.submit_fin_cnt, i.avg_amount
                     FROM industry_benchmarks b
                     JOIN industry_benchmark_items i ON i.benchmark_id=b.id
-                    WHERE b.submit_obj_code='65110' AND b.fiscal_year='2568'
+                    WHERE b.submit_obj_code=:submit_obj_code AND b.fiscal_year='2568'
                       AND b.business_size_code='L' AND b.location_type='TH' AND b.location_no='00'
                       AND i.item_code='assets'
-                """)
+                """),
+                {"submit_obj_code": submit_obj_code},
             )
         ).one()
     assert row[0] == 200

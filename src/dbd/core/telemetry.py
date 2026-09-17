@@ -7,10 +7,27 @@ REQUESTS = Counter("dbd_http_requests_total", "HTTP attempts", ["status"])
 HTTP_RETRIES = Counter("dbd_http_retries_total", "HTTP retries after the first attempt")
 LATENCY = Histogram("dbd_http_seconds", "HTTP attempt duration")
 EFFECTIVE_RATE = Gauge(
-    "dbd_effective_rate_per_second", "Current manager HTTP admission rate"
+    "dbd_effective_rate_per_second", "Configured/shared global HTTP admission ceiling"
+)
+ENDPOINT_EFFECTIVE_RATE = Gauge(
+    "dbd_endpoint_effective_rate_per_second",
+    "Current adaptive HTTP admission rate by endpoint",
+    ["endpoint"],
 )
 TASKS = Counter("dbd_tasks_total", "Endpoint task outcomes", ["endpoint", "status"])
 IN_FLIGHT = Gauge("dbd_tasks_in_flight", "Tasks owned by this process")
+PIPELINE_QUEUE_DEPTH = Gauge(
+    "dbd_pipeline_queue_depth", "In-memory high-throughput pipeline queue depth", ["stage"]
+)
+PIPELINE_STAGE_TOTAL = Counter(
+    "dbd_pipeline_stage_total", "High-throughput pipeline stage events", ["stage", "outcome"]
+)
+PIPELINE_BATCH_SIZE = Histogram(
+    "dbd_pipeline_batch_size", "Batch sizes used by durable queue/archive operations", ["operation"]
+)
+ARCHIVE_BYTES = Counter(
+    "dbd_archive_bytes_total", "Archive bytes before/after optional compression", ["kind"]
+)
 
 DISCOVERY_NEW_IDENTITIES = Counter(
     "dbd_discovery_new_identities_total", "New unique identities first observed during this process"
@@ -45,13 +62,7 @@ _last_discovery_identities: int | None = None
 
 
 def observe_discovery(summary: dict) -> None:
-    """Publish one low-cardinality durable discovery snapshot.
-
-    The first snapshot establishes a process baseline. Later increases feed a
-    counter, so Prometheus `rate(dbd_discovery_new_identities_total[...])` reports
-    newly discovered identities without running an expensive COUNT after every
-    search page.
-    """
+    """Publish one low-cardinality durable discovery snapshot."""
     global _last_discovery_identities
 
     identities = int(summary.get("unique_companies") or 0)

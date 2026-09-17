@@ -9,7 +9,7 @@ from ..core.exceptions import DbdError
 from ..core.settings import settings
 from ..core.telemetry import configure
 from ..runtime.locking import assert_manager_lock, manager_lock
-from ..runtime.resources import endpoints
+from ..runtime.resources import PARTS, endpoints
 from ..runtime.worker import STATUS_OPERATING, prepare, process
 from ..storage.mysql.async_engine import create_engine
 from ..storage.mysql.repositories.worker_repository import WorkerRepository
@@ -36,6 +36,26 @@ def parts(value):
     except ValueError as exc:
         raise argparse.ArgumentTypeError(str(exc)) from None
     return selected
+
+
+def endpoint_rate_map(value):
+    valid = {endpoint for group in PARTS.values() for endpoint in group}
+    result = {}
+    for item in value.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            endpoint, raw_rate = item.split("=", 1)
+        except ValueError:
+            raise argparse.ArgumentTypeError("use endpoint=rate,endpoint=rate") from None
+        endpoint = endpoint.strip()
+        if endpoint not in valid:
+            raise argparse.ArgumentTypeError(f"unknown endpoint {endpoint!r}")
+        result[endpoint] = positive_rate(raw_rate)
+    if not result:
+        raise argparse.ArgumentTypeError("at least one endpoint=rate is required")
+    return result
 
 
 def safe_error(exc: BaseException) -> str:
@@ -66,7 +86,15 @@ async def worker_command(args, health=None):
                     )
                     print(json.dumps([dict(r) for r in rows], default=str, indent=2))
                 return
-            print(json.dumps(await repo.progress(args.run_id), indent=2))
+            print(
+                json.dumps(
+                    {
+                        "status": await repo.progress(args.run_id),
+                        "stages": await repo.progress_by_stage(args.run_id),
+                    },
+                    indent=2,
+                )
+            )
             return
         if args.command == "bulk-retry":
             await repo.get_run(args.run_id)
@@ -114,6 +142,8 @@ async def worker_command(args, health=None):
             rate=args.rate,
             limit=getattr(args, "limit", None),
             health=health,
+            endpoint_rates=getattr(args, "endpoint_rates", None),
+            distributed=getattr(args, "distributed", False),
         )
         print(json.dumps({"run_id": run_id, **result}, indent=2))
         if result.get("failed", 0):
@@ -124,7 +154,7 @@ async def worker_command(args, health=None):
 
 def main():
     parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
-    parser.add_argument("--version", action="version", version="dbd-data 0.2.0")
+    parser.add_argument("--version", action="version", version="dbd-data 0.3.0")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("check-db", help="Check database connectivity")
     sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)")
@@ -141,6 +171,11 @@ def main():
         p.add_argument("--fiscal-year")
         p.add_argument("--concurrency", type=positive)
         p.add_argument("--rate", type=positive_rate)
+        p.add_argument(
+            "--endpoint-rates",
+            type=endpoint_rate_map,
+            help="Optional adaptive targets such as profile=20,industry_benchmark=8",
+        )
         p.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
         if name == "fetch-company":
             p.add_argument("company_code")
@@ -149,8 +184,13 @@ def main():
             source.add_argument("--file")
             source.add_argument("--master", action="store_true")
             source.add_argument("--run-id", type=positive)
-            p.add_argument("--limit", type=positive, help="Maximum endpoint attempts in this invocation")
+            p.add_argument("--limit", type=positive, help="Maximum task claims in this invocation")
             p.add_argument("--enqueue-only", action="store_true")
+            p.add_argument(
+                "--distributed",
+                action="store_true",
+                help="Join an existing run from multiple processes using the Redis shared rate cap",
+            )
             p.add_argument(
                 "--all-statuses",
                 action="store_true",
@@ -209,8 +249,15 @@ def main():
                 asyncio.run(worker_command(args))
         elif args.command in ("bulk", "fetch-company"):
             configure(args.metrics_port)
-            with manager_lock() as conn:
-                asyncio.run(worker_command(args, health=lambda: assert_manager_lock(conn)))
+            if args.command == "bulk" and args.distributed:
+                if args.run_id is None or args.master or args.file or args.enqueue_only:
+                    raise ValueError("--distributed requires an existing --run-id and cannot build a run")
+                if not settings.dbd_redis_url:
+                    raise ValueError("--distributed requires DBD_REDIS_URL")
+                asyncio.run(worker_command(args))
+            else:
+                with manager_lock() as conn:
+                    asyncio.run(worker_command(args, health=lambda: assert_manager_lock(conn)))
         elif args.command == "replay":
             from ..runtime.replay import replay_archive
 

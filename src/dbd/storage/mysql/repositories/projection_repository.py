@@ -121,7 +121,11 @@ def project(
     path: str,
     scope: str = "",
 ) -> str:
-    """Fence projection and task acknowledgement in one MySQL transaction."""
+    """Fence projection and task acknowledgement in one MySQL transaction.
+
+    V2 requires stage=project here. That invariant proves the response archive was
+    durably committed before any relational projection can acknowledge the task.
+    """
     endpoint = task["endpoint"]
     normalized = normalize_resource(endpoint, payload)
     if endpoint == "profile" and (normalized.jp_no, normalized.jp_type_code) != (
@@ -136,14 +140,14 @@ def project(
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT id FROM endpoint_tasks WHERE id=%s AND status='running'
+                    SELECT id FROM endpoint_tasks WHERE id=%s AND stage='project' AND status='running'
                       AND lease_owner=%s AND lease_version=%s AND lease_expires_at>UTC_TIMESTAMP(6)
                     FOR UPDATE
                     """,
                     (task["id"], task["lease_owner"], task["lease_version"]),
                 )
                 if cur.fetchone() is None:
-                    raise LeaseLost("Task lease is no longer owned")
+                    raise LeaseLost("Project-stage task lease is no longer owned")
                 cur.execute(
                     "SELECT company_id FROM company_master WHERE company_id=%s FOR UPDATE",
                     (task["company_id"],),

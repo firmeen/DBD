@@ -23,6 +23,7 @@ from ..core.settings import settings
 from ..core.telemetry import EFFECTIVE_RATE, HTTP_RETRIES, LATENCY, REQUESTS, log
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
+from .rate_control import EndpointRateController
 from .rate_limit import TokenBucket
 from .session import WARMUP_PAGE_URL, create_session
 
@@ -56,7 +57,6 @@ def retry_after(value: str | None) -> float:
 
 
 def _curl_code(exc) -> object:
-    """Extract curl_cffi's numeric code when present without serializing the exception."""
     code = getattr(exc, "code", None)
     if code is not None:
         return code
@@ -64,11 +64,29 @@ def _curl_code(exc) -> object:
 
 
 class AsyncDbdClient:
-    def __init__(self, *, concurrency=None, rate_per_second=None, max_retries=None):
+    def __init__(
+        self,
+        *,
+        concurrency=None,
+        rate_per_second=None,
+        max_retries=None,
+        endpoint_rates=None,
+        redis_url=None,
+        redis_key=None,
+    ):
         self.concurrency = settings.dbd_concurrency if concurrency is None else concurrency
         if self.concurrency < 1:
             raise ValueError("concurrency must be positive")
-        self.rate = TokenBucket(settings.dbd_rate_per_second if rate_per_second is None else rate_per_second)
+        global_rate = settings.dbd_rate_per_second if rate_per_second is None else rate_per_second
+        # Discovery/global-only callers retain the original limiter. Bulk V2 passes
+        # rate_key and uses the endpoint-aware controller with a global safety layer.
+        self.rate = TokenBucket(global_rate)
+        self.endpoint_rate = EndpointRateController(
+            global_rate,
+            endpoint_rates=settings.dbd_endpoint_rates if endpoint_rates is None else endpoint_rates,
+            redis_url=redis_url,
+            redis_key=redis_key or settings.dbd_redis_rate_key,
+        )
         EFFECTIVE_RATE.set(self.rate.rate)
         self.max_retries = settings.dbd_http_retries if max_retries is None else max_retries
         self._semaphore = asyncio.Semaphore(self.concurrency)
@@ -80,6 +98,7 @@ class AsyncDbdClient:
         self.requests_made = self.retries_made = self.rate_limit_hits = 0
 
     async def __aenter__(self):
+        await self.endpoint_rate.open()
         self._session = AsyncSession(impersonate="chrome", max_clients=self.concurrency)
         self._auth_session = create_session()
         try:
@@ -96,6 +115,7 @@ class AsyncDbdClient:
         if self._auth_session is not None:
             self._auth_session.close()
             self._auth_session = None
+        await self.endpoint_rate.close()
 
     async def _ensure_token(self, *, rejected=None, force=False):
         async with self._auth_lock:
@@ -124,7 +144,15 @@ class AsyncDbdClient:
         }
 
     async def fetch(
-        self, method, path, *, json_body=None, params=None, referer=WARMUP_PAGE_URL, timeout=None
+        self,
+        method,
+        path,
+        *,
+        json_body=None,
+        params=None,
+        referer=WARMUP_PAGE_URL,
+        timeout=None,
+        rate_key: str | None = None,
     ):
         if self._session is None:
             raise RuntimeError("Use async with AsyncDbdClient")
@@ -142,7 +170,10 @@ class AsyncDbdClient:
                     self.retries_made += 1
                     HTTP_RETRIES.inc()
                 async with self._semaphore:
-                    await self.rate.acquire()
+                    if rate_key:
+                        await self.endpoint_rate.acquire(rate_key)
+                    else:
+                        await self.rate.acquire()
                     token = await self._ensure_token()
                     requested = datetime.now(timezone.utc).replace(tzinfo=None)
                     self.requests_made += 1
@@ -162,6 +193,7 @@ class AsyncDbdClient:
                                 "http_transport_error",
                                 stage="request",
                                 path=path,
+                                endpoint=rate_key,
                                 exception_type=type(exc).__name__,
                                 curl_code=_curl_code(exc),
                             )
@@ -170,17 +202,30 @@ class AsyncDbdClient:
                     REQUESTS.labels(str(status)).inc()
                     if status in (429, 503):
                         self.rate_limit_hits += 1
-                        old_rate = self.rate.rate
-                        new_rate = self.rate.slow_down()
-                        EFFECTIVE_RATE.set(new_rate)
                         cooldown = retry_after(response.headers.get("retry-after"))
-                        self.rate.cooldown(cooldown)
+                        if rate_key:
+                            (
+                                old_rate,
+                                new_rate,
+                                old_global_rate,
+                                new_global_rate,
+                            ) = await self.endpoint_rate.penalize(rate_key, cooldown)
+                        else:
+                            old_rate = self.rate.rate
+                            new_rate = self.rate.slow_down()
+                            self.rate.cooldown(cooldown)
+                            EFFECTIVE_RATE.set(new_rate)
+                            old_global_rate = old_rate
+                            new_global_rate = new_rate
                         log.warning(
                             "rate_penalty",
                             status=status,
                             path=path,
+                            endpoint=rate_key,
                             old_rate=old_rate,
                             new_rate=new_rate,
+                            old_global_rate=old_global_rate,
+                            new_global_rate=new_global_rate,
                             cooldown_seconds=cooldown,
                         )
                     if status == 401:
@@ -203,16 +248,32 @@ class AsyncDbdClient:
                             "http_decode_error",
                             stage="decode",
                             path=path,
+                            endpoint=rate_key,
                             status=status,
                             exception_type=type(exc).__name__,
                             body_bytes=len(body),
                             body_sha256=sha256(body).hexdigest(),
                         )
                         raise
-                    recovered = self.rate.recover()
+                    if rate_key:
+                        endpoint_recovered, global_recovered = await self.endpoint_rate.recover(
+                            rate_key
+                        )
+                        recovered = endpoint_recovered or global_recovered
+                    else:
+                        recovered = self.rate.recover()
+                        if recovered is not None:
+                            EFFECTIVE_RATE.set(recovered)
                     if recovered is not None:
-                        EFFECTIVE_RATE.set(recovered)
-                        log.info("rate_recovered", path=path, effective_rate=recovered)
+                        log.info(
+                            "rate_recovered",
+                            path=path,
+                            endpoint=rate_key,
+                            effective_rate=recovered,
+                            global_effective_rate=(
+                                self.endpoint_rate.global_effective_rate() if rate_key else self.rate.rate
+                            ),
+                        )
                     return ApiResponse(
                         data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
                     )
