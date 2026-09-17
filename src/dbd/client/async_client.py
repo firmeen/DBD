@@ -79,11 +79,22 @@ class AsyncDbdClient:
             raise ValueError("concurrency must be positive")
         global_rate = settings.dbd_rate_per_second if rate_per_second is None else rate_per_second
         self.rate = TokenBucket(global_rate)
+        self._shared_admission = bool(redis_url)
         self.endpoint_rate = EndpointRateController(
             global_rate,
             endpoint_rates=settings.dbd_endpoint_rates if endpoint_rates is None else endpoint_rates,
             redis_url=redis_url,
             redis_key=redis_key or settings.dbd_redis_rate_key,
+            shared_rate_ceiling=settings.dbd_fleet_rate_ceiling,
+            circuit_failure_threshold=settings.dbd_circuit_failure_threshold,
+            circuit_window_seconds=settings.dbd_circuit_window_seconds,
+            circuit_open_seconds=settings.dbd_circuit_open_seconds,
+            global_pressure_window_seconds=settings.dbd_global_pressure_window_seconds,
+            global_pressure_endpoint_threshold=settings.dbd_global_pressure_endpoint_threshold,
+            circuit_probe_seconds=max(
+                float(settings.request_timeout) + 10.0,
+                float(settings.dbd_circuit_open_seconds),
+            ),
         )
         EFFECTIVE_RATE.set(self.rate.rate)
         self.max_retries = settings.dbd_http_retries if max_retries is None else max_retries
@@ -178,7 +189,7 @@ class AsyncDbdClient:
                     self.retries_made += 1
                     HTTP_RETRIES.inc()
                 async with self._semaphore:
-                    if rate_key:
+                    if rate_key is not None or self._shared_admission:
                         await self.endpoint_rate.acquire(rate_key)
                     else:
                         await self.rate.acquire()
@@ -213,6 +224,7 @@ class AsyncDbdClient:
                         server_cooldown = retry_after(response.headers.get("retry-after"))
                         penalty_key = rate_key or "__global__"
                         streak = self._next_penalty_streak(penalty_key)
+                        global_escalated = rate_key is None
                         if rate_key:
                             old_effective = self.endpoint_rate.effective_rate(rate_key)
                             expected_rate = max(0.5, old_effective * 0.5)
@@ -224,7 +236,18 @@ class AsyncDbdClient:
                                 new_rate,
                                 old_global_rate,
                                 new_global_rate,
+                                global_escalated,
                             ) = await self.endpoint_rate.penalize(rate_key, cooldown)
+                        elif self._shared_admission:
+                            old_effective = self.endpoint_rate.global_effective_rate()
+                            expected_rate = max(0.5, old_effective * 0.5)
+                            cooldown = protective_cooldown(
+                                server_cooldown, expected_rate, streak
+                            )
+                            old_global_rate, new_global_rate = (
+                                await self.endpoint_rate.penalize_global(cooldown)
+                            )
+                            old_rate, new_rate = old_global_rate, new_global_rate
                         else:
                             old_rate = self.rate.rate
                             new_rate = self.rate.slow_down()
@@ -242,6 +265,7 @@ class AsyncDbdClient:
                             new_rate=new_rate,
                             old_global_rate=old_global_rate,
                             new_global_rate=new_global_rate,
+                            global_escalated=global_escalated,
                             penalty_streak=streak,
                             server_retry_after_seconds=server_cooldown,
                             cooldown_seconds=cooldown,
@@ -276,8 +300,13 @@ class AsyncDbdClient:
                     if rate_key:
                         endpoint_recovered, global_recovered = await self.endpoint_rate.recover(rate_key)
                         recovered = endpoint_recovered or global_recovered
+                        global_effective = self.endpoint_rate.global_effective_rate()
+                    elif self._shared_admission:
+                        recovered = await self.endpoint_rate.recover_global()
+                        global_effective = self.endpoint_rate.global_effective_rate()
                     else:
                         recovered = self.rate.recover()
+                        global_effective = self.rate.rate
                         if recovered is not None:
                             EFFECTIVE_RATE.set(recovered)
                     if recovered is not None:
@@ -286,9 +315,7 @@ class AsyncDbdClient:
                             path=path,
                             endpoint=rate_key,
                             effective_rate=recovered,
-                            global_effective_rate=(
-                                self.endpoint_rate.global_effective_rate() if rate_key else self.rate.rate
-                            ),
+                            global_effective_rate=global_effective,
                         )
                     return ApiResponse(
                         data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
