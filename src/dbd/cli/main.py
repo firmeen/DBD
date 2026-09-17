@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import os
 
 from ..contracts.identity import parse_code
 from ..core.exceptions import DbdError
@@ -19,6 +20,13 @@ def positive(value):
     value = int(value)
     if value < 1:
         raise argparse.ArgumentTypeError("must be positive")
+    return value
+
+
+def non_negative(value):
+    value = int(value)
+    if value < 0:
+        raise argparse.ArgumentTypeError("must be non-negative")
     return value
 
 
@@ -59,7 +67,7 @@ def endpoint_rate_map(value):
 
 
 def safe_error(exc: BaseException) -> str:
-    """Expose our sanitized diagnostics without serializing third-party objects/bodies."""
+    """Expose sanitized diagnostics without serializing third-party objects/bodies."""
     if isinstance(exc, BaseExceptionGroup):
         messages = list(dict.fromkeys(safe_error(child) for child in exc.exceptions))
         return "; ".join(messages)[:1000]
@@ -152,6 +160,84 @@ async def worker_command(args, health=None):
         await engine.dispose()
 
 
+async def _prepare_campaign(args) -> int:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        return await prepare(
+            repo,
+            file=args.file,
+            master=args.master,
+            parts=args.only,
+            fiscal_year=args.fiscal_year,
+            statuses=None if args.all_statuses else STATUS_OPERATING,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _validate_campaign_run(run_id: int) -> None:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        await repo.get_run(run_id)
+    finally:
+        await engine.dispose()
+
+
+def _add_campaign_worker_options(parser):
+    parser.add_argument("--workers", type=positive, default=4)
+    parser.add_argument("--worker-concurrency", type=positive, default=8)
+    parser.add_argument("--worker-rate", type=positive_rate, default=settings.dbd_rate_per_second)
+    parser.add_argument(
+        "--rate-mode",
+        choices=("shared", "multiply", "adaptive"),
+        default="adaptive",
+        help="shared=fleet cap, multiply=worker-rate x workers, adaptive=scaled ceiling with low start",
+    )
+    parser.add_argument("--max-restarts", type=non_negative, default=3)
+    display = parser.add_mutually_exclusive_group()
+    display.add_argument("--open-powershell", dest="open_powershell", action="store_true")
+    display.add_argument("--headless", dest="open_powershell", action="store_false")
+    parser.set_defaults(open_powershell=os.name == "nt")
+
+
+def _campaign_command(args) -> None:
+    from ..runtime.supervisor import campaign_status, request_campaign_stop, supervise_campaign
+
+    if args.campaign_command == "status":
+        print(json.dumps(campaign_status(args.run_id), indent=2, default=str))
+        return
+    if args.campaign_command == "stop":
+        request_campaign_stop(args.run_id)
+        print(f"Graceful stop requested for campaign {args.run_id}")
+        return
+
+    if not settings.dbd_redis_url:
+        raise ValueError("campaign requires DBD_REDIS_URL")
+
+    if args.campaign_command == "start":
+        with manager_lock() as conn:
+            run_id = asyncio.run(_prepare_campaign(args))
+            assert_manager_lock(conn)
+        print(f"Campaign run {run_id} prepared", flush=True)
+    else:
+        run_id = args.run_id
+        asyncio.run(_validate_campaign_run(run_id))
+
+    code = supervise_campaign(
+        run_id,
+        workers=args.workers,
+        worker_concurrency=args.worker_concurrency,
+        worker_rate=args.worker_rate,
+        rate_mode=args.rate_mode,
+        open_powershell=args.open_powershell,
+        max_restarts=args.max_restarts,
+    )
+    if code:
+        raise SystemExit(code)
+
+
 def main():
     parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
     parser.add_argument("--version", action="version", version="dbd-data 0.3.0")
@@ -165,6 +251,25 @@ def main():
     reset.add_argument("--bucket-id", type=positive)
     replay = sub.add_parser("replay", help="Reprocess an archived endpoint payload without HTTP")
     replay.add_argument("archive_id", type=positive)
+
+    campaign = sub.add_parser("campaign", help="Supervise a coordinated local worker fleet")
+    campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
+    campaign_start = campaign_sub.add_parser("start", help="Create a run and launch coordinated workers")
+    source = campaign_start.add_mutually_exclusive_group(required=True)
+    source.add_argument("--file")
+    source.add_argument("--master", action="store_true")
+    campaign_start.add_argument("--only", type=parts)
+    campaign_start.add_argument("--fiscal-year")
+    campaign_start.add_argument("--all-statuses", action="store_true")
+    _add_campaign_worker_options(campaign_start)
+    campaign_resume = campaign_sub.add_parser("resume", help="Resume one existing run with workers")
+    campaign_resume.add_argument("run_id", type=positive)
+    _add_campaign_worker_options(campaign_resume)
+    campaign_status_parser = campaign_sub.add_parser("status", help="Show fleet and durable queue status")
+    campaign_status_parser.add_argument("run_id", type=positive)
+    campaign_stop = campaign_sub.add_parser("stop", help="Request graceful draining of all workers")
+    campaign_stop.add_argument("run_id", type=positive)
+
     for name in ("fetch-company", "bulk"):
         p = sub.add_parser(name)
         p.add_argument("--only", type=parts)
@@ -241,6 +346,8 @@ def main():
                 )
                 row = cur.fetchone()
             print(json.dumps({key: int(value or 0) for key, value in row.items()}, indent=2))
+        elif args.command == "campaign":
+            _campaign_command(args)
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
                 with manager_lock():
@@ -276,9 +383,9 @@ def main():
             with manager_lock():
                 command_bulk(None, args.run_id, [], args.limit)
         elif args.command == "discover-status":
-            from .legacy import command_discover_status
+            from ..storage.mysql.repositories.discovery_repository import discovery_summary
 
-            command_discover_status()
+            print(json.dumps(discovery_summary(), indent=2, default=str))
         elif args.command == "discover":
             from .legacy import command_discover
 
