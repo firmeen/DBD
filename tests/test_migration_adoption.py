@@ -6,11 +6,10 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0007_project_attempt_budget"
+HEAD = "0008_collection_fabric"
 
 
 def test_correctness_migration_adopts_existing_objects():
-    """Replay later migrations after Alembic metadata lags behind applied DDL."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute("UPDATE alembic_version SET version_num='0003_queue_indexes'")
         conn.commit()
@@ -44,7 +43,6 @@ def test_correctness_migration_adopts_existing_objects():
 
 
 def test_high_throughput_migration_adopts_existing_objects():
-    """0005 must be safe when MySQL DDL committed but Alembic version did not."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute("UPDATE alembic_version SET version_num='0004_correctness_guards'")
         conn.commit()
@@ -88,7 +86,6 @@ def test_high_throughput_migration_adopts_existing_objects():
 
 
 def test_external_archive_migration_adopts_existing_objects():
-    """0006 is repeat-safe after MySQL committed the external metadata DDL."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute("UPDATE alembic_version SET version_num='0005_high_throughput_pipeline'")
         conn.commit()
@@ -118,7 +115,6 @@ def test_external_archive_migration_adopts_existing_objects():
 
 
 def test_project_attempt_migration_adopts_existing_column():
-    """0007 remains safe when the column exists but Alembic metadata lagged."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute("UPDATE alembic_version SET version_num='0006_external_archive_backend'")
         conn.commit()
@@ -136,3 +132,49 @@ def test_project_attempt_migration_adopts_existing_column():
             """
         )
         assert [row["name"] for row in cur.fetchall()] == ["project_attempts"]
+
+
+def test_collection_fabric_migration_adopts_partial_ddl():
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE alembic_version SET version_num='0007_project_attempt_budget'")
+        cur.execute(
+            "ALTER TABLE worker_runs ADD COLUMN IF NOT EXISTS scheduler_mode "
+            "VARCHAR(16) NOT NULL DEFAULT 'legacy' AFTER fiscal_year"
+        )
+        conn.commit()
+
+    migrate()
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='company_master'
+              AND column_name IN ('master_hash','last_master_changed_at','last_seen_campaign','latest_search_archive_id')
+            ORDER BY column_name
+            """
+        )
+        assert [row["name"] for row in cur.fetchall()] == [
+            "last_master_changed_at",
+            "last_seen_campaign",
+            "latest_search_archive_id",
+            "master_hash",
+        ]
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM information_schema.tables
+            WHERE table_schema=DATABASE() AND table_name='company_collection_state'
+            """
+        )
+        assert cur.fetchone()["n"] == 1
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM information_schema.statistics
+            WHERE table_schema=DATABASE() AND table_name='company_collection_state'
+              AND index_name='idx_collection_claim'
+            """
+        )
+        assert cur.fetchone()["n"] > 0
