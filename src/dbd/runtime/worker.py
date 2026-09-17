@@ -179,11 +179,9 @@ async def process(
         if coordinator is None or identity is None:
             return
         while not stop.is_set() and not drain_requested.is_set():
-            if (
-                await coordinator.stop_requested()
-                or await coordinator.worker_drain_requested(identity)
-            ):
+            if await coordinator.control_requested(identity):
                 drain_requested.set()
+                await coordinator.heartbeat_worker(identity, status="draining")
                 return
             try:
                 await asyncio.wait_for(stop.wait(), _CONTROL_POLL_SECONDS)
