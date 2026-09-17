@@ -16,6 +16,9 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
     invalid = True
     seen = []
     start = int(uuid4().hex[:10], 16)
+    page1_no = str(start + 1).zfill(13)
+    page2_no = str(start + 2).zfill(13)
+    rejected_no = str(start + 100).zfill(13)
 
     class Client:
         concurrency = 2
@@ -26,9 +29,9 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
             rows = [{"jpNo": str(start + page).zfill(13), "jpTypeCode": "7"}]
             if page == 2:
                 rows.append(
-                    {"jpNo": str(start + 100).zfill(13), "jpTypeCode": "7", "jpStatus": ["bad shape"]}
+                    {"jpNo": rejected_no, "jpTypeCode": "7", "jpStatus": ["bad shape"]}
                     if invalid
-                    else {"jpNo": str(start + 100).zfill(13), "jpTypeCode": "7", "jpStatCode": "1"}
+                    else {"jpNo": rejected_no, "jpTypeCode": "7", "jpStatCode": "1"}
                 )
             return {
                 "meta": {"currentPage": page, "totalItems": 3, "totalPages": 2},
@@ -59,10 +62,17 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
         )
         assert cur.fetchone()["n"] == 1
         cur.execute(
-            "SELECT COUNT(*) n FROM discovery_sightings WHERE first_bucket_id=%s",
-            (bucket,),
+            """
+            SELECT jp_no FROM discovery_sightings
+            WHERE jp_type_code='7' AND jp_no IN (%s,%s,%s)
+            ORDER BY jp_no
+            """,
+            (page1_no, page2_no, rejected_no),
         )
-        assert cur.fetchone()["n"] == 2, "valid neighbor from partial page was lost"
+        assert {row["jp_no"] for row in cur.fetchall()} == {
+            page1_no,
+            page2_no,
+        }, "valid neighbor from partial page was lost or rejected row leaked into sightings"
 
         # Search pages now have one raw source of truth: response_archive. The
         # search projection must not duplicate the same payload in raw_responses.
@@ -71,7 +81,7 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
             SELECT COUNT(*) n FROM raw_responses
             WHERE endpoint='search_page' AND jp_no IN (%s,%s)
             """,
-            (str(start + 1).zfill(13), str(start + 2).zfill(13)),
+            (page1_no, page2_no),
         )
         assert cur.fetchone()["n"] == 0
 
@@ -84,7 +94,7 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
             JOIN discovery_pages p ON p.bucket_id=%s AND p.page_no=1
             WHERE c.jp_no=%s AND c.jp_type_code='7'
             """,
-            (bucket, str(start + 1).zfill(13)),
+            (bucket, page1_no),
         )
         projected = cur.fetchone()
         assert projected["latest_archive_id"] == projected["archive_id"]
@@ -105,9 +115,12 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
         )
         assert cur.fetchone()["n"] == 0
         cur.execute(
-            "SELECT COUNT(*) n,MIN(times_seen) min_seen,MAX(times_seen) max_seen "
-            "FROM discovery_sightings WHERE first_bucket_id=%s",
-            (bucket,),
+            """
+            SELECT COUNT(*) n,MIN(times_seen) min_seen,MAX(times_seen) max_seen
+            FROM discovery_sightings
+            WHERE jp_type_code='7' AND jp_no IN (%s,%s,%s)
+            """,
+            (page1_no, page2_no, rejected_no),
         )
         sightings = cur.fetchone()
         assert sightings["n"] == 3
