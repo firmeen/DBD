@@ -191,9 +191,9 @@ class CampaignCoordinator:
             )
         )
 
-    async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> None:
-        """Publish startup without ever erasing a pre-existing stop/drain request."""
-        await self._publish_worker(
+    async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> str:
+        """Publish startup and return the atomic ACTIVE/DRAINING state."""
+        return await self._publish_worker(
             identity,
             status="active",
             ttl_seconds=ttl_seconds,
