@@ -202,8 +202,9 @@ class AsyncDbdClient:
                     REQUESTS.labels(str(status)).inc()
                     if status in (429, 503):
                         self.rate_limit_hits += 1
-                        cooldown = retry_after(response.headers.get("retry-after"))
+                        server_cooldown = retry_after(response.headers.get("retry-after"))
                         if rate_key:
+                            cooldown = server_cooldown
                             (
                                 old_rate,
                                 new_rate,
@@ -212,8 +213,7 @@ class AsyncDbdClient:
                             ) = await self.endpoint_rate.penalize(rate_key, cooldown)
                         else:
                             old_rate = self.rate.rate
-                            new_rate = self.rate.slow_down()
-                            self.rate.cooldown(cooldown)
+                            new_rate, cooldown = self.rate.penalize(server_cooldown)
                             EFFECTIVE_RATE.set(new_rate)
                             old_global_rate = old_rate
                             new_global_rate = new_rate
@@ -226,6 +226,7 @@ class AsyncDbdClient:
                             new_rate=new_rate,
                             old_global_rate=old_global_rate,
                             new_global_rate=new_global_rate,
+                            server_retry_after_seconds=server_cooldown,
                             cooldown_seconds=cooldown,
                         )
                     if status == 401:
