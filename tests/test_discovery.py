@@ -3,12 +3,13 @@ import pytest
 from dbd.client.endpoints.search import SearchFilters
 from dbd.core.exceptions import ContractError
 from dbd.pipelines import discovery
+from dbd.storage.mysql.repositories import discovery_batch_repository as batch_repository
 from dbd.storage.mysql.repositories import discovery_repository as repository
 
 
 async def test_failed_middle_page_is_retried_without_redoing_completed_pages(monkeypatch):
     states = {}
-    archives = []
+    persisted = []
     updates = []
     requested = []
     fail = True
@@ -26,20 +27,29 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
                 "contents": [{"jpTypeCode": "7", "jpNo": str(page).zfill(13)}],
             }
 
-    def archive(*args, **kwargs):
-        archives.append((args, kwargs))
-        return len(archives)
-
-    def finish(bucket, page, *args):
-        states[page] = "done"
-        return 1
+    def persist_batch(records):
+        outcomes = []
+        for record in records:
+            page = record["page_no"]
+            persisted.append(page)
+            states[page] = "done"
+            outcomes.append(
+                {
+                    "page_no": page,
+                    "archive_id": page,
+                    "status": "done",
+                    "written": len(record["profiles"]),
+                    "rejected": 0,
+                    "projected": len(record["projection_profiles"]),
+                }
+            )
+        return outcomes
 
     monkeypatch.setattr(discovery, "update_bucket", lambda *a, **kw: updates.append(kw))
     monkeypatch.setattr(
         repository, "completed_pages", lambda b: {p for p, s in states.items() if s == "done"}
     )
-    monkeypatch.setattr(repository, "archive_search", archive)
-    monkeypatch.setattr(repository, "finish_page", finish)
+    monkeypatch.setattr(batch_repository, "persist_page_batch", persist_batch)
     monkeypatch.setattr(repository, "fail_page", lambda b, p, e: states.update({p: "failed"}))
     monkeypatch.setattr(
         repository,
@@ -56,10 +66,14 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
     await discovery._drain_bucket(Client(), 1, filters, 3, 1, verbose=False)
     assert updates[-1]["status"] == "failed"
     assert updates[-1]["pages_done"] == 2
+    assert sorted(persisted) == [1, 3]
+
     fail = False
     requested.clear()
+    persisted.clear()
     await discovery._drain_bucket(Client(), 1, filters, 3, 3, verbose=False)
     assert requested == [2]
+    assert persisted == [2]
     assert updates[-1]["status"] == "done"
     assert updates[-1]["rows_seen"] == 3
 
