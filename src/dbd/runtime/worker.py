@@ -22,6 +22,10 @@ from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
 
+STATUS_OPERATING = ("1",)
+_CONTROL_POLL_SECONDS = 0.5
+
+
 def code_batches(path: str, size: int):
     batch = []
     with open(path, encoding="utf-8-sig") as handle:
@@ -38,9 +42,6 @@ def code_batches(path: str, size: int):
                 batch = []
         if batch:
             yield batch
-
-
-STATUS_OPERATING = ("1",)
 
 
 async def prepare(repo, *, file=None, master=False, parts=None, fiscal_year=None, statuses=None):
@@ -173,17 +174,28 @@ async def process(
         PIPELINE_QUEUE_DEPTH.labels("archive").set(archive_queue.qsize())
         PIPELINE_QUEUE_DEPTH.labels("project").set(project_queue.qsize())
 
+    async def control_watcher():
+        """Poll ephemeral stop/drain control without increasing MySQL heartbeat writes."""
+        if coordinator is None or identity is None:
+            return
+        while not stop.is_set() and not drain_requested.is_set():
+            if (
+                await coordinator.stop_requested()
+                or await coordinator.worker_drain_requested(identity)
+            ):
+                drain_requested.set()
+                return
+            try:
+                await asyncio.wait_for(stop.wait(), _CONTROL_POLL_SECONDS)
+            except TimeoutError:
+                pass
+
     async def heartbeat():
         while not stop.is_set():
             if health:
                 await asyncio.to_thread(health)
             await repo.heartbeat(owner)
             if coordinator is not None and identity is not None:
-                if (
-                    await coordinator.stop_requested()
-                    or await coordinator.worker_drain_requested(identity)
-                ):
-                    drain_requested.set()
                 await coordinator.heartbeat_worker(
                     identity, status="draining" if drain_requested.is_set() else "active"
                 )
@@ -387,6 +399,8 @@ async def process(
     try:
         async with client_factory(**client_kwargs) as client:
             async with asyncio.TaskGroup() as group:
+                if coordinator is not None:
+                    group.create_task(control_watcher())
                 group.create_task(heartbeat())
                 group.create_task(scheduler())
                 for _ in range(fetch_workers):
