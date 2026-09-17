@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from uuid import uuid4
 
 from redis import Redis
@@ -23,6 +23,13 @@ _AUTOSCALE_DOWN_COOLDOWN_SECONDS = 15.0
 _AUTOSCALE_LOW_PRESSURE_OBSERVATIONS = 2
 _FAILURE_DRAIN_SECONDS = 10.0
 _COMPLETE_DRAIN_SECONDS = 10.0
+_PROGRESS_SNAPSHOT_SECONDS = 0.75
+_WORKER_STATE_REFRESH_SECONDS = 0.75
+_WORKER_STARTUP_GRACE_SECONDS = 20.0
+_WORKER_HEARTBEAT_TIMEOUT_SECONDS = 15.0
+_WORKER_DRAIN_TIMEOUT_SECONDS = 90.0
+_WORKER_KILL_WAIT_SECONDS = 5.0
+_RATE_STATE_TTL_SECONDS = 600
 
 
 @dataclass
@@ -34,6 +41,10 @@ class WorkerProcess:
     log_handle: object | None = None
     draining: bool = False
     drain_requested_at: float | None = None
+    started_at: float = field(default_factory=time.time)
+    last_heartbeat_at: float | None = None
+    registered_once: bool = False
+    capacity_lost: bool = False
 
 
 @dataclass(frozen=True)
@@ -160,16 +171,39 @@ def _worker_drain_key(run_id: int, worker_id: str) -> str:
     return f"{_worker_key(run_id, worker_id)}:drain"
 
 
+def _rate_target_key(rate_key: str) -> str:
+    return f"{rate_key}:target-rate"
+
+
 def _task_progress(run_id: int) -> dict[str, int]:
+    """Read one durable queue snapshot with a single aggregate scan."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT status,COUNT(*) n FROM endpoint_tasks WHERE run_id=%s GROUP BY status",
+            """
+            SELECT COUNT(*) AS total,
+              COALESCE(SUM(status='pending'),0) AS pending,
+              COALESCE(SUM(status='retry_wait'),0) AS retry_wait,
+              COALESCE(SUM(status='running'),0) AS running,
+              COALESCE(SUM(status='failed'),0) AS failed,
+              COALESCE(SUM(status='done'),0) AS done,
+              COALESCE(SUM(status='not_available'),0) AS not_available
+            FROM endpoint_tasks WHERE run_id=%s
+            """,
             (run_id,),
         )
-        result = {row["status"]: int(row["n"]) for row in cur.fetchall()}
-        cur.execute("SELECT COUNT(*) n FROM endpoint_tasks WHERE run_id=%s", (run_id,))
-        result["total"] = int(cur.fetchone()["n"])
-        return result
+        row = cur.fetchone() or {}
+        return {
+            key: int(row.get(key) or 0)
+            for key in (
+                "total",
+                "pending",
+                "retry_wait",
+                "running",
+                "failed",
+                "done",
+                "not_available",
+            )
+        }
 
 
 def _run_status(run_id: int) -> str:
@@ -205,6 +239,7 @@ def _spawn_worker(
     *,
     concurrency: int,
     rate: float,
+    fleet_rate_ceiling: float | None,
     open_powershell: bool,
     restart_count: int = 0,
 ) -> WorkerProcess:
@@ -212,6 +247,8 @@ def _spawn_worker(
     worker_id = f"local-{run_id}-{index}-{uuid4().hex[:8]}"
     env = os.environ.copy()
     env["DBD_WORKER_ID"] = worker_id
+    if fleet_rate_ceiling is not None:
+        env["DBD_FLEET_RATE_CEILING"] = str(float(fleet_rate_ceiling))
     command = _worker_command(run_id, concurrency=concurrency, rate=rate)
     creationflags = 0
     start_new_session = False
@@ -284,7 +321,7 @@ def _request_worker_drain(redis: Redis, run_id: int, worker_id: str, reason: str
 
 
 def _cleanup_worker_control(redis: Redis, run_id: int, worker_id: str) -> None:
-    """Forget an exited local worker immediately instead of waiting for heartbeat TTLs."""
+    """Forget an exited local worker immediately instead of waiting for TTLs."""
     try:
         pipe = redis.pipeline(transaction=False)
         pipe.delete(_worker_key(run_id, worker_id), _worker_drain_key(run_id, worker_id))
@@ -298,17 +335,50 @@ def _clear_stop(redis: Redis, run_id: int) -> None:
     redis.delete(f"{_campaign_key(run_id)}:stop")
 
 
-def _seed_rate(redis: Redis, rate_key: str, initial_rate: float) -> None:
-    """Seed a missing shared rate without erasing an active fleet penalty/cooldown."""
+def _seed_rate(
+    redis: Redis,
+    rate_key: str,
+    initial_rate: float,
+    target_rate: float | None = None,
+) -> None:
+    """Seed shared safety state without erasing an active penalty/cooldown."""
+    target = float(initial_rate if target_rate is None else target_rate)
     pipe = redis.pipeline(transaction=False)
-    pipe.set(f"{rate_key}:effective-rate", str(initial_rate), ex=600, nx=True)
+    pipe.set(f"{rate_key}:effective-rate", str(initial_rate), ex=_RATE_STATE_TTL_SECONDS, nx=True)
     pipe.set(
         f"{rate_key}:last-penalty-ms",
         str(int(time.time() * 1000) - 120_000),
-        ex=600,
+        ex=_RATE_STATE_TTL_SECONDS,
         nx=True,
     )
+    pipe.set(_rate_target_key(rate_key), str(target), ex=_RATE_STATE_TTL_SECONDS)
     pipe.execute()
+
+
+def _set_rate_target(redis: Redis, rate_key: str, target_rate: float) -> float:
+    """Retarget the fleet atomically; scale-down clamps immediately, scale-up recovers gradually."""
+    script = """
+    local target = tonumber(ARGV[1])
+    local ttl = tonumber(ARGV[2])
+    local current = tonumber(redis.call('GET', KEYS[1]) or target)
+    redis.call('SET', KEYS[2], tostring(target), 'EX', ttl)
+    if current > target then
+      current = target
+      redis.call('SET', KEYS[1], tostring(current), 'EX', ttl)
+    elseif redis.call('EXISTS', KEYS[1]) == 1 then
+      redis.call('EXPIRE', KEYS[1], ttl)
+    end
+    return tostring(current)
+    """
+    result = redis.eval(
+        script,
+        2,
+        f"{rate_key}:effective-rate",
+        _rate_target_key(rate_key),
+        str(float(target_rate)),
+        str(_RATE_STATE_TTL_SECONDS),
+    )
+    return float(result)
 
 
 def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
@@ -317,6 +387,12 @@ def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
         return float(raw) if raw is not None else fallback
     except (TypeError, ValueError):
         return fallback
+
+
+def _fleet_rate_target(plan: CampaignRatePlan, rate_workers: int) -> float:
+    if plan.mode == "shared":
+        return plan.worker_rate
+    return min(plan.ceiling, plan.worker_rate * max(1, int(rate_workers)))
 
 
 def _registered_worker_states(redis: Redis, run_id: int) -> list[dict]:
@@ -338,16 +414,54 @@ def _registered_worker_states(redis: Redis, run_id: int) -> list[dict]:
         except (TypeError, ValueError):
             result.append({"worker_id": worker_id, "status": "unknown"})
     if stale:
-        pipe = redis.pipeline(transaction=False)
-        pipe.srem(set_key, *stale)
-        for worker_id in stale:
-            pipe.delete(_worker_drain_key(run_id, worker_id))
-        pipe.execute()
+        # Missing heartbeat visibility may remove set membership, but targeted drain
+        # is control state and must survive until confirmed process exit/unregister.
+        redis.srem(set_key, *stale)
     return result
 
 
 def _registered_workers(redis: Redis, run_id: int) -> int:
     return len(_registered_worker_states(redis, run_id))
+
+
+def _worker_metrics(states: list[dict]) -> dict[str, int]:
+    summed = (
+        "claimed",
+        "completed",
+        "failed",
+        "retry_wait",
+        "not_available",
+        "fetch_active",
+        "archive_active",
+        "project_active",
+        "fetch_queue",
+        "archive_queue",
+        "project_queue",
+        "inflight",
+        "requests",
+        "http_retries",
+        "rate_limit_hits",
+    )
+    return {
+        key: sum(int(row.get(key, 0) or 0) for row in states)
+        for key in summed
+    }
+
+
+def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict[str, int]:
+    result = dict(live)
+    for key in (
+        "claimed",
+        "completed",
+        "failed",
+        "retry_wait",
+        "not_available",
+        "requests",
+        "http_retries",
+        "rate_limit_hits",
+    ):
+        result[key] = int(result.get(key, 0)) + int(retired.get(key, 0))
+    return result
 
 
 def _acquire_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
@@ -432,10 +546,22 @@ def _force_kill_worker(worker: WorkerProcess) -> None:
     worker.process.kill()
 
 
+def _wait_worker_exit(worker: WorkerProcess, timeout: float = _WORKER_KILL_WAIT_SECONDS) -> bool:
+    if worker.process.poll() is not None:
+        return True
+    try:
+        worker.process.wait(timeout=max(0.0, float(timeout)))
+    except (subprocess.TimeoutExpired, OSError):
+        return worker.process.poll() is not None
+    return True
+
+
 def _terminate_workers(workers: list[WorkerProcess]) -> None:
     if os.name == "nt":
         for worker in workers:
             _force_kill_worker(worker)
+        for worker in workers:
+            _wait_worker_exit(worker)
             _close_worker_handle(worker)
         return
 
@@ -448,7 +574,37 @@ def _terminate_workers(workers: list[WorkerProcess]) -> None:
     for worker in workers:
         if worker.process.poll() is None:
             _force_kill_worker(worker)
+            _wait_worker_exit(worker)
         _close_worker_handle(worker)
+
+
+def _release_dead_worker_leases(run_id: int, worker_id: str) -> int:
+    """Immediately reclaim only after the local process tree is confirmed dead."""
+    try:
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE endpoint_tasks
+                SET status='pending',lease_owner=NULL,lease_expires_at=NULL,
+                  attempts=CASE
+                    WHEN stage='fetch' AND attempts>0 THEN attempts-1
+                    ELSE attempts
+                  END,
+                  project_attempts=CASE
+                    WHEN stage='project' AND project_attempts>0 THEN project_attempts-1
+                    ELSE project_attempts
+                  END,
+                  available_at=UTC_TIMESTAMP(6),last_error='worker_process_lost'
+                WHERE run_id=%s AND lease_owner=%s AND status='running'
+                """,
+                (run_id, worker_id),
+            )
+            reclaimed = int(cur.rowcount or 0)
+            conn.commit()
+            return reclaimed
+    except Exception:
+        # Lease expiry remains the durable fallback if immediate reclamation fails.
+        return 0
 
 
 def _request_local_drain(
@@ -487,17 +643,61 @@ def _contain_local_fleet(
     requested = _request_local_drain(redis, run_id, live, reason)
     if requested + already_draining < len(live):
         _terminate_workers(live)
-        return
-
-    deadline = time.monotonic() + max(0.0, grace_seconds)
-    while time.monotonic() < deadline:
+    else:
+        deadline = time.monotonic() + max(0.0, grace_seconds)
+        while time.monotonic() < deadline:
+            remaining = [worker for worker in live if worker.process.poll() is None]
+            if not remaining:
+                break
+            time.sleep(0.1)
         remaining = [worker for worker in live if worker.process.poll() is None]
-        if not remaining:
-            break
-        time.sleep(0.1)
-    remaining = [worker for worker in live if worker.process.poll() is None]
-    if remaining:
-        _terminate_workers(remaining)
+        if remaining:
+            _terminate_workers(remaining)
+
+    for worker in live:
+        if worker.process.poll() is not None:
+            _release_dead_worker_leases(run_id, worker.worker_id)
+            _cleanup_worker_control(redis, run_id, worker.worker_id)
+            _close_worker_handle(worker)
+
+
+def _observe_worker_heartbeat(worker: WorkerProcess, state: dict | None) -> None:
+    if not state:
+        return
+    try:
+        heartbeat_at = float(state.get("heartbeat_at") or 0.0)
+    except (TypeError, ValueError):
+        heartbeat_at = 0.0
+    if heartbeat_at > 0:
+        worker.last_heartbeat_at = heartbeat_at
+        worker.registered_once = True
+
+
+def _worker_unresponsive_reason(
+    worker: WorkerProcess,
+    state: dict | None,
+    *,
+    now_wall: float,
+    now_mono: float,
+) -> str | None:
+    if worker.process.poll() is not None or worker.capacity_lost:
+        return None
+    _observe_worker_heartbeat(worker, state)
+    if worker.draining and worker.drain_requested_at is not None:
+        if now_mono - worker.drain_requested_at > _WORKER_DRAIN_TIMEOUT_SECONDS:
+            return "drain_timeout"
+    if state:
+        heartbeat_at = worker.last_heartbeat_at
+        if heartbeat_at is not None and now_wall - heartbeat_at > _WORKER_HEARTBEAT_TIMEOUT_SECONDS:
+            return "heartbeat_timeout"
+        return None
+    if worker.registered_once and worker.last_heartbeat_at is not None:
+        if now_wall - worker.last_heartbeat_at > _WORKER_HEARTBEAT_TIMEOUT_SECONDS:
+            return "heartbeat_missing"
+        return None
+    if now_wall - worker.started_at > _WORKER_STARTUP_GRACE_SECONDS:
+        return "startup_timeout"
+    return None
 
 
 def supervise_campaign(
@@ -512,7 +712,7 @@ def supervise_campaign(
     workers_min: int | None = None,
     workers_max: int | None = None,
 ) -> int:
-    """Run one lease-protected local fleet with graceful autoscaling and durable work recovery."""
+    """Run one lease-protected local fleet with graceful autoscaling and durable recovery."""
     if not settings.dbd_redis_url:
         raise ValueError("Campaign supervisor requires DBD_REDIS_URL")
     if worker_concurrency < 1 or max_restarts < 0:
@@ -540,6 +740,12 @@ def supervise_campaign(
     supervisor_error = False
     next_lease_refresh = 0.0
     next_state_write = 0.0
+    next_progress_refresh = 0.0
+    next_worker_refresh = 0.0
+    last_rate_target: float | None = None
+    state: dict[str, int] = {}
+    registered_states: list[dict] = []
+    retired_metrics: dict[str, int] = {}
     progress = ProgressLine(f"CAMPAIGN {run_id}", interval=0.75)
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
@@ -549,7 +755,8 @@ def supervise_campaign(
             run_id,
             index,
             concurrency=worker_concurrency,
-            rate=plan.ceiling,
+            rate=plan.worker_rate,
+            fleet_rate_ceiling=plan.ceiling,
             open_powershell=open_powershell,
             restart_count=restarts,
         )
@@ -557,13 +764,57 @@ def supervise_campaign(
             next_index += 1
         return worker
 
+    def retire_metrics(row: dict | None) -> None:
+        if not row:
+            return
+        for key in (
+            "claimed",
+            "completed",
+            "failed",
+            "retry_wait",
+            "not_available",
+            "requests",
+            "http_retries",
+            "rate_limit_hits",
+        ):
+            retired_metrics[key] = int(retired_metrics.get(key, 0)) + int(row.get(key, 0) or 0)
+
+    def replacement_for(worker: WorkerProcess, reason: str) -> WorkerProcess | None:
+        nonlocal exhausted_capacity
+        if worker.restarts >= max_restarts:
+            exhausted_capacity += 1
+            progress.event(
+                f"worker {worker.index} {reason}; restart budget exhausted; fleet capacity reduced by 1"
+            )
+            return None
+        try:
+            replacement = spawn_worker(
+                restart_index=worker.index,
+                restarts=worker.restarts + 1,
+            )
+        except OSError as exc:
+            exhausted_capacity += 1
+            progress.event(
+                f"worker {worker.index} restart failed ({type(exc).__name__}); fleet capacity reduced by 1"
+            )
+            return None
+        progress.event(
+            f"worker {worker.index} {reason}; restarted ({replacement.restarts}/{max_restarts})"
+        )
+        return replacement
+
     try:
         redis.ping()
         _acquire_supervisor_lease(redis, run_id, token)
         lease_acquired = True
-        next_lease_refresh = time.monotonic() + _SUPERVISOR_REFRESH_SECONDS
+        now = time.monotonic()
+        next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
+        next_progress_refresh = now
+        next_worker_refresh = now
         _clear_stop(redis, run_id)
-        _seed_rate(redis, settings.dbd_redis_rate_key, plan.initial)
+        initial_rate_target = _fleet_rate_target(plan, initial_workers)
+        _seed_rate(redis, settings.dbd_redis_rate_key, plan.initial, initial_rate_target)
+        last_rate_target = initial_rate_target
 
         for _ in range(initial_workers):
             children.append(spawn_worker())
@@ -584,22 +835,35 @@ def supervise_campaign(
             worker_concurrency=worker_concurrency,
             worker_rate=worker_rate,
             rate_mode=rate_mode,
+            rate_target=initial_rate_target,
             rate_ceiling=plan.ceiling,
         )
 
         while True:
             now = time.monotonic()
+            now_wall = time.time()
             if now >= next_lease_refresh:
                 _refresh_supervisor_lease(redis, run_id, token)
                 next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
 
-            state = _task_progress(run_id)
+            if now >= next_progress_refresh or not state:
+                state = _task_progress(run_id)
+                next_progress_refresh = now + _PROGRESS_SNAPSHOT_SECONDS
             total = state.get("total", 0)
             pending = state.get("pending", 0) + state.get("retry_wait", 0)
             running = state.get("running", 0)
             failed = state.get("failed", 0)
             done = state.get("done", 0) + state.get("not_available", 0)
             active_work = pending + running
+
+            if now >= next_worker_refresh:
+                registered_states = _registered_worker_states(redis, run_id)
+                next_worker_refresh = now + _WORKER_STATE_REFRESH_SECONDS
+            state_by_id = {
+                str(row.get("worker_id")): row
+                for row in registered_states
+                if row.get("worker_id")
+            }
 
             if _stop_requested(redis, run_id) and not graceful_stop:
                 graceful_stop = True
@@ -608,44 +872,61 @@ def supervise_campaign(
 
             survivors: list[WorkerProcess] = []
             for worker in children:
+                row = state_by_id.get(worker.worker_id)
                 code = worker.process.poll()
                 if code is None:
-                    survivors.append(worker)
+                    reason = _worker_unresponsive_reason(
+                        worker,
+                        row,
+                        now_wall=now_wall,
+                        now_mono=now,
+                    )
+                    if reason is None:
+                        survivors.append(worker)
+                        continue
+
+                    progress.event(f"worker {worker.index} unresponsive ({reason}); stopping process tree")
+                    _force_kill_worker(worker)
+                    if not _wait_worker_exit(worker):
+                        if not worker.capacity_lost:
+                            exhausted_capacity += 1
+                            worker.capacity_lost = True
+                        worker.draining = True
+                        worker.drain_requested_at = worker.drain_requested_at or now
+                        survivors.append(worker)
+                        progress.event(
+                            f"worker {worker.index} could not be confirmed stopped; capacity quarantined"
+                        )
+                        continue
+                    code = worker.process.poll()
+                    retire_metrics(row)
+                    reclaimed = _release_dead_worker_leases(run_id, worker.worker_id)
+                    _close_worker_handle(worker)
+                    _cleanup_worker_control(redis, run_id, worker.worker_id)
+                    if reclaimed:
+                        progress.event(
+                            f"worker {worker.index} dead leases reclaimed: {reclaimed} task(s)"
+                        )
+                    if graceful_stop or worker.draining or not active_work:
+                        continue
+                    replacement = replacement_for(worker, f"stopped after {reason}")
+                    if replacement is not None:
+                        survivors.append(replacement)
                     continue
 
+                retire_metrics(row)
+                _release_dead_worker_leases(run_id, worker.worker_id)
                 _close_worker_handle(worker)
                 _cleanup_worker_control(redis, run_id, worker.worker_id)
                 if graceful_stop or worker.draining or not active_work:
                     continue
-
-                if worker.restarts < max_restarts:
-                    try:
-                        replacement = spawn_worker(
-                            restart_index=worker.index,
-                            restarts=worker.restarts + 1,
-                        )
-                    except OSError as exc:
-                        exhausted_capacity += 1
-                        progress.event(
-                            f"worker {worker.index} restart failed ({type(exc).__name__}); "
-                            "fleet capacity reduced by 1"
-                        )
-                    else:
-                        survivors.append(replacement)
-                        progress.event(
-                            f"worker {worker.index} exited {code}; restarted "
-                            f"({replacement.restarts}/{max_restarts})"
-                        )
-                else:
-                    exhausted_capacity += 1
-                    progress.event(
-                        f"worker {worker.index} exited {code}; restart budget exhausted; "
-                        "fleet capacity reduced by 1"
-                    )
+                replacement = replacement_for(worker, f"exited {code}")
+                if replacement is not None:
+                    survivors.append(replacement)
             children = survivors
 
             live = [worker for worker in children if worker.process.poll() is None]
-            active_live = [worker for worker in live if not worker.draining]
+            active_live = [worker for worker in live if not worker.draining and not worker.capacity_lost]
             draining_live = [worker for worker in live if worker.draining]
             effective_maximum = max(0, maximum - exhausted_capacity)
 
@@ -724,11 +1005,26 @@ def supervise_campaign(
                     f"({len(active_live)}/{required_floor})"
                 )
 
-            effective = _effective_rate(redis, settings.dbd_redis_rate_key, plan.initial)
-            registered_states = _registered_worker_states(redis, run_id)
+            # Draining workers can still finish already-owned HTTP work, so they
+            # remain part of the upstream budget until their process exits.
+            rate_workers = len([worker for worker in live if not worker.capacity_lost])
+            rate_target = _fleet_rate_target(plan, rate_workers)
+            if rate_target != last_rate_target or now >= next_state_write:
+                effective = _set_rate_target(redis, settings.dbd_redis_rate_key, rate_target)
+                last_rate_target = rate_target
+            else:
+                effective = _effective_rate(redis, settings.dbd_redis_rate_key, plan.initial)
+
+            live_metrics = _worker_metrics(registered_states)
+            campaign_metrics = _with_retired_metrics(live_metrics, retired_metrics)
             registered = len(registered_states)
             registered_draining = sum(
                 str(worker.get("status", "")).lower() == "draining"
+                for worker in registered_states
+            )
+            stale_registered = sum(
+                now_wall - float(worker.get("heartbeat_at") or now_wall)
+                > _WORKER_HEARTBEAT_TIMEOUT_SECONDS
                 for worker in registered_states
             )
             worker_label = (
@@ -741,7 +1037,10 @@ def supervise_campaign(
                 done + failed,
                 total,
                 detail=(
-                    f"workers {worker_label} | rate {effective:.2f}/{plan.ceiling:.2f}/s | "
+                    f"workers {worker_label} | rate {effective:.2f}/{rate_target:.2f}/{plan.ceiling:.2f}/s | "
+                    f"q {live_metrics.get('fetch_queue', 0)}/{live_metrics.get('archive_queue', 0)}/"
+                    f"{live_metrics.get('project_queue', 0)} | http {campaign_metrics.get('requests', 0):,} "
+                    f"429/503 {campaign_metrics.get('rate_limit_hits', 0):,} | "
                     f"pending {pending:,} running {running:,} failed {failed:,}"
                 ),
             )
@@ -760,13 +1059,16 @@ def supervise_campaign(
                     workers_active=len(active_live),
                     workers_draining=len(draining_live),
                     workers_registered=registered,
+                    workers_stale=stale_registered,
                     exhausted_capacity=exhausted_capacity,
                     effective_worker_max=effective_maximum,
                     worker_concurrency=worker_concurrency,
                     worker_rate=worker_rate,
                     rate_mode=rate_mode,
                     rate_effective=effective,
+                    rate_target=rate_target,
                     rate_ceiling=plan.ceiling,
+                    worker_metrics=campaign_metrics,
                     pending=pending,
                     running=running,
                     done=done,
@@ -829,10 +1131,14 @@ def supervise_campaign(
                         detail=f"draining | workers {registered} | running {running:,}",
                         force=True,
                     )
-                    time.sleep(0.5)
+                    time.sleep(0.75)
             except KeyboardInterrupt:
                 progress.event("Second Ctrl+C received: forcing worker termination")
                 _terminate_workers(children)
+                for worker in children:
+                    if worker.process.poll() is not None:
+                        _release_dead_worker_leases(run_id, worker.worker_id)
+                        _cleanup_worker_control(redis, run_id, worker.worker_id)
         finally:
             exit_code = 130
 
@@ -852,6 +1158,7 @@ def supervise_campaign(
         for worker in children:
             _close_worker_handle(worker)
             if worker.process.poll() is not None:
+                _release_dead_worker_leases(run_id, worker.worker_id)
                 _cleanup_worker_control(redis, run_id, worker.worker_id)
 
         if lease_acquired:
@@ -887,7 +1194,11 @@ def supervise_campaign(
                     worker_concurrency=worker_concurrency,
                     worker_rate=worker_rate,
                     rate_mode=rate_mode,
+                    rate_target=last_rate_target,
                     rate_ceiling=plan.ceiling,
+                    worker_metrics=_with_retired_metrics(
+                        _worker_metrics(registered_states), retired_metrics
+                    ),
                     pending=snapshot.get("pending", 0) + snapshot.get("retry_wait", 0),
                     running=snapshot.get("running", 0),
                     done=snapshot.get("done", 0) + snapshot.get("not_available", 0),
@@ -934,20 +1245,44 @@ def campaign_status(run_id: int) -> dict:
         try:
             redis.ping()
             workers = _registered_worker_states(redis, run_id)
+            now = time.time()
+            worker_details = []
+            for row in workers:
+                item = dict(row)
+                try:
+                    heartbeat_at = float(item.get("heartbeat_at") or 0.0)
+                except (TypeError, ValueError):
+                    heartbeat_at = 0.0
+                item["heartbeat_age_seconds"] = (
+                    max(0.0, now - heartbeat_at) if heartbeat_at else None
+                )
+                worker_details.append(item)
             state["workers"] = len(workers)
             state["worker_states"] = {
                 "active": sum(str(row.get("status", "")).lower() == "active" for row in workers),
                 "draining": sum(
                     str(row.get("status", "")).lower() == "draining" for row in workers
                 ),
+                "stale": sum(
+                    (now - float(row.get("heartbeat_at") or now))
+                    > _WORKER_HEARTBEAT_TIMEOUT_SECONDS
+                    for row in workers
+                ),
                 "unknown": sum(
                     str(row.get("status", "")).lower() not in {"active", "draining"}
                     for row in workers
                 ),
             }
+            state["worker_metrics"] = _worker_metrics(workers)
+            state["worker_details"] = worker_details
             state["effective_rate"] = _effective_rate(
                 redis, settings.dbd_redis_rate_key, settings.dbd_rate_per_second
             )
+            target_raw = redis.get(_rate_target_key(settings.dbd_redis_rate_key))
+            try:
+                state["rate_target"] = float(target_raw) if target_raw is not None else None
+            except (TypeError, ValueError):
+                state["rate_target"] = None
             state["stop_requested"] = _stop_requested(redis, run_id)
             state["supervisor_active"] = bool(redis.exists(_supervisor_lease_key(run_id)))
             runtime = _read_runtime_state(redis, run_id)
