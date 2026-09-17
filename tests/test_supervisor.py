@@ -98,6 +98,7 @@ def test_windows_terminate_workers_skips_wrapper_only_terminate(monkeypatch) -> 
     process = SimpleNamespace(
         pid=9876,
         poll=lambda: None,
+        wait=lambda timeout=None: calls.append(("wait", timeout)),
         terminate=lambda: calls.append("terminate"),
         kill=lambda: calls.append("kill"),
     )
@@ -115,3 +116,4 @@ def test_windows_terminate_workers_skips_wrapper_only_terminate(monkeypatch) -> 
     assert "terminate" not in calls
     assert "kill" not in calls
     assert calls[0][0] == ["taskkill", "/PID", "9876", "/T", "/F"]
+    assert calls[1] == ("wait", 5.0)
