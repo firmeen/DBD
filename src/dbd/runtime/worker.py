@@ -179,7 +179,10 @@ async def process(
                 await asyncio.to_thread(health)
             await repo.heartbeat(owner)
             if coordinator is not None and identity is not None:
-                if await coordinator.stop_requested():
+                if (
+                    await coordinator.stop_requested()
+                    or await coordinator.worker_drain_requested(identity)
+                ):
                     drain_requested.set()
                 await coordinator.heartbeat_worker(
                     identity, status="draining" if drain_requested.is_set() else "active"
