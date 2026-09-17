@@ -90,6 +90,46 @@ def test_invalid_row_is_quarantined_without_losing_valid_neighbor():
     assert rejected[0]["error_code"] == "ContractError"
 
 
+def test_master_cache_promotes_only_after_successful_persistence():
+    profiles, rejected = discovery._normalize_rows(
+        [{"jpTypeCode": "7", "jpNo": "0107556000051", "jpName": "stable"}]
+    )
+    assert rejected == []
+    cache = {}
+
+    first = {"profiles": list(profiles)}
+    first_staged = discovery._stage_projection_cache([first], cache)
+    assert len(first["projection_profiles"]) == 1
+    assert first_staged
+    assert cache == {}
+
+    # A failed DB transaction must leave the committed cache untouched, so retrying
+    # the same profile still projects it instead of treating rolled-back state as real.
+    retry = {"profiles": list(profiles)}
+    retry_staged = discovery._stage_projection_cache([retry], cache)
+    assert len(retry["projection_profiles"]) == 1
+    assert cache == {}
+
+    cache.update(retry_staged)
+    after_commit = {"profiles": list(profiles)}
+    assert discovery._stage_projection_cache([after_commit], cache) == {}
+    assert after_commit["projection_profiles"] == []
+
+
+def test_master_cache_suppresses_duplicates_inside_one_microbatch():
+    profiles, _ = discovery._normalize_rows(
+        [{"jpTypeCode": "7", "jpNo": "0107556000051", "jpName": "stable"}]
+    )
+    first = {"profiles": list(profiles)}
+    second = {"profiles": list(profiles)}
+
+    staged = discovery._stage_projection_cache([first, second], {})
+
+    assert staged
+    assert len(first["projection_profiles"]) == 1
+    assert second["projection_profiles"] == []
+
+
 def test_observed_type_a_short_identity_is_not_quarantined():
     profiles, rejected = discovery._normalize_rows(
         [{"jpTypeCode": "A", "jpNo": "12345678901", "jpName": "observed type A"}]
