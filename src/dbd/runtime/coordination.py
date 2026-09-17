@@ -109,6 +109,11 @@ class CampaignCoordinator:
         payload["heartbeat_at"] = time.time()
         payload["status"] = status
         await client.set(key, json.dumps(payload), ex=ttl_seconds)
+        # Campaigns may run longer than one day. Refresh membership as part of
+        # every heartbeat so expiry of the set cannot make live workers vanish
+        # from supervisor/status views while their individual heartbeat keys live.
+        await client.sadd(self.workers_key, identity.worker_id)
+        await client.expire(self.workers_key, 86400)
 
     async def unregister_worker(self, identity: WorkerIdentity) -> None:
         client = self._client()
