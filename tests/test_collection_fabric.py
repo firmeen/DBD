@@ -7,7 +7,6 @@ from dbd.runtime.collection_fabric import (
     remaining_mask,
 )
 
-
 DEFAULT_SEVEN = (
     "profile",
     "committees",
