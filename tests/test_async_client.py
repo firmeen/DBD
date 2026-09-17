@@ -7,7 +7,7 @@ import pytest
 
 from dbd.client import rate_limit
 from dbd.client.async_client import AsyncDbdClient
-from dbd.client.rate_limit import TokenBucket
+from dbd.client.rate_limit import TokenBucket, protective_cooldown
 from dbd.core.exceptions import DbdTokenExpiredError
 
 
@@ -66,18 +66,46 @@ async def test_429_sets_shared_cooldown_before_retry():
     assert c.rate._cooldown_until > time.monotonic()
 
 
-async def test_endpoint_429_penalizes_endpoint_and_global_safety_layer():
+async def test_endpoint_429_penalizes_endpoint_without_global_collapse():
     c = client()
     c.endpoint_rate.acquire = AsyncMock()
     c._session.request.side_effect = [response(429, {"retry-after": "0"}), response()]
 
     await c.fetch("GET", "/profile", rate_key="profile")
 
-    # The legacy limiter is not used for keyed V2 traffic.
     assert c.rate.rate == 1000
     assert c.endpoint_rate.effective_rate("profile") == 500
     assert c.endpoint_rate.effective_rate("committees") == 1000
+    assert c.endpoint_rate.global_effective_rate() == 1000
+
+
+async def test_distinct_endpoint_pressure_escalates_global_safety_layer():
+    c = client()
+    c.endpoint_rate.acquire = AsyncMock()
+    c._session.request.side_effect = [
+        response(429, {"retry-after": "0"}),
+        response(),
+        response(429, {"retry-after": "0"}),
+        response(),
+    ]
+
+    await c.fetch("GET", "/profile", rate_key="profile")
+    assert c.endpoint_rate.global_effective_rate() == 1000
+
+    await c.fetch("GET", "/committees", rate_key="committees")
+    assert c.endpoint_rate.effective_rate("profile") == 500
+    assert c.endpoint_rate.effective_rate("committees") == 500
     assert c.endpoint_rate.global_effective_rate() == 500
+
+
+def test_protective_cooldown_respects_server_and_repeated_window_pressure():
+    assert protective_cooldown(8, 2.5, 1) == 8
+    first = protective_cooldown(1, 2.5, 1)
+    second = protective_cooldown(1, 1.25, 2)
+    third = protective_cooldown(1, 0.625, 3)
+    assert first >= 2
+    assert second > first
+    assert third > second
 
 
 def test_rate_recovers_gradually_and_never_exceeds_target(monkeypatch):

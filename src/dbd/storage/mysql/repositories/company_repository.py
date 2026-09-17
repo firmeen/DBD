@@ -11,8 +11,6 @@ def _json(value: object) -> str:
     return json.dumps(value, ensure_ascii=False, default=str)
 
 
-# Declared once so the single-company path and the bulk path can never drift
-# apart. Order here defines the order of values in `company_values()`.
 COMPANY_COLUMNS: tuple[str, ...] = (
     "jp_no",
     "jp_type_code",
@@ -61,18 +59,21 @@ COMPANY_COLUMNS: tuple[str, ...] = (
     "net_profit",
     "submit_fin_year",
     "latest_raw_response_id",
+    "latest_archive_id",
     "first_seen_at",
     "last_seen_at",
 )
 
-# first_seen_at is intentionally absent: it must survive later refreshes.
 _COMPANY_UPDATE_COLUMNS = tuple(c for c in COMPANY_COLUMNS if c not in ("jp_no", "first_seen_at"))
-
-# These always take the incoming value — they describe the write, not the company.
-_ALWAYS_OVERWRITE = {"latest_raw_response_id", "last_seen_at", "jp_type_code"}
+_ALWAYS_OVERWRITE = {"last_seen_at", "jp_type_code"}
 
 
-def company_values(profile: CompanyProfile, raw_response_id: int, requested_at: datetime) -> tuple:
+def company_values(
+    profile: CompanyProfile,
+    raw_response_id: int | None,
+    requested_at: datetime,
+    archive_id: int | None = None,
+) -> tuple:
     return (
         profile.jp_no,
         profile.jp_type_code,
@@ -121,20 +122,14 @@ def company_values(profile: CompanyProfile, raw_response_id: int, requested_at: 
         profile.net_profit,
         profile.submit_fin_year,
         raw_response_id,
+        archive_id,
         requested_at,
         requested_at,
     )
 
 
 def company_upsert_sql(present_fields: set[str] | None = None) -> str:
-    """Merge rather than overwrite.
-
-    The same company arrives from two sources of different richness: a search
-    page populates ~27 fields, while the per-company profile populates ~68.
-    A plain `col = VALUES(col)` therefore lets a later search result erase
-    regDate, financials and ratios that the profile had already supplied.
-    COALESCE keeps the known value when the incoming one is NULL.
-    """
+    """Merge partial Search and richer Profile projections without erasing known fields."""
     placeholders = ", ".join(["%s"] * len(COMPANY_COLUMNS))
     assignments = ", ".join(
         f"{c} = VALUES({c})"
@@ -148,25 +143,23 @@ def company_upsert_sql(present_fields: set[str] | None = None) -> str:
     )
 
 
-def bulk_upsert_companies(cur, profiles, raw_response_id: int, requested_at: datetime) -> int:
-    """One executemany for a whole page/batch of companies.
-
-    At a million companies the per-company round trip is the bottleneck, not
-    the query itself, so discovery writes in batches instead of one statement
-    (and one transaction) per company.
-    """
+def bulk_upsert_companies(
+    cur,
+    profiles,
+    raw_response_id: int | None,
+    requested_at: datetime,
+    archive_id: int | None = None,
+) -> int:
     if not profiles:
         return 0
-
     cur.executemany(
         company_upsert_sql(),
-        [company_values(p, raw_response_id, requested_at) for p in profiles],
+        [company_values(p, raw_response_id, requested_at, archive_id) for p in profiles],
     )
     return len(profiles)
 
 
 def find_submit_fin_year(jp_no: str) -> str | None:
-    """The profile's `submitFinYear` ("2568 2567 ...") as already stored."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT submit_fin_year FROM companies WHERE jp_no = %s", (jp_no,))
         row = cur.fetchone()
@@ -182,11 +175,6 @@ def save_company_profile(
     body_sha256: str,
     request_path: str,
 ) -> int:
-    """Persist one company-profile fetch: raw JSON (source of truth, append-only),
-    the latest normalized projection, and a generic key/value dump of every
-    field not promoted to a `companies` column. Mirrors creden's
-    http_snapshots -> companies -> company_facts pattern.
-    """
     with connect() as conn:
         try:
             with conn.cursor() as cur:

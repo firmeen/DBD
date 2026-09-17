@@ -1,0 +1,136 @@
+from datetime import datetime, timezone
+from uuid import uuid4
+
+import pytest
+
+from dbd.client.endpoints.search import SearchFilters
+from dbd.storage.mysql.engine import connect
+from dbd.storage.mysql.repositories.discovery_batch_repository import persist_page_batch
+from dbd.storage.mysql.repositories.discovery_repository import (
+    DiscoveryLeaseLost,
+    get_bucket,
+    release_bucket_claim,
+    update_bucket,
+    upsert_bucket,
+)
+from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+pytestmark = pytest.mark.integration
+
+
+def _set_lease(bucket_id: int, owner: str, version: int) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE discovery_buckets
+            SET status='draining',lease_owner=%s,lease_version=%s,
+                lease_expires_at=TIMESTAMPADD(SECOND,60,UTC_TIMESTAMP(6))
+            WHERE id=%s
+            """,
+            (owner, version, bucket_id),
+        )
+        conn.commit()
+
+
+def test_stale_discovery_worker_cannot_mutate_or_persist_reclaimed_bucket() -> None:
+    filters = SearchFilters("lease-" + uuid4().hex)
+    bucket_id = upsert_bucket(filters)
+    _set_lease(bucket_id, "worker-b", 2)
+
+    with pytest.raises(DiscoveryLeaseLost):
+        update_bucket(
+            bucket_id,
+            lease_owner="worker-a",
+            lease_version=1,
+            status="done",
+        )
+
+    record = {
+        "bucket_id": bucket_id,
+        "page_no": 1,
+        "filters": filters,
+        "data": {"meta": {"currentPage": 1, "totalItems": 0, "totalPages": 0}, "contents": []},
+        "requested": datetime.now(timezone.utc).replace(tzinfo=None),
+        "profiles": [],
+        "projection_profiles": [],
+        "rejections": [],
+        "lease_owner": "worker-a",
+        "lease_version": 1,
+    }
+    with pytest.raises(DiscoveryLeaseLost):
+        persist_page_batch([record])
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM discovery_pages WHERE bucket_id=%s",
+            (bucket_id,),
+        )
+        assert cur.fetchone()["n"] == 0
+
+    assert release_bucket_claim(bucket_id, "worker-a", 1) is False
+    current = get_bucket(bucket_id)
+    assert current["lease_owner"] == "worker-b"
+    assert int(current["lease_version"]) == 2
+    assert current["status"] == "draining"
+
+    update_bucket(
+        bucket_id,
+        lease_owner="worker-b",
+        lease_version=2,
+        status="done",
+    )
+    assert get_bucket(bucket_id)["status"] == "done"
+
+
+def test_split_is_atomic_and_rejects_stale_worker() -> None:
+    parent = SearchFilters("split-" + uuid4().hex)
+    bucket_id = upsert_bucket(parent)
+    _set_lease(bucket_id, "worker-b", 4)
+    child = SearchFilters(
+        keyword=parent.keyword,
+        search_type=parent.search_type,
+        jp_types=["2"],
+    )
+
+    with pytest.raises(DiscoveryLeaseLost):
+        split_bucket(
+            bucket_id,
+            [child],
+            1,
+            lease_owner="worker-a",
+            lease_version=3,
+        )
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) AS n FROM discovery_buckets WHERE parent_id=%s", (bucket_id,))
+        assert cur.fetchone()["n"] == 0
+
+    child_ids = split_bucket(
+        bucket_id,
+        [child],
+        1,
+        lease_owner="worker-b",
+        lease_version=4,
+    )
+    assert len(child_ids) == 1
+    assert get_bucket(bucket_id)["status"] == "split"
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT parent_id,depth,status FROM discovery_buckets WHERE id=%s", (child_ids[0],))
+        created = cur.fetchone()
+    assert int(created["parent_id"]) == bucket_id
+    assert int(created["depth"]) == 1
+    assert created["status"] == "pending"
+
+
+def test_release_is_fenced_by_lease_version_even_for_same_owner() -> None:
+    filters = SearchFilters("release-" + uuid4().hex)
+    bucket_id = upsert_bucket(filters)
+    _set_lease(bucket_id, "worker-reused", 7)
+
+    assert release_bucket_claim(bucket_id, "worker-reused", 6) is False
+    assert get_bucket(bucket_id)["lease_owner"] == "worker-reused"
+
+    assert release_bucket_claim(bucket_id, "worker-reused", 7) is True
+    current = get_bucket(bucket_id)
+    assert current["lease_owner"] is None
+    assert current["lease_expires_at"] is None
