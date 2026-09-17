@@ -1,4 +1,7 @@
-from dbd.runtime.supervisor import _worker_command, build_rate_plan
+from types import SimpleNamespace
+
+import dbd.runtime.supervisor as supervisor
+from dbd.runtime.supervisor import WorkerProcess, _force_kill_worker, _worker_command, build_rate_plan
 
 
 def test_shared_rate_is_fleet_cap() -> None:
@@ -23,3 +26,23 @@ def test_child_workers_disable_prometheus_listener_collision() -> None:
     command = _worker_command(42, concurrency=8, rate=15)
     assert "--distributed" in command
     assert command[command.index("--metrics-port") + 1] == "0"
+
+
+def test_windows_force_stop_kills_entire_worker_tree(monkeypatch) -> None:
+    calls = []
+    process = SimpleNamespace(pid=4321, poll=lambda: None, kill=lambda: calls.append("kill"))
+    worker = WorkerProcess(1, "worker-1", process)
+
+    monkeypatch.setattr(supervisor.os, "name", "nt")
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+
+    _force_kill_worker(worker)
+
+    command, kwargs = calls[0]
+    assert command == ["taskkill", "/PID", "4321", "/T", "/F"]
+    assert kwargs["check"] is False
+    assert "kill" not in calls
