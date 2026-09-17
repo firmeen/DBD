@@ -1,7 +1,13 @@
 from types import SimpleNamespace
 
 import dbd.runtime.supervisor as supervisor
-from dbd.runtime.supervisor import WorkerProcess, _force_kill_worker, _worker_command, build_rate_plan
+from dbd.runtime.supervisor import (
+    WorkerProcess,
+    _force_kill_worker,
+    _seed_rate,
+    _worker_command,
+    build_rate_plan,
+)
 
 
 def test_shared_rate_is_fleet_cap() -> None:
@@ -26,6 +32,28 @@ def test_child_workers_disable_prometheus_listener_collision() -> None:
     command = _worker_command(42, concurrency=8, rate=15)
     assert "--distributed" in command
     assert command[command.index("--metrics-port") + 1] == "0"
+
+
+def test_seed_rate_does_not_clear_existing_shared_penalty_state() -> None:
+    class FakeRedis:
+        def __init__(self):
+            self.set_calls = []
+
+        def set(self, key, value, **kwargs):
+            self.set_calls.append((key, value, kwargs))
+
+        def delete(self, *keys):
+            raise AssertionError(f"must not clear active pacing state: {keys}")
+
+    redis = FakeRedis()
+    _seed_rate(redis, "dbd:rate", 15)
+
+    assert [call[0] for call in redis.set_calls] == [
+        "dbd:rate:effective-rate",
+        "dbd:rate:last-penalty-ms",
+    ]
+    assert all(call[2].get("nx") is True for call in redis.set_calls)
+    assert all(call[2].get("ex") == 600 for call in redis.set_calls)
 
 
 def test_windows_force_stop_kills_entire_worker_tree(monkeypatch) -> None:
