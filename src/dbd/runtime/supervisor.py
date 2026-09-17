@@ -6,7 +6,6 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
-from pathlib import Path
 from uuid import uuid4
 
 from redis import Redis
@@ -91,6 +90,8 @@ def _worker_command(run_id: int, *, concurrency: int, rate: float) -> list[str]:
         str(concurrency),
         "--rate",
         str(rate),
+        "--metrics-port",
+        "0",
     ]
 
 
@@ -121,7 +122,7 @@ def _spawn_worker(
                 "powershell.exe",
                 "-NoProfile",
                 "-Command",
-                f"$Host.UI.RawUI.WindowTitle='{title}'; {rendered}; exit $LASTEXITCODE",
+                f"$Host.UI.RawUI.WindowTitle='{title}'; & {rendered}; exit $LASTEXITCODE",
             ]
     else:
         start_new_session = True
@@ -311,7 +312,9 @@ def supervise_campaign(
         except KeyboardInterrupt:
             progress.event("Second Ctrl+C received: forcing worker termination")
             _terminate_workers(children)
-        progress.close(message=f"Campaign {run_id} paused safely; resume with dbd-data campaign resume {run_id}")
+        progress.close(
+            message=f"Campaign {run_id} paused safely; resume with dbd-data campaign resume {run_id}"
+        )
         redis.close()
         return 130
     finally:
