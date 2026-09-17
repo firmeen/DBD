@@ -18,6 +18,7 @@ class TokenBucket:
         self._lock = asyncio.Lock()
         self._cooldown_until = 0.0
         self._last_penalty = 0.0
+        self._penalty_streak = 0
 
     async def acquire(self):
         # Serializing admission lets a changed limiter/cooldown affect queued
@@ -43,6 +44,26 @@ class TokenBucket:
         self._last_penalty = time.monotonic()
         return self._set_rate(min(self.rate, max(floor, self.rate * factor)))
 
+    def penalize(self, retry_after_seconds: float) -> tuple[float, float]:
+        """Slow down and hold admission long enough to drain a rolling server window.
+
+        DBD Search can return a short Retry-After even while the preceding request
+        window still carries quota debt. Re-entering immediately can therefore
+        produce a 429 cascade that repeatedly halves the effective rate. Consecutive
+        penalties inside one recovery window receive progressively longer protective
+        cooldowns, while the server-provided Retry-After remains a hard minimum.
+        """
+        now = time.monotonic()
+        if self._last_penalty <= 0 or now - self._last_penalty >= 30.0:
+            self._penalty_streak = 0
+        self._penalty_streak = min(10, self._penalty_streak + 1)
+        new_rate = self.slow_down()
+        debt_seconds = (2 ** min(self._penalty_streak, 4)) / max(new_rate, 0.5)
+        protective = min(30.0, max(2.0, debt_seconds))
+        cooldown_seconds = max(0.0, float(retry_after_seconds), protective)
+        self.cooldown(cooldown_seconds)
+        return new_rate, cooldown_seconds
+
     def recover(self, factor=1.25, step=0.5, quiet_seconds=30.0):
         """Increase effective rate slowly after a quiet period with no new penalty.
 
@@ -59,4 +80,5 @@ class TokenBucket:
         if new_rate <= self.rate:
             return None
         self._last_penalty = now
+        self._penalty_streak = 0
         return self._set_rate(new_rate)
