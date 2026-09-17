@@ -33,6 +33,7 @@ from ..storage.mysql.repositories.discovery_repository import (
     update_bucket,
     upsert_bucket,
 )
+from ..storage.mysql.repositories.discovery_split_repository import split_bucket
 
 JP_TYPES = ("0", "2", "3", "5", "7", "8", "9", "A")
 BUSINESS_SIZES = ("S", "M", "L")
@@ -453,9 +454,14 @@ async def _process_bucket(
                 ),
             )
             return 0, 0
-        for child in children:
-            upsert_bucket(child, parent_id=bucket_id, depth=int(row["depth"]) + 1)
-        owned_update(status="split")
+        await asyncio.to_thread(
+            split_bucket,
+            bucket_id,
+            children,
+            int(row["depth"]) + 1,
+            lease_owner=lease_owner,
+            lease_version=lease_version,
+        )
         if progress_line is not None:
             progress_line.event(
                 f"bucket {bucket_id}: {total_items:,} rows -> split into {len(children)} child buckets"
