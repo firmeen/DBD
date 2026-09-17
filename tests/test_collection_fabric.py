@@ -1,4 +1,4 @@
-import dbd.runtime.collection_fabric as fabric
+from dbd.runtime import collection_fabric as fabric
 
 
 DEFAULT_SEVEN = (
