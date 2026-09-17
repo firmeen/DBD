@@ -19,3 +19,6 @@ build/
 dist/
 .coverage
 pytest-cache-files-*/
+
+# Pipeline data belongs to pipl-v2
+/data/
