@@ -71,8 +71,8 @@ def _now() -> datetime:
 
 
 def _filters_from_row(row: dict) -> SearchFilters:
-    def split(value: str) -> list[str]:
-        return [value for value in (value or "").split(",") if value]
+    def split(raw: str) -> list[str]:
+        return [item for item in (raw or "").split(",") if item]
 
     return SearchFilters(
         keyword=row["keyword"],
@@ -203,13 +203,22 @@ async def _drain_bucket(
     bucket_id,
     filters,
     pages_total,
+    start_page=None,
     *,
+    verbose=False,
     first_page=None,
     master_cache: dict[tuple[str, str], str] | None = None,
     progress_line: ProgressLine | None = None,
 ):
+    """Drain incomplete page checkpoints; start_page is retained for API compatibility."""
     from ..storage.mysql.repositories.discovery_batch_repository import persist_page_batch
     from ..storage.mysql.repositories.discovery_repository import completed_pages, fail_page, page_progress
+
+    del start_page
+    local_progress = None
+    if progress_line is None and verbose:
+        local_progress = ProgressLine("DISCOVERY", interval=0.75)
+        progress_line = local_progress
 
     update_bucket(bucket_id, status="draining", last_error=None)
     completed = await asyncio.to_thread(completed_pages, bucket_id)
@@ -223,6 +232,8 @@ async def _drain_bucket(
             rows_seen=state["rows"] + state["rejected"],
             last_error=None if state["done"] == pages_total else "Discovery page state incomplete",
         )
+        if local_progress is not None:
+            local_progress.close()
         return 0, 0
 
     cache = master_cache if master_cache is not None else {}
@@ -356,6 +367,8 @@ async def _drain_bucket(
         rows_seen=state["rows"] + state["rejected"],
         last_error=error,
     )
+    if local_progress is not None:
+        local_progress.close()
     return fetched, written
 
 
@@ -415,6 +428,8 @@ async def _process_bucket(
         bucket_id,
         filters,
         pages_total,
+        1,
+        verbose=False,
         first_page=first_page,
         master_cache=master_cache,
         progress_line=progress_line,
@@ -471,23 +486,22 @@ async def _run_work(
     for seed in seeds:
         upsert_bucket(SearchFilters(keyword=seed, search_type=search_type))
 
+    base_parallelism = max(1, min(4, client.concurrency // 4 or 1))
     while True:
+        remaining = None if max_buckets is None else max_buckets - buckets_processed
+        if remaining is not None and remaining <= 0:
+            break
+        desired = base_parallelism if remaining is None else min(base_parallelism, remaining)
         if distributed:
             rows = await asyncio.to_thread(
-                claim_buckets, owner, 25, settings.dbd_lease_seconds
+                claim_buckets, owner, desired, settings.dbd_lease_seconds
             )
+            batch = rows
         else:
             rows = await asyncio.to_thread(pending_buckets, 25)
-        if not rows:
+            batch = rows[:desired]
+        if not batch:
             break
-        if max_buckets is not None:
-            remaining = max_buckets - buckets_processed
-            if remaining <= 0:
-                break
-            rows = rows[:remaining]
-
-        bucket_parallelism = max(1, min(4, client.concurrency // 4 or 1, len(rows)))
-        batch = rows[:bucket_parallelism]
 
         async def process_one(row):
             bucket_id = int(row["id"])
