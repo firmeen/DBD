@@ -200,6 +200,26 @@ def _normalize_rows(rows: list[dict]) -> tuple[list, list[dict]]:
     return profiles, rejections
 
 
+def _stage_projection_cache(batch: list[dict], cache: dict[tuple[str, str], str]) -> dict:
+    """Select projections against committed cache without mutating it before DB commit."""
+    staged: dict[tuple[str, str], str] = {}
+    for record in batch:
+        selected = []
+        fingerprints = []
+        for profile in record["profiles"]:
+            fingerprint = master_fingerprint(profile)
+            key = (profile.jp_type_code, profile.jp_no)
+            known = staged.get(key, cache.get(key))
+            if known == fingerprint:
+                continue
+            staged[key] = fingerprint
+            selected.append(profile)
+            fingerprints.append((key, fingerprint))
+        record["projection_profiles"] = selected
+        record["projection_fingerprints"] = fingerprints
+    return staged
+
+
 async def _drain_bucket(
     client,
     bucket_id,
@@ -277,14 +297,6 @@ async def _drain_bucket(
             if page.current_page != page_no or (not page.rows and page.total_items > 0):
                 raise ContractError("Search page number or empty-page contract mismatch")
             profiles, rejections = _normalize_rows(page.rows)
-            projection_profiles = []
-            for profile in profiles:
-                fingerprint = master_fingerprint(profile)
-                key = (profile.jp_type_code, profile.jp_no)
-                if cache.get(key) == fingerprint:
-                    continue
-                cache[key] = fingerprint
-                projection_profiles.append(profile)
             canonical_payload = json.dumps(data, ensure_ascii=False, default=str)
             result = {
                 "bucket_id": bucket_id,
@@ -296,7 +308,8 @@ async def _drain_bucket(
                 "requested": requested,
                 "archive_id": archive_id,
                 "profiles": profiles,
-                "projection_profiles": projection_profiles,
+                "projection_profiles": [],
+                "projection_fingerprints": [],
                 "rejections": rejections,
             }
             if lease_owner is not None:
@@ -352,12 +365,14 @@ async def _drain_bucket(
                     batch.append(result_queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            staged_cache = _stage_projection_cache(batch, cache)
             started = time.monotonic()
             try:
                 outcomes = await asyncio.to_thread(persist_page_batch, batch)
             finally:
                 for _ in batch:
                     result_queue.task_done()
+            cache.update(staged_cache)
             elapsed = time.monotonic() - started
             fetched += len(outcomes)
             written += sum(int(outcome["written"]) for outcome in outcomes)
