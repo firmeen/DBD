@@ -49,8 +49,14 @@ class CampaignCoordinator:
 
     async def close(self) -> None:
         if self._redis is not None:
-            await self._redis.aclose()
+            client = self._redis
             self._redis = None
+            try:
+                await client.aclose()
+            except Exception:
+                # Redis is control-plane state only. Closing a broken socket must
+                # never replace the durable worker/MySQL error being propagated.
+                pass
 
     def _client(self) -> Redis:
         if self._redis is None:
@@ -115,10 +121,20 @@ class CampaignCoordinator:
         await client.sadd(self.workers_key, identity.worker_id)
         await client.expire(self.workers_key, 86400)
 
-    async def unregister_worker(self, identity: WorkerIdentity) -> None:
-        client = self._client()
-        await client.delete(f"{self.base_key}:worker:{identity.worker_id}")
-        await client.srem(self.workers_key, identity.worker_id)
+    async def unregister_worker(self, identity: WorkerIdentity) -> bool:
+        """Best-effort ephemeral cleanup; durable MySQL lease release happens separately."""
+        if self._redis is None:
+            return False
+        try:
+            client = self._client()
+            await client.delete(f"{self.base_key}:worker:{identity.worker_id}")
+            await client.srem(self.workers_key, identity.worker_id)
+            return True
+        except Exception:
+            # Heartbeat keys have TTLs, so failed cleanup self-heals. Swallowing
+            # here preserves the original worker failure while MySQL remains the
+            # authoritative lease/work source.
+            return False
 
     async def workers(self) -> list[dict]:
         client = self._client()
@@ -139,16 +155,17 @@ class CampaignCoordinator:
         *,
         ttl_seconds: int = 600,
     ) -> None:
-        """Seed only shared effective rate; configured worker rate remains the ceiling."""
+        """Seed a missing shared rate without erasing an active fleet penalty/cooldown."""
         client = self._client()
-        await client.delete(redis_rate_key, f"{redis_rate_key}:cooldown-until-ms")
         await client.set(
             f"{redis_rate_key}:effective-rate",
             str(float(effective_rate)),
             ex=ttl_seconds,
+            nx=True,
         )
         await client.set(
             f"{redis_rate_key}:last-penalty-ms",
             str(int(time.time() * 1000) - 120_000),
             ex=ttl_seconds,
+            nx=True,
         )
