@@ -48,6 +48,30 @@ async def test_campaign_stop_and_worker_heartbeat_are_shared():
         await second.close()
 
 
+async def test_per_worker_drain_is_targeted_and_cleared_on_unregister():
+    run_id = int(uuid4().hex[:8], 16)
+    namespace = "dbd:test-worker-drain:" + uuid4().hex
+    coordinator = CampaignCoordinator(REDIS_URL, run_id, namespace=namespace)
+    first = WorkerIdentity("worker-a", run_id, 111)
+    second = WorkerIdentity("worker-b", run_id, 222)
+    await coordinator.open()
+    try:
+        await coordinator.register_worker(first, ttl_seconds=5)
+        await coordinator.register_worker(second, ttl_seconds=5)
+        await coordinator.request_worker_drain(first.worker_id, "scale_down", ttl_seconds=5)
+
+        assert await coordinator.worker_drain_requested(first) is True
+        assert await coordinator.worker_drain_requested(second) is False
+
+        assert await coordinator.unregister_worker(first) is True
+        assert await coordinator.worker_drain_requested(first) is False
+        assert [item["worker_id"] for item in await coordinator.workers()] == ["worker-b"]
+    finally:
+        await coordinator.unregister_worker(first)
+        await coordinator.unregister_worker(second)
+        await coordinator.close()
+
+
 async def test_unregister_failure_is_best_effort_and_close_does_not_mask_errors():
     class BrokenRedis:
         async def delete(self, *args):
