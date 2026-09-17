@@ -19,7 +19,7 @@ async def test_campaign_stop_and_worker_heartbeat_are_shared():
     await second.open()
     try:
         await first.clear_stop()
-        await first.register_worker(worker, ttl_seconds=5)
+        assert await first.register_worker(worker, ttl_seconds=5) == "active"
         workers = await second.workers()
         assert [item["worker_id"] for item in workers] == ["worker-a"]
         assert workers[0]["status"] == "active"
@@ -57,7 +57,7 @@ async def test_preexisting_targeted_drain_survives_register_and_active_heartbeat
     await coordinator.open()
     try:
         await coordinator.request_worker_drain(worker.worker_id, "scale_down", ttl_seconds=5)
-        await coordinator.register_worker(worker, ttl_seconds=5)
+        assert await coordinator.register_worker(worker, ttl_seconds=5) == "draining"
 
         workers = await coordinator.workers()
         assert len(workers) == 1
