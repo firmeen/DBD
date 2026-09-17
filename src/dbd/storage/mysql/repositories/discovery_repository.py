@@ -6,9 +6,9 @@ from hashlib import sha256
 
 from ....client.endpoints.search import SearchFilters
 from ....core.telemetry import DISCOVERY_PAGE_RESULTS, DISCOVERY_VALID_ROWS, observe_discovery
+from ....runtime.collection_fabric import master_fingerprint
 from ..engine import connect, use_connection
 from .company_repository import company_upsert_sql, company_values
-from .raw_repository import insert_raw_response
 
 
 def _now() -> datetime:
@@ -78,8 +78,6 @@ def update_bucket(bucket_id: int, **fields) -> None:
             )
         conn.commit()
 
-    # Bucket transitions are infrequent enough to refresh durable backlog gauges
-    # without adding a database-wide COUNT to every search page.
     if "status" in fields:
         observe_discovery(discovery_summary())
 
@@ -117,45 +115,42 @@ def save_page(
     *,
     bucket_id: int,
     profiles: list,
-    raw_json: object,
-    request_path: str,
+    archive_id: int,
     requested_at: datetime,
-    body_sha256: str,
 ) -> int:
-    """Persist valid rows from one search page in one transaction."""
+    """Project one archived search page without storing the raw payload twice.
+
+    response_archive is the only raw source of truth for search pages. Search may
+    seed a missing `companies` row but never overwrites a richer verified profile.
+    The master row receives a stable fingerprint so later discovery passes can
+    identify unchanged companies without regenerating depth work.
+    """
     if not profiles:
         return 0
 
+    hashes = [master_fingerprint(profile) for profile in profiles]
     with connect() as conn:
         try:
             with conn.cursor() as cur:
-                raw_response_id = insert_raw_response(
-                    cur,
-                    jp_type_code=profiles[0].jp_type_code,
-                    jp_no=profiles[0].jp_no,
-                    endpoint="search_page",
-                    request_path=request_path,
-                    requested_at=requested_at,
-                    http_status=200,
-                    body_sha256=body_sha256,
-                    raw_json=raw_json,
-                )
-
-                # Discovery seeds missing projections. A later search result
-                # cannot erase or relabel a verified profile.
-                cur.executemany(
+                # Seed only missing relational projections. Existing per-company
+                # profile data remains authoritative over the thinner search row.
+                insert_company = (
                     company_upsert_sql()
                     .split(" ON DUPLICATE KEY UPDATE")[0]
-                    .replace("INSERT INTO", "INSERT IGNORE INTO", 1),
-                    [company_values(p, raw_response_id, requested_at) for p in profiles],
+                    .replace("INSERT INTO", "INSERT IGNORE INTO", 1)
                 )
-                written = len(profiles)
+                cur.executemany(
+                    insert_company,
+                    [company_values(p, None, requested_at, archive_id) for p in profiles],
+                )
+
                 cur.executemany(
                     """
                     INSERT INTO company_master(
                         jp_no,jp_type_code,observed_jp_stat_code,observed_status_at,
+                        master_hash,last_master_changed_at,latest_search_archive_id,
                         first_seen_at,last_seen_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s)
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
                         last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),
                         observed_jp_stat_code=IF(
@@ -167,34 +162,46 @@ def save_page(
                             VALUES(observed_jp_stat_code) IS NULL,
                             observed_status_at,
                             VALUES(observed_status_at)
-                        )
+                        ),
+                        last_master_changed_at=IF(
+                            NOT (company_master.master_hash <=> VALUES(master_hash)),
+                            VALUES(last_master_changed_at),
+                            company_master.last_master_changed_at
+                        ),
+                        master_hash=VALUES(master_hash),
+                        latest_search_archive_id=VALUES(latest_search_archive_id)
                     """,
                     [
                         (
-                            p.jp_no,
-                            p.jp_type_code,
-                            p.jp_stat_code,
-                            requested_at if p.jp_stat_code is not None else None,
+                            profile.jp_no,
+                            profile.jp_type_code,
+                            profile.jp_stat_code,
+                            requested_at if profile.jp_stat_code is not None else None,
+                            fingerprint,
+                            requested_at,
+                            archive_id,
                             requested_at,
                             requested_at,
                         )
-                        for p in profiles
+                        for profile, fingerprint in zip(profiles, hashes, strict=True)
                     ],
                 )
 
+                # Coverage needs durable presence, not a synchronous increment for
+                # every overlapping bucket. Duplicate observations become no-op writes.
                 cur.executemany(
                     """
-                    INSERT INTO discovery_sightings (
-                        jp_no, jp_type_code, first_bucket_id, first_seen_at, last_seen_at
-                    ) VALUES (%s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        times_seen = times_seen + 1,
-                        last_seen_at = VALUES(last_seen_at)
+                    INSERT IGNORE INTO discovery_sightings (
+                        jp_no,jp_type_code,first_bucket_id,first_seen_at,last_seen_at
+                    ) VALUES (%s,%s,%s,%s,%s)
                     """,
-                    [(p.jp_no, p.jp_type_code, bucket_id, requested_at, requested_at) for p in profiles],
+                    [
+                        (p.jp_no, p.jp_type_code, bucket_id, requested_at, requested_at)
+                        for p in profiles
+                    ],
                 )
             conn.commit()
-            return written
+            return len(profiles)
         except Exception:
             conn.rollback()
             raise
@@ -244,8 +251,9 @@ def completed_pages(bucket_id):
 
 
 def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=True):
-    """Archive decoded search payload before row normalization."""
+    """Serialize/hash a search response once and make it the durable raw source."""
     payload = json.dumps(data, ensure_ascii=False, default=str)
+    payload_sha256 = sha256(payload.encode()).hexdigest()
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -266,7 +274,7 @@ def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=Tr
                 requested,
                 _now(),
                 payload,
-                sha256(payload.encode()).hexdigest(),
+                payload_sha256,
             ),
         )
         archive_id = int(cur.lastrowid)
@@ -300,7 +308,6 @@ def mark_search_archive(archive_id, status, error=None):
 
 
 def _replace_rejections(cur, bucket_id, page_no, rejections, requested):
-    # A retry supersedes unresolved observations from the previous copy of this page.
     cur.execute(
         """
         UPDATE discovery_rejections SET resolved_at=UTC_TIMESTAMP(6)
@@ -357,10 +364,8 @@ def finish_page(bucket_id, page_no, archive_id, profiles, data, requested, rejec
                 written = save_page(
                     bucket_id=bucket_id,
                     profiles=profiles,
-                    raw_json=data,
-                    request_path="/api/v1/company-profiles/infos",
+                    archive_id=archive_id,
                     requested_at=requested,
-                    body_sha256=sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest(),
                 )
 
             with conn.cursor() as cur:
