@@ -25,6 +25,41 @@ class CampaignCoordinator:
     heartbeats, maintenance leadership and shared adaptive rate state.
     """
 
+    _PUBLISH_WORKER_SCRIPT = """
+    local raw = redis.call('GET', KEYS[1])
+    local payload = cjson.decode(ARGV[1])
+    local requested_status = ARGV[2]
+    local heartbeat_at = tonumber(ARGV[3])
+    local ttl = tonumber(ARGV[4])
+    local worker_id = ARGV[5]
+    local previous_status = ''
+
+    if raw then
+      local existing = cjson.decode(raw)
+      previous_status = tostring(existing['status'] or '')
+      for key, value in pairs(existing) do
+        if payload[key] == nil then
+          payload[key] = value
+        end
+      end
+    end
+
+    payload['heartbeat_at'] = heartbeat_at
+    if requested_status == 'draining'
+      or previous_status == 'draining'
+      or redis.call('EXISTS', KEYS[3]) == 1
+      or redis.call('EXISTS', KEYS[4]) == 1 then
+      payload['status'] = 'draining'
+    else
+      payload['status'] = 'active'
+    end
+
+    redis.call('SET', KEYS[1], cjson.encode(payload), 'EX', ttl)
+    redis.call('SADD', KEYS[2], worker_id)
+    redis.call('EXPIRE', KEYS[2], 86400)
+    return payload['status']
+    """
+
     def __init__(self, url: str, run_id: int, *, namespace: str = "dbd:campaign") -> None:
         self.url = url
         self.run_id = int(run_id)
@@ -110,34 +145,57 @@ class CampaignCoordinator:
         )
         return stop is not None or drain is not None
 
-    async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> None:
-        """Publish a worker without ever erasing a drain requested before startup.
-
-        Worker ids are unique per spawn. A supervisor may request a targeted drain
-        immediately after Popen but before this coroutine runs; deleting that key
-        here would resurrect a worker that the supervisor already removed from its
-        active fleet accounting.
-        """
-        now = time.time()
-        client = self._client()
-        stop_signal, drain_signal = await client.mget(
-            [self.stop_key, self.worker_drain_key(identity.worker_id)]
-        )
-        payload = {
+    def _identity_payload(self, identity: WorkerIdentity, *, started_at: float | None = None) -> dict:
+        return {
             "worker_id": identity.worker_id,
             "run_id": identity.run_id,
             "pid": identity.pid,
             "role": identity.role,
             "hostname": socket.gethostname(),
-            "started_at": now,
-            "heartbeat_at": now,
-            "status": "draining" if stop_signal is not None or drain_signal is not None else "active",
+            "started_at": time.time() if started_at is None else float(started_at),
         }
-        async with client.pipeline(transaction=False) as pipe:
-            pipe.set(self.worker_key(identity.worker_id), json.dumps(payload), ex=ttl_seconds)
-            pipe.sadd(self.workers_key, identity.worker_id)
-            pipe.expire(self.workers_key, 86400)
-            await pipe.execute()
+
+    async def _publish_worker(
+        self,
+        identity: WorkerIdentity,
+        *,
+        status: str,
+        ttl_seconds: int,
+        payload: Mapping[str, object] | None = None,
+    ) -> str:
+        """Publish heartbeat + membership as one monotonic Redis transition.
+
+        Stop/drain visibility and worker status are evaluated inside the same Lua
+        execution that writes the heartbeat. A stale ACTIVE heartbeat therefore
+        cannot race after a visible drain request and overwrite DRAINING.
+        """
+        client = self._client()
+        body = self._identity_payload(identity)
+        if payload:
+            body.update(dict(payload))
+        return str(
+            await client.eval(
+                self._PUBLISH_WORKER_SCRIPT,
+                4,
+                self.worker_key(identity.worker_id),
+                self.workers_key,
+                self.stop_key,
+                self.worker_drain_key(identity.worker_id),
+                json.dumps(body, default=str),
+                status,
+                time.time(),
+                max(1, int(ttl_seconds)),
+                identity.worker_id,
+            )
+        )
+
+    async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> None:
+        """Publish startup without ever erasing a pre-existing stop/drain request."""
+        await self._publish_worker(
+            identity,
+            status="active",
+            ttl_seconds=ttl_seconds,
+        )
 
     async def heartbeat_worker(
         self,
@@ -147,34 +205,12 @@ class CampaignCoordinator:
         ttl_seconds: int = 30,
         metrics: Mapping[str, object] | None = None,
     ) -> None:
-        key = self.worker_key(identity.worker_id)
-        drain_key = self.worker_drain_key(identity.worker_id)
-        client = self._client()
-        raw, stop_signal, drain_signal = await client.mget([key, self.stop_key, drain_key])
-        payload = json.loads(raw) if raw else {
-            "worker_id": identity.worker_id,
-            "run_id": identity.run_id,
-            "pid": identity.pid,
-            "role": identity.role,
-            "hostname": socket.gethostname(),
-            "started_at": time.time(),
-        }
-        payload["heartbeat_at"] = time.time()
-        # Once control-plane drain is visible, stale active heartbeats must never
-        # overwrite it. This keeps supervisor fleet accounting monotonic while a
-        # worker is finishing already-owned fetch/archive/project work.
-        payload["status"] = (
-            "draining"
-            if status == "draining" or stop_signal is not None or drain_signal is not None
-            else "active"
+        await self._publish_worker(
+            identity,
+            status=status,
+            ttl_seconds=ttl_seconds,
+            payload=metrics,
         )
-        if metrics:
-            payload.update(dict(metrics))
-        async with client.pipeline(transaction=False) as pipe:
-            pipe.set(key, json.dumps(payload, default=str), ex=ttl_seconds)
-            pipe.sadd(self.workers_key, identity.worker_id)
-            pipe.expire(self.workers_key, 86400)
-            await pipe.execute()
 
     async def acquire_maintenance_slot(
         self,
