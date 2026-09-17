@@ -45,6 +45,9 @@ class CampaignCoordinator:
     end
 
     payload['heartbeat_at'] = heartbeat_at
+    if payload['started_at'] == nil then
+      payload['started_at'] = heartbeat_at
+    end
     if requested_status == 'draining'
       or previous_status == 'draining'
       or redis.call('EXISTS', KEYS[3]) == 1
@@ -145,14 +148,13 @@ class CampaignCoordinator:
         )
         return stop is not None or drain is not None
 
-    def _identity_payload(self, identity: WorkerIdentity, *, started_at: float | None = None) -> dict:
+    def _identity_payload(self, identity: WorkerIdentity) -> dict:
         return {
             "worker_id": identity.worker_id,
             "run_id": identity.run_id,
             "pid": identity.pid,
             "role": identity.role,
             "hostname": socket.gethostname(),
-            "started_at": time.time() if started_at is None else float(started_at),
         }
 
     async def _publish_worker(
