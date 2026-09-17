@@ -192,7 +192,9 @@ async def process(
         coordinator = CampaignCoordinator(settings.dbd_redis_url, run_id)
         await coordinator.open()
         identity = WorkerIdentity(owner, int(run_id), os.getpid())
-        await coordinator.register_worker(identity)
+        registration_status = await coordinator.register_worker(identity)
+        if registration_status == "draining":
+            drain_requested.set()
 
     def queue_metrics():
         PIPELINE_QUEUE_DEPTH.labels("fetch").set(fetch_queue.qsize())
