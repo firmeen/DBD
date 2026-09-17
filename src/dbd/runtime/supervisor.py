@@ -21,6 +21,8 @@ _RUNTIME_STATE_TTL_SECONDS = 86400
 _AUTOSCALE_UP_COOLDOWN_SECONDS = 5.0
 _AUTOSCALE_DOWN_COOLDOWN_SECONDS = 15.0
 _AUTOSCALE_LOW_PRESSURE_OBSERVATIONS = 2
+_FAILURE_DRAIN_SECONDS = 10.0
+_COMPLETE_DRAIN_SECONDS = 10.0
 
 
 @dataclass
@@ -31,6 +33,7 @@ class WorkerProcess:
     restarts: int = 0
     log_handle: object | None = None
     draining: bool = False
+    drain_requested_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -74,17 +77,11 @@ class AutoscaleController:
         if now < self.next_decision_at:
             return current
 
-        # Keep scale-up deliberately conservative. A worker can have many durable
-        # claims in flight, so a several-times-concurrency backlog is required
-        # before another process is added.
         if current < effective_maximum and pending > max(capacity, current * capacity * 4):
             self.low_pressure_observations = 0
             self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
             return current + 1
 
-        # Scale-down requires sustained low pending work and a bounded running set.
-        # A worker is never killed to shrink the fleet; the supervisor only asks it
-        # to stop claiming and waits for its owned fetch/archive/project work to drain.
         low_pending = pending <= max(1, ((current - 1) * capacity) // 2)
         bounded_running = running <= max(capacity, current * capacity * 2)
         if current > minimum and low_pending and bounded_running:
@@ -95,7 +92,6 @@ class AutoscaleController:
                 return current - 1
         else:
             self.low_pressure_observations = 0
-
         return current
 
 
@@ -156,6 +152,14 @@ def _runtime_state_key(run_id: int) -> str:
     return f"{_campaign_key(run_id)}:supervisor:state"
 
 
+def _worker_key(run_id: int, worker_id: str) -> str:
+    return f"{_campaign_key(run_id)}:worker:{worker_id}"
+
+
+def _worker_drain_key(run_id: int, worker_id: str) -> str:
+    return f"{_worker_key(run_id, worker_id)}:drain"
+
+
 def _task_progress(run_id: int) -> dict[str, int]:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -204,6 +208,7 @@ def _spawn_worker(
     open_powershell: bool,
     restart_count: int = 0,
 ) -> WorkerProcess:
+    """Spawn one worker atomically; no log handle survives a failed Popen."""
     worker_id = f"local-{run_id}-{index}-{uuid4().hex[:8]}"
     env = os.environ.copy()
     env["DBD_WORKER_ID"] = worker_id
@@ -227,21 +232,26 @@ def _spawn_worker(
     else:
         start_new_session = True
 
-    if not open_powershell:
-        log_dir = PROJECT_ROOT / "data" / "logs"
-        log_dir.mkdir(parents=True, exist_ok=True)
-        log_path = log_dir / f"campaign-{run_id}-worker-{index}.log"
-        log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
+    try:
+        if not open_powershell:
+            log_dir = PROJECT_ROOT / "data" / "logs"
+            log_dir.mkdir(parents=True, exist_ok=True)
+            log_path = log_dir / f"campaign-{run_id}-worker-{index}.log"
+            log_handle = open(log_path, "a", encoding="utf-8", buffering=1)
 
-    process = subprocess.Popen(
-        command,
-        env=env,
-        stdin=subprocess.DEVNULL,
-        stdout=None if open_powershell else log_handle,
-        stderr=None if open_powershell else subprocess.STDOUT,
-        creationflags=creationflags,
-        start_new_session=start_new_session,
-    )
+        process = subprocess.Popen(
+            command,
+            env=env,
+            stdin=subprocess.DEVNULL,
+            stdout=None if open_powershell else log_handle,
+            stderr=None if open_powershell else subprocess.STDOUT,
+            creationflags=creationflags,
+            start_new_session=start_new_session,
+        )
+    except BaseException:
+        if log_handle is not None:
+            log_handle.close()
+        raise
     return WorkerProcess(index, worker_id, process, restart_count, log_handle)
 
 
@@ -267,10 +277,21 @@ def _stop_requested(redis: Redis, run_id: int) -> bool:
 
 def _request_worker_drain(redis: Redis, run_id: int, worker_id: str, reason: str) -> None:
     redis.set(
-        f"{_campaign_key(run_id)}:worker:{worker_id}:drain",
+        _worker_drain_key(run_id, worker_id),
         json.dumps({"reason": reason, "requested_at": time.time()}),
         ex=3600,
     )
+
+
+def _cleanup_worker_control(redis: Redis, run_id: int, worker_id: str) -> None:
+    """Forget an exited local worker immediately instead of waiting for heartbeat TTLs."""
+    try:
+        pipe = redis.pipeline(transaction=False)
+        pipe.delete(_worker_key(run_id, worker_id), _worker_drain_key(run_id, worker_id))
+        pipe.srem(f"{_campaign_key(run_id)}:workers", worker_id)
+        pipe.execute()
+    except Exception:
+        pass
 
 
 def _clear_stop(redis: Redis, run_id: int) -> None:
@@ -278,14 +299,16 @@ def _clear_stop(redis: Redis, run_id: int) -> None:
 
 
 def _seed_rate(redis: Redis, rate_key: str, initial_rate: float) -> None:
-    """Seed a fresh shared pacer without erasing an active fleet penalty or cooldown."""
-    redis.set(f"{rate_key}:effective-rate", str(initial_rate), ex=600, nx=True)
-    redis.set(
+    """Seed a missing shared rate without erasing an active fleet penalty/cooldown."""
+    pipe = redis.pipeline(transaction=False)
+    pipe.set(f"{rate_key}:effective-rate", str(initial_rate), ex=600, nx=True)
+    pipe.set(
         f"{rate_key}:last-penalty-ms",
         str(int(time.time() * 1000) - 120_000),
         ex=600,
         nx=True,
     )
+    pipe.execute()
 
 
 def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
@@ -297,10 +320,11 @@ def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
 
 
 def _registered_worker_states(redis: Redis, run_id: int) -> list[dict]:
-    ids = sorted(redis.smembers(f"{_campaign_key(run_id)}:workers"))
+    set_key = f"{_campaign_key(run_id)}:workers"
+    ids = sorted(redis.smembers(set_key))
     if not ids:
         return []
-    keys = [f"{_campaign_key(run_id)}:worker:{worker_id}" for worker_id in ids]
+    keys = [_worker_key(run_id, worker_id) for worker_id in ids]
     values = redis.mget(keys)
     result = []
     stale = []
@@ -309,11 +333,16 @@ def _registered_worker_states(redis: Redis, run_id: int) -> list[dict]:
             stale.append(worker_id)
             continue
         try:
-            result.append(json.loads(value))
+            row = json.loads(value)
+            result.append(row if isinstance(row, dict) else {"worker_id": worker_id, "status": "unknown"})
         except (TypeError, ValueError):
             result.append({"worker_id": worker_id, "status": "unknown"})
     if stale:
-        redis.srem(f"{_campaign_key(run_id)}:workers", *stale)
+        pipe = redis.pipeline(transaction=False)
+        pipe.srem(set_key, *stale)
+        for worker_id in stale:
+            pipe.delete(_worker_drain_key(run_id, worker_id))
+        pipe.execute()
     return result
 
 
@@ -362,7 +391,6 @@ def _release_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
     try:
         redis.eval(script, 1, _supervisor_lease_key(run_id), token)
     except Exception:
-        # The lease has a TTL. Cleanup failure must not replace the campaign result.
         pass
 
 
@@ -430,25 +458,28 @@ def _request_local_drain(
     reason: str,
 ) -> int:
     requested = 0
+    now = time.monotonic()
     for worker in workers:
         if worker.process.poll() is None and not worker.draining:
             try:
                 _request_worker_drain(redis, run_id, worker.worker_id, reason)
                 worker.draining = True
+                worker.drain_requested_at = now
                 requested += 1
             except Exception:
-                # If Redis itself is unavailable, durable MySQL leases still make
-                # abrupt process loss recoverable. The caller may force-stop locally.
                 pass
     return requested
 
 
-def _drain_or_terminate_local(
+def _contain_local_fleet(
     redis: Redis,
     run_id: int,
     workers: list[WorkerProcess],
     reason: str,
+    *,
+    grace_seconds: float,
 ) -> None:
+    """Drain local workers for a bounded period, then force only remaining process trees."""
     live = [worker for worker in workers if worker.process.poll() is None]
     if not live:
         return
@@ -456,6 +487,17 @@ def _drain_or_terminate_local(
     requested = _request_local_drain(redis, run_id, live, reason)
     if requested + already_draining < len(live):
         _terminate_workers(live)
+        return
+
+    deadline = time.monotonic() + max(0.0, grace_seconds)
+    while time.monotonic() < deadline:
+        remaining = [worker for worker in live if worker.process.poll() is None]
+        if not remaining:
+            break
+        time.sleep(0.1)
+    remaining = [worker for worker in live if worker.process.poll() is None]
+    if remaining:
+        _terminate_workers(remaining)
 
 
 def supervise_campaign(
@@ -479,9 +521,10 @@ def supervise_campaign(
     requested_workers = int(workers)
     minimum = requested_workers if workers_min is None else int(workers_min)
     maximum = requested_workers if workers_max is None else int(workers_max)
-    if requested_workers < 1 or minimum < 1 or maximum < minimum:
-        raise ValueError("workers/workers-min/workers-max must satisfy 1 <= min <= max")
-    initial_workers = min(max(requested_workers, minimum), maximum)
+    if requested_workers < 1 or minimum < 1 or maximum < minimum or not minimum <= requested_workers <= maximum:
+        raise ValueError("workers/workers-min/workers-max must satisfy 1 <= min <= workers <= max")
+
+    initial_workers = requested_workers
     autoscale = minimum != maximum
     plan = build_rate_plan(rate_mode, worker_rate, maximum, initial_workers=initial_workers)
     controller = AutoscaleController(minimum, maximum, worker_concurrency)
@@ -502,9 +545,7 @@ def supervise_campaign(
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
         nonlocal next_index
         index = next_index if restart_index is None else restart_index
-        if restart_index is None:
-            next_index += 1
-        return _spawn_worker(
+        worker = _spawn_worker(
             run_id,
             index,
             concurrency=worker_concurrency,
@@ -512,6 +553,9 @@ def supervise_campaign(
             open_powershell=open_powershell,
             restart_count=restarts,
         )
+        if restart_index is None:
+            next_index += 1
+        return worker
 
     try:
         redis.ping()
@@ -559,6 +603,7 @@ def supervise_campaign(
 
             if _stop_requested(redis, run_id) and not graceful_stop:
                 graceful_stop = True
+                _request_local_drain(redis, run_id, children, "campaign_stop")
                 progress.event("campaign stop requested: draining workers without claiming new work")
 
             survivors: list[WorkerProcess] = []
@@ -569,24 +614,33 @@ def supervise_campaign(
                     continue
 
                 _close_worker_handle(worker)
+                _cleanup_worker_control(redis, run_id, worker.worker_id)
                 if graceful_stop or worker.draining or not active_work:
                     continue
 
                 if worker.restarts < max_restarts:
-                    replacement = spawn_worker(
-                        restart_index=worker.index,
-                        restarts=worker.restarts + 1,
-                    )
-                    survivors.append(replacement)
-                    progress.event(
-                        f"worker {worker.index} exited {code}; restarted "
-                        f"({replacement.restarts}/{max_restarts})"
-                    )
+                    try:
+                        replacement = spawn_worker(
+                            restart_index=worker.index,
+                            restarts=worker.restarts + 1,
+                        )
+                    except OSError as exc:
+                        exhausted_capacity += 1
+                        progress.event(
+                            f"worker {worker.index} restart failed ({type(exc).__name__}); "
+                            "fleet capacity reduced by 1"
+                        )
+                    else:
+                        survivors.append(replacement)
+                        progress.event(
+                            f"worker {worker.index} exited {code}; restarted "
+                            f"({replacement.restarts}/{max_restarts})"
+                        )
                 else:
                     exhausted_capacity += 1
                     progress.event(
                         f"worker {worker.index} exited {code}; restart budget exhausted; "
-                        f"fleet capacity reduced by 1"
+                        "fleet capacity reduced by 1"
                     )
             children = survivors
 
@@ -600,7 +654,13 @@ def supervise_campaign(
                     f"available fleet capacity {effective_maximum} fell below minimum {minimum}"
                 )
                 exit_code = 2
-                _drain_or_terminate_local(redis, run_id, children, "capacity_exhausted")
+                _contain_local_fleet(
+                    redis,
+                    run_id,
+                    children,
+                    "capacity_exhausted",
+                    grace_seconds=_FAILURE_DRAIN_SECONDS,
+                )
                 break
 
             target = len(active_live)
@@ -612,11 +672,15 @@ def supervise_campaign(
                     effective_maximum=effective_maximum,
                     now=now,
                 )
-                if target > len(active_live):
-                    # Draining processes still consume DB/archive capacity. Do not
-                    # exceed the effective process ceiling while one is finishing.
-                    if len(live) < effective_maximum:
+                if target > len(active_live) and len(live) < effective_maximum:
+                    try:
                         worker = spawn_worker()
+                    except OSError as exc:
+                        exhausted_capacity += 1
+                        progress.event(
+                            f"autoscale up failed ({type(exc).__name__}); fleet capacity reduced by 1"
+                        )
+                    else:
                         children.append(worker)
                         active_live.append(worker)
                         live.append(worker)
@@ -628,6 +692,7 @@ def supervise_campaign(
                     candidate = max(active_live, key=lambda item: item.index)
                     _request_worker_drain(redis, run_id, candidate.worker_id, "autoscale_down")
                     candidate.draining = True
+                    candidate.drain_requested_at = now
                     active_live.remove(candidate)
                     draining_live.append(candidate)
                     progress.event(
@@ -635,8 +700,7 @@ def supervise_campaign(
                         f"({len(active_live) + 1}->{len(active_live)})"
                     )
 
-            # Both fixed and autoscaled fleets repair the configured floor after
-            # ordinary exits, but never above the reduced post-failure maximum.
+            effective_maximum = max(0, maximum - exhausted_capacity)
             required_floor = min(minimum, effective_maximum)
             while (
                 active_work
@@ -644,7 +708,14 @@ def supervise_campaign(
                 and len(active_live) < required_floor
                 and len(live) < effective_maximum
             ):
-                worker = spawn_worker()
+                try:
+                    worker = spawn_worker()
+                except OSError as exc:
+                    exhausted_capacity += 1
+                    progress.event(
+                        f"fleet floor repair failed ({type(exc).__name__}); fleet capacity reduced by 1"
+                    )
+                    break
                 children.append(worker)
                 active_live.append(worker)
                 live.append(worker)
@@ -705,8 +776,16 @@ def supervise_campaign(
                 next_state_write = now + 1.0
 
             if pending == 0 and running == 0:
+                _contain_local_fleet(
+                    redis,
+                    run_id,
+                    children,
+                    "campaign_complete",
+                    grace_seconds=_COMPLETE_DRAIN_SECONDS,
+                )
                 break
 
+            live = [worker for worker in children if worker.process.poll() is None]
             if not live and active_work:
                 if graceful_stop:
                     exit_code = 130
@@ -722,6 +801,7 @@ def supervise_campaign(
         progress.event("Ctrl+C received: requesting graceful drain; Ctrl+C again forces stop")
         try:
             _request_stop(redis, run_id, "supervisor_keyboard_interrupt")
+            _request_local_drain(redis, run_id, children, "supervisor_keyboard_interrupt")
             _write_runtime_state(
                 redis,
                 run_id,
@@ -758,20 +838,30 @@ def supervise_campaign(
 
     except Exception:
         supervisor_error = True
-        # A supervisor must never silently leave its local fleet claiming new work.
-        # Prefer graceful per-worker drain; force-stop only if Redis cannot carry it.
-        _drain_or_terminate_local(redis, run_id, children, "supervisor_failure")
-        progress.close(message=f"Campaign {run_id} supervisor failed; local workers are stopping")
+        _contain_local_fleet(
+            redis,
+            run_id,
+            children,
+            "supervisor_failure",
+            grace_seconds=_FAILURE_DRAIN_SECONDS,
+        )
+        progress.close(message=f"Campaign {run_id} supervisor failed; local workers are stopped")
         raise
 
     finally:
         for worker in children:
             _close_worker_handle(worker)
+            if worker.process.poll() is not None:
+                _cleanup_worker_control(redis, run_id, worker.worker_id)
 
         if lease_acquired:
             try:
                 snapshot = _task_progress(run_id)
-                remaining = snapshot.get("pending", 0) + snapshot.get("retry_wait", 0) + snapshot.get("running", 0)
+                remaining = (
+                    snapshot.get("pending", 0)
+                    + snapshot.get("retry_wait", 0)
+                    + snapshot.get("running", 0)
+                )
                 if supervisor_error:
                     runtime_status = "supervisor_error"
                 elif exit_code == 130:
