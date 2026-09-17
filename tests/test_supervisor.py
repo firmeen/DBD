@@ -5,6 +5,7 @@ from dbd.runtime.supervisor import (
     WorkerProcess,
     _force_kill_worker,
     _seed_rate,
+    _terminate_workers,
     _worker_command,
     build_rate_plan,
 )
@@ -74,3 +75,27 @@ def test_windows_force_stop_kills_entire_worker_tree(monkeypatch) -> None:
     assert command == ["taskkill", "/PID", "4321", "/T", "/F"]
     assert kwargs["check"] is False
     assert "kill" not in calls
+
+
+def test_windows_terminate_workers_skips_wrapper_only_terminate(monkeypatch) -> None:
+    calls = []
+    process = SimpleNamespace(
+        pid=9876,
+        poll=lambda: None,
+        terminate=lambda: calls.append("terminate"),
+        kill=lambda: calls.append("kill"),
+    )
+    worker = WorkerProcess(1, "worker-1", process)
+
+    monkeypatch.setattr(supervisor.os, "name", "nt")
+    monkeypatch.setattr(
+        supervisor.subprocess,
+        "run",
+        lambda command, **kwargs: calls.append((command, kwargs)),
+    )
+
+    _terminate_workers([worker])
+
+    assert "terminate" not in calls
+    assert "kill" not in calls
+    assert calls[0][0] == ["taskkill", "/PID", "9876", "/T", "/F"]
