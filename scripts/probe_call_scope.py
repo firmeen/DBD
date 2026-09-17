@@ -162,7 +162,7 @@ async def fetch_search_match(client: AsyncDbdClient, target: Target):
     response = await client.fetch(
         "POST",
         SEARCH_PATH,
-        json=SearchFilters(keyword=target.number).payload(page=1),
+        json_body=SearchFilters(keyword=target.number).payload(page=1),
         referer=SEARCH_REFERER,
         rate_key="search",
     )
@@ -215,7 +215,6 @@ async def inspect_target(client: AsyncDbdClient, target: Target, verbose: bool) 
     except Exception as exc:
         result["errors"].append({"endpoint": "search", "error": _error_signature(exc)})
 
-    profile_payload = None
     fiscal_year = None
     try:
         response = await fetch_endpoint(client, target, "profile", None)
@@ -366,8 +365,6 @@ def analyse(results: list[dict]) -> dict:
     }
     observed_benchmark_savings = sum(count - 1 for count in stable_repeated.values())
 
-    # Current first-load logical model: profile + 3 details for every company;
-    # three financial calls only when Profile exposes a submitted fiscal year.
     current_theoretical_depth = sample * 7
     observed_required_depth = sample * 4 + fiscal * 3
     proven_no_year_savings = no_fiscal * 3
@@ -376,6 +373,7 @@ def analyse(results: list[dict]) -> dict:
     transformations = endpoint_stats.get("transformations", {})
     transformation_success = transformations.get("success", 0)
     transformation_empty = transformations.get("empty_or_null", 0)
+    clean_sample = not errors and sample > 0
 
     return {
         "sample": sample,
@@ -406,7 +404,7 @@ def analyse(results: list[dict]) -> dict:
         "elimination": {
             "no_fiscal_year_financial_calls": {
                 "calls": proven_no_year_savings,
-                "classification": "PROVEN",
+                "classification": "PROVEN" if clean_sample else "OBSERVED_WITH_ERRORS",
                 "reason": "Financial requests require a resolved fiscal year and are not sent without one.",
             },
             "profile_from_search": {
@@ -420,19 +418,29 @@ def analyse(results: list[dict]) -> dict:
         },
         "projected_calls_per_company": {
             "current_model": 7.0 if sample else 0.0,
-            "proven_required": observed_required_depth / sample if sample else 0.0,
-            "with_observed_benchmark_coalescing": candidate_benchmark_depth / sample if sample else 0.0,
-            "target_4_or_less_proven": bool(sample and observed_required_depth / sample <= 4.0),
-            "target_3_5_or_less_proven": bool(sample and observed_required_depth / sample <= 3.5),
+            "proven_required": observed_required_depth / sample if clean_sample else None,
+            "with_observed_benchmark_coalescing": (
+                candidate_benchmark_depth / sample if clean_sample else None
+            ),
+            "target_4_or_less_proven": bool(
+                clean_sample and observed_required_depth / sample <= 4.0
+            ),
+            "target_3_5_or_less_proven": bool(
+                clean_sample and observed_required_depth / sample <= 3.5
+            ),
         },
         "request_model": {
             "current_theoretical_depth_calls": current_theoretical_depth,
-            "proven_required_depth_calls": observed_required_depth,
+            "observed_required_depth_calls": observed_required_depth,
             "candidate_after_benchmark_coalescing": candidate_benchmark_depth,
             "note": "Probe-only exact Search lookups are excluded from the production depth-call model.",
         },
         "errors": dict(errors),
     }
+
+
+def _format_rate(value) -> str:
+    return "N/A" if value is None else f"{value:.2f}"
 
 
 def print_summary(summary: dict) -> None:
@@ -448,16 +456,16 @@ def print_summary(summary: dict) -> None:
     print(f"No fiscal year                            {fiscal['missing']:>8,}")
     print("\nCALL MODEL (depth HTTP only)")
     print(f"Current theoretical                       {calls['current_model']:>8.2f} calls/company")
-    print(f"PROVEN required from sample               {calls['proven_required']:>8.2f} calls/company")
+    print(f"PROVEN required from sample               {_format_rate(calls['proven_required']):>8} calls/company")
     print(
         f"CANDIDATE with observed benchmark reuse   "
-        f"{calls['with_observed_benchmark_coalescing']:>8.2f} calls/company"
+        f"{_format_rate(calls['with_observed_benchmark_coalescing']):>8} calls/company"
     )
     print(f"Target <=4.0 proven                       {'YES' if calls['target_4_or_less_proven'] else 'NO'}")
     print(f"Target <=3.5 proven                       {'YES' if calls['target_3_5_or_less_proven'] else 'NO'}")
     print("\nREQUEST ELIMINATION")
     no_year = summary["elimination"]["no_fiscal_year_financial_calls"]
-    print(f"PROVEN no-year financial skips            {no_year['calls']:>8,} calls")
+    print(f"{no_year['classification']:<40} {no_year['calls']:>8,} no-year financial calls")
     print(f"CANDIDATE benchmark duplicate calls       {benchmark['observed_duplicate_calls']:>8,} calls")
     print("CANDIDATE profile elimination             requires Search/Profile dependency proof")
     print("\nBENCHMARK SCOPE")
