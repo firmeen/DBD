@@ -36,12 +36,24 @@ def test_child_workers_disable_prometheus_listener_collision() -> None:
 
 
 def test_seed_rate_does_not_clear_existing_shared_penalty_state() -> None:
+    class FakePipeline:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def set(self, key, value, **kwargs):
+            self.calls.append((key, value, kwargs))
+            return self
+
+        def execute(self):
+            return [True] * len(self.calls)
+
     class FakeRedis:
         def __init__(self):
             self.set_calls = []
 
-        def set(self, key, value, **kwargs):
-            self.set_calls.append((key, value, kwargs))
+        def pipeline(self, *, transaction=False):
+            assert transaction is False
+            return FakePipeline(self.set_calls)
 
         def delete(self, *keys):
             raise AssertionError(f"must not clear active pacing state: {keys}")
@@ -52,9 +64,13 @@ def test_seed_rate_does_not_clear_existing_shared_penalty_state() -> None:
     assert [call[0] for call in redis.set_calls] == [
         "dbd:rate:effective-rate",
         "dbd:rate:last-penalty-ms",
+        "dbd:rate:target-rate",
     ]
-    assert all(call[2].get("nx") is True for call in redis.set_calls)
+    assert redis.set_calls[0][2].get("nx") is True
+    assert redis.set_calls[1][2].get("nx") is True
+    assert redis.set_calls[2][2].get("nx") is None
     assert all(call[2].get("ex") == 600 for call in redis.set_calls)
+    assert float(redis.set_calls[2][1]) == 15.0
 
 
 def test_windows_force_stop_kills_entire_worker_tree(monkeypatch) -> None:
