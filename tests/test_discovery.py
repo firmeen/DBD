@@ -1,6 +1,7 @@
 import pytest
 
 from dbd.client.endpoints.search import SearchFilters
+from dbd.cli import legacy
 from dbd.core.exceptions import ContractError
 from dbd.pipelines import discovery
 from dbd.storage.mysql.repositories import discovery_batch_repository as batch_repository
@@ -97,6 +98,36 @@ def test_observed_type_a_short_identity_is_not_quarantined():
     )
     assert profiles[0].jp_no == "12345678901"
     assert rejected == []
+
+
+def test_discover_status_uses_current_discovery_summary(monkeypatch, capsys):
+    monkeypatch.setattr(
+        discovery,
+        "discovery_summary",
+        lambda: {
+            "unique_companies": 12,
+            "rows_fetched": 34,
+            "buckets": 5,
+            "buckets_done": 2,
+            "buckets_split": 1,
+            "buckets_open": 2,
+            "buckets_failed": 0,
+            "buckets_uncounted": 1,
+            "remaining_counted_pages": 3,
+            "pages_done": 9,
+            "pages_failed": 1,
+            "pages_partial": 0,
+            "unresolved_rejections": 0,
+            "partitions_lossy": 0,
+        },
+    )
+    monkeypatch.setattr(discovery, "coverage_gaps", lambda: [])
+
+    legacy.command_discover_status()
+
+    output = capsys.readouterr().out
+    assert "unique companies : 12" in output
+    assert "page checkpoints  : 9 done, 1 failed, 0 partial" in output
 
 
 async def test_province_seed_cover_includes_audited_exception():
