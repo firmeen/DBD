@@ -12,7 +12,7 @@ from dbd.runtime.fabric_worker import process_fabric
 from dbd.runtime.locking import manager_lock
 from dbd.runtime.resources import DEFAULT_PARTS, PARTS, endpoints
 from dbd.storage.mysql.async_engine import create_engine
-from dbd.storage.mysql.repositories.fabric_repository import FabricRepository
+from dbd.storage.mysql.repositories.collection_repository import FabricRepository
 from dbd.storage.mysql.repositories.worker_repository import WorkerRepository
 
 
