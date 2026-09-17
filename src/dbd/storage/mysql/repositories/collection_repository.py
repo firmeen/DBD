@@ -4,17 +4,122 @@ from sqlalchemy import bindparam, text
 
 from ....core.settings import settings
 from ....core.telemetry import PIPELINE_BATCH_SIZE
+from ....runtime.collection_fabric import next_endpoint, remaining_mask
 from .fabric_repository import FabricRepository as _FabricRepository
 from .worker_repository import transaction_retry
 
 
 class FabricRepository(_FabricRepository):
-    """Production collection-fabric repository with critical-path claiming.
+    """Production collection-fabric repository with delta and critical-path policy."""
 
-    The base implementation contains the durable state/archive machinery. This
-    layer keeps scheduler policy isolated: breadth-first profiles first, then the
-    fiscal-year-dependent financial path, then lower-priority detail collections.
-    """
+    @transaction_retry
+    async def seed_master(self, run_id, required_mask, *, batch_size, statuses=None, delta=False):
+        """Seed one state row/company and optionally carry unchanged completed state.
+
+        Delta mode only carries a prior `done` state when the current non-null
+        master hash exactly matches that prior campaign. If the requested scope is
+        wider than the prior scope, only the missing bits are scheduled.
+        """
+        after = 0
+        while True:
+            clause = ""
+            params = {"run": run_id, "after": after, "size": batch_size}
+            if statuses:
+                clause = " AND m.observed_jp_stat_code IN :statuses"
+                params["statuses"] = tuple(statuses)
+            query = text(
+                """
+                SELECT m.company_id,m.master_hash,
+                       p.id AS previous_state_id,p.master_hash AS previous_master_hash,
+                       p.done_mask AS previous_done_mask,
+                       p.not_available_mask AS previous_not_available_mask,
+                       p.fiscal_year AS previous_fiscal_year
+                FROM company_master m
+                LEFT JOIN company_collection_state p ON p.id=(
+                  SELECT p2.id FROM company_collection_state p2
+                  WHERE p2.company_id=m.company_id AND p2.run_id<>:run AND p2.status='done'
+                  ORDER BY p2.run_id DESC LIMIT 1
+                )
+                WHERE m.company_id>:after AND m.identity_status<>'conflict'
+                """
+                + clause
+                + " ORDER BY m.company_id LIMIT :size"
+            )
+            if statuses:
+                query = query.bindparams(bindparam("statuses", expanding=True))
+
+            async with self.engine.begin() as conn:
+                rows = (await conn.execute(query, params)).mappings().all()
+                if not rows:
+                    return
+
+                seeds = []
+                company_ids = []
+                for row in rows:
+                    company_id = int(row["company_id"])
+                    current_hash = row["master_hash"]
+                    carry = bool(
+                        delta
+                        and current_hash
+                        and row["previous_state_id"] is not None
+                        and current_hash == row["previous_master_hash"]
+                    )
+                    if carry:
+                        done_mask = int(row["previous_done_mask"] or 0) & required_mask
+                        not_available_mask = (
+                            int(row["previous_not_available_mask"] or 0) & required_mask
+                        )
+                        fiscal_year = row["previous_fiscal_year"]
+                    else:
+                        done_mask = 0
+                        not_available_mask = 0
+                        fiscal_year = None
+
+                    missing = remaining_mask(required_mask, done_mask, not_available_mask)
+                    next_item = next_endpoint(
+                        required_mask,
+                        done_mask,
+                        not_available_mask,
+                        fiscal_year=fiscal_year,
+                    )
+                    status = "done" if missing == 0 else "pending"
+                    seeds.append(
+                        {
+                            "run": run_id,
+                            "company": company_id,
+                            "required": required_mask,
+                            "done": done_mask,
+                            "na": not_available_mask,
+                            "dirty": missing,
+                            "endpoint": next_item,
+                            "fiscal": fiscal_year,
+                            "hash": current_hash,
+                            "status": status,
+                        }
+                    )
+                    company_ids.append(company_id)
+
+                await conn.execute(
+                    text("""
+                    INSERT INTO company_collection_state(
+                      run_id,company_id,required_mask,done_mask,not_available_mask,
+                      dirty_mask,next_endpoint,fiscal_year,master_hash,status,finished_at
+                    ) VALUES (
+                      :run,:company,:required,:done,:na,:dirty,:endpoint,:fiscal,:hash,:status,
+                      IF(:status='done',UTC_TIMESTAMP(6),NULL)
+                    )
+                    ON DUPLICATE KEY UPDATE id=id
+                    """),
+                    seeds,
+                )
+                await conn.execute(
+                    text("""
+                    UPDATE company_master SET last_seen_campaign=:run
+                    WHERE company_id IN :ids
+                    """).bindparams(bindparam("ids", expanding=True)),
+                    {"run": run_id, "ids": company_ids},
+                )
+                after = company_ids[-1]
 
     @transaction_retry
     async def maintain(self, run_id):
