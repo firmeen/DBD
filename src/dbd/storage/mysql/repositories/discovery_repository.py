@@ -6,9 +6,9 @@ from hashlib import sha256
 
 from ....client.endpoints.search import SearchFilters
 from ....core.telemetry import DISCOVERY_PAGE_RESULTS, DISCOVERY_VALID_ROWS, observe_discovery
+from ....runtime.delta import MASTER_HASH_VERSION, master_fingerprint
 from ..engine import connect, use_connection
 from .company_repository import company_upsert_sql, company_values
-from .raw_repository import insert_raw_response
 
 
 def _now() -> datetime:
@@ -16,7 +16,6 @@ def _now() -> datetime:
 
 
 def upsert_bucket(filters: SearchFilters, *, parent_id: int | None = None, depth: int = 0) -> int:
-    """Register a bucket, or return the existing one. Re-running discovery resumes."""
     now = _now()
     with connect() as conn:
         try:
@@ -24,11 +23,11 @@ def upsert_bucket(filters: SearchFilters, *, parent_id: int | None = None, depth
                 cur.execute(
                     """
                     INSERT INTO discovery_buckets (
-                        parent_id, bucket_key, keyword, search_type,
-                        pv_codes, jp_statuses, jp_types, business_sizes,
-                        depth, created_at, updated_at
-                    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE id = LAST_INSERT_ID(id), updated_at = VALUES(updated_at)
+                        parent_id,bucket_key,keyword,search_type,
+                        pv_codes,jp_statuses,jp_types,business_sizes,
+                        depth,created_at,updated_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),updated_at=VALUES(updated_at)
                     """,
                     (
                         parent_id,
@@ -55,7 +54,6 @@ def upsert_bucket(filters: SearchFilters, *, parent_id: int | None = None, depth
 def update_bucket(bucket_id: int, **fields) -> None:
     if not fields:
         return
-
     allowed = {
         "total_items",
         "pages_total",
@@ -68,25 +66,20 @@ def update_bucket(bucket_id: int, **fields) -> None:
     unknown = set(fields) - allowed
     if unknown:
         raise ValueError(f"Unknown bucket field(s): {unknown}")
-
-    assignments = ", ".join(f"{k} = %s" for k in fields)
-    with connect() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"UPDATE discovery_buckets SET {assignments}, updated_at = %s WHERE id = %s",
-                (*fields.values(), _now(), bucket_id),
-            )
+    assignments = ", ".join(f"{key} = %s" for key in fields)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            f"UPDATE discovery_buckets SET {assignments},updated_at=%s WHERE id=%s",
+            (*fields.values(), _now(), bucket_id),
+        )
         conn.commit()
-
-    # Bucket transitions are infrequent enough to refresh durable backlog gauges
-    # without adding a database-wide COUNT to every search page.
     if "status" in fields:
         observe_discovery(discovery_summary())
 
 
 def get_bucket(bucket_id: int) -> dict | None:
     with connect() as conn, conn.cursor() as cur:
-        cur.execute("SELECT * FROM discovery_buckets WHERE id = %s", (bucket_id,))
+        cur.execute("SELECT * FROM discovery_buckets WHERE id=%s", (bucket_id,))
         return cur.fetchone()
 
 
@@ -96,105 +89,179 @@ def pending_buckets(limit: int = 50) -> list[dict]:
             """
             SELECT * FROM discovery_buckets
             WHERE status IN ('pending','counted','draining')
-            ORDER BY depth, id
-            LIMIT %s
+              AND (lease_owner IS NULL OR lease_expires_at<UTC_TIMESTAMP(6))
+            ORDER BY depth,id LIMIT %s
             """,
             (limit,),
         )
         return cur.fetchall()
 
 
+def claim_buckets(owner: str, limit: int, lease_seconds: int) -> list[dict]:
+    """Atomically claim buckets across Discovery processes without overlap."""
+    if limit < 1:
+        return []
+    with connect() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM discovery_buckets
+                    WHERE status IN ('pending','counted','draining')
+                      AND (lease_owner IS NULL OR lease_expires_at<UTC_TIMESTAMP(6))
+                    ORDER BY depth,id
+                    LIMIT %s FOR UPDATE SKIP LOCKED
+                    """,
+                    (limit,),
+                )
+                rows = cur.fetchall()
+                if not rows:
+                    conn.commit()
+                    return []
+                ids = [int(row["id"]) for row in rows]
+                placeholders = ",".join(["%s"] * len(ids))
+                cur.execute(
+                    f"""
+                    UPDATE discovery_buckets
+                    SET lease_owner=%s,lease_version=lease_version+1,
+                        lease_expires_at=TIMESTAMPADD(SECOND,%s,UTC_TIMESTAMP(6)),
+                        updated_at=UTC_TIMESTAMP(6)
+                    WHERE id IN ({placeholders})
+                    """,
+                    (owner, lease_seconds, *ids),
+                )
+                cur.execute(
+                    f"SELECT * FROM discovery_buckets WHERE id IN ({placeholders}) ORDER BY depth,id",
+                    ids,
+                )
+                claimed = cur.fetchall()
+            conn.commit()
+            return claimed
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def heartbeat_bucket_claims(owner: str, lease_seconds: int) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE discovery_buckets
+            SET lease_expires_at=TIMESTAMPADD(SECOND,%s,UTC_TIMESTAMP(6)),updated_at=UTC_TIMESTAMP(6)
+            WHERE lease_owner=%s AND lease_expires_at>UTC_TIMESTAMP(6)
+            """,
+            (lease_seconds, owner),
+        )
+        conn.commit()
+
+
+def release_bucket_claim(bucket_id: int, owner: str) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE discovery_buckets
+            SET lease_owner=NULL,lease_expires_at=NULL,updated_at=UTC_TIMESTAMP(6)
+            WHERE id=%s AND lease_owner=%s
+            """,
+            (bucket_id, owner),
+        )
+        conn.commit()
+
+
+def release_bucket_claims(owner: str) -> None:
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE discovery_buckets
+            SET lease_owner=NULL,lease_expires_at=NULL,updated_at=UTC_TIMESTAMP(6)
+            WHERE lease_owner=%s
+            """,
+            (owner,),
+        )
+        conn.commit()
+
+
 def child_total(bucket_id: int) -> int:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            "SELECT COALESCE(SUM(total_items), 0) AS t FROM discovery_buckets WHERE parent_id = %s",
+            "SELECT COALESCE(SUM(total_items),0) AS t FROM discovery_buckets WHERE parent_id=%s",
             (bucket_id,),
         )
         return int(cur.fetchone()["t"])
 
 
-def save_page(
-    *,
-    bucket_id: int,
-    profiles: list,
-    raw_json: object,
-    request_path: str,
-    requested_at: datetime,
-    body_sha256: str,
-) -> int:
-    """Persist valid rows from one search page in one transaction."""
+def save_page(*, bucket_id: int, profiles: list, archive_id: int, requested_at: datetime) -> int:
+    """Project one archived Search page without storing the raw payload twice."""
     if not profiles:
         return 0
-
+    hashes = [master_fingerprint(profile) for profile in profiles]
     with connect() as conn:
         try:
             with conn.cursor() as cur:
-                raw_response_id = insert_raw_response(
-                    cur,
-                    jp_type_code=profiles[0].jp_type_code,
-                    jp_no=profiles[0].jp_no,
-                    endpoint="search_page",
-                    request_path=request_path,
-                    requested_at=requested_at,
-                    http_status=200,
-                    body_sha256=body_sha256,
-                    raw_json=raw_json,
-                )
-
-                # Discovery seeds missing projections. A later search result
-                # cannot erase or relabel a verified profile.
-                cur.executemany(
+                insert_company = (
                     company_upsert_sql()
                     .split(" ON DUPLICATE KEY UPDATE")[0]
-                    .replace("INSERT INTO", "INSERT IGNORE INTO", 1),
-                    [company_values(p, raw_response_id, requested_at) for p in profiles],
+                    .replace("INSERT INTO", "INSERT IGNORE INTO", 1)
                 )
-                written = len(profiles)
+                cur.executemany(
+                    insert_company,
+                    [company_values(profile, None, requested_at, archive_id) for profile in profiles],
+                )
                 cur.executemany(
                     """
                     INSERT INTO company_master(
-                        jp_no,jp_type_code,observed_jp_stat_code,observed_status_at,
-                        first_seen_at,last_seen_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s)
+                      jp_no,jp_type_code,observed_jp_stat_code,observed_status_at,
+                      master_hash,master_hash_version,last_master_changed_at,
+                      latest_search_archive_id,first_seen_at,last_seen_at
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                     ON DUPLICATE KEY UPDATE
-                        last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),
-                        observed_jp_stat_code=IF(
-                            VALUES(observed_jp_stat_code) IS NULL,
-                            observed_jp_stat_code,
-                            VALUES(observed_jp_stat_code)
-                        ),
-                        observed_status_at=IF(
-                            VALUES(observed_jp_stat_code) IS NULL,
-                            observed_status_at,
-                            VALUES(observed_status_at)
-                        )
+                      last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),
+                      observed_jp_stat_code=IF(
+                        VALUES(observed_jp_stat_code) IS NULL,
+                        observed_jp_stat_code,VALUES(observed_jp_stat_code)
+                      ),
+                      observed_status_at=IF(
+                        VALUES(observed_jp_stat_code) IS NULL,
+                        observed_status_at,VALUES(observed_status_at)
+                      ),
+                      change_mask=IF(company_master.master_hash <=> VALUES(master_hash),0,127),
+                      last_master_changed_at=IF(
+                        company_master.master_hash <=> VALUES(master_hash),
+                        company_master.last_master_changed_at,VALUES(last_master_changed_at)
+                      ),
+                      master_hash=VALUES(master_hash),
+                      master_hash_version=VALUES(master_hash_version),
+                      latest_search_archive_id=VALUES(latest_search_archive_id)
                     """,
                     [
                         (
-                            p.jp_no,
-                            p.jp_type_code,
-                            p.jp_stat_code,
-                            requested_at if p.jp_stat_code is not None else None,
+                            profile.jp_no,
+                            profile.jp_type_code,
+                            profile.jp_stat_code,
+                            requested_at if profile.jp_stat_code is not None else None,
+                            fingerprint,
+                            MASTER_HASH_VERSION,
+                            requested_at,
+                            archive_id,
                             requested_at,
                             requested_at,
                         )
-                        for p in profiles
+                        for profile, fingerprint in zip(profiles, hashes, strict=True)
                     ],
                 )
-
                 cur.executemany(
                     """
-                    INSERT INTO discovery_sightings (
-                        jp_no, jp_type_code, first_bucket_id, first_seen_at, last_seen_at
-                    ) VALUES (%s, %s, %s, %s, %s)
-                    ON DUPLICATE KEY UPDATE
-                        times_seen = times_seen + 1,
-                        last_seen_at = VALUES(last_seen_at)
+                    INSERT IGNORE INTO discovery_sightings(
+                      jp_no,jp_type_code,first_bucket_id,first_seen_at,last_seen_at
+                    ) VALUES (%s,%s,%s,%s,%s)
                     """,
-                    [(p.jp_no, p.jp_type_code, bucket_id, requested_at, requested_at) for p in profiles],
+                    [
+                        (profile.jp_no, profile.jp_type_code, bucket_id, requested_at, requested_at)
+                        for profile in profiles
+                    ],
                 )
             conn.commit()
-            return written
+            return len(profiles)
         except Exception:
             conn.rollback()
             raise
@@ -240,12 +307,12 @@ def completed_pages(bucket_id):
             "SELECT page_no FROM discovery_pages WHERE bucket_id=%s AND status='done'",
             (bucket_id,),
         )
-        return {r["page_no"] for r in cur.fetchall()}
+        return {row["page_no"] for row in cur.fetchall()}
 
 
 def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=True):
-    """Archive decoded search payload before row normalization."""
     payload = json.dumps(data, ensure_ascii=False, default=str)
+    payload_sha256 = sha256(payload.encode()).hexdigest()
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -266,14 +333,16 @@ def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=Tr
                 requested,
                 _now(),
                 payload,
-                sha256(payload.encode()).hexdigest(),
+                payload_sha256,
             ),
         )
         archive_id = int(cur.lastrowid)
         if link_page:
             cur.execute(
-                """INSERT INTO discovery_pages(bucket_id,page_no,archive_id) VALUES (%s,%s,%s)
-                ON DUPLICATE KEY UPDATE archive_id=VALUES(archive_id)""",
+                """
+                INSERT INTO discovery_pages(bucket_id,page_no,archive_id) VALUES (%s,%s,%s)
+                ON DUPLICATE KEY UPDATE archive_id=VALUES(archive_id)
+                """,
                 (bucket_id, page_no, archive_id),
             )
         conn.commit()
@@ -283,8 +352,10 @@ def archive_search(bucket_id, page_no, filters, data, requested, *, link_page=Tr
 def link_search_page(bucket_id, page_no, archive_id):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO discovery_pages(bucket_id,page_no,archive_id) VALUES (%s,%s,%s)
-            ON DUPLICATE KEY UPDATE archive_id=VALUES(archive_id)""",
+            """
+            INSERT INTO discovery_pages(bucket_id,page_no,archive_id) VALUES (%s,%s,%s)
+            ON DUPLICATE KEY UPDATE archive_id=VALUES(archive_id)
+            """,
             (bucket_id, page_no, archive_id),
         )
         conn.commit()
@@ -300,7 +371,6 @@ def mark_search_archive(archive_id, status, error=None):
 
 
 def _replace_rejections(cur, bucket_id, page_no, rejections, requested):
-    # A retry supersedes unresolved observations from the previous copy of this page.
     cur.execute(
         """
         UPDATE discovery_rejections SET resolved_at=UTC_TIMESTAMP(6)
@@ -352,17 +422,13 @@ def finish_page(bucket_id, page_no, archive_id, profiles, data, requested, rejec
                 if existing["status"] == "done":
                     conn.commit()
                     return 0
-
             with use_connection(conn):
                 written = save_page(
                     bucket_id=bucket_id,
                     profiles=profiles,
-                    raw_json=data,
-                    request_path="/api/v1/company-profiles/infos",
+                    archive_id=archive_id,
                     requested_at=requested,
-                    body_sha256=sha256(json.dumps(data, sort_keys=True, default=str).encode()).hexdigest(),
                 )
-
             with conn.cursor() as cur:
                 _replace_rejections(cur, bucket_id, page_no, rejections, requested)
                 status = "partial" if rejections else "done"
@@ -402,13 +468,20 @@ def finish_page(bucket_id, page_no, archive_id, profiles, data, requested, rejec
 def fail_page(bucket_id, page_no, error):
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
-            """INSERT INTO discovery_pages(bucket_id,page_no,status,last_error) VALUES (%s,%s,'failed',%s)
-            ON DUPLICATE KEY UPDATE status='failed',last_error=VALUES(last_error),updated_at=UTC_TIMESTAMP(6)""",
+            """
+            INSERT INTO discovery_pages(bucket_id,page_no,status,last_error)
+            VALUES (%s,%s,'failed',%s)
+            ON DUPLICATE KEY UPDATE
+              status='failed',last_error=VALUES(last_error),updated_at=UTC_TIMESTAMP(6)
+            """,
             (bucket_id, page_no, error),
         )
         cur.execute(
-            """UPDATE response_archive a JOIN discovery_pages p ON p.archive_id=a.id
-            SET a.processing_status='failed',a.error_code=%s WHERE p.bucket_id=%s AND p.page_no=%s""",
+            """
+            UPDATE response_archive a JOIN discovery_pages p ON p.archive_id=a.id
+            SET a.processing_status='failed',a.error_code=%s
+            WHERE p.bucket_id=%s AND p.page_no=%s
+            """,
             (error, bucket_id, page_no),
         )
         conn.commit()
@@ -428,13 +501,13 @@ def page_progress(bucket_id):
             """,
             (bucket_id,),
         )
-        r = cur.fetchone()
+        row = cur.fetchone()
         return {
-            "done": int(r["done"]),
-            "failed": int(r["failed"]),
-            "partial": int(r["partial"]),
-            "rejected": int(r["rejected"]),
-            "rows": int(r["rows_total"]),
+            "done": int(row["done"]),
+            "failed": int(row["failed"]),
+            "partial": int(row["partial"]),
+            "rejected": int(row["rejected"]),
+            "rows": int(row["rows_total"]),
         }
 
 
@@ -444,7 +517,8 @@ def reset_discovery(refresh=False, bucket_id=None):
             parameters = (bucket_id,) if bucket_id else ()
             cur.execute(
                 "UPDATE discovery_buckets SET status='pending',total_items=NULL,pages_total=NULL,"
-                "pages_done=0,rows_seen=0,last_error=NULL,partition_lossless=NULL "
+                "pages_done=0,rows_seen=0,last_error=NULL,partition_lossless=NULL,"
+                "lease_owner=NULL,lease_expires_at=NULL "
                 + ("WHERE id=%s AND status<>'split'" if bucket_id else "WHERE status<>'split'"),
                 parameters,
             )
@@ -454,8 +528,15 @@ def reset_discovery(refresh=False, bucket_id=None):
                 parameters,
             )
             cur.execute(
-                "DELETE FROM discovery_pages" + (" WHERE bucket_id=%s" if bucket_id else ""), parameters
+                "DELETE FROM discovery_pages" + (" WHERE bucket_id=%s" if bucket_id else ""),
+                parameters,
             )
         else:
-            cur.execute("UPDATE discovery_buckets SET status='pending',last_error=NULL WHERE status='failed'")
+            cur.execute(
+                """
+                UPDATE discovery_buckets
+                SET status='pending',last_error=NULL,lease_owner=NULL,lease_expires_at=NULL
+                WHERE status='failed'
+                """
+            )
         conn.commit()
