@@ -98,6 +98,13 @@ class CampaignCoordinator:
     async def worker_drain_requested(self, identity: WorkerIdentity) -> bool:
         return bool(await self._client().exists(self.worker_drain_key(identity.worker_id)))
 
+    async def control_requested(self, identity: WorkerIdentity) -> bool:
+        """Read fleet-stop and targeted-drain state in one Redis round trip."""
+        stop, drain = await self._client().mget(
+            [self.stop_key, self.worker_drain_key(identity.worker_id)]
+        )
+        return stop is not None or drain is not None
+
     async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> None:
         now = time.time()
         payload = {
