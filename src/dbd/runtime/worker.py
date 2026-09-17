@@ -24,6 +24,11 @@ from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
 STATUS_OPERATING = ("1",)
 _CONTROL_POLL_SECONDS = 0.5
+_REDIS_HEARTBEAT_SECONDS = 2.0
+_MAINTENANCE_INTERVAL_SECONDS = 5.0
+_MAINTENANCE_LEASE_SECONDS = 8
+_DRAIN_DB_POLL_SECONDS = 0.5
+_IDLE_PROGRESS_POLL_SECONDS = 1.0
 
 
 def code_batches(path: str, size: int):
@@ -81,7 +86,7 @@ def _attempt_count(task) -> int:
     return int(task["attempts"])
 
 
-async def _fail_task(repo, task, exc, archive_id=None) -> None:
+async def _fail_task(repo, task, exc, archive_id=None) -> str | None:
     if isinstance(exc, IdentityConflict):
         code = type(exc).__name__
         finished = await repo.finish_identity_conflict(task, archive_id, code)
@@ -95,7 +100,8 @@ async def _fail_task(repo, task, exc, archive_id=None) -> None:
                 endpoint=task["endpoint"],
                 error_code=code,
             )
-        return
+            return "failed"
+        return None
 
     terminal = isinstance(exc, (ContractError, DbdForbiddenError, DbdAuthError, ValueError, TypeError))
     exhausted = _attempt_count(task) >= settings.dbd_max_task_attempts
@@ -116,6 +122,8 @@ async def _fail_task(repo, task, exc, archive_id=None) -> None:
             error_code=code,
             status=status,
         )
+        return status
+    return None
 
 
 async def _queue_get(queue: asyncio.Queue, stop: asyncio.Event):
@@ -160,8 +168,20 @@ async def process(
     writes = asyncio.Semaphore(projection_workers)
     claimed_attempts = 0
     maintenance_at = 0.0
+    drain_db_check_at = 0.0
+    idle_progress_at = 0.0
     coordinator = None
     identity = None
+    client_ref = None
+    runtime_stats = {
+        "completed": 0,
+        "failed": 0,
+        "retry_wait": 0,
+        "not_available": 0,
+        "fetch_active": 0,
+        "archive_active": 0,
+        "project_active": 0,
+    }
 
     if distributed:
         coordinator = CampaignCoordinator(settings.dbd_redis_url, run_id)
@@ -174,6 +194,59 @@ async def process(
         PIPELINE_QUEUE_DEPTH.labels("archive").set(archive_queue.qsize())
         PIPELINE_QUEUE_DEPTH.labels("project").set(project_queue.qsize())
 
+    def heartbeat_metrics() -> dict[str, object]:
+        client = client_ref
+        effective_rate = None
+        if client is not None:
+            controller = getattr(client, "endpoint_rate", None)
+            if controller is not None:
+                try:
+                    effective_rate = float(controller.global_effective_rate())
+                except Exception:
+                    effective_rate = None
+        active = {
+            "fetch": int(runtime_stats["fetch_active"]),
+            "archive": int(runtime_stats["archive_active"]),
+            "project": int(runtime_stats["project_active"]),
+        }
+        current_stage = "idle"
+        for stage in ("project", "archive", "fetch"):
+            if active[stage] > 0:
+                current_stage = stage
+                break
+        return {
+            "current_stage": current_stage,
+            "claimed": int(claimed_attempts),
+            "completed": int(runtime_stats["completed"]),
+            "failed": int(runtime_stats["failed"]),
+            "retry_wait": int(runtime_stats["retry_wait"]),
+            "not_available": int(runtime_stats["not_available"]),
+            "fetch_active": active["fetch"],
+            "archive_active": active["archive"],
+            "project_active": active["project"],
+            "fetch_queue": fetch_queue.qsize(),
+            "archive_queue": archive_queue.qsize(),
+            "project_queue": project_queue.qsize(),
+            "inflight": sum(active.values())
+            + fetch_queue.qsize()
+            + archive_queue.qsize()
+            + project_queue.qsize(),
+            "requests": int(getattr(client, "requests_made", 0) or 0),
+            "http_retries": int(getattr(client, "retries_made", 0) or 0),
+            "rate_limit_hits": int(getattr(client, "rate_limit_hits", 0) or 0),
+            "effective_rate": effective_rate,
+            "drain_requested": drain_requested.is_set(),
+        }
+
+    async def publish_heartbeat(*, status: str | None = None) -> None:
+        if coordinator is None or identity is None:
+            return
+        await coordinator.heartbeat_worker(
+            identity,
+            status=status or ("draining" if drain_requested.is_set() else "active"),
+            metrics=heartbeat_metrics(),
+        )
+
     async def control_watcher():
         """Poll ephemeral stop/drain control without increasing MySQL heartbeat writes."""
         if coordinator is None or identity is None:
@@ -181,49 +254,67 @@ async def process(
         while not stop.is_set() and not drain_requested.is_set():
             if await coordinator.control_requested(identity):
                 drain_requested.set()
-                await coordinator.heartbeat_worker(identity, status="draining")
+                await publish_heartbeat(status="draining")
                 return
             try:
                 await asyncio.wait_for(stop.wait(), _CONTROL_POLL_SECONDS)
             except TimeoutError:
                 pass
 
-    async def heartbeat():
+    async def mysql_heartbeat():
         while not stop.is_set():
             if health:
                 await asyncio.to_thread(health)
             await repo.heartbeat(owner)
-            if coordinator is not None and identity is not None:
-                await coordinator.heartbeat_worker(
-                    identity, status="draining" if drain_requested.is_set() else "active"
-                )
             try:
                 await asyncio.wait_for(stop.wait(), min(10, settings.dbd_lease_seconds / 3))
             except TimeoutError:
                 pass
 
-    async def scheduler():
-        nonlocal claimed_attempts, maintenance_at
+    async def redis_heartbeat():
+        if coordinator is None or identity is None:
+            return
         while not stop.is_set():
-            if time.monotonic() >= maintenance_at:
-                await repo.maintain(run_id)
-                maintenance_at = time.monotonic() + 5
+            await publish_heartbeat()
+            try:
+                await asyncio.wait_for(stop.wait(), _REDIS_HEARTBEAT_SECONDS)
+            except TimeoutError:
+                pass
+
+    async def scheduler():
+        nonlocal claimed_attempts, maintenance_at, drain_db_check_at, idle_progress_at
+        while not stop.is_set():
+            now = time.monotonic()
+            if now >= maintenance_at:
+                should_maintain = True
+                if coordinator is not None and identity is not None:
+                    should_maintain = await coordinator.acquire_maintenance_slot(
+                        identity, ttl_seconds=_MAINTENANCE_LEASE_SECONDS
+                    )
+                if should_maintain:
+                    await repo.maintain(run_id)
+                maintenance_at = now + _MAINTENANCE_INTERVAL_SECONDS
 
             if drain_requested.is_set():
-                if (
-                    await repo.owner_running(owner) == 0
-                    and fetch_queue.empty()
-                    and archive_queue.empty()
-                    and project_queue.empty()
-                ):
+                # Do not hammer MySQL while in-memory work is visibly still moving.
+                if not (fetch_queue.empty() and archive_queue.empty() and project_queue.empty()):
+                    await asyncio.sleep(0.1)
+                    continue
+                now = time.monotonic()
+                if now < drain_db_check_at:
+                    await asyncio.sleep(min(0.1, drain_db_check_at - now))
+                    continue
+                drain_db_check_at = now + _DRAIN_DB_POLL_SECONDS
+                if await repo.owner_running(owner) == 0:
                     stop.set()
                     return
-                await asyncio.sleep(0.05)
+                await asyncio.sleep(0.1)
                 continue
 
             remaining = None if limit is None else max(0, limit - claimed_attempts)
             if remaining == 0:
                 drain_requested.set()
+                await publish_heartbeat(status="draining")
                 continue
 
             batch_limit = settings.dbd_claim_batch_size
@@ -261,13 +352,20 @@ async def process(
 
             queue_metrics()
             if project_batch or fetch_batch:
+                idle_progress_at = time.monotonic() + _IDLE_PROGRESS_POLL_SECONDS
                 await asyncio.sleep(0)
                 continue
 
-            progress = await repo.progress(run_id)
-            if not any(progress.get(status, 0) for status in ("pending", "running", "retry_wait")):
-                drain_requested.set()
-                continue
+            now = time.monotonic()
+            if now >= idle_progress_at:
+                progress = await repo.progress(run_id)
+                idle_progress_at = now + _IDLE_PROGRESS_POLL_SECONDS
+                if not any(
+                    progress.get(status, 0) for status in ("pending", "running", "retry_wait")
+                ):
+                    drain_requested.set()
+                    await publish_heartbeat(status="draining")
+                    continue
             await asyncio.sleep(0.1)
 
     async def fetcher(client):
@@ -275,6 +373,7 @@ async def process(
             task = await _queue_get(fetch_queue, stop)
             if task is None:
                 return
+            runtime_stats["fetch_active"] += 1
             try:
                 endpoint = task["endpoint"]
                 year = await repo.fiscal_year(task) if endpoint in FINANCIAL else None
@@ -282,6 +381,8 @@ async def process(
                     if await _finish_if_owned(repo, task, "not_available", "no_submitted_fiscal_year"):
                         TASKS.labels(endpoint, "not_available").inc()
                         PIPELINE_STAGE_TOTAL.labels("fetch", "not_available").inc()
+                        runtime_stats["completed"] += 1
+                        runtime_stats["not_available"] += 1
                     IN_FLIGHT.dec()
                     continue
                 path = request_path(endpoint, task["jp_type_code"], task["jp_no"])
@@ -294,9 +395,14 @@ async def process(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                await _fail_task(repo, task, exc)
+                status = await _fail_task(repo, task, exc)
+                if status == "failed":
+                    runtime_stats["failed"] += 1
+                elif status == "retry_wait":
+                    runtime_stats["retry_wait"] += 1
                 IN_FLIGHT.dec()
             finally:
+                runtime_stats["fetch_active"] -= 1
                 fetch_queue.task_done()
                 queue_metrics()
 
@@ -311,6 +417,7 @@ async def process(
                     batch.append(archive_queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            runtime_stats["archive_active"] += len(batch)
             try:
                 archived = await repo.archive_batch(batch)
                 archived_ids = {item["task"]["id"] for item in archived}
@@ -330,9 +437,14 @@ async def process(
                 raise
             except Exception as exc:
                 for item in batch:
-                    await _fail_task(repo, item["task"], exc)
+                    status = await _fail_task(repo, item["task"], exc)
+                    if status == "failed":
+                        runtime_stats["failed"] += 1
+                    elif status == "retry_wait":
+                        runtime_stats["retry_wait"] += 1
                     IN_FLIGHT.dec()
             finally:
+                runtime_stats["archive_active"] -= len(batch)
                 for _ in batch:
                     archive_queue.task_done()
                 queue_metrics()
@@ -342,6 +454,7 @@ async def process(
             item = await _queue_get(project_queue, stop)
             if item is None:
                 return
+            runtime_stats["project_active"] += 1
             task = item["task"]
             archive_id = item.get("archive_id") or task.get("raw_response_id")
             try:
@@ -374,14 +487,20 @@ async def process(
                     )
                 TASKS.labels(task["endpoint"], outcome).inc()
                 PIPELINE_STAGE_TOTAL.labels("project", outcome).inc()
+                runtime_stats["completed"] += 1
             except asyncio.CancelledError:
                 raise
             except LeaseLost:
                 PIPELINE_STAGE_TOTAL.labels("project", "lease_lost").inc()
                 log.warning("lease_lost", task_id=task["id"], endpoint=task["endpoint"])
             except Exception as exc:
-                await _fail_task(repo, task, exc, archive_id)
+                status = await _fail_task(repo, task, exc, archive_id)
+                if status == "failed":
+                    runtime_stats["failed"] += 1
+                elif status == "retry_wait":
+                    runtime_stats["retry_wait"] += 1
             finally:
+                runtime_stats["project_active"] -= 1
                 IN_FLIGHT.dec()
                 project_queue.task_done()
                 queue_metrics()
@@ -396,10 +515,12 @@ async def process(
 
     try:
         async with client_factory(**client_kwargs) as client:
+            client_ref = client
             async with asyncio.TaskGroup() as group:
                 if coordinator is not None:
                     group.create_task(control_watcher())
-                group.create_task(heartbeat())
+                    group.create_task(redis_heartbeat())
+                group.create_task(mysql_heartbeat())
                 group.create_task(scheduler())
                 for _ in range(fetch_workers):
                     group.create_task(fetcher(client))
