@@ -1,0 +1,64 @@
+-- Reference DDL for distributed campaign runtime.
+-- Alembic revision 0008_campaign_runtime is authoritative and adoption-safe.
+
+ALTER TABLE worker_runs
+  ADD COLUMN scheduler_mode VARCHAR(16) NOT NULL DEFAULT 'legacy' AFTER fiscal_year;
+
+ALTER TABLE company_master
+  ADD COLUMN master_hash CHAR(64) NULL AFTER observed_status_at,
+  ADD COLUMN master_hash_version SMALLINT UNSIGNED NOT NULL DEFAULT 1 AFTER master_hash,
+  ADD COLUMN change_mask BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER master_hash_version,
+  ADD COLUMN last_master_changed_at DATETIME(6) NULL AFTER change_mask,
+  ADD COLUMN last_seen_campaign BIGINT UNSIGNED NULL AFTER last_master_changed_at,
+  ADD COLUMN latest_search_archive_id BIGINT UNSIGNED NULL AFTER last_seen_campaign;
+
+ALTER TABLE companies
+  MODIFY COLUMN latest_raw_response_id BIGINT UNSIGNED NULL,
+  ADD COLUMN latest_archive_id BIGINT UNSIGNED NULL AFTER latest_raw_response_id;
+
+ALTER TABLE response_archive
+  ADD COLUMN run_id BIGINT UNSIGNED NULL AFTER task_id;
+
+ALTER TABLE discovery_buckets
+  ADD COLUMN lease_owner VARCHAR(64) NULL AFTER last_error,
+  ADD COLUMN lease_version BIGINT UNSIGNED NOT NULL DEFAULT 0 AFTER lease_owner,
+  ADD COLUMN lease_expires_at DATETIME(6) NULL AFTER lease_version;
+
+CREATE TABLE company_collection_state (
+  id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT PRIMARY KEY,
+  run_id BIGINT UNSIGNED NOT NULL,
+  company_id BIGINT UNSIGNED NOT NULL,
+  required_mask BIGINT UNSIGNED NOT NULL,
+  done_mask BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  not_available_mask BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  failed_mask BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  dirty_mask BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  next_endpoint VARCHAR(64) NULL,
+  fiscal_year VARCHAR(8) NULL,
+  master_hash CHAR(64) NULL,
+  stage ENUM('fetch','project') NOT NULL DEFAULT 'fetch',
+  status ENUM('pending','running','retry_wait','done','failed') NOT NULL DEFAULT 'pending',
+  attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  project_attempts INT UNSIGNED NOT NULL DEFAULT 0,
+  available_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  lease_owner VARCHAR(64) NULL,
+  lease_version BIGINT UNSIGNED NOT NULL DEFAULT 0,
+  lease_expires_at DATETIME(6) NULL,
+  raw_response_id BIGINT UNSIGNED NULL,
+  last_error VARCHAR(500) NULL,
+  updated_at DATETIME(6) NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
+  finished_at DATETIME(6) NULL,
+  UNIQUE KEY uq_collection_state (run_id,company_id),
+  KEY idx_collection_claim (run_id,stage,status,available_at,id),
+  KEY idx_collection_endpoint (run_id,next_endpoint,status,available_at,id),
+  KEY idx_collection_lease (lease_owner,status,lease_expires_at),
+  CONSTRAINT fk_collection_run FOREIGN KEY (run_id) REFERENCES worker_runs(id),
+  CONSTRAINT fk_collection_company FOREIGN KEY (company_id) REFERENCES company_master(company_id)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
+
+CREATE INDEX idx_archive_run_processing
+  ON response_archive(run_id,processing_status,id);
+CREATE INDEX idx_master_hash
+  ON company_master(master_hash);
+CREATE INDEX idx_discovery_claim
+  ON discovery_buckets(status,lease_expires_at,depth,id);
