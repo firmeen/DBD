@@ -20,6 +20,18 @@ def _column_exists(connection, table: str, column: str) -> bool:
     )
 
 
+def _column_nullable(connection, table: str, column: str) -> bool:
+    row = connection.exec_driver_sql(
+        """
+        SELECT is_nullable FROM information_schema.columns
+        WHERE table_schema=DATABASE() AND table_name=%s AND column_name=%s
+        LIMIT 1
+        """,
+        (table, column),
+    ).first()
+    return bool(row and str(row[0]).upper() == "YES")
+
+
 def _index_exists(connection, table: str, index: str) -> bool:
     return (
         connection.exec_driver_sql(
@@ -78,6 +90,14 @@ def upgrade():
         if not _column_exists(connection, table, column):
             connection.exec_driver_sql(ddl)
 
+    # Search pages now use response_archive as their only raw source. A newly
+    # discovered company can therefore exist before any per-company raw_response.
+    # Existing profile rows keep their FK value; MySQL permits NULL through the FK.
+    if not _column_nullable(connection, "companies", "latest_raw_response_id"):
+        connection.exec_driver_sql(
+            "ALTER TABLE companies MODIFY COLUMN latest_raw_response_id BIGINT UNSIGNED NULL"
+        )
+
     connection.exec_driver_sql(
         """
         CREATE TABLE IF NOT EXISTS company_collection_state (
@@ -106,8 +126,8 @@ def upgrade():
           finished_at DATETIME(6) NULL,
           UNIQUE KEY uq_collection_state (run_id, company_id),
           KEY idx_collection_claim (run_id, stage, status, available_at, id),
-          KEY idx_collection_endpoint (run_id, next_endpoint, status, available_at, id),
-          KEY idx_collection_lease (lease_owner, status, lease_expires_at),
+          KEY idx_collection_endpoint (run_id, next_endpoint, status,available_at,id),
+          KEY idx_collection_lease (lease_owner,status,lease_expires_at),
           CONSTRAINT fk_collection_run FOREIGN KEY (run_id) REFERENCES worker_runs(id),
           CONSTRAINT fk_collection_company FOREIGN KEY (company_id) REFERENCES company_master(company_id)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
