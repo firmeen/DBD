@@ -27,6 +27,8 @@ class AdaptiveCircuitBreaker:
     The pressure tracker is separate from endpoint circuit state. It escalates to a
     global penalty only after multiple distinct endpoints show pressure inside the
     configured window, avoiding fleet-wide collapse from one endpoint-specific 429.
+    A short shared gate prevents the same pressure burst from repeatedly halving the
+    fleet rate before the controller has time to observe the previous penalty.
     """
 
     _BEFORE_SCRIPT = """
@@ -142,6 +144,7 @@ return state
         self.probe_seconds = max(1.0, float(probe_seconds))
         self._local: dict[str, _LocalCircuit] = {}
         self._local_pressure: dict[str, float] = {}
+        self._last_global_pressure_at = 0.0
 
     def _keys(self, key: str) -> tuple[str, str, str, str, str]:
         prefix = f"{self.namespace}:{key}"
@@ -164,6 +167,10 @@ return state
             )
             * 1000
         )
+
+    @property
+    def _pressure_gate_seconds(self) -> float:
+        return max(1.0, self.pressure_window_seconds / 2.0)
 
     async def before(self, key: str) -> str:
         """Block admission while OPEN and return the state that admitted the call."""
@@ -260,7 +267,7 @@ return state
         return str(result)
 
     async def record_endpoint_pressure(self, endpoint: str) -> bool:
-        """Return True when distinct endpoint pressure justifies a global penalty."""
+        """Return True only for a gated multi-endpoint global-pressure event."""
         if self.redis is None:
             now = time.monotonic()
             cutoff = now - self.pressure_window_seconds
@@ -270,15 +277,30 @@ return state
                 if observed >= cutoff
             }
             self._local_pressure[str(endpoint)] = now
-            return len(self._local_pressure) >= self.pressure_endpoint_threshold
+            if len(self._local_pressure) < self.pressure_endpoint_threshold:
+                return False
+            if now - self._last_global_pressure_at < self._pressure_gate_seconds:
+                return False
+            self._last_global_pressure_at = now
+            return True
 
-        key = f"{self.namespace}:pressure:endpoints"
+        pressure_key = f"{self.namespace}:pressure:endpoints"
+        gate_key = f"{self.namespace}:pressure:global-penalty-gate"
         now_ms = int(time.time() * 1000)
         cutoff_ms = now_ms - int(self.pressure_window_seconds * 1000)
         async with self.redis.pipeline(transaction=False) as pipe:
-            pipe.zadd(key, {str(endpoint): now_ms})
-            pipe.zremrangebyscore(key, 0, cutoff_ms)
-            pipe.zcard(key)
-            pipe.pexpire(key, max(1000, int(self.pressure_window_seconds * 3000)))
+            pipe.zadd(pressure_key, {str(endpoint): now_ms})
+            pipe.zremrangebyscore(pressure_key, 0, cutoff_ms)
+            pipe.zcard(pressure_key)
+            pipe.pexpire(pressure_key, max(1000, int(self.pressure_window_seconds * 3000)))
             results = await pipe.execute()
-        return int(results[2] or 0) >= self.pressure_endpoint_threshold
+        if int(results[2] or 0) < self.pressure_endpoint_threshold:
+            return False
+        return bool(
+            await self.redis.set(
+                gate_key,
+                str(now_ms),
+                px=max(1000, int(self._pressure_gate_seconds * 1000)),
+                nx=True,
+            )
+        )
