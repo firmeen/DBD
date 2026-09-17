@@ -133,8 +133,9 @@ class CampaignCoordinator:
         ttl_seconds: int = 30,
     ) -> None:
         key = self.worker_key(identity.worker_id)
+        drain_key = self.worker_drain_key(identity.worker_id)
         client = self._client()
-        raw = await client.get(key)
+        raw, stop_signal, drain_signal = await client.mget([key, self.stop_key, drain_key])
         payload = json.loads(raw) if raw else {
             "worker_id": identity.worker_id,
             "run_id": identity.run_id,
@@ -144,10 +145,12 @@ class CampaignCoordinator:
             "started_at": time.time(),
         }
         payload["heartbeat_at"] = time.time()
-        payload["status"] = status
-        # Keep the worker heartbeat and set membership refreshed together. A
-        # non-transactional pipeline reduces fleet coordination RTT without
-        # changing durability semantics: Redis is still ephemeral control state.
+        # Once control-plane drain is visible, stale active heartbeats must never
+        # overwrite it. This keeps supervisor fleet accounting monotonic while a
+        # worker is finishing already-owned fetch/archive/project work.
+        payload["status"] = (
+            "draining" if status == "draining" or stop_signal is not None or drain_signal is not None else "active"
+        )
         async with client.pipeline(transaction=False) as pipe:
             pipe.set(key, json.dumps(payload), ex=ttl_seconds)
             pipe.sadd(self.workers_key, identity.worker_id)
