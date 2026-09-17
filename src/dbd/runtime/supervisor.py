@@ -166,9 +166,14 @@ def _clear_stop(redis: Redis, run_id: int) -> None:
 
 
 def _seed_rate(redis: Redis, rate_key: str, initial_rate: float) -> None:
-    redis.delete(rate_key, f"{rate_key}:cooldown-until-ms")
-    redis.set(f"{rate_key}:effective-rate", str(initial_rate), ex=600)
-    redis.set(f"{rate_key}:last-penalty-ms", str(int(time.time() * 1000) - 120_000), ex=600)
+    """Seed a fresh shared pacer without erasing an active fleet penalty or cooldown."""
+    redis.set(f"{rate_key}:effective-rate", str(initial_rate), ex=600, nx=True)
+    redis.set(
+        f"{rate_key}:last-penalty-ms",
+        str(int(time.time() * 1000) - 120_000),
+        ex=600,
+        nx=True,
+    )
 
 
 def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
