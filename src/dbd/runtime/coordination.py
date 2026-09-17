@@ -118,10 +118,12 @@ class CampaignCoordinator:
             "status": "active",
         }
         client = self._client()
-        await client.delete(self.worker_drain_key(identity.worker_id))
-        await client.set(self.worker_key(identity.worker_id), json.dumps(payload), ex=ttl_seconds)
-        await client.sadd(self.workers_key, identity.worker_id)
-        await client.expire(self.workers_key, 86400)
+        async with client.pipeline(transaction=False) as pipe:
+            pipe.delete(self.worker_drain_key(identity.worker_id))
+            pipe.set(self.worker_key(identity.worker_id), json.dumps(payload), ex=ttl_seconds)
+            pipe.sadd(self.workers_key, identity.worker_id)
+            pipe.expire(self.workers_key, 86400)
+            await pipe.execute()
 
     async def heartbeat_worker(
         self,
@@ -143,12 +145,14 @@ class CampaignCoordinator:
         }
         payload["heartbeat_at"] = time.time()
         payload["status"] = status
-        await client.set(key, json.dumps(payload), ex=ttl_seconds)
-        # Campaigns may run longer than one day. Refresh membership as part of
-        # every heartbeat so expiry of the set cannot make live workers vanish
-        # from supervisor/status views while their individual heartbeat keys live.
-        await client.sadd(self.workers_key, identity.worker_id)
-        await client.expire(self.workers_key, 86400)
+        # Keep the worker heartbeat and set membership refreshed together. A
+        # non-transactional pipeline reduces fleet coordination RTT without
+        # changing durability semantics: Redis is still ephemeral control state.
+        async with client.pipeline(transaction=False) as pipe:
+            pipe.set(key, json.dumps(payload), ex=ttl_seconds)
+            pipe.sadd(self.workers_key, identity.worker_id)
+            pipe.expire(self.workers_key, 86400)
+            await pipe.execute()
 
     async def unregister_worker(self, identity: WorkerIdentity) -> bool:
         """Best-effort ephemeral cleanup; durable MySQL lease release happens separately."""
@@ -156,11 +160,13 @@ class CampaignCoordinator:
             return False
         try:
             client = self._client()
-            await client.delete(
-                self.worker_key(identity.worker_id),
-                self.worker_drain_key(identity.worker_id),
-            )
-            await client.srem(self.workers_key, identity.worker_id)
+            async with client.pipeline(transaction=False) as pipe:
+                pipe.delete(
+                    self.worker_key(identity.worker_id),
+                    self.worker_drain_key(identity.worker_id),
+                )
+                pipe.srem(self.workers_key, identity.worker_id)
+                await pipe.execute()
             return True
         except Exception:
             # Heartbeat/drain keys have TTLs, so failed cleanup self-heals.
@@ -189,15 +195,17 @@ class CampaignCoordinator:
     ) -> None:
         """Seed a missing shared rate without erasing an active fleet penalty/cooldown."""
         client = self._client()
-        await client.set(
-            f"{redis_rate_key}:effective-rate",
-            str(float(effective_rate)),
-            ex=ttl_seconds,
-            nx=True,
-        )
-        await client.set(
-            f"{redis_rate_key}:last-penalty-ms",
-            str(int(time.time() * 1000) - 120_000),
-            ex=ttl_seconds,
-            nx=True,
-        )
+        async with client.pipeline(transaction=False) as pipe:
+            pipe.set(
+                f"{redis_rate_key}:effective-rate",
+                str(float(effective_rate)),
+                ex=ttl_seconds,
+                nx=True,
+            )
+            pipe.set(
+                f"{redis_rate_key}:last-penalty-ms",
+                str(int(time.time() * 1000) - 120_000),
+                ex=ttl_seconds,
+                nx=True,
+            )
+            await pipe.execute()
