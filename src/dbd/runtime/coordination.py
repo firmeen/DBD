@@ -4,6 +4,7 @@ import json
 import socket
 import time
 from dataclasses import dataclass
+from typing import Mapping
 
 from redis.asyncio import Redis
 
@@ -20,8 +21,8 @@ class CampaignCoordinator:
     """Ephemeral Redis coordination for a durable MySQL-backed campaign.
 
     MySQL remains the source of truth for work and leases. Redis carries only
-    fleet-wide control state: graceful-stop requests, worker heartbeats and the
-    shared adaptive rate state already consumed by RedisPacer.
+    fleet-wide control state: graceful-stop requests, targeted drains, worker
+    heartbeats, maintenance leadership and shared adaptive rate state.
     """
 
     def __init__(self, url: str, run_id: int, *, namespace: str = "dbd:campaign") -> None:
@@ -41,6 +42,10 @@ class CampaignCoordinator:
     @property
     def workers_key(self) -> str:
         return f"{self.base_key}:workers"
+
+    @property
+    def maintenance_key(self) -> str:
+        return f"{self.base_key}:maintenance"
 
     def worker_key(self, worker_id: str) -> str:
         return f"{self.base_key}:worker:{worker_id}"
@@ -106,7 +111,18 @@ class CampaignCoordinator:
         return stop is not None or drain is not None
 
     async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> None:
+        """Publish a worker without ever erasing a drain requested before startup.
+
+        Worker ids are unique per spawn. A supervisor may request a targeted drain
+        immediately after Popen but before this coroutine runs; deleting that key
+        here would resurrect a worker that the supervisor already removed from its
+        active fleet accounting.
+        """
         now = time.time()
+        client = self._client()
+        stop_signal, drain_signal = await client.mget(
+            [self.stop_key, self.worker_drain_key(identity.worker_id)]
+        )
         payload = {
             "worker_id": identity.worker_id,
             "run_id": identity.run_id,
@@ -115,11 +131,9 @@ class CampaignCoordinator:
             "hostname": socket.gethostname(),
             "started_at": now,
             "heartbeat_at": now,
-            "status": "active",
+            "status": "draining" if stop_signal is not None or drain_signal is not None else "active",
         }
-        client = self._client()
         async with client.pipeline(transaction=False) as pipe:
-            pipe.delete(self.worker_drain_key(identity.worker_id))
             pipe.set(self.worker_key(identity.worker_id), json.dumps(payload), ex=ttl_seconds)
             pipe.sadd(self.workers_key, identity.worker_id)
             pipe.expire(self.workers_key, 86400)
@@ -131,6 +145,7 @@ class CampaignCoordinator:
         *,
         status: str = "active",
         ttl_seconds: int = 30,
+        metrics: Mapping[str, object] | None = None,
     ) -> None:
         key = self.worker_key(identity.worker_id)
         drain_key = self.worker_drain_key(identity.worker_id)
@@ -149,13 +164,38 @@ class CampaignCoordinator:
         # overwrite it. This keeps supervisor fleet accounting monotonic while a
         # worker is finishing already-owned fetch/archive/project work.
         payload["status"] = (
-            "draining" if status == "draining" or stop_signal is not None or drain_signal is not None else "active"
+            "draining"
+            if status == "draining" or stop_signal is not None or drain_signal is not None
+            else "active"
         )
+        if metrics:
+            payload.update(dict(metrics))
         async with client.pipeline(transaction=False) as pipe:
-            pipe.set(key, json.dumps(payload), ex=ttl_seconds)
+            pipe.set(key, json.dumps(payload, default=str), ex=ttl_seconds)
             pipe.sadd(self.workers_key, identity.worker_id)
             pipe.expire(self.workers_key, 86400)
             await pipe.execute()
+
+    async def acquire_maintenance_slot(
+        self,
+        identity: WorkerIdentity,
+        *,
+        ttl_seconds: int = 8,
+    ) -> bool:
+        """Elect one short-lived distributed maintenance leader.
+
+        The lease is intentionally disposable: if the elected worker dies another
+        process can run durable maintenance after the TTL without coordinator state
+        becoming a source of truth.
+        """
+        return bool(
+            await self._client().set(
+                self.maintenance_key,
+                identity.worker_id,
+                ex=max(1, int(ttl_seconds)),
+                nx=True,
+            )
+        )
 
     async def unregister_worker(self, identity: WorkerIdentity) -> bool:
         """Best-effort ephemeral cleanup; durable MySQL lease release happens separately."""
@@ -164,6 +204,8 @@ class CampaignCoordinator:
         try:
             client = self._client()
             async with client.pipeline(transaction=False) as pipe:
+                # A targeted drain is deleted only after this worker is actually
+                # exiting. Missing/stale heartbeat cleanup must never delete it.
                 pipe.delete(
                     self.worker_key(identity.worker_id),
                     self.worker_drain_key(identity.worker_id),
