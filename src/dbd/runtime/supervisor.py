@@ -187,6 +187,24 @@ def _registered_workers(redis: Redis, run_id: int) -> int:
     return sum(value is not None for value in redis.mget(keys))
 
 
+def _force_kill_worker(worker: WorkerProcess) -> None:
+    """Force-stop a worker process tree; PowerShell wrappers must not orphan Python children."""
+    if worker.process.poll() is not None:
+        return
+    if os.name == "nt":
+        try:
+            subprocess.run(
+                ["taskkill", "/PID", str(worker.process.pid), "/T", "/F"],
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return
+        except OSError:
+            pass
+    worker.process.kill()
+
+
 def _terminate_workers(workers: list[WorkerProcess]) -> None:
     for worker in workers:
         if worker.process.poll() is None:
@@ -196,7 +214,7 @@ def _terminate_workers(workers: list[WorkerProcess]) -> None:
         time.sleep(0.1)
     for worker in workers:
         if worker.process.poll() is None:
-            worker.process.kill()
+            _force_kill_worker(worker)
         _close_worker_handle(worker)
 
 
