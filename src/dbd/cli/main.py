@@ -185,14 +185,32 @@ async def _validate_campaign_run(run_id: int) -> None:
 
 
 def _add_campaign_worker_options(parser):
-    parser.add_argument("--workers", type=positive, default=4)
+    parser.add_argument(
+        "--workers",
+        type=positive,
+        default=4,
+        help="Fixed worker count, or initial worker count when autoscaling is enabled",
+    )
+    parser.add_argument(
+        "--workers-min",
+        type=positive,
+        help="Minimum claiming workers; differs from --workers-max to enable autoscaling",
+    )
+    parser.add_argument(
+        "--workers-max",
+        type=positive,
+        help="Maximum local worker processes; scale-down is always graceful",
+    )
     parser.add_argument("--worker-concurrency", type=positive, default=8)
     parser.add_argument("--worker-rate", type=positive_rate, default=settings.dbd_rate_per_second)
     parser.add_argument(
         "--rate-mode",
         choices=("shared", "multiply", "adaptive"),
         default="adaptive",
-        help="shared=fleet cap, multiply=worker-rate x workers, adaptive=scaled ceiling with low start",
+        help=(
+            "shared=fleet cap, multiply=worker-rate x workers-max, "
+            "adaptive=scaled ceiling with conservative initial rate"
+        ),
     )
     parser.add_argument("--max-restarts", type=non_negative, default=3)
     display = parser.add_mutually_exclusive_group()
@@ -224,6 +242,8 @@ def _campaign_command(args) -> None:
     code = supervise_campaign(
         run_id,
         workers=args.workers,
+        workers_min=args.workers_min,
+        workers_max=args.workers_max,
         worker_concurrency=args.worker_concurrency,
         worker_rate=args.worker_rate,
         rate_mode=args.rate_mode,
@@ -310,7 +330,11 @@ def main():
     disc.add_argument("--concurrency", type=positive)
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
-    disc.add_argument("--distributed", action="store_true", help="Claim buckets across processes with Redis-shared Search pacing")
+    disc.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Claim buckets across processes with Redis-shared Search pacing",
+    )
     disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
     args = parser.parse_args()
     try:
