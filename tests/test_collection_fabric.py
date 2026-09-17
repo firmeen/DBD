@@ -1,7 +1,7 @@
 from dbd.runtime.collection_fabric import (
+    FINANCIAL_MASK,
     advance_state,
     endpoint_bit,
-    FINANCIAL_MASK,
     mask_for_endpoints,
     next_endpoint,
     remaining_mask,
