@@ -11,6 +11,7 @@ ALTER TABLE company_master
   ADD COLUMN latest_search_archive_id BIGINT UNSIGNED NULL AFTER last_seen_campaign;
 
 ALTER TABLE companies
+  MODIFY COLUMN latest_raw_response_id BIGINT UNSIGNED NULL,
   ADD COLUMN latest_archive_id BIGINT UNSIGNED NULL AFTER latest_raw_response_id;
 
 ALTER TABLE response_archive
