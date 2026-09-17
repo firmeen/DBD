@@ -8,7 +8,12 @@ from uuid import uuid4
 
 from ..client.async_client import AsyncDbdClient
 from ..contracts.identity import parse_code
-from ..core.exceptions import ContractError, DbdAuthError, DbdForbiddenError, IdentityConflict
+from ..core.exceptions import (
+    ContractError,
+    DbdAuthError,
+    DbdForbiddenError,
+    IdentityConflict,
+)
 from ..core.settings import settings
 from ..core.telemetry import (
     IN_FLIGHT,
