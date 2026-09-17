@@ -29,8 +29,10 @@ async def run(args):
     base = WorkerRepository(engine)
     fabric = FabricRepository(engine)
     try:
+        delta_mode = False
         if args.master:
             parts = parse_parts(args.only)
+            delta_mode = bool(args.delta)
             run_id = await base.create_run("company_master:fabric", parts, args.fiscal_year)
             async with engine.begin() as conn:
                 await conn.execute(
@@ -44,6 +46,7 @@ async def run(args):
                 required,
                 batch_size=settings.dbd_write_batch_size,
                 statuses=statuses,
+                delta=delta_mode,
             )
             await base.ready(run_id)
         else:
@@ -53,15 +56,17 @@ async def run(args):
             run_id = int(run["id"])
 
         async with engine.connect() as conn:
-            state_count = int(
-                (
-                    await conn.execute(
-                        text("SELECT COUNT(*) FROM company_collection_state WHERE run_id=:run"),
-                        {"run": run_id},
-                    )
-                ).scalar()
-                or 0
-            )
+            state = (
+                await conn.execute(
+                    text("""
+                    SELECT COUNT(*) n,
+                           COALESCE(SUM(status='done'),0) already_done,
+                           COALESCE(SUM(status<>'done'),0) scheduled
+                    FROM company_collection_state WHERE run_id=:run
+                    """),
+                    {"run": run_id},
+                )
+            ).mappings().one()
             endpoint_tasks = int(
                 (
                     await conn.execute(
@@ -71,12 +76,16 @@ async def run(args):
                 ).scalar()
                 or 0
             )
+        state_count = int(state["n"] or 0)
         print(
             json.dumps(
                 {
                     "run_id": run_id,
                     "scheduler": "fabric",
+                    "delta_mode": delta_mode,
                     "company_state_rows": state_count,
+                    "already_done_without_calls": int(state["already_done"] or 0),
+                    "scheduled_companies": int(state["scheduled"] or 0),
                     "endpoint_task_rows": endpoint_tasks,
                     "materialization_ratio": 0 if state_count == 0 else endpoint_tasks / state_count,
                 },
@@ -110,6 +119,11 @@ def main():
     parser.add_argument("--only", help=f"Comma-separated parts: {','.join(PARTS)}")
     parser.add_argument("--fiscal-year")
     parser.add_argument("--all-statuses", action="store_true")
+    parser.add_argument(
+        "--delta",
+        action="store_true",
+        help="Carry completed endpoint masks for unchanged master hashes from the latest fabric run",
+    )
     parser.add_argument("--concurrency", type=int)
     parser.add_argument("--rate", type=float)
     parser.add_argument("--limit", type=int)
@@ -117,6 +131,8 @@ def main():
     args = parser.parse_args()
     if args.run_id is not None and args.run_id < 1:
         parser.error("--run-id must be positive")
+    if args.delta and not args.master:
+        parser.error("--delta is only valid when creating a new --master fabric run")
     with manager_lock():
         asyncio.run(run(args))
 
