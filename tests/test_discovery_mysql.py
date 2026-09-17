@@ -64,6 +64,33 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
         )
         assert cur.fetchone()["n"] == 2, "valid neighbor from partial page was lost"
 
+        # Search pages now have one raw source of truth: response_archive. The
+        # search projection must not duplicate the same payload in raw_responses.
+        cur.execute(
+            """
+            SELECT COUNT(*) n FROM raw_responses
+            WHERE endpoint='search_page' AND jp_no IN (%s,%s)
+            """,
+            (str(start + 1).zfill(13), str(start + 2).zfill(13)),
+        )
+        assert cur.fetchone()["n"] == 0
+
+        cur.execute(
+            """
+            SELECT c.latest_archive_id,p.archive_id,m.master_hash,m.latest_search_archive_id
+            FROM companies c
+            JOIN company_master m
+              ON m.jp_no=c.jp_no AND m.jp_type_code=c.jp_type_code
+            JOIN discovery_pages p ON p.bucket_id=%s AND p.page_no=1
+            WHERE c.jp_no=%s AND c.jp_type_code='7'
+            """,
+            (bucket, str(start + 1).zfill(13)),
+        )
+        projected = cur.fetchone()
+        assert projected["latest_archive_id"] == projected["archive_id"]
+        assert projected["latest_search_archive_id"] == projected["archive_id"]
+        assert projected["master_hash"] is not None and len(projected["master_hash"]) == 64
+
     invalid = False
     seen.clear()
     await _drain_bucket(Client(), bucket, filters, 2, 2, verbose=False)
@@ -77,3 +104,11 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
             (bucket,),
         )
         assert cur.fetchone()["n"] == 0
+        cur.execute(
+            "SELECT COUNT(*) n,MIN(times_seen) min_seen,MAX(times_seen) max_seen "
+            "FROM discovery_sightings WHERE first_bucket_id=%s",
+            (bucket,),
+        )
+        sightings = cur.fetchone()
+        assert sightings["n"] == 3
+        assert sightings["min_seen"] == sightings["max_seen"] == 1
