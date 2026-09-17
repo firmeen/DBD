@@ -67,7 +67,6 @@ def endpoint_rate_map(value):
 
 
 def safe_error(exc: BaseException) -> str:
-    """Expose sanitized diagnostics without serializing third-party objects/bodies."""
     if isinstance(exc, BaseExceptionGroup):
         messages = list(dict.fromkeys(safe_error(child) for child in exc.exceptions))
         return "; ".join(messages)[:1000]
@@ -212,10 +211,8 @@ def _campaign_command(args) -> None:
         request_campaign_stop(args.run_id)
         print(f"Graceful stop requested for campaign {args.run_id}")
         return
-
     if not settings.dbd_redis_url:
         raise ValueError("campaign requires DBD_REDIS_URL")
-
     if args.campaign_command == "start":
         with manager_lock() as conn:
             run_id = asyncio.run(_prepare_campaign(args))
@@ -224,7 +221,6 @@ def _campaign_command(args) -> None:
     else:
         run_id = args.run_id
         asyncio.run(_validate_campaign_run(run_id))
-
     code = supervise_campaign(
         run_id,
         workers=args.workers,
@@ -299,8 +295,7 @@ def main():
             p.add_argument(
                 "--all-statuses",
                 action="store_true",
-                help="Include struck-off, liquidated and dissolved companies"
-                " (default: only companies still operating)",
+                help="Include struck-off, liquidated and dissolved companies (default: operating only)",
             )
     for name in ("bulk-status", "bulk-retry"):
         p = sub.add_parser(name)
@@ -315,6 +310,7 @@ def main():
     disc.add_argument("--concurrency", type=positive)
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
+    disc.add_argument("--distributed", action="store_true", help="Claim buckets across processes with Redis-shared Search pacing")
     disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
     args = parser.parse_args()
     try:
@@ -333,14 +329,11 @@ def main():
             with connect() as conn, conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT
-                      COUNT(*) AS total,
+                    SELECT COUNT(*) AS total,
                       COALESCE(SUM(identity_status='conflict'),0) AS conflicts,
                       COALESCE(SUM(identity_status<>'conflict'),0) AS eligible_all_statuses,
-                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code='1'),0)
-                        AS eligible_operating,
-                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code IS NULL),0)
-                        AS unknown_status
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code='1'),0) AS eligible_operating,
+                      COALESCE(SUM(identity_status<>'conflict' AND observed_jp_stat_code IS NULL),0) AS unknown_status
                     FROM company_master
                     """
                 )
@@ -387,26 +380,46 @@ def main():
 
             print(json.dumps(discovery_summary(), indent=2, default=str))
         elif args.command == "discover":
-            from .legacy import command_discover
+            from ..pipelines import discovery
 
             seeds = list(args.seeds)
             if args.seed_file:
                 with open(args.seed_file, encoding="utf-8-sig") as handle:
                     seeds.extend(s.strip() for s in handle if s.strip() and not s.lstrip().startswith("#"))
-            if any(len(s) < 3 for s in seeds):
+            if any(len(seed) < 3 for seed in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
             configure(args.metrics_port)
-            with manager_lock() as conn:
-                command_discover(
-                    seeds,
-                    args.type,
-                    args.concurrency,
-                    args.rate,
-                    args.max_buckets,
-                    health=lambda: assert_manager_lock(conn),
+            if args.distributed:
+                if not settings.dbd_redis_url:
+                    raise ValueError("--distributed discovery requires DBD_REDIS_URL")
+                result = asyncio.run(
+                    discovery.run(
+                        seeds,
+                        search_type=args.type,
+                        concurrency=args.concurrency,
+                        rate=args.rate,
+                        max_buckets=args.max_buckets,
+                        distributed=True,
+                    )
                 )
+            else:
+                with manager_lock() as conn:
+                    result = asyncio.run(
+                        discovery.run(
+                            seeds,
+                            search_type=args.type,
+                            concurrency=args.concurrency,
+                            rate=args.rate,
+                            max_buckets=args.max_buckets,
+                            health=lambda: assert_manager_lock(conn),
+                        )
+                    )
+            print(
+                f"buckets {result.buckets_processed}, pages {result.pages_fetched}, "
+                f"companies {result.companies_written}, requests {result.requests_made}"
+            )
     except KeyboardInterrupt:
-        print("Interrupted. Resume the same run; unfinished endpoint tasks remain recoverable.")
+        print("Interrupted. Durable checkpoints remain recoverable.")
         raise SystemExit(130) from None
     except Exception as exc:
         parser.exit(1, f"dbd-data: {safe_error(exc)}\n")
