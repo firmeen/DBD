@@ -23,6 +23,7 @@ from ..core.progress import ProgressLine
 from ..core.settings import settings
 from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
+    DiscoveryLeaseLost,
     claim_buckets,
     discovery_summary,
     heartbeat_bucket_claims,
@@ -209,6 +210,8 @@ async def _drain_bucket(
     first_page=None,
     master_cache: dict[tuple[str, str], str] | None = None,
     progress_line: ProgressLine | None = None,
+    lease_owner: str | None = None,
+    lease_version: int | None = None,
 ):
     """Drain incomplete page checkpoints; start_page is retained for API compatibility."""
     from ..storage.mysql.repositories.discovery_batch_repository import persist_page_batch
@@ -220,13 +223,23 @@ async def _drain_bucket(
         local_progress = ProgressLine("DISCOVERY", interval=0.75)
         progress_line = local_progress
 
-    update_bucket(bucket_id, status="draining", last_error=None)
+    def owned_update(**fields) -> None:
+        if lease_owner is None:
+            update_bucket(bucket_id, **fields)
+        else:
+            update_bucket(
+                bucket_id,
+                lease_owner=lease_owner,
+                lease_version=lease_version,
+                **fields,
+            )
+
+    owned_update(status="draining", last_error=None)
     completed = await asyncio.to_thread(completed_pages, bucket_id)
     pages = [page for page in range(1, pages_total + 1) if page not in completed]
     if not pages:
         state = await asyncio.to_thread(page_progress, bucket_id)
-        update_bucket(
-            bucket_id,
+        owned_update(
             status="done" if state["done"] == pages_total else "failed",
             pages_done=state["done"],
             rows_seen=state["rows"] + state["rejected"],
@@ -272,7 +285,7 @@ async def _drain_bucket(
                 cache[key] = fingerprint
                 projection_profiles.append(profile)
             canonical_payload = json.dumps(data, ensure_ascii=False, default=str)
-            return {
+            result = {
                 "bucket_id": bucket_id,
                 "page_no": page_no,
                 "filters": filters,
@@ -285,8 +298,24 @@ async def _drain_bucket(
                 "projection_profiles": projection_profiles,
                 "rejections": rejections,
             }
+            if lease_owner is not None:
+                result["lease_owner"] = lease_owner
+                result["lease_version"] = lease_version
+            return result
+        except DiscoveryLeaseLost:
+            raise
         except Exception as exc:
-            await asyncio.to_thread(fail_page, bucket_id, page_no, type(exc).__name__)
+            if lease_owner is None:
+                await asyncio.to_thread(fail_page, bucket_id, page_no, type(exc).__name__)
+            else:
+                await asyncio.to_thread(
+                    fail_page,
+                    bucket_id,
+                    page_no,
+                    type(exc).__name__,
+                    lease_owner=lease_owner,
+                    lease_version=lease_version,
+                )
             return None
 
     async def page_worker():
@@ -333,8 +362,7 @@ async def _drain_bucket(
             written += sum(int(outcome["written"]) for outcome in outcomes)
             controller.observe(result_queue.qsize(), result_queue.maxsize, elapsed)
             state = await asyncio.to_thread(page_progress, bucket_id)
-            update_bucket(
-                bucket_id,
+            owned_update(
                 pages_done=state["done"],
                 rows_seen=state["rows"] + state["rejected"],
             )
@@ -360,8 +388,7 @@ async def _drain_bucket(
         error = "One or more pages contain quarantined rows; fix the contract and run discover-retry"
     else:
         error = "One or more pages failed; run discover-retry"
-    update_bucket(
-        bucket_id,
+    owned_update(
         status="done" if complete else "failed",
         pages_done=state["done"],
         rows_seen=state["rows"] + state["rejected"],
@@ -379,6 +406,8 @@ async def _process_bucket(
     *,
     master_cache: dict[tuple[str, str], str],
     progress_line: ProgressLine | None,
+    lease_owner: str | None = None,
+    lease_version: int | None = None,
 ) -> tuple[int, int]:
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
@@ -389,16 +418,27 @@ async def _process_bucket(
     first_page = None
     count_archive_id = None
 
+    def owned_update(**fields) -> None:
+        if lease_owner is None:
+            update_bucket(bucket_id, **fields)
+        else:
+            update_bucket(
+                bucket_id,
+                lease_owner=lease_owner,
+                lease_version=lease_version,
+                **fields,
+            )
+
     if total_items is None:
         page, count_archive_id, data, requested = await _count(client, bucket_id, filters)
         total_items, pages_total = page.total_items, page.total_pages
         first_page = (count_archive_id, data, requested)
-        update_bucket(bucket_id, total_items=total_items, pages_total=pages_total, status="counted")
+        owned_update(total_items=total_items, pages_total=pages_total, status="counted")
 
     if total_items == 0:
         if count_archive_id is not None:
             await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
-        update_bucket(bucket_id, status="done")
+        owned_update(status="done")
         return 0, 0
 
     if total_items > MAX_ROWS_PER_QUERY:
@@ -406,8 +446,7 @@ async def _process_bucket(
             await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
         children = _children_for(filters, provinces)
         if not children:
-            update_bucket(
-                bucket_id,
+            owned_update(
                 status="failed",
                 last_error=(
                     f"{total_items} rows exceeds the {MAX_ROWS_PER_QUERY} ceiling and no split dimension remains"
@@ -416,7 +455,7 @@ async def _process_bucket(
             return 0, 0
         for child in children:
             upsert_bucket(child, parent_id=bucket_id, depth=int(row["depth"]) + 1)
-        update_bucket(bucket_id, status="split")
+        owned_update(status="split")
         if progress_line is not None:
             progress_line.event(
                 f"bucket {bucket_id}: {total_items:,} rows -> split into {len(children)} child buckets"
@@ -433,6 +472,8 @@ async def _process_bucket(
         first_page=first_page,
         master_cache=master_cache,
         progress_line=progress_line,
+        lease_owner=lease_owner,
+        lease_version=lease_version,
     )
 
 
@@ -505,6 +546,7 @@ async def _run_work(
 
         async def process_one(row):
             bucket_id = int(row["id"])
+            lease_version = int(row["lease_version"]) if distributed else None
             try:
                 return await _process_bucket(
                     client,
@@ -512,20 +554,47 @@ async def _run_work(
                     provinces,
                     master_cache=master_cache,
                     progress_line=progress_line,
+                    lease_owner=owner if distributed else None,
+                    lease_version=lease_version,
                 )
+            except DiscoveryLeaseLost:
+                progress_line.event(
+                    f"bucket {bucket_id}: lease moved to another worker; stale result discarded"
+                )
+                return 0, 0
             except Exception as exc:
-                update_bucket(
-                    bucket_id,
-                    status="failed",
-                    last_error=f"{type(exc).__name__}: {str(exc)[:300]}",
-                )
+                try:
+                    if distributed:
+                        update_bucket(
+                            bucket_id,
+                            lease_owner=owner,
+                            lease_version=lease_version,
+                            status="failed",
+                            last_error=f"{type(exc).__name__}: {str(exc)[:300]}",
+                        )
+                    else:
+                        update_bucket(
+                            bucket_id,
+                            status="failed",
+                            last_error=f"{type(exc).__name__}: {str(exc)[:300]}",
+                        )
+                except DiscoveryLeaseLost:
+                    progress_line.event(
+                        f"bucket {bucket_id}: lease changed while handling {type(exc).__name__}; not failed"
+                    )
+                    return 0, 0
                 progress_line.event(
                     f"bucket {bucket_id} FAILED: {type(exc).__name__}: {str(exc)[:120]}"
                 )
                 return 0, 0
             finally:
                 if distributed:
-                    await asyncio.to_thread(release_bucket_claim, bucket_id, owner)
+                    await asyncio.to_thread(
+                        release_bucket_claim,
+                        bucket_id,
+                        owner,
+                        lease_version,
+                    )
 
         results = await asyncio.gather(*(process_one(row) for row in batch))
         buckets_processed += len(batch)
@@ -550,7 +619,8 @@ async def run(
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed discovery requires DBD_REDIS_URL")
     stop = asyncio.Event()
-    owner = os.environ.get("DBD_WORKER_ID") or f"discovery-{uuid4().hex}"
+    owner_label = os.environ.get("DBD_WORKER_ID") or "discovery"
+    owner = f"{owner_label}-{uuid4().hex}"
     progress_line = ProgressLine("DISCOVERY", interval=0.75, enabled=verbose)
     global_rate = settings.dbd_rate_per_second if rate is None else rate
 
