@@ -80,6 +80,31 @@ async def test_endpoint_429_penalizes_endpoint_and_global_safety_layer():
     assert c.endpoint_rate.global_effective_rate() == 500
 
 
+def test_discovery_penalty_drains_rolling_window(monkeypatch):
+    clock = [100.0]
+    monkeypatch.setattr(rate_limit.time, "monotonic", lambda: clock[0])
+    bucket = TokenBucket(5)
+
+    rate, cooldown = bucket.penalize(1)
+    assert rate == pytest.approx(2.5)
+    assert cooldown == pytest.approx(2.0)
+
+    clock[0] = 101.0
+    rate, cooldown = bucket.penalize(1)
+    assert rate == pytest.approx(1.25)
+    assert cooldown == pytest.approx(3.2)
+
+    clock[0] = 102.0
+    rate, cooldown = bucket.penalize(1)
+    assert rate == pytest.approx(0.625)
+    assert cooldown == pytest.approx(12.8)
+
+    clock[0] = 140.0
+    rate, cooldown = bucket.penalize(1)
+    assert rate == pytest.approx(0.5)
+    assert cooldown == pytest.approx(4.0)
+
+
 def test_rate_recovers_gradually_and_never_exceeds_target(monkeypatch):
     clock = [0.0]
     monkeypatch.setattr(rate_limit.time, "monotonic", lambda: clock[0])
