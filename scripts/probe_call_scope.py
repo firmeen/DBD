@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-from collections import Counter, defaultdict
-from dataclasses import asdict, dataclass
 import json
+from collections import Counter
+from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from dbd.client.async_client import AsyncDbdClient
@@ -134,9 +134,9 @@ async def probe_company(client: AsyncDbdClient, target: Target) -> CompanyResult
     scope = None
 
     profile_path = request_path("profile", target.jp_type_code, target.jp_no)
+    calls += 1
     try:
         response = await client.fetch("GET", profile_path, rate_key="profile")
-        calls += 1
         profile = normalize_resource("profile", response.data)
         endpoint_rows["profile"] = row_count(profile)
         fiscal_year = derive_fiscal_year(getattr(profile, "submit_fin_year", None))
@@ -160,15 +160,14 @@ async def probe_company(client: AsyncDbdClient, target: Target) -> CompanyResult
             continue
         path = request_path(endpoint, target.jp_type_code, target.jp_no)
         params = {"fiscalYear": fiscal_year} if endpoint in FINANCIAL else None
+        calls += 1
         try:
             response = await client.fetch("GET", path, params=params, rate_key=endpoint)
-            calls += 1
             normalized = normalize_resource(endpoint, response.data)
             endpoint_rows[endpoint] = row_count(normalized)
             if endpoint == "industry_benchmark":
                 scope = benchmark_scope(normalized)
         except Exception as exc:
-            calls += 1
             errors.append(f"{endpoint}:{type(exc).__name__}")
 
     return CompanyResult(
@@ -215,9 +214,9 @@ def print_report(results: list[CompanyResult], client: AsyncDbdClient) -> dict:
     print("=" * 88)
     print(f"Companies sampled             {companies:>10,}")
     print(f"Companies with fiscal year    {with_year:>10,}")
-    print(f"Actual upstream calls         {total_calls:>10,}")
+    print(f"Logical depth calls           {total_calls:>10,}")
     print(f"Measured calls/company        {measured_per_company:>10.2f}")
-    print(f"Client requests incl retries  {client.requests_made:>10,}")
+    print(f"Physical requests incl retry  {client.requests_made:>10,}")
     print()
     print("ENDPOINT COVERAGE")
     print("-" * 88)
@@ -232,7 +231,7 @@ def print_report(results: list[CompanyResult], client: AsyncDbdClient) -> dict:
     print(f"Baseline 7-depth-call model   {current_model:>10,}")
     print(f"PROVEN no-year skips          {proven_saved:>10,}")
     print(f"PROVEN floor/company          {proven_floor:>10.2f}")
-    print(f"Benchmark requests            {benchmark_calls:>10,}")
+    print(f"Benchmark successful calls    {benchmark_calls:>10,}")
     print(f"Unique observed scopes        {unique_scopes:>10,}")
     print(f"CANDIDATE scope-coalesce save {candidate_saved:>10,}")
     print(f"CANDIDATE floor/company       {candidate_floor:>10.2f}")
@@ -250,9 +249,9 @@ def print_report(results: list[CompanyResult], client: AsyncDbdClient) -> dict:
     return {
         "companies": companies,
         "companies_with_fiscal_year": with_year,
-        "actual_calls": total_calls,
+        "logical_depth_calls": total_calls,
         "measured_calls_per_company": measured_per_company,
-        "client_requests_including_retries": client.requests_made,
+        "physical_requests_including_retries": client.requests_made,
         "baseline_depth_calls": current_model,
         "proven_no_year_skips": proven_saved,
         "proven_floor_calls_per_company": proven_floor,
@@ -260,7 +259,7 @@ def print_report(results: list[CompanyResult], client: AsyncDbdClient) -> dict:
         "benchmark_unique_observed_scopes": unique_scopes,
         "candidate_scope_coalesce_saved": candidate_saved,
         "candidate_floor_calls_per_company": candidate_floor,
-        "endpoint_attempted": dict(endpoint_calls),
+        "endpoint_attempted_successfully": dict(endpoint_calls),
         "endpoint_nonempty": dict(endpoint_nonempty),
         "errors": dict(errors),
         "results": [asdict(result) for result in results],
