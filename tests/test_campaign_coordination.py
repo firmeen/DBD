@@ -40,9 +40,29 @@ async def test_campaign_stop_and_worker_heartbeat_are_shared():
         workers = await second.workers()
         assert [item["worker_id"] for item in workers] == ["worker-a"]
 
-        await first.unregister_worker(worker)
+        assert await first.unregister_worker(worker) is True
         assert await second.workers() == []
     finally:
         await first.clear_stop()
         await first.close()
         await second.close()
+
+
+async def test_unregister_failure_is_best_effort_and_close_does_not_mask_errors():
+    class BrokenRedis:
+        async def delete(self, *args):
+            raise ConnectionError("redis unavailable")
+
+        async def srem(self, *args):
+            raise ConnectionError("redis unavailable")
+
+        async def aclose(self):
+            raise ConnectionError("redis unavailable")
+
+    coordinator = CampaignCoordinator("redis://unused", 1)
+    coordinator._redis = BrokenRedis()
+    worker = WorkerIdentity("worker-a", 1, 12345)
+
+    assert await coordinator.unregister_worker(worker) is False
+    await coordinator.close()
+    assert coordinator._redis is None
