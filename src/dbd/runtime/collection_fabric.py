@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from hashlib import sha256
-import json
 
 from .resources import endpoints
 
@@ -94,10 +94,7 @@ def next_endpoint(
 
 
 def master_fingerprint(profile) -> str:
-    payload = {
-        field: getattr(profile, field, None)
-        for field in MASTER_HASH_FIELDS
-    }
+    payload = {field: getattr(profile, field, None) for field in MASTER_HASH_FIELDS}
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":"))
     return sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -150,9 +147,11 @@ def advance_state(
         not_available_mask,
         fiscal_year=fiscal_year,
     )
-    status = "done" if next_item is None and remaining_mask(
-        required_mask, done_mask, not_available_mask
-    ) == 0 else "pending"
+    status = (
+        "done"
+        if next_item is None and remaining_mask(required_mask, done_mask, not_available_mask) == 0
+        else "pending"
+    )
     return CollectionTransition(
         done_mask=done_mask,
         not_available_mask=not_available_mask,
