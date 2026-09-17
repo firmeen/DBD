@@ -24,7 +24,7 @@ from ..core.telemetry import EFFECTIVE_RATE, HTTP_RETRIES, LATENCY, REQUESTS, lo
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
 from .rate_control import EndpointRateController
-from .rate_limit import TokenBucket
+from .rate_limit import TokenBucket, protective_cooldown
 from .session import WARMUP_PAGE_URL, create_session
 
 
@@ -78,8 +78,6 @@ class AsyncDbdClient:
         if self.concurrency < 1:
             raise ValueError("concurrency must be positive")
         global_rate = settings.dbd_rate_per_second if rate_per_second is None else rate_per_second
-        # Discovery/global-only callers retain the original limiter. Bulk V2 passes
-        # rate_key and uses the endpoint-aware controller with a global safety layer.
         self.rate = TokenBucket(global_rate)
         self.endpoint_rate = EndpointRateController(
             global_rate,
@@ -95,7 +93,17 @@ class AsyncDbdClient:
         self._token = None
         self._session = None
         self._auth_session = None
+        self._penalty_streaks: dict[str, int] = {}
+        self._last_penalty_at: dict[str, float] = {}
         self.requests_made = self.retries_made = self.rate_limit_hits = 0
+
+    def _next_penalty_streak(self, key: str) -> int:
+        now = time.monotonic()
+        last = self._last_penalty_at.get(key, 0.0)
+        streak = self._penalty_streaks.get(key, 0) + 1 if now - last <= 30.0 else 1
+        self._penalty_streaks[key] = streak
+        self._last_penalty_at[key] = now
+        return streak
 
     async def __aenter__(self):
         await self.endpoint_rate.open()
@@ -202,8 +210,15 @@ class AsyncDbdClient:
                     REQUESTS.labels(str(status)).inc()
                     if status in (429, 503):
                         self.rate_limit_hits += 1
-                        cooldown = retry_after(response.headers.get("retry-after"))
+                        server_cooldown = retry_after(response.headers.get("retry-after"))
+                        penalty_key = rate_key or "__global__"
+                        streak = self._next_penalty_streak(penalty_key)
                         if rate_key:
+                            old_effective = self.endpoint_rate.effective_rate(rate_key)
+                            expected_rate = max(0.5, old_effective * 0.5)
+                            cooldown = protective_cooldown(
+                                server_cooldown, expected_rate, streak
+                            )
                             (
                                 old_rate,
                                 new_rate,
@@ -213,6 +228,7 @@ class AsyncDbdClient:
                         else:
                             old_rate = self.rate.rate
                             new_rate = self.rate.slow_down()
+                            cooldown = protective_cooldown(server_cooldown, new_rate, streak)
                             self.rate.cooldown(cooldown)
                             EFFECTIVE_RATE.set(new_rate)
                             old_global_rate = old_rate
@@ -226,6 +242,8 @@ class AsyncDbdClient:
                             new_rate=new_rate,
                             old_global_rate=old_global_rate,
                             new_global_rate=new_global_rate,
+                            penalty_streak=streak,
+                            server_retry_after_seconds=server_cooldown,
                             cooldown_seconds=cooldown,
                         )
                     if status == 401:
@@ -256,9 +274,7 @@ class AsyncDbdClient:
                         )
                         raise
                     if rate_key:
-                        endpoint_recovered, global_recovered = await self.endpoint_rate.recover(
-                            rate_key
-                        )
+                        endpoint_recovered, global_recovered = await self.endpoint_rate.recover(rate_key)
                         recovered = endpoint_recovered or global_recovered
                     else:
                         recovered = self.rate.recover()
