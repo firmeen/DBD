@@ -3,12 +3,12 @@ import pytest
 from dbd.client.endpoints.search import SearchFilters
 from dbd.core.exceptions import ContractError
 from dbd.pipelines import discovery
+from dbd.storage.mysql.repositories import discovery_batch_repository as batch_repository
 from dbd.storage.mysql.repositories import discovery_repository as repository
 
 
 async def test_failed_middle_page_is_retried_without_redoing_completed_pages(monkeypatch):
     states = {}
-    archives = []
     updates = []
     requested = []
     fail = True
@@ -26,21 +26,30 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
                 "contents": [{"jpTypeCode": "7", "jpNo": str(page).zfill(13)}],
             }
 
-    def archive(*args, **kwargs):
-        archives.append((args, kwargs))
-        return len(archives)
-
-    def finish(bucket, page, *args):
-        states[page] = "done"
-        return 1
+    def persist(records):
+        outcomes = []
+        for record in records:
+            states[record["page_no"]] = "done"
+            outcomes.append(
+                {
+                    "page_no": record["page_no"],
+                    "archive_id": record["page_no"],
+                    "status": "done",
+                    "written": len(record["profiles"]),
+                    "rejected": 0,
+                    "projected": len(record["projection_profiles"]),
+                }
+            )
+        return outcomes
 
     monkeypatch.setattr(discovery, "update_bucket", lambda *a, **kw: updates.append(kw))
     monkeypatch.setattr(
-        repository, "completed_pages", lambda b: {p for p, s in states.items() if s == "done"}
+        repository, "completed_pages", lambda b: {p for p, state in states.items() if state == "done"}
     )
-    monkeypatch.setattr(repository, "archive_search", archive)
-    monkeypatch.setattr(repository, "finish_page", finish)
-    monkeypatch.setattr(repository, "fail_page", lambda b, p, e: states.update({p: "failed"}))
+    monkeypatch.setattr(
+        repository, "fail_page", lambda b, page, error: states.update({page: "failed"})
+    )
+    monkeypatch.setattr(batch_repository, "persist_page_batch", persist)
     monkeypatch.setattr(
         repository,
         "page_progress",
@@ -52,10 +61,12 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
             "rows": list(states.values()).count("done"),
         },
     )
+
     filters = SearchFilters("010")
     await discovery._drain_bucket(Client(), 1, filters, 3, 1, verbose=False)
     assert updates[-1]["status"] == "failed"
     assert updates[-1]["pages_done"] == 2
+
     fail = False
     requested.clear()
     await discovery._drain_bucket(Client(), 1, filters, 3, 3, verbose=False)
@@ -71,7 +82,9 @@ def test_invalid_row_is_quarantined_without_losing_valid_neighbor():
             {"jpTypeCode": "7", "jpNo": "short", "jpName": "invalid"},
         ]
     )
-    assert [(p.jp_type_code, p.jp_no) for p in profiles] == [("7", "0107556000051")]
+    assert [(profile.jp_type_code, profile.jp_no) for profile in profiles] == [
+        ("7", "0107556000051")
+    ]
     assert len(rejected) == 1
     assert rejected[0]["row_index"] == 1
     assert rejected[0]["error_code"] == "ContractError"
@@ -103,7 +116,7 @@ async def test_province_seed_cover_includes_audited_exception():
     seeds = await province_seeds(Client())
 
     assert seeds == ["005", "010", "096", "099"], seeds
-    assert all(len(s) == 3 for s in seeds)
+    assert all(len(seed) == 3 for seed in seeds)
     assert len(seeds) == len(set(seeds))
     for number, expected in [
         ("0107556000051", "010"),
