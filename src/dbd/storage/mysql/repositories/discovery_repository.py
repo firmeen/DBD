@@ -11,8 +11,40 @@ from ..engine import connect, use_connection
 from .company_repository import company_upsert_sql, company_values
 
 
+class DiscoveryLeaseLost(RuntimeError):
+    """Raised when a stale Discovery worker attempts to mutate a reclaimed bucket."""
+
+
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+def assert_bucket_lease(cur, bucket_id: int, owner: str | None, lease_version: int | None) -> None:
+    """Fence a mutation against the current live bucket lease inside its transaction."""
+    if owner is None:
+        return
+    if lease_version is None:
+        raise ValueError("lease_version is required when lease_owner is provided")
+    cur.execute(
+        """
+        SELECT lease_owner,lease_version,
+               (lease_expires_at IS NOT NULL AND lease_expires_at>UTC_TIMESTAMP(6)) AS lease_live
+        FROM discovery_buckets
+        WHERE id=%s
+        FOR UPDATE
+        """,
+        (bucket_id,),
+    )
+    row = cur.fetchone()
+    if (
+        row is None
+        or row["lease_owner"] != owner
+        or int(row["lease_version"]) != int(lease_version)
+        or not int(row["lease_live"] or 0)
+    ):
+        raise DiscoveryLeaseLost(
+            f"Discovery bucket {bucket_id} lease lost for owner={owner} version={lease_version}"
+        )
 
 
 def upsert_bucket(filters: SearchFilters, *, parent_id: int | None = None, depth: int = 0) -> int:
@@ -51,7 +83,13 @@ def upsert_bucket(filters: SearchFilters, *, parent_id: int | None = None, depth
             raise
 
 
-def update_bucket(bucket_id: int, **fields) -> None:
+def update_bucket(
+    bucket_id: int,
+    *,
+    lease_owner: str | None = None,
+    lease_version: int | None = None,
+    **fields,
+) -> None:
     if not fields:
         return
     allowed = {
@@ -67,12 +105,18 @@ def update_bucket(bucket_id: int, **fields) -> None:
     if unknown:
         raise ValueError(f"Unknown bucket field(s): {unknown}")
     assignments = ", ".join(f"{key} = %s" for key in fields)
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            f"UPDATE discovery_buckets SET {assignments},updated_at=%s WHERE id=%s",
-            (*fields.values(), _now(), bucket_id),
-        )
-        conn.commit()
+    with connect() as conn:
+        try:
+            with conn.cursor() as cur:
+                assert_bucket_lease(cur, bucket_id, lease_owner, lease_version)
+                cur.execute(
+                    f"UPDATE discovery_buckets SET {assignments},updated_at=%s WHERE id=%s",
+                    (*fields.values(), _now(), bucket_id),
+                )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
     if "status" in fields:
         observe_discovery(discovery_summary())
 
@@ -155,17 +199,29 @@ def heartbeat_bucket_claims(owner: str, lease_seconds: int) -> None:
         conn.commit()
 
 
-def release_bucket_claim(bucket_id: int, owner: str) -> None:
+def release_bucket_claim(bucket_id: int, owner: str, lease_version: int | None = None) -> bool:
     with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            UPDATE discovery_buckets
-            SET lease_owner=NULL,lease_expires_at=NULL,updated_at=UTC_TIMESTAMP(6)
-            WHERE id=%s AND lease_owner=%s
-            """,
-            (bucket_id, owner),
-        )
+        if lease_version is None:
+            cur.execute(
+                """
+                UPDATE discovery_buckets
+                SET lease_owner=NULL,lease_expires_at=NULL,updated_at=UTC_TIMESTAMP(6)
+                WHERE id=%s AND lease_owner=%s
+                """,
+                (bucket_id, owner),
+            )
+        else:
+            cur.execute(
+                """
+                UPDATE discovery_buckets
+                SET lease_owner=NULL,lease_expires_at=NULL,updated_at=UTC_TIMESTAMP(6)
+                WHERE id=%s AND lease_owner=%s AND lease_version=%s
+                """,
+                (bucket_id, owner, lease_version),
+            )
+        released = cur.rowcount > 0
         conn.commit()
+        return released
 
 
 def release_bucket_claims(owner: str) -> None:
@@ -407,11 +463,23 @@ def _replace_rejections(cur, bucket_id, page_no, rejections, requested):
         )
 
 
-def finish_page(bucket_id, page_no, archive_id, profiles, data, requested, rejections=None):
+def finish_page(
+    bucket_id,
+    page_no,
+    archive_id,
+    profiles,
+    data,
+    requested,
+    rejections=None,
+    *,
+    lease_owner: str | None = None,
+    lease_version: int | None = None,
+):
     rejections = list(rejections or [])
     with connect() as conn:
         try:
             with conn.cursor() as cur:
+                assert_bucket_lease(cur, bucket_id, lease_owner, lease_version)
                 cur.execute(
                     "SELECT status FROM discovery_pages WHERE bucket_id=%s AND page_no=%s FOR UPDATE",
                     (bucket_id, page_no),
@@ -465,26 +533,39 @@ def finish_page(bucket_id, page_no, archive_id, profiles, data, requested, rejec
             raise
 
 
-def fail_page(bucket_id, page_no, error):
-    with connect() as conn, conn.cursor() as cur:
-        cur.execute(
-            """
-            INSERT INTO discovery_pages(bucket_id,page_no,status,last_error)
-            VALUES (%s,%s,'failed',%s)
-            ON DUPLICATE KEY UPDATE
-              status='failed',last_error=VALUES(last_error),updated_at=UTC_TIMESTAMP(6)
-            """,
-            (bucket_id, page_no, error),
-        )
-        cur.execute(
-            """
-            UPDATE response_archive a JOIN discovery_pages p ON p.archive_id=a.id
-            SET a.processing_status='failed',a.error_code=%s
-            WHERE p.bucket_id=%s AND p.page_no=%s
-            """,
-            (error, bucket_id, page_no),
-        )
-        conn.commit()
+def fail_page(
+    bucket_id,
+    page_no,
+    error,
+    *,
+    lease_owner: str | None = None,
+    lease_version: int | None = None,
+):
+    with connect() as conn:
+        try:
+            with conn.cursor() as cur:
+                assert_bucket_lease(cur, bucket_id, lease_owner, lease_version)
+                cur.execute(
+                    """
+                    INSERT INTO discovery_pages(bucket_id,page_no,status,last_error)
+                    VALUES (%s,%s,'failed',%s)
+                    ON DUPLICATE KEY UPDATE
+                      status='failed',last_error=VALUES(last_error),updated_at=UTC_TIMESTAMP(6)
+                    """,
+                    (bucket_id, page_no, error),
+                )
+                cur.execute(
+                    """
+                    UPDATE response_archive a JOIN discovery_pages p ON p.archive_id=a.id
+                    SET a.processing_status='failed',a.error_code=%s
+                    WHERE p.bucket_id=%s AND p.page_no=%s
+                    """,
+                    (error, bucket_id, page_no),
+                )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
     DISCOVERY_PAGE_RESULTS.labels("failed").inc()
 
 
@@ -518,7 +599,7 @@ def reset_discovery(refresh=False, bucket_id=None):
             cur.execute(
                 "UPDATE discovery_buckets SET status='pending',total_items=NULL,pages_total=NULL,"
                 "pages_done=0,rows_seen=0,last_error=NULL,partition_lossless=NULL,"
-                "lease_owner=NULL,lease_expires_at=NULL "
+                "lease_owner=NULL,lease_expires_at=NULL,lease_version=lease_version+1 "
                 + ("WHERE id=%s AND status<>'split'" if bucket_id else "WHERE status<>'split'"),
                 parameters,
             )
@@ -535,7 +616,8 @@ def reset_discovery(refresh=False, bucket_id=None):
             cur.execute(
                 """
                 UPDATE discovery_buckets
-                SET status='pending',last_error=NULL,lease_owner=NULL,lease_expires_at=NULL
+                SET status='pending',last_error=NULL,lease_owner=NULL,lease_expires_at=NULL,
+                    lease_version=lease_version+1
                 WHERE status='failed'
                 """
             )
