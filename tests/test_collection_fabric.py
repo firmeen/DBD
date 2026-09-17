@@ -4,8 +4,8 @@ from dbd.runtime.collection_fabric import (
     ENDPOINT_BITS,
     FINANCIAL_MASK,
     advance_state,
-    master_fingerprint,
     mask_for_parts,
+    master_fingerprint,
     next_endpoint,
 )
 
