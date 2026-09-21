@@ -899,6 +899,12 @@ def supervise_campaign(
     worker_concurrency: int,
     worker_rate: float,
     rate_mode: str = "adaptive",
+    fleet_rate_initial: float | None = None,
+    fleet_rate_max: float | None = None,
+    fleet_db_connections_max: int | None = None,
+    fleet_archive_workers_max: int | None = None,
+    fleet_projection_workers_max: int | None = None,
+    fleet_redis_connections_max: int | None = None,
     open_powershell: bool = False,
     max_restarts: int = 3,
     workers_min: int | None = None,
@@ -918,10 +924,32 @@ def supervise_campaign(
 
     initial_workers = requested_workers
     autoscale = minimum != maximum
-    plan = build_rate_plan(rate_mode, worker_rate, maximum, initial_workers=initial_workers)
+    plan = build_rate_plan(
+        rate_mode,
+        worker_rate,
+        maximum,
+        initial_workers=initial_workers,
+        fleet_rate_initial=fleet_rate_initial,
+        fleet_rate_max=fleet_rate_max,
+    )
+    resource_plan = build_resource_plan(
+        maximum,
+        db_pool_size=settings.db_pool_size,
+        archive_workers=settings.dbd_archive_workers,
+        projection_workers=settings.dbd_projection_workers,
+        redis_max_connections=settings.dbd_redis_max_connections,
+        db_connections_max=fleet_db_connections_max,
+        archive_workers_max=fleet_archive_workers_max,
+        projection_workers_max=fleet_projection_workers_max,
+        redis_connections_max=fleet_redis_connections_max,
+    )
     controller = AutoscaleController(minimum, maximum, worker_concurrency)
 
-    redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+    redis = Redis.from_url(
+        settings.dbd_redis_url,
+        decode_responses=True,
+        max_connections=resource_plan.redis_connections_per_client,
+    )
     token = f"{os.getpid()}-{uuid4().hex}"
     children: list[WorkerProcess] = []
     next_index = 1
@@ -953,6 +981,7 @@ def supervise_campaign(
             rate=plan.worker_rate,
             fleet_rate_ceiling=plan.ceiling,
             open_powershell=open_powershell,
+            resource_plan=resource_plan,
             restart_count=restarts,
         )
         if restart_index is None:
