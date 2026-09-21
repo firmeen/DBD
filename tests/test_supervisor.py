@@ -3,6 +3,7 @@ from types import SimpleNamespace
 
 import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
+    AutoscaleController,
     CampaignResourcePlan,
     WorkerProcess,
     _drain_registered_workers,
@@ -391,3 +392,76 @@ def test_spawn_worker_applies_derived_resource_caps(monkeypatch) -> None:
     assert captured["env"]["DBD_ARCHIVE_WORKERS"] == "1"
     assert captured["env"]["DBD_PROJECTION_WORKERS"] == "2"
     assert captured["env"]["DBD_REDIS_MAX_CONNECTIONS"] == "3"
+
+
+
+def test_autoscale_adds_worker_when_http_capacity_is_underutilized() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    target = controller.target(
+        pending=5000,
+        running=24,
+        current=4,
+        effective_maximum=8,
+        now=10.0,
+        fetch_queue=10,
+        archive_queue=0,
+        project_queue=0,
+        observed_http_rate=6.0,
+        rate_target=12.0,
+        rate_limit_delta=0,
+    )
+    assert target == 5
+
+
+def test_autoscale_holds_when_rate_is_saturated_and_fetch_queue_is_deep() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    target = controller.target(
+        pending=5000,
+        running=24,
+        current=4,
+        effective_maximum=8,
+        now=10.0,
+        fetch_queue=500,
+        archive_queue=0,
+        project_queue=0,
+        observed_http_rate=11.5,
+        rate_target=12.0,
+        rate_limit_delta=0,
+    )
+    assert target == 4
+
+
+def test_autoscale_freezes_on_rate_limit_pressure() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    target = controller.target(
+        pending=5000,
+        running=24,
+        current=4,
+        effective_maximum=8,
+        now=10.0,
+        fetch_queue=0,
+        archive_queue=0,
+        project_queue=0,
+        observed_http_rate=4.0,
+        rate_target=12.0,
+        rate_limit_delta=1,
+    )
+    assert target == 4
+
+
+def test_autoscale_freezes_on_downstream_backlog() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    target = controller.target(
+        pending=5000,
+        running=24,
+        current=4,
+        effective_maximum=8,
+        now=10.0,
+        fetch_queue=0,
+        archive_queue=0,
+        project_queue=500,
+        observed_http_rate=4.0,
+        rate_target=12.0,
+        rate_limit_delta=0,
+    )
+    assert target == 4
