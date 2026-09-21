@@ -108,6 +108,31 @@ dbd-data campaign start `
 
 ค่าด้านบนเป็น operational example ไม่ใช่ rate guarantee ของ upstream service ถ้า 429/503 เพิ่มขึ้น ให้ลด rate หรือกลับไปใช้ค่าที่ผ่าน canary
 
+สำหรับ campaign ใหม่สามารถแยกจำนวน worker ออกจาก HTTP budget ได้โดย explicit fleet rate:
+
+```powershell
+dbd-data campaign start `
+  --master `
+  --all-statuses `
+  --workers 6 `
+  --workers-min 4 `
+  --workers-max 20 `
+  --worker-concurrency 12 `
+  --fleet-rate-initial 12 `
+  --fleet-rate-max 20 `
+  --fleet-db-connections-max 96 `
+  --fleet-archive-workers-max 20 `
+  --fleet-projection-workers-max 40 `
+  --fleet-redis-connections-max 128 `
+  --rate-mode adaptive `
+  --max-restarts 3 `
+  --headless
+```
+
+ในโหมดนี้ `workers-max=20` ไม่ได้หมายถึง 40 req/s หรือ `worker-rate × workers` อีกต่อไป
+`--fleet-rate-max` เป็น hard shared ceiling ส่วน worker count ใช้เพิ่ม local pipeline capacity เท่านั้น
+resource budget จะถูกแบ่งเป็น per-worker caps ตั้งแต่เริ่ม supervisor และ configuration ที่เล็กจนรองรับ `workers-max` ไม่ได้จะถูก reject ก่อน spawn worker
+
 เมื่อ command แสดง:
 
 ```text
