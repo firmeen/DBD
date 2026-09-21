@@ -967,10 +967,26 @@ def supervise_campaign(
         archive_workers=settings.dbd_archive_workers,
         projection_workers=settings.dbd_projection_workers,
         redis_max_connections=settings.dbd_redis_max_connections,
-        db_connections_max=fleet_db_connections_max,
-        archive_workers_max=fleet_archive_workers_max,
-        projection_workers_max=fleet_projection_workers_max,
-        redis_connections_max=fleet_redis_connections_max,
+        db_connections_max=(
+            settings.dbd_fleet_db_connections_max
+            if fleet_db_connections_max is None
+            else fleet_db_connections_max
+        ),
+        archive_workers_max=(
+            settings.dbd_fleet_archive_workers_max
+            if fleet_archive_workers_max is None
+            else fleet_archive_workers_max
+        ),
+        projection_workers_max=(
+            settings.dbd_fleet_projection_workers_max
+            if fleet_projection_workers_max is None
+            else fleet_projection_workers_max
+        ),
+        redis_connections_max=(
+            settings.dbd_fleet_redis_connections_max
+            if fleet_redis_connections_max is None
+            else fleet_redis_connections_max
+        ),
     )
     controller = AutoscaleController(minimum, maximum, worker_concurrency)
 
@@ -1085,6 +1101,8 @@ def supervise_campaign(
 
         now = time.monotonic()
         http_sample_at = now
+        if autoscale:
+            controller.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
         next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
         next_work_check = now
         next_worker_refresh = now
@@ -1256,12 +1274,14 @@ def supervise_campaign(
                 break
 
             target = len(active_live)
-            current_effective_rate = _effective_rate(
-                redis,
-                settings.dbd_redis_rate_key,
-                plan.initial,
-            )
+            current_effective_rate = None
             if autoscale and not graceful_stop:
+                if plan.independent:
+                    current_effective_rate = _effective_rate(
+                        redis,
+                        settings.dbd_redis_rate_key,
+                        plan.initial,
+                    )
                 target = controller.target(
                     pending=pending,
                     running=running,
