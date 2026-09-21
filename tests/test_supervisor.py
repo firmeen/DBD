@@ -248,6 +248,7 @@ def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) ->
             dbd_redis_url="redis://test",
             dbd_redis_rate_key="dbd:test:rate",
             dbd_rate_per_second=1.0,
+            dbd_redis_max_connections=4,
         ),
     )
     monkeypatch.setattr(
