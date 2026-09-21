@@ -1076,10 +1076,23 @@ def supervise_campaign(
             workers_draining=0,
             exhausted_capacity=0,
             worker_concurrency=worker_concurrency,
-            worker_rate=worker_rate,
+            worker_rate=plan.worker_rate,
             rate_mode=rate_mode,
+            rate_independent=plan.independent,
+            fleet_rate_initial=plan.initial,
+            fleet_rate_max=plan.ceiling,
             rate_target=initial_rate_target,
             rate_ceiling=plan.ceiling,
+            db_connections_budget=resource_plan.db_connections_budget,
+            db_connections_effective_max=resource_plan.db_connections_effective_max,
+            db_pool_per_worker=resource_plan.db_pool_per_worker,
+            archive_workers_budget=resource_plan.archive_workers_budget,
+            archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+            projection_workers_budget=resource_plan.projection_workers_budget,
+            projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+            redis_connections_budget=resource_plan.redis_connections_budget,
+            redis_connections_effective_max=resource_plan.redis_connections_effective_max,
+            redis_connections_per_client=resource_plan.redis_connections_per_client,
         )
 
         while True:
@@ -1308,11 +1321,24 @@ def supervise_campaign(
                     exhausted_capacity=exhausted_capacity,
                     effective_worker_max=effective_maximum,
                     worker_concurrency=worker_concurrency,
-                    worker_rate=worker_rate,
+                    worker_rate=plan.worker_rate,
                     rate_mode=rate_mode,
+                    rate_independent=plan.independent,
+                    fleet_rate_initial=plan.initial,
+                    fleet_rate_max=plan.ceiling,
                     rate_effective=effective,
                     rate_target=rate_target,
                     rate_ceiling=plan.ceiling,
+                    db_connections_budget=resource_plan.db_connections_budget,
+                    db_connections_effective_max=resource_plan.db_connections_effective_max,
+                    db_pool_per_worker=resource_plan.db_pool_per_worker,
+                    archive_workers_budget=resource_plan.archive_workers_budget,
+                    archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+                    projection_workers_budget=resource_plan.projection_workers_budget,
+                    projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+                    redis_connections_budget=resource_plan.redis_connections_budget,
+                    redis_connections_effective_max=resource_plan.redis_connections_effective_max,
+                    redis_connections_per_client=resource_plan.redis_connections_per_client,
                     worker_metrics=campaign_metrics,
                     progress_source="redis_worker_heartbeat",
                     reconciled_at=reconciled_at,
@@ -1364,9 +1390,16 @@ def supervise_campaign(
                 workers_min=minimum,
                 workers_max=maximum,
                 worker_concurrency=worker_concurrency,
-                worker_rate=worker_rate,
+                worker_rate=plan.worker_rate,
                 rate_mode=rate_mode,
+                rate_independent=plan.independent,
+                fleet_rate_initial=plan.initial,
+                fleet_rate_max=plan.ceiling,
                 rate_ceiling=plan.ceiling,
+                db_pool_per_worker=resource_plan.db_pool_per_worker,
+                archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+                projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+                redis_connections_per_client=resource_plan.redis_connections_per_client,
             )
             try:
                 while any(worker.process.poll() is None for worker in children):
@@ -1444,10 +1477,23 @@ def supervise_campaign(
                     workers_max=maximum,
                     exhausted_capacity=exhausted_capacity,
                     worker_concurrency=worker_concurrency,
-                    worker_rate=worker_rate,
+                    worker_rate=plan.worker_rate,
                     rate_mode=rate_mode,
+                    rate_independent=plan.independent,
+                    fleet_rate_initial=plan.initial,
+                    fleet_rate_max=plan.ceiling,
                     rate_target=last_rate_target,
                     rate_ceiling=plan.ceiling,
+                    db_connections_budget=resource_plan.db_connections_budget,
+                    db_connections_effective_max=resource_plan.db_connections_effective_max,
+                    db_pool_per_worker=resource_plan.db_pool_per_worker,
+                    archive_workers_budget=resource_plan.archive_workers_budget,
+                    archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+                    projection_workers_budget=resource_plan.projection_workers_budget,
+                    projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+                    redis_connections_budget=resource_plan.redis_connections_budget,
+                    redis_connections_effective_max=resource_plan.redis_connections_effective_max,
+                    redis_connections_per_client=resource_plan.redis_connections_per_client,
                     worker_metrics=_with_retired_metrics(
                         _worker_metrics(registered_states), retired_metrics
                     ),
@@ -1503,7 +1549,11 @@ def campaign_status(run_id: int) -> dict:
 
     if settings.dbd_redis_url:
         try:
-            redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+            redis = Redis.from_url(
+                settings.dbd_redis_url,
+                decode_responses=True,
+                max_connections=settings.dbd_redis_max_connections,
+            )
             redis.ping()
             runtime = _read_runtime_state(redis, run_id)
             supervisor_active = bool(redis.exists(_supervisor_lease_key(run_id)))
@@ -1591,7 +1641,11 @@ def campaign_status(run_id: int) -> dict:
 def request_campaign_stop(run_id: int) -> None:
     if not settings.dbd_redis_url:
         raise ValueError("Campaign stop requires DBD_REDIS_URL")
-    redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+    redis = Redis.from_url(
+        settings.dbd_redis_url,
+        decode_responses=True,
+        max_connections=settings.dbd_redis_max_connections,
+    )
     try:
         redis.ping()
         _request_stop(redis, run_id, "operator_command")
