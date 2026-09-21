@@ -882,6 +882,14 @@ def supervise_campaign(
         redis.ping()
         _acquire_supervisor_lease(redis, run_id, token)
         lease_acquired = True
+        orphaned = _drain_registered_workers(redis, run_id)
+        if orphaned:
+            progress.event(
+                f"supervisor handoff: drained {orphaned} previously registered worker(s)"
+            )
+
+        # Reconcile only after predecessor workers have drained so their final
+        # durable transitions are part of the new supervisor's baseline.
         baseline = _task_progress(run_id)
         reconciled_at = time.time()
         has_work = (
@@ -890,11 +898,6 @@ def supervise_campaign(
             + baseline.get("running", 0)
             > 0
         )
-        orphaned = _drain_registered_workers(redis, run_id)
-        if orphaned:
-            progress.event(
-                f"supervisor handoff: drained {orphaned} previously registered worker(s)"
-            )
 
         now = time.monotonic()
         next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
