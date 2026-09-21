@@ -921,8 +921,8 @@ def supervise_campaign(
             workers_initial=initial_workers,
             workers_min=minimum,
             workers_max=maximum,
-            workers_target=initial_workers,
-            workers_active=initial_workers,
+            workers_target=initial_workers if has_work else 0,
+            workers_active=len(children),
             workers_draining=0,
             exhausted_capacity=0,
             worker_concurrency=worker_concurrency,
@@ -1301,10 +1301,15 @@ def supervise_campaign(
                     worker_metrics=_with_retired_metrics(
                         _worker_metrics(registered_states), retired_metrics
                     ),
+                    progress_source="mysql_reconciled",
+                    reconciled_at=time.time(),
                     pending=snapshot.get("pending", 0) + snapshot.get("retry_wait", 0),
                     running=snapshot.get("running", 0),
                     done=snapshot.get("done", 0) + snapshot.get("not_available", 0),
+                    done_only=snapshot.get("done", 0),
+                    not_available=snapshot.get("not_available", 0),
                     failed=snapshot.get("failed", 0),
+                    remaining=remaining,
                     total=snapshot.get("total", 0),
                 )
                 if remaining == 0 and not supervisor_error:
@@ -1339,14 +1344,53 @@ def supervise_campaign(
 
 
 def campaign_status(run_id: int) -> dict:
-    state = _task_progress(run_id)
+    """Prefer the live Redis snapshot while supervised; fall back to exact MySQL."""
+    state: dict | None = None
+    redis = None
+    workers: list[dict] = []
+    runtime = None
+    supervisor_active = False
+
+    if settings.dbd_redis_url:
+        try:
+            redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+            redis.ping()
+            runtime = _read_runtime_state(redis, run_id)
+            supervisor_active = bool(redis.exists(_supervisor_lease_key(run_id)))
+            workers = _registered_worker_states(redis, run_id)
+            if runtime is not None and supervisor_active and runtime.get("total") is not None:
+                state = {
+                    "total": int(runtime.get("total", 0) or 0),
+                    "pending": int(runtime.get("pending", 0) or 0),
+                    "retry_wait": 0,
+                    "running": int(runtime.get("running", 0) or 0),
+                    "failed": int(runtime.get("failed", 0) or 0),
+                    "done": int(runtime.get("done_only", 0) or 0),
+                    "not_available": int(runtime.get("not_available", 0) or 0),
+                    "progress_source": runtime.get(
+                        "progress_source", "redis_worker_heartbeat"
+                    ),
+                    "progress_exact": False,
+                    "pending_includes_retry_wait": True,
+                }
+        except Exception:
+            if redis is not None:
+                try:
+                    redis.close()
+                except Exception:
+                    pass
+            redis = None
+
+    if state is None:
+        state = _task_progress(run_id)
+        state["progress_source"] = "mysql_reconciled"
+        state["progress_exact"] = True
+
     state["run_id"] = int(run_id)
     state["run_status"] = _run_status(run_id)
-    if settings.dbd_redis_url:
-        redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+
+    if redis is not None:
         try:
-            redis.ping()
-            workers = _registered_worker_states(redis, run_id)
             now = time.time()
             worker_details = []
             for row in workers:
@@ -1386,8 +1430,7 @@ def campaign_status(run_id: int) -> dict:
             except (TypeError, ValueError):
                 state["rate_target"] = None
             state["stop_requested"] = _stop_requested(redis, run_id)
-            state["supervisor_active"] = bool(redis.exists(_supervisor_lease_key(run_id)))
-            runtime = _read_runtime_state(redis, run_id)
+            state["supervisor_active"] = supervisor_active
             if runtime is not None:
                 state["supervisor"] = runtime
         finally:

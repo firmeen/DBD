@@ -48,6 +48,8 @@ async def test_run_persists_scheduler_mode_and_rejects_unknown_mode(repo):
         ["profile"],
         scheduler_mode="fabric_v2",
     )
+    await repo.ready(legacy)
+    await repo.ready(fabric)
     assert (await repo.get_run(legacy))["scheduler_mode"] == "legacy"
     assert (await repo.get_run(fabric))["scheduler_mode"] == "fabric_v2"
     with pytest.raises(ValueError, match="scheduler_mode"):
