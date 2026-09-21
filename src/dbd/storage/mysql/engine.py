@@ -24,7 +24,7 @@ def pooled_engine():
             database=settings.db_name,
         ),
         pool_size=settings.db_pool_size,
-        max_overflow=2,
+        max_overflow=0,
         pool_pre_ping=True,
         isolation_level="READ COMMITTED",
         pool_recycle=1800,
