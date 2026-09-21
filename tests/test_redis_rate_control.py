@@ -59,3 +59,15 @@ async def test_penalty_and_cooldown_are_shared_across_processes():
         await first.clear_state()
         await first.close()
         await second.close()
+
+
+
+async def test_redis_pacer_applies_connection_pool_cap():
+    key = "dbd:test-capped-rate:" + uuid4().hex
+    pacer = RedisPacer(REDIS_URL, key, 10, max_connections=2)
+    await pacer.open()
+    try:
+        assert pacer._redis.connection_pool.max_connections == 2
+    finally:
+        await pacer.clear_state()
+        await pacer.close()
