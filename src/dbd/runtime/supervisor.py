@@ -845,6 +845,7 @@ def supervise_campaign(
         for key in (
             "claimed",
             "completed",
+            "done",
             "failed",
             "retry_wait",
             "not_available",
