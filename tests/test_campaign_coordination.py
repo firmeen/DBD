@@ -116,3 +116,19 @@ async def test_unregister_failure_is_best_effort_and_close_does_not_mask_errors(
     assert await coordinator.unregister_worker(worker) is False
     await coordinator.close()
     assert coordinator._redis is None
+
+
+
+async def test_campaign_coordinator_applies_connection_pool_cap():
+    run_id = int(uuid4().hex[:8], 16)
+    coordinator = CampaignCoordinator(
+        REDIS_URL,
+        run_id,
+        namespace="dbd:test-capped-campaign:" + uuid4().hex,
+        max_connections=2,
+    )
+    await coordinator.open()
+    try:
+        assert coordinator._client().connection_pool.max_connections == 2
+    finally:
+        await coordinator.close()
