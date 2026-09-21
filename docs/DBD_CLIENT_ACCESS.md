@@ -1,123 +1,146 @@
 # DBD Client Access
 
-คู่มือสั้นสำหรับ Client ที่ต้องการเชื่อมต่อฐานข้อมูล MySQL `dbd` จากเครื่องอื่น เช่นผ่าน VS Code Database Client extension หรือ Python
+คู่มือสำหรับ Client ที่ต้องการอ่าน MySQL `dbd` จากเครื่องอื่นผ่าน VS Code Database Client, DBeaver หรือ Python
 
-## Connection settings
+มี 2 วิธีใช้งาน:
 
-ใช้ค่าที่ทีมได้รับจากผู้ดูแลระบบ:
+1. **Direct LAN** — ใช้เมื่อ Client อยู่บน network ที่เข้าถึง MySQL Server ได้โดยตรง
+2. **Python Remote Gateway** — ใช้เมื่อไม่ต้องการเปิด MySQL public และต้องการให้ Client ต่อผ่าน `127.0.0.1:13307`
+
+รายละเอียดเต็มของ Gateway: [DBD Remote MySQL Gateway](DBD_REMOTE_GATEWAY.md)
+
+## Mode A — Direct LAN
+
+ค่าตัวอย่าง:
 
 | Field | Value |
 |---|---|
 | Server Type | MySQL |
-| Host | `172.16.4.49` |
+| Host | IP private ของ DB Server เช่น `172.16.4.49` |
 | Port | `3307` |
 | Database | `dbd` |
 | Username | `dbd-<team>` เช่น `dbd-tipdi` |
 | Password | รหัสผ่านของทีม |
-| SSL | Off / Disabled สำหรับ private network ที่กำหนด |
-| Socket Path | เว้นว่าง |
-| Connection String | Off |
 
-> **สำคัญ:** บนเครื่อง Client ห้ามใช้ `localhost` หรือ `127.0.0.1` เป็น Host เพราะจะหมายถึงเครื่อง Client เอง ไม่ใช่เครื่อง Database Server
-
-## VS Code Database Client
-
-ในหน้า **Connect to server**:
-
-1. เลือก **MySQL**
-2. ตั้งชื่อ connection เช่น `DBD - TIPDI`
-3. กรอก:
-   - Host: `172.16.4.49`
-   - Port: `3307`
-   - Username: account ของทีม เช่น `dbd-tipdi`
-   - Password: รหัสผ่านของทีม
-   - Database: `dbd`
-4. ปล่อย Socket Path ว่าง
-5. ปิด SSL ถ้าเชื่อมต่อผ่าน private network ที่กำหนด
-6. กด **Connect**
-
-## Test network ก่อนเชื่อมต่อ
-
-PowerShell:
+ตรวจ network:
 
 ```powershell
 Test-NetConnection 172.16.4.49 -Port 3307
 ```
 
-ต้องได้:
-
-```text
-TcpTestSucceeded : True
-```
-
-ถ้าเป็น `False` ปัญหาอยู่ที่ network/routing/server listener ก่อนถึงขั้น username/password
-
-## Python connection test
-
-ติดตั้ง PyMySQL:
-
-```powershell
-pip install pymysql
-```
-
-สร้างไฟล์ `test_db.py`:
-
-```python
-import pymysql
-
-try:
-    conn = pymysql.connect(
-        host="172.16.4.49",
-        port=3307,
-        user="dbd-tipdi",
-        password="TEAM_PASSWORD",
-        database="dbd",
-        connect_timeout=5,
-    )
-
-    with conn.cursor() as cur:
-        cur.execute("SELECT DATABASE(), USER(), NOW();")
-        print(cur.fetchone())
-
-    conn.close()
-    print("CONNECTED")
-except Exception as exc:
-    print("FAILED:", exc)
-```
-
-รัน:
-
-```powershell
-python test_db.py
-```
-
-## สิทธิ์ของ Client
-
-โดยค่าเริ่มต้น remote client ได้สิทธิ์ **read-only**:
-
-```text
-SELECT on dbd.*
-```
-
-จึงอ่าน/query ข้อมูลได้ แต่ไม่ควรสามารถ `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER` หรือ `DROP` ได้
-
-## Error ที่พบบ่อย
-
-- **Connection timed out / Can't connect** — ตรวจ Host, Port, network route และ MySQL listener
-- **Access denied** — ตรวจ Client IP, Username และ Password กับผู้ดูแลระบบ
-- **Unknown database** — Database ต้องเป็น `dbd`
-- **CONNECTED** — พร้อมใช้งาน
-
-## สิ่งที่ต้องส่งให้ผู้ดูแลระบบ
-
-ก่อนใช้งานครั้งแรก Client ต้องส่ง **IP ของเครื่องที่จะเชื่อมต่อ** เพื่อให้ผู้ดูแลเพิ่ม MySQL account ในรูปแบบ:
-
-```text
-dbd-<team>@<client-ip>
-```
-
-ตัวอย่าง:
+Direct LAN ใช้ MySQL account แบบจำกัด source host เช่น:
 
 ```text
 dbd-tipdi@172.24.114.41
 ```
+
+หลีกเลี่ยง wildcard `dbd-tipdi@%`
+
+## Mode B — Python Remote Gateway
+
+เมื่อ `dbd_client.py` ทำงาน Client จะเห็น MySQL เป็น local endpoint:
+
+```text
+Host      127.0.0.1
+Port      13307
+Database  dbd
+Username  dbd-tipdi
+Password  <MYSQL_TEAM_PASSWORD>
+```
+
+เส้นทางจริง:
+
+```text
+DBeaver / VS Code / PyMySQL
+        ↓
+127.0.0.1:13307
+        ↓
+dbd_client.py
+        ↓ WSS/TLS
+Cloudflare Tunnel
+        ↓
+dbd_gateway.py
+        ↓
+127.0.0.1:3307
+        ↓
+MySQL dbd
+```
+
+เพราะ Gateway Server เป็นผู้เปิด TCP ไป MySQL ผ่าน loopback MySQL จึงควรมี account:
+
+```text
+dbd-<team>@127.0.0.1
+```
+
+ตัวอย่าง:
+
+```sql
+CREATE USER 'dbd-tipdi'@'127.0.0.1'
+IDENTIFIED BY '<STRONG_TEAM_PASSWORD>';
+
+GRANT SELECT
+ON dbd.*
+TO 'dbd-tipdi'@'127.0.0.1';
+```
+
+คำสั่งด้านบนเป็นตัวอย่างเท่านั้น ให้เปลี่ยน password ก่อน execute และห้าม commit secret
+
+## Client usage
+
+ติดตั้ง:
+
+```powershell
+python -m pip install "websockets>=17,<18" pymysql
+```
+
+ตั้งค่าจาก output ของ Server Gateway:
+
+```powershell
+$env:DBD_WS_URL = "wss://<QUICK_TUNNEL_HOST>/dbd"
+$env:DBD_GATEWAY_TOKEN = "<TOKEN_FROM_SERVER>"
+$env:DBD_CLIENT_NAME = "tipdi-client-01"
+$env:DBD_CLIENT_LOCAL_PORT = "13307"
+
+python .\dbd_client.py
+```
+
+Client จะ preflight `/healthz` ก่อนเปิด port 13307 ถ้า remote endpoint เข้าไม่ได้โปรแกรมจะ fail fast แทนการปล่อย database client ค้าง
+
+## Verify MySQL identity
+
+หลังต่อสำเร็จ:
+
+```sql
+SELECT
+    DATABASE(),
+    USER(),
+    CURRENT_USER(),
+    CONNECTION_ID(),
+    NOW();
+```
+
+สำหรับ Gateway mode ค่า `CURRENT_USER()` ควร match loopback account เช่น:
+
+```text
+dbd-tipdi@127.0.0.1
+```
+
+## Default privileges
+
+Client ปกติควรเป็น read-only:
+
+```text
+SELECT ON dbd.*
+```
+
+ไม่ควรได้ `INSERT`, `UPDATE`, `DELETE`, `CREATE`, `ALTER`, `DROP` หรือ `GRANT OPTION` โดยไม่จำเป็น
+
+## Troubleshooting
+
+- **Connection timeout ใน Direct LAN** — ตรวจ Host, Port, route, firewall และ MySQL listener
+- **Gateway preflight HTTP 403** — endpoint อาจถูก corporate proxy/security policy block ให้ใช้ endpoint/network ที่องค์กรอนุญาตหรือขอ allowlist
+- **Errno 10048 / port 13307 in use** — มี `dbd_client.py` อีกตัวฟัง port เดียวกัน
+- **Access denied** — ตรวจ MySQL username/password และ account host ที่ match
+- **Unknown database** — Database ต้องเป็น `dbd`
+
+ดูขั้นตอน Server/Client แบบเต็มที่ [DBD Remote MySQL Gateway](DBD_REMOTE_GATEWAY.md)
