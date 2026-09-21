@@ -522,7 +522,12 @@ def _live_progress(baseline: dict[str, int], metrics: dict[str, int]) -> dict[st
 
 def _runtime_progress_baseline(redis: Redis, run_id: int) -> dict[str, int] | None:
     """Reuse the last supervisor snapshot on resume to avoid a multi-million-row scan."""
-    runtime = _read_runtime_state(redis, run_id)
+    try:
+        runtime = _read_runtime_state(redis, run_id)
+    except Exception as exc:
+        if _is_transient_redis_error(exc):
+            return None
+        raise
     if not runtime:
         return None
     try:
@@ -851,6 +856,7 @@ def supervise_campaign(
     last_rate_target: float | None = None
     last_effective_rate = plan.initial
     last_lease_confirmed = 0.0
+    last_redis_warning_at = 0.0
     baseline: dict[str, int] = {}
     has_work = True
     registered_states: list[dict] = []
@@ -919,7 +925,15 @@ def supervise_campaign(
 
         # Resume from the last supervisor snapshot when available. This avoids
         # re-aggregating a multi-million-row endpoint queue just to redraw progress.
-        baseline = _runtime_progress_baseline(redis, run_id) or _task_progress(run_id)
+        baseline = _runtime_progress_baseline(redis, run_id)
+        if baseline is None:
+            try:
+                baseline = _task_progress(run_id)
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Campaign {run_id} startup durable progress reconciliation failed: "
+                    f"{type(exc).__name__}"
+                ) from exc
         has_work = _has_active_work(run_id)
 
         now = time.monotonic()
@@ -972,10 +986,12 @@ def supervise_campaign(
                 if lease_error is not None:
                     control_plane_degraded = True
                     next_lease_refresh = now + _REDIS_RETRY_SECONDS
-                    progress.event(
-                        f"Redis control plane timeout; preserving workers and retrying lease "
-                        f"({now - last_lease_confirmed:.1f}s degraded)"
-                    )
+                    if now - last_redis_warning_at >= 5.0:
+                        progress.event(
+                            f"Redis control plane timeout; preserving workers and retrying lease "
+                            f"({now - last_lease_confirmed:.1f}s degraded)"
+                        )
+                        last_redis_warning_at = now
                 else:
                     next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
 
@@ -1209,7 +1225,7 @@ def supervise_campaign(
                 else f"{registered}/{initial_workers}"
             )
             progress.update(
-                done + failed,
+                live_progress["terminal"],
                 total,
                 detail=(
                     f"workers {worker_label} | rate {effective:.2f}/{rate_target:.2f}/{plan.ceiling:.2f}/s | "
@@ -1322,7 +1338,7 @@ def supervise_campaign(
         finally:
             exit_code = 130
 
-    except Exception:
+    except Exception as exc:
         supervisor_error = True
         _contain_local_fleet(
             redis,
@@ -1331,8 +1347,17 @@ def supervise_campaign(
             "supervisor_failure",
             grace_seconds=_FAILURE_DRAIN_SECONDS,
         )
-        progress.close(message=f"Campaign {run_id} supervisor failed; local workers are stopped")
-        raise
+        progress.close(
+            message=(
+                f"Campaign {run_id} supervisor failed; local workers are stopped "
+                f"({type(exc).__name__})"
+            )
+        )
+        detail = str(exc).strip()
+        detail = f": {detail[:300]}" if detail else ""
+        raise RuntimeError(
+            f"Campaign {run_id} supervisor failure [{type(exc).__name__}]{detail}"
+        ) from exc
 
     finally:
         for worker in children:
