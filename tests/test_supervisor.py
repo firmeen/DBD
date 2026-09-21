@@ -8,8 +8,8 @@ from dbd.runtime.supervisor import (
     _force_kill_worker,
     _live_progress,
     _seed_rate,
-    _with_retired_metrics,
     _terminate_workers,
+    _with_retired_metrics,
     _worker_command,
     build_rate_plan,
 )
