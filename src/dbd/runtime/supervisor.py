@@ -1256,10 +1256,6 @@ def supervise_campaign(
                 break
 
             target = len(active_live)
-            current_rate_target = _fleet_rate_target(
-                plan,
-                len([worker for worker in live if not worker.capacity_lost]),
-            )
             current_effective_rate = _effective_rate(
                 redis,
                 settings.dbd_redis_rate_key,
