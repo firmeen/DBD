@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ..core.progress import ProgressLine
 from ..core.settings import PROJECT_ROOT, settings
@@ -23,8 +25,12 @@ _AUTOSCALE_DOWN_COOLDOWN_SECONDS = 15.0
 _AUTOSCALE_LOW_PRESSURE_OBSERVATIONS = 2
 _FAILURE_DRAIN_SECONDS = 10.0
 _COMPLETE_DRAIN_SECONDS = 10.0
-_PROGRESS_SNAPSHOT_SECONDS = 0.75
-_WORKER_STATE_REFRESH_SECONDS = 0.75
+_DURABLE_WORK_CHECK_SECONDS = 1.0
+_WORKER_STATE_REFRESH_SECONDS = 2.0
+_REDIS_RETRY_SECONDS = 1.0
+_SUPERVISOR_LEASE_FAILURE_BUDGET_SECONDS = 20.0
+_REDIS_SOCKET_TIMEOUT_SECONDS = 5.0
+_REDIS_CONNECT_TIMEOUT_SECONDS = 5.0
 _WORKER_STARTUP_GRACE_SECONDS = 20.0
 _WORKER_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 _WORKER_DRAIN_TIMEOUT_SECONDS = 90.0
@@ -204,6 +210,20 @@ def _task_progress(run_id: int) -> dict[str, int]:
                 "not_available",
             )
         }
+
+
+def _has_active_work(run_id: int) -> bool:
+    """Use the queue index for a cheap completion probe instead of aggregating the run."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM endpoint_tasks
+            WHERE run_id=%s AND status IN ('pending','running','retry_wait')
+            LIMIT 1
+            """,
+            (run_id,),
+        )
+        return cur.fetchone() is not None
 
 
 def _run_status(run_id: int) -> str:
@@ -424,6 +444,20 @@ def _registered_workers(redis: Redis, run_id: int) -> int:
     return len(_registered_worker_states(redis, run_id))
 
 
+def _redis_client() -> Redis:
+    return Redis.from_url(
+        settings.dbd_redis_url,
+        decode_responses=True,
+        socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
+        socket_connect_timeout=_REDIS_CONNECT_TIMEOUT_SECONDS,
+        health_check_interval=15,
+    )
+
+
+def _is_transient_redis_error(exc: BaseException) -> bool:
+    return isinstance(exc, (RedisConnectionError, RedisTimeoutError, OSError))
+
+
 def _worker_metrics(states: list[dict]) -> dict[str, int]:
     summed = (
         "claimed",
@@ -462,6 +496,78 @@ def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict
     ):
         result[key] = int(result.get(key, 0)) + int(retired.get(key, 0))
     return result
+
+
+def _live_progress(baseline: dict[str, int], metrics: dict[str, int]) -> dict[str, int]:
+    """Overlay worker heartbeat counters on one durable lifecycle baseline."""
+    total = int(baseline.get("total", 0))
+    baseline_done = int(baseline.get("done", 0)) + int(
+        baseline.get("not_available", 0)
+    )
+    done = baseline_done + int(metrics.get("completed", 0))
+    failed = int(baseline.get("failed", 0)) + int(metrics.get("failed", 0))
+    terminal = min(total, done + failed)
+    remaining = max(0, total - terminal)
+    inflight = min(max(0, int(metrics.get("inflight", 0))), remaining)
+    return {
+        "total": total,
+        "done": min(done, total),
+        "failed": min(failed, total),
+        "terminal": terminal,
+        "remaining": remaining,
+        "inflight": inflight,
+        "pending_estimate": max(0, remaining - inflight),
+    }
+
+
+def _runtime_progress_baseline(redis: Redis, run_id: int) -> dict[str, int] | None:
+    """Reuse the last supervisor snapshot on resume to avoid a multi-million-row scan."""
+    runtime = _read_runtime_state(redis, run_id)
+    if not runtime:
+        return None
+    try:
+        total = int(runtime.get("total", 0) or 0)
+        done = int(runtime.get("done", 0) or 0)
+        failed = int(runtime.get("failed", 0) or 0)
+        pending = int(runtime.get("pending", 0) or 0)
+        running = int(runtime.get("running", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    return {
+        "total": total,
+        "pending": pending,
+        "retry_wait": 0,
+        "running": running,
+        "failed": failed,
+        "done": done,
+        "not_available": 0,
+    }
+
+
+def _refresh_lease_with_grace(
+    redis: Redis,
+    run_id: int,
+    token: str,
+    *,
+    now: float,
+    last_confirmed: float,
+) -> tuple[float, BaseException | None]:
+    """Tolerate a short Redis outage, but fail closed before the 30s lease can expire."""
+    try:
+        _refresh_supervisor_lease(redis, run_id, token)
+    except Exception as exc:
+        if not _is_transient_redis_error(exc):
+            raise
+        unavailable_for = max(0.0, now - last_confirmed)
+        if unavailable_for >= _SUPERVISOR_LEASE_FAILURE_BUDGET_SECONDS:
+            raise RuntimeError(
+                f"Campaign {run_id} Redis control plane unavailable for "
+                f"{unavailable_for:.1f}s; stopping before supervisor lease expiry"
+            ) from exc
+        return last_confirmed, exc
+    return now, None
 
 
 def _acquire_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
