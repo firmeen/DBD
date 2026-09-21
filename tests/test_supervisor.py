@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import dbd.runtime.supervisor as supervisor
@@ -177,3 +178,87 @@ def test_replacement_supervisor_refuses_to_spawn_over_registered_workers(monkeyp
         raise AssertionError("handoff must fail closed while an old worker remains registered")
 
     assert drains == [(7, "old-worker", "supervisor_replacement")]
+
+
+def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) -> None:
+    runtime = {
+        "total": 1000,
+        "pending": 700,
+        "running": 8,
+        "done_only": 180,
+        "not_available": 100,
+        "failed": 12,
+        "progress_source": "redis_worker_heartbeat",
+    }
+    worker = {
+        "worker_id": "worker-a",
+        "status": "active",
+        "heartbeat_at": 1.0,
+        "done": 10,
+        "not_available": 2,
+        "failed": 0,
+    }
+
+    class FakeRedis:
+        def ping(self):
+            return True
+
+        def get(self, key):
+            if key.endswith(":supervisor:state"):
+                return json.dumps(runtime)
+            if key.endswith(":effective-rate"):
+                return "11.5"
+            if key.endswith(":target-rate"):
+                return "12"
+            return None
+
+        def exists(self, key):
+            return key.endswith(":supervisor:lease")
+
+        def smembers(self, key):
+            return {"worker-a"}
+
+        def mget(self, keys):
+            return [json.dumps(worker)]
+
+        def srem(self, *args):
+            return 0
+
+        def close(self):
+            pass
+
+    fake = FakeRedis()
+
+    class FakeRedisFactory:
+        @staticmethod
+        def from_url(*args, **kwargs):
+            return fake
+
+    monkeypatch.setattr(supervisor, "Redis", FakeRedisFactory)
+    monkeypatch.setattr(
+        supervisor,
+        "settings",
+        SimpleNamespace(
+            dbd_redis_url="redis://test",
+            dbd_redis_rate_key="dbd:test:rate",
+            dbd_rate_per_second=1.0,
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_task_progress",
+        lambda run_id: (_ for _ in ()).throw(
+            AssertionError("active campaign status must not run an exact aggregate scan")
+        ),
+    )
+    monkeypatch.setattr(supervisor, "_run_status", lambda run_id: "ready")
+
+    state = supervisor.campaign_status(7)
+
+    assert state["progress_source"] == "redis_worker_heartbeat"
+    assert state["progress_exact"] is False
+    assert state["done"] == 180
+    assert state["not_available"] == 100
+    assert state["failed"] == 12
+    assert state["workers"] == 1
+    assert state["supervisor_active"] is True
