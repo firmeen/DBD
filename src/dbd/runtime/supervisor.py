@@ -32,6 +32,9 @@ _WORKER_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 _WORKER_DRAIN_TIMEOUT_SECONDS = 90.0
 _WORKER_KILL_WAIT_SECONDS = 5.0
 _RATE_STATE_TTL_SECONDS = 600
+_DB_POOLS_PER_WORKER = 2
+_REDIS_CLIENTS_PER_WORKER = 2
+_REDIS_SUPERVISOR_CLIENTS = 1
 
 
 @dataclass
@@ -56,6 +59,41 @@ class CampaignRatePlan:
     workers: int
     ceiling: float
     initial: float
+    independent: bool = False
+
+
+@dataclass(frozen=True)
+class CampaignResourcePlan:
+    max_workers: int
+    supervisor_db_pool: int
+    db_connections_budget: int
+    db_pool_per_worker: int
+    archive_workers_budget: int
+    archive_workers_per_worker: int
+    projection_workers_budget: int
+    projection_workers_per_worker: int
+    redis_connections_budget: int
+    redis_connections_per_client: int
+
+    @property
+    def db_connections_effective_max(self) -> int:
+        return self.supervisor_db_pool + (
+            self.db_pool_per_worker * _DB_POOLS_PER_WORKER * self.max_workers
+        )
+
+    @property
+    def archive_workers_effective_max(self) -> int:
+        return self.archive_workers_per_worker * self.max_workers
+
+    @property
+    def projection_workers_effective_max(self) -> int:
+        return self.projection_workers_per_worker * self.max_workers
+
+    @property
+    def redis_connections_effective_max(self) -> int:
+        return self.redis_connections_per_client * (
+            _REDIS_SUPERVISOR_CLIENTS + _REDIS_CLIENTS_PER_WORKER * self.max_workers
+        )
 
 
 @dataclass
@@ -114,6 +152,8 @@ def build_rate_plan(
     workers: int,
     *,
     initial_workers: int | None = None,
+    fleet_rate_initial: float | None = None,
+    fleet_rate_max: float | None = None,
 ) -> CampaignRatePlan:
     if mode not in _RATE_MODES:
         raise ValueError(f"rate mode must be one of {sorted(_RATE_MODES)}")
@@ -122,6 +162,21 @@ def build_rate_plan(
     initial_workers = workers if initial_workers is None else int(initial_workers)
     if worker_rate <= 0 or workers < 1 or not 1 <= initial_workers <= workers:
         raise ValueError("worker rate/count and initial worker count must be positive and ordered")
+
+    independent = fleet_rate_initial is not None or fleet_rate_max is not None
+    if independent:
+        ceiling = float(
+            fleet_rate_max if fleet_rate_max is not None else fleet_rate_initial
+        )
+        initial = float(
+            fleet_rate_initial
+            if fleet_rate_initial is not None
+            else min(worker_rate, ceiling)
+        )
+        if initial <= 0 or ceiling <= 0 or initial > ceiling:
+            raise ValueError("fleet rate must satisfy 0 < initial <= max")
+        return CampaignRatePlan(mode, ceiling, workers, ceiling, initial, True)
+
     if mode == "shared":
         ceiling = initial = worker_rate
     elif mode == "multiply":
@@ -130,7 +185,64 @@ def build_rate_plan(
     else:
         ceiling = worker_rate * workers
         initial = worker_rate
-    return CampaignRatePlan(mode, worker_rate, workers, ceiling, initial)
+    return CampaignRatePlan(mode, worker_rate, workers, ceiling, initial, False)
+
+
+def build_resource_plan(
+    max_workers: int,
+    *,
+    db_pool_size: int,
+    archive_workers: int,
+    projection_workers: int,
+    redis_max_connections: int,
+    db_connections_max: int | None = None,
+    archive_workers_max: int | None = None,
+    projection_workers_max: int | None = None,
+    redis_connections_max: int | None = None,
+) -> CampaignResourcePlan:
+    max_workers = int(max_workers)
+    db_pool_size = int(db_pool_size)
+    archive_workers = int(archive_workers)
+    projection_workers = int(projection_workers)
+    redis_max_connections = int(redis_max_connections)
+    if min(max_workers, db_pool_size, archive_workers, projection_workers, redis_max_connections) < 1:
+        raise ValueError("worker/resource defaults must be positive")
+
+    supervisor_db_pool = db_pool_size
+    db_budget = int(db_connections_max if db_connections_max is not None else supervisor_db_pool + (max_workers * _DB_POOLS_PER_WORKER * db_pool_size))
+    db_per_worker = min(db_pool_size, (db_budget - supervisor_db_pool) // (max_workers * _DB_POOLS_PER_WORKER))
+    if db_per_worker < 1:
+        minimum = supervisor_db_pool + (max_workers * _DB_POOLS_PER_WORKER)
+        raise ValueError(f"fleet DB connection budget {db_budget} is too small; need at least {minimum} for workers-max={max_workers}")
+
+    archive_budget = int(archive_workers_max if archive_workers_max is not None else max_workers * archive_workers)
+    archive_per_worker = min(archive_workers, archive_budget // max_workers, db_per_worker)
+    if archive_per_worker < 1:
+        raise ValueError(f"fleet archive-worker budget {archive_budget} is too small; need at least {max_workers}")
+
+    projection_budget = int(projection_workers_max if projection_workers_max is not None else max_workers * min(projection_workers, db_pool_size))
+    projection_per_worker = min(projection_workers, projection_budget // max_workers, db_per_worker)
+    if projection_per_worker < 1:
+        raise ValueError(f"fleet projection-worker budget {projection_budget} is too small; need at least {max_workers}")
+
+    redis_clients = _REDIS_SUPERVISOR_CLIENTS + (_REDIS_CLIENTS_PER_WORKER * max_workers)
+    redis_budget = int(redis_connections_max if redis_connections_max is not None else redis_clients * redis_max_connections)
+    redis_per_client = min(redis_max_connections, redis_budget // redis_clients)
+    if redis_per_client < 1:
+        raise ValueError(f"fleet Redis connection budget {redis_budget} is too small; need at least {redis_clients} for workers-max={max_workers}")
+
+    return CampaignResourcePlan(
+        max_workers=max_workers,
+        supervisor_db_pool=supervisor_db_pool,
+        db_connections_budget=db_budget,
+        db_pool_per_worker=db_per_worker,
+        archive_workers_budget=archive_budget,
+        archive_workers_per_worker=archive_per_worker,
+        projection_workers_budget=projection_budget,
+        projection_workers_per_worker=projection_per_worker,
+        redis_connections_budget=redis_budget,
+        redis_connections_per_client=redis_per_client,
+    )
 
 
 def _next_worker_target(
@@ -257,6 +369,7 @@ def _spawn_worker(
     rate: float,
     fleet_rate_ceiling: float | None,
     open_powershell: bool,
+    resource_plan: CampaignResourcePlan | None = None,
     restart_count: int = 0,
 ) -> WorkerProcess:
     """Spawn one worker atomically; no log handle survives a failed Popen."""
@@ -265,6 +378,11 @@ def _spawn_worker(
     env["DBD_WORKER_ID"] = worker_id
     if fleet_rate_ceiling is not None:
         env["DBD_FLEET_RATE_CEILING"] = str(float(fleet_rate_ceiling))
+    if resource_plan is not None:
+        env["DB_POOL_SIZE"] = str(resource_plan.db_pool_per_worker)
+        env["DBD_ARCHIVE_WORKERS"] = str(resource_plan.archive_workers_per_worker)
+        env["DBD_PROJECTION_WORKERS"] = str(resource_plan.projection_workers_per_worker)
+        env["DBD_REDIS_MAX_CONNECTIONS"] = str(resource_plan.redis_connections_per_client)
     command = _worker_command(run_id, concurrency=concurrency, rate=rate)
     creationflags = 0
     start_new_session = False
@@ -406,6 +524,8 @@ def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
 
 
 def _fleet_rate_target(plan: CampaignRatePlan, rate_workers: int) -> float:
+    if plan.independent:
+        return plan.ceiling
     if plan.mode == "shared":
         return plan.worker_rate
     return min(plan.ceiling, plan.worker_rate * max(1, int(rate_workers)))
