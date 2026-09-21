@@ -197,8 +197,8 @@ cost, retention and restore obligations that must be measured in canaries.
 ## Database safety and CI
 
 Back up MySQL before schema maintenance. Alembic migrations are additive/forward-only
-and automatic downgrade is disabled. V2 schema head is currently
-`0007_project_attempt_budget`; restore a backup to roll back.
+and automatic downgrade is disabled. Current schema head is
+`0008_campaign_runtime`; restore a backup to roll back.
 
 Local/CI integration tests require `DBD_INTEGRATION=1` and a database name beginning
 `dbd_test_`. Redis tests use a disposable Redis database. A green workflow on the
