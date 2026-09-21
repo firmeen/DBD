@@ -998,6 +998,11 @@ def supervise_campaign(
     final_snapshot: dict[str, int] | None = None
     registered_states: list[dict] = []
     retired_metrics: dict[str, int] = {}
+    http_sample_at = 0.0
+    http_sample_requests = 0
+    http_sample_rate_limit_hits = 0
+    observed_http_rate: float | None = None
+    recent_rate_limit_delta = 0
     progress = ProgressLine(f"CAMPAIGN {run_id}", interval=0.75)
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
@@ -1079,6 +1084,7 @@ def supervise_campaign(
         )
 
         now = time.monotonic()
+        http_sample_at = now
         next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
         next_work_check = now
         next_worker_refresh = now
@@ -1131,12 +1137,28 @@ def supervise_campaign(
                 _refresh_supervisor_lease(redis, run_id, token)
                 next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
 
+            worker_state_refreshed = False
             if now >= next_worker_refresh:
                 registered_states = _registered_worker_states(redis, run_id)
                 next_worker_refresh = now + _WORKER_STATE_REFRESH_SECONDS
+                worker_state_refreshed = True
 
             live_metrics = _worker_metrics(registered_states)
             campaign_metrics = _with_retired_metrics(live_metrics, retired_metrics)
+            if worker_state_refreshed:
+                elapsed = max(0.001, now - http_sample_at)
+                current_requests = int(campaign_metrics.get("requests", 0))
+                current_rate_limit_hits = int(campaign_metrics.get("rate_limit_hits", 0))
+                observed_http_rate = (
+                    max(0, current_requests - http_sample_requests) / elapsed
+                )
+                recent_rate_limit_delta = max(
+                    0,
+                    current_rate_limit_hits - http_sample_rate_limit_hits,
+                )
+                http_sample_at = now
+                http_sample_requests = current_requests
+                http_sample_rate_limit_hits = current_rate_limit_hits
             live_progress = _live_progress(baseline, campaign_metrics)
             total = live_progress["total"]
             pending = live_progress["pending_estimate"]
@@ -1234,6 +1256,15 @@ def supervise_campaign(
                 break
 
             target = len(active_live)
+            current_rate_target = _fleet_rate_target(
+                plan,
+                len([worker for worker in live if not worker.capacity_lost]),
+            )
+            current_effective_rate = _effective_rate(
+                redis,
+                settings.dbd_redis_rate_key,
+                plan.initial,
+            )
             if autoscale and not graceful_stop:
                 target = controller.target(
                     pending=pending,
@@ -1241,6 +1272,12 @@ def supervise_campaign(
                     current=len(active_live),
                     effective_maximum=effective_maximum,
                     now=now,
+                    fetch_queue=live_metrics.get("fetch_queue", 0),
+                    archive_queue=live_metrics.get("archive_queue", 0),
+                    project_queue=live_metrics.get("project_queue", 0),
+                    observed_http_rate=observed_http_rate if plan.independent else None,
+                    rate_target=current_effective_rate if plan.independent else None,
+                    rate_limit_delta=recent_rate_limit_delta,
                 )
                 if target > len(active_live) and len(live) < effective_maximum:
                     try:
@@ -1358,6 +1395,8 @@ def supervise_campaign(
                     rate_effective=effective,
                     rate_target=rate_target,
                     rate_ceiling=plan.ceiling,
+                    http_rate_observed=observed_http_rate,
+                    rate_limit_delta=recent_rate_limit_delta,
                     db_connections_budget=resource_plan.db_connections_budget,
                     db_connections_effective_max=resource_plan.db_connections_effective_max,
                     db_pool_per_worker=resource_plan.db_pool_per_worker,
