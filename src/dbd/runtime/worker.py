@@ -53,12 +53,22 @@ def code_batches(path: str, size: int):
             yield batch
 
 
-async def prepare(repo, *, file=None, master=False, parts=None, fiscal_year=None, statuses=None):
+async def prepare(
+    repo,
+    *,
+    file=None,
+    master=False,
+    parts=None,
+    fiscal_year=None,
+    statuses=None,
+    scheduler_mode="legacy",
+):
     resources = endpoints(list(parts or DEFAULT_PARTS))
     run_id = await repo.create_run(
         str(Path(file).resolve()) if file else "company_master",
         list(parts or DEFAULT_PARTS),
         fiscal_year,
+        scheduler_mode=scheduler_mode,
     )
     if file:
         for batch in code_batches(file, settings.dbd_write_batch_size):
@@ -179,6 +189,7 @@ async def process(
     client_ref = None
     runtime_stats = {
         "completed": 0,
+        "done": 0,
         "failed": 0,
         "retry_wait": 0,
         "not_available": 0,
@@ -224,6 +235,7 @@ async def process(
             "current_stage": current_stage,
             "claimed": int(claimed_attempts),
             "completed": int(runtime_stats["completed"]),
+            "done": int(runtime_stats["done"]),
             "failed": int(runtime_stats["failed"]),
             "retry_wait": int(runtime_stats["retry_wait"]),
             "not_available": int(runtime_stats["not_available"]),
@@ -364,11 +376,8 @@ async def process(
 
             now = time.monotonic()
             if now >= idle_progress_at:
-                progress = await repo.progress(run_id)
                 idle_progress_at = now + _IDLE_PROGRESS_POLL_SECONDS
-                if not any(
-                    progress.get(status, 0) for status in ("pending", "running", "retry_wait")
-                ):
+                if not await repo.has_active_work(run_id):
                     drain_requested.set()
                     await publish_heartbeat(status="draining")
                     continue
@@ -494,6 +503,10 @@ async def process(
                 TASKS.labels(task["endpoint"], outcome).inc()
                 PIPELINE_STAGE_TOTAL.labels("project", outcome).inc()
                 runtime_stats["completed"] += 1
+                if outcome == "not_available":
+                    runtime_stats["not_available"] += 1
+                else:
+                    runtime_stats["done"] += 1
             except asyncio.CancelledError:
                 raise
             except LeaseLost:

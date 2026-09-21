@@ -81,6 +81,14 @@ async def test_archived_fetch_resumes_projection_without_http(repo):
     archive_id = await repo.archive(task, response, "/synthetic/profile", None)
 
     async with repo.engine.connect() as conn:
+        archive_run_id = (
+            await conn.execute(
+                text("SELECT run_id FROM response_archive WHERE id=:id"),
+                {"id": archive_id},
+            )
+        ).scalar_one()
+        assert archive_run_id == run
+
         row = (
             await conn.execute(
                 text("""
