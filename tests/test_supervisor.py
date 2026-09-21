@@ -3,15 +3,19 @@ from types import SimpleNamespace
 
 import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
+    CampaignResourcePlan,
     WorkerProcess,
     _drain_registered_workers,
+    _fleet_rate_target,
     _force_kill_worker,
     _live_progress,
     _seed_rate,
+    _spawn_worker,
     _terminate_workers,
     _with_retired_metrics,
     _worker_command,
     build_rate_plan,
+    build_resource_plan,
 )
 
 
@@ -273,3 +277,117 @@ def test_retired_terminal_metrics_preserve_done_progress() -> None:
     assert merged["done"] == 10
     assert merged["not_available"] == 3
     assert merged["failed"] == 1
+
+
+def test_explicit_fleet_rate_is_independent_of_worker_count() -> None:
+    plan = build_rate_plan(
+        "adaptive",
+        2,
+        20,
+        initial_workers=4,
+        fleet_rate_initial=12,
+        fleet_rate_max=20,
+    )
+    assert plan.independent is True
+    assert plan.initial == 12
+    assert plan.ceiling == 20
+    assert plan.worker_rate == 20
+    assert _fleet_rate_target(plan, 4) == 20
+    assert _fleet_rate_target(plan, 20) == 20
+
+
+def test_explicit_fleet_rate_rejects_initial_above_ceiling() -> None:
+    try:
+        build_rate_plan(
+            "adaptive",
+            2,
+            20,
+            fleet_rate_initial=21,
+            fleet_rate_max=20,
+        )
+    except ValueError as exc:
+        assert "0 < initial <= max" in str(exc)
+    else:
+        raise AssertionError("invalid explicit fleet rate must fail")
+
+
+def test_resource_plan_bounds_maximum_fleet() -> None:
+    plan = build_resource_plan(
+        20,
+        db_pool_size=8,
+        archive_workers=2,
+        projection_workers=8,
+        redis_max_connections=4,
+        db_connections_max=96,
+        archive_workers_max=20,
+        projection_workers_max=40,
+        redis_connections_max=128,
+    )
+    assert plan.db_pool_per_worker == 2
+    assert plan.db_connections_effective_max <= 96
+    assert plan.archive_workers_per_worker == 1
+    assert plan.archive_workers_effective_max == 20
+    assert plan.projection_workers_per_worker == 2
+    assert plan.projection_workers_effective_max == 40
+    assert plan.redis_connections_per_client == 3
+    assert plan.redis_connections_effective_max <= 128
+
+
+def test_resource_plan_rejects_budget_that_cannot_support_workers_max() -> None:
+    try:
+        build_resource_plan(
+            20,
+            db_pool_size=8,
+            archive_workers=2,
+            projection_workers=8,
+            redis_max_connections=4,
+            db_connections_max=40,
+        )
+    except ValueError as exc:
+        assert "fleet DB connection budget" in str(exc)
+    else:
+        raise AssertionError("undersized DB budget must fail closed")
+
+
+def test_spawn_worker_applies_derived_resource_caps(monkeypatch) -> None:
+    captured = {}
+
+    class FakeProcess:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", fake_popen)
+    plan = CampaignResourcePlan(
+        max_workers=20,
+        supervisor_db_pool=8,
+        db_connections_budget=96,
+        db_pool_per_worker=2,
+        archive_workers_budget=20,
+        archive_workers_per_worker=1,
+        projection_workers_budget=40,
+        projection_workers_per_worker=2,
+        redis_connections_budget=128,
+        redis_connections_per_client=3,
+    )
+
+    worker = _spawn_worker(
+        7,
+        1,
+        concurrency=12,
+        rate=20,
+        fleet_rate_ceiling=20,
+        open_powershell=True,
+        resource_plan=plan,
+    )
+    assert worker.process.pid == 1234
+    assert captured["env"]["DB_POOL_SIZE"] == "2"
+    assert captured["env"]["DBD_ARCHIVE_WORKERS"] == "1"
+    assert captured["env"]["DBD_PROJECTION_WORKERS"] == "2"
+    assert captured["env"]["DBD_REDIS_MAX_CONNECTIONS"] == "3"
