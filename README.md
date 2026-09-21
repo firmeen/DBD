@@ -1,24 +1,96 @@
-# dbd-data
+# DBD Data Platform
 
-MySQL-backed DBD DataWarehouse ingestion with durable discovery checkpoints,
-endpoint-level work queues, crash-safe leases, replayable response archives and
-natural-key-fenced projections. MySQL remains the durable metadata/source-of-truth
-boundary. Redis and S3-compatible object storage are optional scale features; neither
-is required for the default single-process/MySQL deployment.
+ระบบสำหรับเก็บและจัดการข้อมูลจาก DBD DataWarehouse แบบทำงานต่อเนื่องได้ แม้ process หยุดหรือเครื่อง restart โดยใช้ **MySQL เป็นข้อมูลหลักที่เชื่อถือได้**, ใช้ queue/task state สำหรับ resume งาน และสามารถใช้ **Redis** เพื่อควบคุม Campaign/worker หลาย process ร่วมกัน
 
-## Install
+ถ้าคุณเพิ่งเข้ามาในโปรเจกต์นี้ ไม่จำเป็นต้องอ่าน architecture ทั้งหมดก่อน ให้เริ่มจากหัวข้อ **เริ่มใช้งานแบบสั้นที่สุด** ด้านล่าง
 
-Python 3.11+ and MySQL 8+ are required. The local configuration commonly uses
-port **3307**.
+---
 
-```powershell
-.\scripts\bootstrap.ps1 -Dev -InstallCommand
+## ระบบนี้ทำอะไร
+
+ภาพรวมการทำงาน:
+
+```text
+DBD DataWarehouse
+       │
+       ▼
+Discovery
+ค้นหา/เก็บ master บริษัท
+       │
+       ▼
+company_master (MySQL)
+       │
+       ▼
+Campaign / Bulk collection
+       │
+       ├── fetch
+       ├── durable archive
+       └── project
+               │
+               ▼
+        normalized tables
 ```
 
-Configuration is read from the checkout's `.env`; set `DBD_ENV_FILE` to an absolute
-file to use another config. Shell environment variables override the file. Never
-commit database passwords, Redis credentials, object-store credentials or archive
-encryption keys.
+MySQL เก็บ durable state ของงานทั้งหมด เช่น master company, run, task, lease และ archive metadata
+
+Redis ไม่ใช่ฐานข้อมูลหลัก ใช้สำหรับ coordination เช่น shared rate, worker heartbeat, cooldown และ campaign control
+
+---
+
+## เริ่มใช้งานแบบสั้นที่สุด
+
+### 1. เตรียมโปรเจกต์
+
+ต้องมีอย่างน้อย:
+
+- Git
+- Python 3.11+
+- MySQL 8+
+
+บน Windows:
+
+```powershell
+git clone https://github.com/firmeen/DBD.git
+cd DBD
+
+.\scripts\bootstrap.ps1 -Dev -InstallCommand
+.\.venv\Scripts\Activate.ps1
+```
+
+ถ้า repository มีอยู่แล้ว:
+
+```powershell
+git switch main
+git pull --ff-only
+```
+
+### 2. ตั้งค่า .env
+
+ไฟล์จริงคือ:
+
+```text
+.env
+```
+
+ตัวอย่างขั้นต่ำ:
+
+```env
+DB_HOST=127.0.0.1
+DB_PORT=3307
+DB_NAME=dbd
+DB_USER=dbd-data
+DB_PASSWORD=<YOUR_MYSQL_PASSWORD>
+```
+
+ห้าม commit `.env`
+
+ตรวจว่า Git ignore แล้ว:
+
+```powershell
+git check-ignore .env
+```
+
+### 3. ตรวจ database
 
 ```powershell
 dbd-data --version
@@ -26,33 +98,46 @@ dbd-data check-db
 dbd-data migrate
 ```
 
-Migrations require schema privileges. Runtime collection needs normal DML privileges.
-Migrations are forward-only and data-preserving; restore a backup to roll back.
+ถ้าพร้อมควรเห็น migration จบด้วย:
 
-## Current collection scope
+```text
+Schema is current
+```
 
-The default production scope is tabs 1-2, **seven endpoints per company**:
+### 4. ดูสถานะข้อมูล
 
-- `profile`
-- `committees`
-- `committee_signs`
-- `transformations`
-- `financial_submissions`
-- `financial_statements`
-- `industry_benchmark`
+```powershell
+dbd-data master-status
+dbd-data discover-status
+```
 
-Tabs 3-4 remain implemented but are not collected by default. Request them explicitly
-with `--only nationality,history`.
+จากจุดนี้ single-process workflow ใช้งานได้แล้ว
 
-Financial endpoints depend on a successfully projected profile. A confirmed lack of
-submitted fiscal years is `not_available`; a transport failure, schema change,
-quarantined row or unseen company is not.
+ถ้าจะใช้ **Campaign / distributed workers** ให้ตั้ง Redis เพิ่มตาม [Redis setup](docs/setup/REDIS.md)
 
-DBD identities remain strings. Numeric juristic-person types are strict 13-digit
-registration numbers. Observed type `A` records may contain 11-13 digits and are
-preserved exactly as returned; the collector does not invent leading zeros.
+---
 
-## Discovery
+## คู่มือติดตั้งและเครื่องมือ
+
+ถ้าเป็นเครื่องใหม่ แนะนำทำตาม [Setup guides](docs/setup/README.md) ตามลำดับ
+
+| คู่มือ | ใช้เมื่อ |
+| --- | --- |
+| [Windows project setup](docs/setup/WINDOWS_PROJECT_SETUP.md) | เตรียม Git, Python, venv และติดตั้งโปรเจกต์ |
+| [MySQL setup](docs/setup/MYSQL.md) | เตรียม database, user และ migration |
+| [Redis setup](docs/setup/REDIS.md) | ใช้ Campaign หรือ distributed mode |
+| [DBeaver setup](docs/setup/DBEAVER.md) | ต้องการเปิดดูฐานข้อมูลและรัน SQL ผ่าน GUI |
+| [Web app setup](docs/setup/WEB_APP.md) | ต้องการรัน/พัฒนา `apps/web` |
+| [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) | ให้เครื่องอื่นหรือทีมอื่นต่อ MySQL |
+| [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md) | Canary, production campaign, status, stop และ resume |
+
+---
+
+## Discovery คืออะไร
+
+Discovery มีหน้าที่ค้นหา company identity จาก DBD และสร้าง/อัปเดต `company_master`
+
+คำสั่งหลัก:
 
 ```powershell
 dbd-data discover
@@ -62,208 +147,294 @@ dbd-data discover-refresh
 dbd-data master-status
 ```
 
-Discovery uses audited registration-prefix seeds, including the observed `099`
-exception, and splits oversized search buckets by legal type, province and business
-size. Valid rows are persisted even when another row on the same page fails contract
-validation; rejected rows are quarantined in `discovery_rejections` and the page
-remains `partial` until a later retry resolves it.
+Discovery มี durable checkpoint ดังนั้นไม่ควร reset ใหม่เพียงเพราะ network error ชั่วคราว
 
-`discover-status` can prove internal seed/sighting consistency and expose observed
-prefix gaps. It cannot prove that upstream search returned every juristic person.
-A complete-population claim still requires reconciliation against an authoritative
-external population/count source.
+ระบบเก็บ valid rows ที่ผ่าน validation และ quarantine row ที่ผิด contract แยกไว้ ไม่ทิ้งทั้ง page เพียงเพราะมีบาง row ผิด
 
-## Bulk collection — V2 staged pipeline
+`discover-status` บอก coverage ที่ระบบสังเกตได้ แต่ไม่ได้หมายความโดยอัตโนมัติว่า upstream ส่งบริษัททั้งหมดครบ 100%
 
-Create one immutable all-status run:
+---
+
+## ข้อมูลเชิงลึกที่เก็บต่อบริษัท
+
+default production scope ปัจจุบันมี **7 endpoints/company**
+
+```text
+profile
+committees
+committee_signs
+transformations
+financial_submissions
+financial_statements
+industry_benchmark
+```
+
+Tabs 3-4 ยังรองรับแบบ opt-in:
+
+```text
+nationality
+history
+```
+
+Financial endpoints ต้องพึ่งข้อมูลจาก profile ก่อน ถ้า source ยืนยันว่าไม่มี fiscal year ที่ต้องใช้ task สามารถจบเป็น `not_available` ได้ ซึ่งไม่ถือเป็น failure
+
+---
+
+## Campaign
+
+Campaign เป็นวิธีที่ง่ายที่สุดในการเปิด worker fleet ที่ coordinated ผ่าน Redis
+
+ก่อน production ให้รัน canary ก่อน ดูขั้นตอนเต็มใน [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md)
+
+ตัวอย่าง production all-status campaign:
+
+```powershell
+$env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
+
+dbd-data campaign start `
+  --master `
+  --all-statuses `
+  --workers 6 `
+  --workers-min 3 `
+  --workers-max 6 `
+  --worker-concurrency 12 `
+  --worker-rate 2 `
+  --rate-mode adaptive `
+  --max-restarts 3 `
+  --headless
+```
+
+ค่าด้านบนเป็น operational example ไม่ใช่การรับประกันว่า upstream จะรับ rate นี้ได้เสมอ ต้องดู canary, 429/503 และ throughput จริง
+
+เมื่อได้ run ID เช่น:
+
+```text
+Campaign run 12 prepared
+```
+
+ให้จำ `12` ไว้
+
+ดูสถานะ:
+
+```powershell
+dbd-data campaign status 12
+dbd-data bulk-status 12
+```
+
+หยุดแบบ graceful:
+
+```powershell
+dbd-data campaign stop 12
+```
+
+resume run เดิม:
+
+```powershell
+dbd-data campaign resume 12 `
+  --workers 6 `
+  --workers-min 3 `
+  --workers-max 6 `
+  --worker-concurrency 12 `
+  --worker-rate 2 `
+  --rate-mode adaptive `
+  --max-restarts 3 `
+  --headless
+```
+
+ถ้า process หยุด **อย่าใช้ `campaign start` เพื่อ resume** เพราะจะสร้าง run ใหม่
+
+---
+
+## Bulk mode
+
+Bulk V2 ยังใช้งานได้โดยตรงโดยไม่ผ่าน Campaign supervisor
+
+สร้าง immutable all-status run:
 
 ```powershell
 dbd-data bulk --master --all-statuses --enqueue-only
 ```
 
-Record its run ID and resume that exact run. V2 decouples fetch, archive and
-projection with bounded queues. A fetched response must become durably recoverable
-before its task transitions to `stage=project`, so restart can resume projection
-without re-contacting DBD.
+จากนั้นใช้ run ID เดิม:
 
 ```powershell
-# Bounded canary first.
-dbd-data bulk --run-id 2 --concurrency 32 --rate 20 --limit 2000 --metrics-port 9108
-
-# Inspect durable status and stage backlog.
-dbd-data bulk-status 2
-
-# Resume the same run after the canary.
-dbd-data bulk --run-id 2 --concurrency 32 --rate 20 --metrics-port 9108
-
-dbd-data bulk-retry 2
+dbd-data bulk --run-id N --concurrency <CONCURRENCY> --rate <RATE>
+dbd-data bulk-status N
 ```
 
-Optional endpoint targets keep known-slower endpoints below the global ceiling:
+ถ้ามี failed task ที่ retry ได้:
 
 ```powershell
-dbd-data bulk `
-  --run-id 2 `
-  --concurrency 48 `
-  --rate 40 `
-  --endpoint-rates "profile=20,committees=12,committee_signs=12,transformations=10,financial_submissions=10,financial_statements=12,industry_benchmark=8" `
-  --metrics-port 9108
+dbd-data bulk-retry N
 ```
 
-These are examples, not recommended production rates. A 429/503 backs off the
-affected endpoint and global safety layer. Healthy decoded responses recover
-conservatively toward configured ceilings.
+อย่าใช้ `bulk --master` เป็นคำสั่ง resume เพราะมันสร้าง run ใหม่
 
-`--master` without `--all-statuses` selects only identities whose latest observed
-status is operating (`jpStatCode=1`). Unknown status is not guessed. The current
-all-company acceptance campaign uses `--all-statuses`.
+---
 
-### Optional distributed workers
+## Redis
 
-Redis is required only for distributed worker mode. Every process must use the same
-MySQL database, existing run ID, Redis URL and rate namespace:
+Redis จำเป็นสำหรับ:
 
-```powershell
-$env:DBD_REDIS_URL = "redis://127.0.0.1:6379/0"
-$env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
+- Campaign supervisor
+- distributed bulk workers
+- distributed discovery
+- shared adaptive rate/cooldown
+- worker heartbeat/control
 
-dbd-data bulk --run-id 2 --distributed --concurrency 32 --rate 40
+ตัวแปร:
+
+```env
+DBD_REDIS_URL="rediss://<USERNAME>:<PASSWORD>@<ENDPOINT>:<PORT>/0"
+DBD_REDIS_RATE_KEY=dbd:dev:global-rate
 ```
 
-MySQL leases and `FOR UPDATE SKIP LOCKED` coordinate work ownership. Redis coordinates
-aggregate pacing **and shared adaptive backoff/cooldown/recovery**, so a 429/503 seen
-by one process constrains the fleet using the same namespace. Do not use independent
-keys, proxies, sessions or IP rotation to bypass upstream throttling.
+สำหรับ production:
 
-## Archive storage
+```env
+DBD_REDIS_RATE_KEY=dbd:production:global-rate
+```
 
-The default is inline MySQL archive storage with optional zstd compression:
+รายละเอียด TLS, user, ACL และ preflight อยู่ที่ [Redis setup](docs/setup/REDIS.md)
+
+---
+
+## Response archive และ recovery
+
+pipeline แยกงานเป็น:
+
+```text
+fetch → archive → project
+```
+
+response ที่ fetch สำเร็จต้องผ่าน durable archive boundary ก่อน projection
+
+เพราะฉะนั้นถ้า process crash หลัง archive แล้ว ระบบสามารถกลับมา project จาก archive โดยไม่จำเป็นต้องยิง DBD ซ้ำ
+
+default archive backend คือ MySQL:
 
 ```powershell
 $env:DBD_ARCHIVE_BACKEND = "mysql"
 ```
 
-For very large campaigns, V2 can instead store response bodies in S3-compatible
-object storage while MySQL retains archive metadata and the durable task reference.
-External blobs are optionally zstd-compressed first and then encrypted client-side
-with **AES-256-GCM** before upload. The database stores object key, nonce, key id and
-checksums; it does not store the external row's decoded response body inline.
+ระบบรองรับ S3-compatible external archive แบบ encrypted ด้วย แต่เป็น advanced deployment ดู [High-throughput V2](docs/HIGH_THROUGHPUT_V2.md)
 
-```powershell
-$env:DBD_ARCHIVE_BACKEND = "s3"
-$env:DBD_ARCHIVE_S3_BUCKET = "dbd-response-archive"
-$env:DBD_ARCHIVE_S3_PREFIX = "production/response-archive"
-$env:DBD_ARCHIVE_S3_REGION = "ap-southeast-1"
-$env:DBD_ARCHIVE_ENCRYPTION_KEY_B64 = "<base64-encoded-32-byte-key>"
-$env:DBD_ARCHIVE_ENCRYPTION_KEY_ID = "v2"
-```
-
-For MinIO/another S3-compatible service, set `DBD_ARCHIVE_S3_ENDPOINT_URL`. boto3 uses
-its normal credential chain; prefer an IAM role/workload identity rather than copying
-cloud credentials into the application config.
-
-Key rotation is supported for reads. New writes always use the active key/id above;
-older key ids can remain replayable through a protected JSON map:
-
-```powershell
-$env:DBD_ARCHIVE_DECRYPTION_KEYS = '{"v1":"<old-base64-key>"}'
-```
-
-Archive backend/key validation happens before opening the DBD HTTP client, so invalid
-archive configuration cannot consume upstream requests. External upload completes
-before MySQL commits the archive reference + `stage=project` transition. A failed
-upload therefore cannot create a project-stage task. A database failure after an
-upload may leave an unreferenced encrypted object, which is safer than committing a
-reference to an object that never existed and can be handled by retention/orphan
-maintenance.
-
-Backup/restore for external archives requires **all three**: MySQL metadata backup,
-object-store data, and the required encryption key ids/keys. See
-`docs/HIGH_THROUGHPUT_V2.md` for the full operational contract.
-
-## Projection correctness and replay
+Replay archive โดยไม่เรียก upstream:
 
 ```powershell
 dbd-data replay ARCHIVE_ID
 ```
 
-Replay never contacts DBD. It can transparently read legacy JSON, zstd-compressed
-MySQL archives, and configured encrypted external archives. External ciphertext SHA,
-AES-GCM authentication and canonical plaintext SHA are checked before projection.
-Missing object/key/decryption/integrity failures fail the project/replay path rather
-than silently refetching upstream.
+---
 
-Freshness is fenced by the **natural keys actually mutated**, not only by request
-scope:
+## Web app
 
-- financial statements: company + fiscal year;
-- submissions: whole company collection;
-- industry benchmark: TSIC + fiscal year + size + location type + location number;
-- other company resources: company + endpoint collection.
-
-An older replay therefore cannot overwrite a newer natural-key projection even when
-request scopes differ or companies share a benchmark scope.
-
-## Monitoring and capacity validation
-
-```powershell
-dbd-data bulk --run-id 2 --metrics-port 9108
-```
-
-Metrics bind only to localhost. Structured diagnostics include safe stage/path/error
-metadata and do not dump tokens, cookies, encryption keys or whole response bodies.
-
-For V2 capacity planning, stop every collector and use the mixed seven-endpoint probe:
-
-```powershell
-python scripts\probe_mixed_capacity.py `
-  --collector-stopped `
-  --min-rate 10 `
-  --max-rate 40 `
-  --concurrency 48 `
-  --companies 100 `
-  --repeats 2 `
-  --step-seconds 20 `
-  --max-requests 12000
-```
-
-The probe stops admission at the measurement deadline and drains only requests already
-on transport. It does not persist responses and does not establish a production
-ceiling or 48-hour guarantee. Those require a persisted bounded canary and the final
-immutable all-status campaign.
-
-## Validation
-
-GitHub Actions runs on Python 3.12 with disposable MySQL 8.4 (`dbd_test_ci`) and Redis
-for distributed-rate integration coverage:
+หน้าเว็บอยู่ที่:
 
 ```text
-python -m compileall -q src scripts tests
-ruff check .
-pytest -q
+apps/web
 ```
 
-The pull request's latest GitHub Actions run is the authoritative validation record
-for its current head. Do not reuse a test count or SHA from an older head.
-
-See:
-
-- `docs/ARCHITECTURE.md` — current design and invariants
-- `docs/HIGH_THROUGHPUT_V2.md` — V2 staging, Redis, archive backends and tuning
-- `docs/RUNBOOK.md` — operating procedure
-- `docs/OPERATIONS.md` — configuration/failure handling
-- `docs/VALIDATION.md` — measured/proven vs unknown
-- `docs/EXECUTION_PLAN_TH.md` — 48-hour acceptance plan and remaining live validation
-
-## Development
+เริ่ม development:
 
 ```powershell
-.\scripts\bootstrap.ps1 -Dev
-.\.venv\Scripts\python.exe -m pytest tests -q
-.\.venv\Scripts\python.exe -m ruff check .
+cd apps\web
+npm ci
+npm run dev
 ```
 
-Local integration tests require `DBD_INTEGRATION=1` and a disposable database whose
-name begins `dbd_test_`. Redis tests use `DBD_REDIS_TEST_URL` and must target a
-disposable Redis database. `scripts/benchmark_queue.py` uses the same disposable-name
-guard and never contacts DBD.
+รายละเอียดอยู่ที่ [Web app setup](docs/setup/WEB_APP.md)
+
+---
+
+## คำสั่งที่ใช้บ่อย
+
+```powershell
+# Database
+dbd-data check-db
+dbd-data migrate
+
+# Discovery
+dbd-data discover
+dbd-data discover-status
+dbd-data master-status
+
+# Campaign
+dbd-data campaign start --help
+dbd-data campaign status RUN_ID
+dbd-data campaign stop RUN_ID
+dbd-data campaign resume RUN_ID
+
+# Bulk queue
+dbd-data bulk-status RUN_ID
+dbd-data bulk-retry RUN_ID
+
+# Archive
+dbd-data replay ARCHIVE_ID
+```
+
+---
+
+## Development validation
+
+Python:
+
+```powershell
+.\.venv\Scripts\python.exe -m compileall -q src scripts tests
+.\.venv\Scripts\python.exe -m ruff check .
+.\.venv\Scripts\python.exe -m pytest tests -q
+```
+
+Web:
+
+```powershell
+cd apps\web
+
+npm run typecheck
+npm run lint
+npm run test
+npm run build
+```
+
+Integration tests ต้องใช้ disposable test database ที่ชื่อขึ้นต้นด้วย `dbd_test_` และ Redis test URL ต้องชี้ไปที่ disposable Redis database
+
+---
+
+## หลักความปลอดภัย
+
+- อย่า commit `.env`
+- อย่าใส่ MySQL/Redis password ใน source code, README, Issue หรือ PR
+- Redis Cloud public endpoint ควรใช้ TLS
+- แยก runtime credential ออกจาก analyst/client credential
+- Remote MySQL user ควรถูกจำกัดด้วย `user@host` และสิทธิ์เท่าที่จำเป็น
+- อย่าแก้ task/run state ด้วย SQL manual บน production ถ้าไม่มี maintenance procedure รองรับ
+- backup ก่อน schema maintenance
+- migration เป็น forward-only; rollback ที่รองรับคือ restore จาก backup
+
+---
+
+## เอกสารเชิงลึก
+
+หลังจากใช้งานพื้นฐานได้แล้ว เอกสารเหล่านี้อธิบายรายละเอียดระดับระบบ:
+
+- [Architecture](docs/ARCHITECTURE.md) — design และ correctness invariants
+- [High-throughput V2](docs/HIGH_THROUGHPUT_V2.md) — staged pipeline, Redis และ archive backend
+- [Runbook](docs/RUNBOOK.md) — ขั้นตอน operation
+- [Operations](docs/OPERATIONS.md) — configuration และ failure handling
+- [Validation](docs/VALIDATION.md) — สิ่งที่พิสูจน์แล้วและสิ่งที่ยังต้องวัดจริง
+- [Execution plan](docs/EXECUTION_PLAN_TH.md) — production acceptance / 48-hour plan
+- [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) — remote database client access
+
+---
+
+## หลักการสำคัญของระบบ
+
+```text
+MySQL = durable source of truth
+Redis = coordination / shared rate control
+Archive = recovery boundary
+Run ID = งานที่ต้อง resume ให้ถูกตัว
+Canary = ต้องผ่านก่อนเพิ่ม load
+```
+
+ถ้าจำ 5 ข้อนี้ได้ จะเข้าใจวิธี operate ระบบส่วนใหญ่ได้ถูกต้อง
