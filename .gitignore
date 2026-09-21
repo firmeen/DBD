@@ -19,3 +19,5 @@ build/
 dist/
 .coverage
 pytest-cache-files-*/
+
+canary-companies*
