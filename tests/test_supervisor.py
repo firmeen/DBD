@@ -8,6 +8,7 @@ from dbd.runtime.supervisor import (
     _force_kill_worker,
     _live_progress,
     _seed_rate,
+    _with_retired_metrics,
     _terminate_workers,
     _worker_command,
     build_rate_plan,
@@ -262,3 +263,13 @@ def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) ->
     assert state["failed"] == 12
     assert state["workers"] == 1
     assert state["supervisor_active"] is True
+
+
+def test_retired_terminal_metrics_preserve_done_progress() -> None:
+    merged = _with_retired_metrics(
+        {"done": 3, "not_available": 1, "failed": 0},
+        {"done": 7, "not_available": 2, "failed": 1},
+    )
+    assert merged["done"] == 10
+    assert merged["not_available"] == 3
+    assert merged["failed"] == 1
