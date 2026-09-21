@@ -112,11 +112,20 @@ class AutoscaleController:
         current: int,
         effective_maximum: int,
         now: float,
+        fetch_queue: int = 0,
+        archive_queue: int = 0,
+        project_queue: int = 0,
+        observed_http_rate: float | None = None,
+        rate_target: float | None = None,
+        rate_limit_delta: int = 0,
     ) -> int:
-        """Return at most one safe fleet-size step with asymmetric hysteresis."""
+        """Scale only when the pipeline needs capacity and downstream is healthy."""
         current = max(0, int(current))
         pending = max(0, int(pending))
         running = max(0, int(running))
+        fetch_queue = max(0, int(fetch_queue))
+        archive_queue = max(0, int(archive_queue))
+        project_queue = max(0, int(project_queue))
         effective_maximum = max(0, min(int(effective_maximum), self.maximum))
         minimum = min(self.minimum, effective_maximum)
         capacity = max(1, int(self.worker_concurrency))
@@ -128,7 +137,27 @@ class AutoscaleController:
         if now < self.next_decision_at:
             return current
 
-        if current < effective_maximum and pending > max(capacity, current * capacity * 4):
+        downstream_limit = max(capacity * 2, current * capacity * 2)
+        downstream_backlog = (
+            archive_queue > downstream_limit or project_queue > downstream_limit
+        )
+        if rate_limit_delta > 0 or downstream_backlog:
+            self.low_pressure_observations = 0
+            self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
+            return current
+
+        high_pending = pending > max(capacity, current * capacity * 4)
+        queue_starved = fetch_queue <= max(capacity, current * capacity)
+        under_rate = (
+            observed_http_rate is None
+            or rate_target is None
+            or observed_http_rate < (float(rate_target) * 0.90)
+        )
+        if (
+            current < effective_maximum
+            and high_pending
+            and (queue_starved or under_rate)
+        ):
             self.low_pressure_observations = 0
             self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
             return current + 1
