@@ -835,7 +835,7 @@ def supervise_campaign(
     plan = build_rate_plan(rate_mode, worker_rate, maximum, initial_workers=initial_workers)
     controller = AutoscaleController(minimum, maximum, worker_concurrency)
 
-    redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+    redis = _redis_client()
     token = f"{os.getpid()}-{uuid4().hex}"
     children: list[WorkerProcess] = []
     next_index = 1
@@ -846,10 +846,13 @@ def supervise_campaign(
     supervisor_error = False
     next_lease_refresh = 0.0
     next_state_write = 0.0
-    next_progress_refresh = 0.0
+    next_work_check = 0.0
     next_worker_refresh = 0.0
     last_rate_target: float | None = None
-    state: dict[str, int] = {}
+    last_effective_rate = plan.initial
+    last_lease_confirmed = 0.0
+    baseline: dict[str, int] = {}
+    has_work = True
     registered_states: list[dict] = []
     retired_metrics: dict[str, int] = {}
     progress = ProgressLine(f"CAMPAIGN {run_id}", interval=0.75)
@@ -913,17 +916,25 @@ def supervise_campaign(
         redis.ping()
         _acquire_supervisor_lease(redis, run_id, token)
         lease_acquired = True
+
+        # Resume from the last supervisor snapshot when available. This avoids
+        # re-aggregating a multi-million-row endpoint queue just to redraw progress.
+        baseline = _runtime_progress_baseline(redis, run_id) or _task_progress(run_id)
+        has_work = _has_active_work(run_id)
+
         now = time.monotonic()
+        last_lease_confirmed = now
         next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
-        next_progress_refresh = now
+        next_work_check = now + _DURABLE_WORK_CHECK_SECONDS
         next_worker_refresh = now
         _clear_stop(redis, run_id)
         initial_rate_target = _fleet_rate_target(plan, initial_workers)
         _seed_rate(redis, settings.dbd_redis_rate_key, plan.initial, initial_rate_target)
         last_rate_target = initial_rate_target
 
-        for _ in range(initial_workers):
-            children.append(spawn_worker())
+        if has_work:
+            for _ in range(initial_workers):
+                children.append(spawn_worker())
 
         _write_runtime_state(
             redis,
@@ -934,8 +945,8 @@ def supervise_campaign(
             workers_initial=initial_workers,
             workers_min=minimum,
             workers_max=maximum,
-            workers_target=initial_workers,
-            workers_active=initial_workers,
+            workers_target=initial_workers if has_work else 0,
+            workers_active=len(children),
             workers_draining=0,
             exhausted_capacity=0,
             worker_concurrency=worker_concurrency,
