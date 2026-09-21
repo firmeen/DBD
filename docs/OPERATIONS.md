@@ -13,11 +13,11 @@ Core controls:
 | `DBD_RATE_PER_SECOND` | Global target admission ceiling |
 | `DBD_ENDPOINT_RATES` / CLI `--endpoint-rates` | Optional per-endpoint ceilings |
 | `DB_POOL_SIZE` | Per-process DB pool default; campaign supervisor may derive a lower worker cap |
-| `DBD_FLEET_DB_CONNECTIONS_MAX` / `--fleet-db-connections-max` | Optional hard MySQL connection budget for one campaign fleet |
-| `DBD_FLEET_ARCHIVE_WORKERS_MAX` / `--fleet-archive-workers-max` | Optional archive-worker budget across `workers-max` |
-| `DBD_FLEET_PROJECTION_WORKERS_MAX` / `--fleet-projection-workers-max` | Optional projection-worker budget across `workers-max` |
+| `DBD_FLEET_DB_CONNECTIONS_MAX` / `--fleet-db-connections-max` | Hard MySQL connection budget for one campaign fleet; default `96` |
+| `DBD_FLEET_ARCHIVE_WORKERS_MAX` / `--fleet-archive-workers-max` | Archive-worker budget across `workers-max`; default `24` |
+| `DBD_FLEET_PROJECTION_WORKERS_MAX` / `--fleet-projection-workers-max` | Projection-worker budget across `workers-max`; default `48` |
 | `DBD_REDIS_MAX_CONNECTIONS` | Maximum connections in each Redis client pool |
-| `DBD_FLEET_REDIS_CONNECTIONS_MAX` / `--fleet-redis-connections-max` | Optional Redis connection budget for the long-lived campaign fleet |
+| `DBD_FLEET_REDIS_CONNECTIONS_MAX` / `--fleet-redis-connections-max` | Redis connection budget for the long-lived campaign fleet; default `128` |
 | `DBD_PIPELINE_QUEUE_SIZE` | Bounded fetch/archive/project backpressure |
 | `DBD_CLAIM_BATCH_SIZE` | Queue claims per transaction |
 | `DBD_ARCHIVE_BATCH_SIZE` | Archive responses handled per batch |
@@ -38,7 +38,9 @@ changing `workers` / `workers-max` does not change the shared HTTP ceiling.
 When they are omitted, the legacy `shared`, `multiply`, and `adaptive`
 worker-rate derivation remains compatible.
 
-Fleet resource limits are calculated before workers start. The supervisor reserves
+Fleet resource limits are calculated before workers start. Defaults are global
+fleet caps rather than per-worker multipliers: 96 MySQL connections, 24 archive
+workers, 48 projection workers and 128 Redis connections. The supervisor reserves
 its own DB pool, then derives identical per-worker DB/archive/projection/Redis caps
 for the configured `workers-max`. A budget that cannot support at least one unit
 per maximum worker fails closed instead of allowing connection or writer growth to
