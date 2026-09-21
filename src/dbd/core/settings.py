@@ -21,6 +21,9 @@ class Settings(BaseSettings):
     db_user: str = "dbd_app"
     db_password: str = Field("", repr=False)
     db_pool_size: int = Field(8, ge=1, le=100)
+    dbd_fleet_db_connections_max: int | None = Field(None, ge=3, le=10000)
+    dbd_fleet_archive_workers_max: int | None = Field(None, ge=1, le=10000)
+    dbd_fleet_projection_workers_max: int | None = Field(None, ge=1, le=10000)
     db_timeout: int = Field(30, ge=1)
     request_timeout: int = Field(30, ge=1)
     user_agent: str = "Mozilla/5.0"
@@ -60,6 +63,8 @@ class Settings(BaseSettings):
     dbd_metrics_port: int = Field(0, ge=0, le=65535)
     dbd_redis_url: str | None = None
     dbd_redis_rate_key: str = "dbd:global-rate"
+    dbd_redis_max_connections: int = Field(4, ge=1, le=128)
+    dbd_fleet_redis_connections_max: int | None = Field(None, ge=1, le=10000)
 
 
 settings = Settings()
