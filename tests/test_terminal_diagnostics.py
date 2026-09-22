@@ -3,11 +3,9 @@ from __future__ import annotations
 from uuid import uuid4
 
 import pytest
-from sqlalchemy import text
-
 from dbd.contracts.identity import parse_code
 from dbd.runtime.collection_fabric import endpoint_bit
-
+from sqlalchemy import text
 
 pytestmark = pytest.mark.integration
 
