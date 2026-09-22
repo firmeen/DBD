@@ -11,6 +11,7 @@ from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
 from curl_cffi.requests.exceptions import RequestException as RequestsError
+from redis.asyncio import Redis
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
@@ -20,7 +21,14 @@ from tenacity import (
 
 from ..core.exceptions import DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
-from ..core.telemetry import EFFECTIVE_RATE, HTTP_RETRIES, LATENCY, REQUESTS, log
+from ..core.telemetry import (
+    EFFECTIVE_RATE,
+    HTTP_RETRIES,
+    LATENCY,
+    REDIS_COMMANDS_PER_HTTP,
+    REQUESTS,
+    log,
+)
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
 from .rate_control import EndpointRateController
@@ -73,6 +81,7 @@ class AsyncDbdClient:
         endpoint_rates=None,
         redis_url=None,
         redis_key=None,
+        redis_client: Redis | None = None,
     ):
         self.concurrency = settings.dbd_concurrency if concurrency is None else concurrency
         if self.concurrency < 1:
@@ -87,6 +96,7 @@ class AsyncDbdClient:
             redis_key=redis_key or settings.dbd_redis_rate_key,
             shared_rate_ceiling=settings.dbd_fleet_rate_ceiling,
             redis_max_connections=settings.dbd_redis_max_connections,
+            redis_client=redis_client,
             circuit_failure_threshold=settings.dbd_circuit_failure_threshold,
             circuit_window_seconds=settings.dbd_circuit_window_seconds,
             circuit_open_seconds=settings.dbd_circuit_open_seconds,
@@ -190,8 +200,9 @@ class AsyncDbdClient:
                     self.retries_made += 1
                     HTTP_RETRIES.inc()
                 async with self._semaphore:
+                    admission = None
                     if rate_key is not None or self._shared_admission:
-                        await self.endpoint_rate.acquire(rate_key)
+                        admission = await self.endpoint_rate.acquire(rate_key)
                     else:
                         await self.rate.acquire()
                     token = await self._ensure_token()
@@ -299,17 +310,26 @@ class AsyncDbdClient:
                         )
                         raise
                     if rate_key:
-                        endpoint_recovered, global_recovered = await self.endpoint_rate.recover(rate_key)
+                        endpoint_recovered, global_recovered = await self.endpoint_rate.recover(
+                            rate_key,
+                            admission=admission,
+                        )
                         recovered = endpoint_recovered or global_recovered
                         global_effective = self.endpoint_rate.global_effective_rate()
                     elif self._shared_admission:
-                        recovered = await self.endpoint_rate.recover_global()
+                        recovered = await self.endpoint_rate.recover_global(
+                            admission=admission,
+                        )
                         global_effective = self.endpoint_rate.global_effective_rate()
                     else:
                         recovered = self.rate.recover()
                         global_effective = self.rate.rate
                         if recovered is not None:
                             EFFECTIVE_RATE.set(recovered)
+                    if self.requests_made:
+                        REDIS_COMMANDS_PER_HTTP.set(
+                            self.endpoint_rate.redis_commands / self.requests_made
+                        )
                     if recovered is not None:
                         log.info(
                             "rate_recovered",

@@ -14,6 +14,7 @@ from ..core.exceptions import (
     DbdForbiddenError,
     IdentityConflict,
 )
+from ..core.redis import close_async_redis, create_async_redis, redis_pool_snapshot
 from ..core.settings import settings
 from ..core.telemetry import (
     IN_FLIGHT,
@@ -27,7 +28,6 @@ from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
 STATUS_OPERATING = ("1",)
-_CONTROL_POLL_SECONDS = 0.5
 _REDIS_HEARTBEAT_SECONDS = 2.0
 _MAINTENANCE_INTERVAL_SECONDS = 5.0
 _MAINTENANCE_LEASE_SECONDS = 8
@@ -187,6 +187,7 @@ async def process(
     coordinator = None
     identity = None
     client_ref = None
+    redis_client = None
     runtime_stats = {
         "completed": 0,
         "done": 0,
@@ -199,16 +200,26 @@ async def process(
     }
 
     if distributed:
-        coordinator = CampaignCoordinator(
+        redis_client = create_async_redis(
             settings.dbd_redis_url,
-            run_id,
             max_connections=settings.dbd_redis_max_connections,
         )
-        await coordinator.open()
-        identity = WorkerIdentity(owner, int(run_id), os.getpid())
-        registration_status = await coordinator.register_worker(identity)
-        if registration_status == "draining":
-            drain_requested.set()
+        try:
+            await redis_client.ping()
+            coordinator = CampaignCoordinator(
+                settings.dbd_redis_url,
+                run_id,
+                max_connections=settings.dbd_redis_max_connections,
+                client=redis_client,
+            )
+            await coordinator.open()
+            identity = WorkerIdentity(owner, int(run_id), os.getpid())
+            registration_status = await coordinator.register_worker(identity)
+            if registration_status == "draining":
+                drain_requested.set()
+        except BaseException:
+            await close_async_redis(redis_client)
+            raise
 
     def queue_metrics():
         PIPELINE_QUEUE_DEPTH.labels("fetch").set(fetch_queue.qsize())
@@ -235,6 +246,14 @@ async def process(
             if active[stage] > 0:
                 current_stage = stage
                 break
+        redis_commands = 0
+        redis_admissions = 0
+        if client is not None:
+            controller = getattr(client, "endpoint_rate", None)
+            if controller is not None:
+                redis_commands = int(getattr(controller, "redis_commands", 0) or 0)
+                redis_admissions = int(getattr(controller, "redis_admissions", 0) or 0)
+        pool = redis_pool_snapshot(redis_client) if redis_client is not None else {}
         return {
             "current_stage": current_stage,
             "claimed": int(claimed_attempts),
@@ -257,31 +276,37 @@ async def process(
             "http_retries": int(getattr(client, "retries_made", 0) or 0),
             "rate_limit_hits": int(getattr(client, "rate_limit_hits", 0) or 0),
             "effective_rate": effective_rate,
+            "redis_commands": redis_commands,
+            "redis_admissions": redis_admissions,
+            "redis_pool_in_use": int(pool.get("in_use", 0)),
+            "redis_pool_created": int(pool.get("created", 0)),
+            "redis_pool_max": int(pool.get("max", 0)),
             "drain_requested": drain_requested.is_set(),
         }
 
-    async def publish_heartbeat(*, status: str | None = None) -> None:
+    async def publish_heartbeat(*, status: str | None = None) -> str | None:
         if coordinator is None or identity is None:
-            return
-        await coordinator.heartbeat_worker(
-            identity,
-            status=status or ("draining" if drain_requested.is_set() else "active"),
-            metrics=heartbeat_metrics(),
-        )
-
-    async def control_watcher():
-        """Poll ephemeral stop/drain control without increasing MySQL heartbeat writes."""
-        if coordinator is None or identity is None:
-            return
-        while not stop.is_set() and not drain_requested.is_set():
-            if await coordinator.control_requested(identity):
-                drain_requested.set()
-                await publish_heartbeat(status="draining")
-                return
-            try:
-                await asyncio.wait_for(stop.wait(), _CONTROL_POLL_SECONDS)
-            except TimeoutError:
-                pass
+            return None
+        try:
+            resolved = await coordinator.heartbeat_worker(
+                identity,
+                status=status or ("draining" if drain_requested.is_set() else "active"),
+                metrics=heartbeat_metrics(),
+            )
+        except Exception as exc:
+            # Redis is an ephemeral control plane. A transient heartbeat failure
+            # must not cancel MySQL-owned in-flight work.
+            log.warning(
+                "redis_heartbeat_failed",
+                worker_id=owner,
+                error_code=type(exc).__name__,
+            )
+            return None
+        # The heartbeat Lua transition evaluates stop + targeted drain atomically.
+        # This replaces the separate 0.5s control polling Redis round trip.
+        if resolved == "draining":
+            drain_requested.set()
+        return resolved
 
     async def mysql_heartbeat():
         while not stop.is_set():
@@ -310,9 +335,18 @@ async def process(
             if now >= maintenance_at:
                 should_maintain = True
                 if coordinator is not None and identity is not None:
-                    should_maintain = await coordinator.acquire_maintenance_slot(
-                        identity, ttl_seconds=_MAINTENANCE_LEASE_SECONDS
-                    )
+                    try:
+                        should_maintain = await coordinator.acquire_maintenance_slot(
+                            identity,
+                            ttl_seconds=_MAINTENANCE_LEASE_SECONDS,
+                        )
+                    except Exception as exc:
+                        should_maintain = False
+                        log.warning(
+                            "redis_maintenance_slot_failed",
+                            worker_id=owner,
+                            error_code=type(exc).__name__,
+                        )
                 if should_maintain:
                     await repo.maintain(run_id)
                 maintenance_at = now + _MAINTENANCE_INTERVAL_SECONDS
@@ -535,13 +569,14 @@ async def process(
         "redis_url": settings.dbd_redis_url if distributed else None,
         "redis_key": settings.dbd_redis_rate_key,
     }
+    if distributed:
+        client_kwargs["redis_client"] = redis_client
 
     try:
         async with client_factory(**client_kwargs) as client:
             client_ref = client
             async with asyncio.TaskGroup() as group:
                 if coordinator is not None:
-                    group.create_task(control_watcher())
                     group.create_task(redis_heartbeat())
                 group.create_task(mysql_heartbeat())
                 group.create_task(scheduler())
@@ -558,6 +593,8 @@ async def process(
         if coordinator is not None and identity is not None:
             await coordinator.unregister_worker(identity)
             await coordinator.close()
+        if redis_client is not None:
+            await close_async_redis(redis_client)
 
     await repo.close_if_complete(run_id)
     return await repo.progress(run_id)

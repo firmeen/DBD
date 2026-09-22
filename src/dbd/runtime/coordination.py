@@ -8,6 +8,9 @@ from typing import Mapping
 
 from redis.asyncio import Redis
 
+from ..core.redis import close_async_redis, create_async_redis
+from ..core.telemetry import REDIS_COMMANDS, REDIS_RTT
+
 
 @dataclass(frozen=True)
 class WorkerIdentity:
@@ -70,12 +73,15 @@ class CampaignCoordinator:
         *,
         namespace: str = "dbd:campaign",
         max_connections: int | None = None,
+        client: Redis | None = None,
     ) -> None:
         self.url = url
         self.run_id = int(run_id)
         self.namespace = namespace.rstrip(":")
         self.max_connections = max_connections
-        self._redis: Redis | None = None
+        self._redis: Redis | None = client
+        self._owns_redis = client is None
+        self._publish_worker_script = None
 
     @property
     def base_key(self) -> str:
@@ -101,22 +107,27 @@ class CampaignCoordinator:
 
     async def open(self) -> None:
         if self._redis is None:
-            kwargs = {"decode_responses": True}
-            if self.max_connections is not None:
-                kwargs["max_connections"] = max(1, int(self.max_connections))
-            self._redis = Redis.from_url(self.url, **kwargs)
-            await self._redis.ping()
+            self._redis = create_async_redis(
+                self.url,
+                max_connections=self.max_connections,
+            )
+        await self._redis.ping()
+        self._publish_worker_script = self._redis.register_script(
+            self._PUBLISH_WORKER_SCRIPT
+        )
+        await self._redis.script_load(self._PUBLISH_WORKER_SCRIPT)
 
     async def close(self) -> None:
-        if self._redis is not None:
+        if self._redis is not None and self._owns_redis:
             client = self._redis
             self._redis = None
             try:
-                await client.aclose()
+                await close_async_redis(client)
             except Exception:
                 # Redis is control-plane state only. Closing a broken socket must
                 # never replace the durable worker/MySQL error being propagated.
                 pass
+        self._publish_worker_script = None
 
     def _client(self) -> Redis:
         if self._redis is None:
@@ -186,21 +197,33 @@ class CampaignCoordinator:
         body = self._identity_payload(identity)
         if payload:
             body.update(dict(payload))
-        return str(
-            await client.eval(
-                self._PUBLISH_WORKER_SCRIPT,
-                4,
-                self.worker_key(identity.worker_id),
-                self.workers_key,
-                self.stop_key,
-                self.worker_drain_key(identity.worker_id),
-                json.dumps(body, default=str),
-                status,
-                time.time(),
-                max(1, int(ttl_seconds)),
-                identity.worker_id,
+        if self._publish_worker_script is None:
+            self._publish_worker_script = client.register_script(
+                self._PUBLISH_WORKER_SCRIPT
             )
-        )
+        started = time.perf_counter()
+        try:
+            result = await self._publish_worker_script(
+                keys=[
+                    self.worker_key(identity.worker_id),
+                    self.workers_key,
+                    self.stop_key,
+                    self.worker_drain_key(identity.worker_id),
+                ],
+                args=[
+                    json.dumps(body, default=str),
+                    status,
+                    time.time(),
+                    max(1, int(ttl_seconds)),
+                    identity.worker_id,
+                ],
+            )
+        finally:
+            REDIS_RTT.labels("worker_heartbeat").observe(
+                time.perf_counter() - started
+            )
+            REDIS_COMMANDS.labels("worker_heartbeat").inc()
+        return str(result)
 
     async def register_worker(self, identity: WorkerIdentity, *, ttl_seconds: int = 30) -> str:
         """Publish startup and return the atomic ACTIVE/DRAINING state."""
@@ -217,8 +240,8 @@ class CampaignCoordinator:
         status: str = "active",
         ttl_seconds: int = 30,
         metrics: Mapping[str, object] | None = None,
-    ) -> None:
-        await self._publish_worker(
+    ) -> str:
+        return await self._publish_worker(
             identity,
             status=status,
             ttl_seconds=ttl_seconds,

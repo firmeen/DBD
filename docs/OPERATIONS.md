@@ -16,7 +16,12 @@ Core controls:
 | `DBD_FLEET_DB_CONNECTIONS_MAX` / `--fleet-db-connections-max` | Hard MySQL connection budget for one campaign fleet; default `96` |
 | `DBD_FLEET_ARCHIVE_WORKERS_MAX` / `--fleet-archive-workers-max` | Archive-worker budget across `workers-max`; default `24` |
 | `DBD_FLEET_PROJECTION_WORKERS_MAX` / `--fleet-projection-workers-max` | Projection-worker budget across `workers-max`; default `48` |
-| `DBD_REDIS_MAX_CONNECTIONS` | Maximum connections in each Redis client pool |
+| `DBD_REDIS_MAX_CONNECTIONS` | Maximum connections in the single shared Redis pool per worker |
+| `DBD_REDIS_POOL_WAIT_SECONDS` | Maximum wait for a free shared Redis connection |
+| `DBD_REDIS_SOCKET_TIMEOUT_SECONDS` | Redis command/read timeout |
+| `DBD_REDIS_CONNECT_TIMEOUT_SECONDS` | Redis connect timeout |
+| `DBD_REDIS_HEALTH_CHECK_INTERVAL_SECONDS` | Redis connection health-check interval |
+| `DBD_REDIS_RECOVERY_INTERVAL_SECONDS` | Minimum interval between shared adaptive recovery writes |
 | `DBD_FLEET_REDIS_CONNECTIONS_MAX` / `--fleet-redis-connections-max` | Redis connection budget for the long-lived campaign fleet; default `128` |
 | `DBD_PIPELINE_QUEUE_SIZE` | Bounded fetch/archive/project backpressure |
 | `DBD_CLAIM_BATCH_SIZE` | Queue claims per transaction |
@@ -57,6 +62,37 @@ Distributed mode additionally requires one shared Redis URL/key. Redis stores th
 aggregate pacing schedule, effective rate, cooldown and last-penalty state. A
 rejection observed by one process therefore constrains all workers using that same
 namespace.
+
+Each worker owns exactly one bounded async Redis pool. Campaign heartbeat/control,
+endpoint/global pacing and circuit protection share that pool for the worker
+lifetime. Healthy endpoint admission uses one registered Lua script (EVALSHA) to
+evaluate global + endpoint circuits and reserve both pacing schedules for the same
+future timestamp. This replaces the previous four healthy-path Redis round trips
+(global circuit, endpoint circuit, endpoint pacer, global pacer) with one logical
+round trip.
+
+A successful healthy request does not write Redis recovery state on every response.
+Local recovery remains immediate; shared recovery is gated and batched, except a
+HALF_OPEN probe success which closes its owned probe promptly. A 429/503 penalty is
+still published immediately so other workers observe the reduced shared rate.
+
+Prometheus exposes Redis RTT, logical command pressure, pool connection counts and
+estimated Redis commands per HTTP attempt. The worker heartbeat also carries
+`redis_commands`, `redis_admissions` and shared pool occupancy.
+
+The CI benchmark compares the legacy four-RTT admission sequence with the atomic
+fast path:
+
+```powershell
+python scripts/benchmark_redis_fast_path.py `
+  --redis-url $env:DBD_REDIS_URL `
+  --iterations 100
+```
+
+The command model is deterministic: legacy healthy endpoint admission is 4 Redis
+round trips/request and the fast path is 1, a 75% reduction. RTT p50/p95 are measured
+on the Redis instance used for the benchmark rather than treated as a universal
+latency guarantee.
 
 ```powershell
 $env:DBD_REDIS_URL = "redis://127.0.0.1:6379/0"

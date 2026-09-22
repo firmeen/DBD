@@ -63,3 +63,8 @@ jobs:
         run: ruff check .
       - name: Tests
         run: pytest -q
+      - name: Redis fast-path benchmark
+        run: >-
+          python scripts/benchmark_redis_fast_path.py
+          --redis-url "$DBD_REDIS_TEST_URL"
+          --iterations 50

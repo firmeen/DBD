@@ -29,6 +29,26 @@ ARCHIVE_BYTES = Counter(
     "dbd_archive_bytes_total", "Archive bytes before/after optional compression", ["kind"]
 )
 
+REDIS_RTT = Histogram(
+    "dbd_redis_rtt_seconds",
+    "Redis command/script round-trip latency",
+    ["operation"],
+)
+REDIS_COMMANDS = Counter(
+    "dbd_redis_commands_total",
+    "Estimated Redis round trips issued by this process",
+    ["operation"],
+)
+REDIS_POOL_CONNECTIONS = Gauge(
+    "dbd_redis_pool_connections",
+    "Shared Redis pool connection counts",
+    ["state"],
+)
+REDIS_COMMANDS_PER_HTTP = Gauge(
+    "dbd_redis_commands_per_http_request",
+    "Estimated Redis round trips per HTTP attempt in this process",
+)
+
 DISCOVERY_NEW_IDENTITIES = Counter(
     "dbd_discovery_new_identities_total", "New unique identities first observed during this process"
 )
