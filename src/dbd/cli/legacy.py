@@ -27,14 +27,17 @@ def _parse_parts(only: str | None) -> list[str]:
     return parts
 
 
-def command_check_db() -> None:
+def check_db_info() -> dict:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT DATABASE() AS db, CURRENT_USER() AS user, VERSION() AS version")
-            row = cur.fetchone()
-    print(f"Database: {row['db']}")
-    print(f"User: {row['user']}")
-    print(f"MySQL: {row['version']}")
+            return dict(cur.fetchone())
+
+
+def command_check_db() -> None:
+    from ..presentation import TerminalPresenter
+
+    TerminalPresenter().check_db(check_db_info())
 
 
 def command_fetch_company(company_code: str, parts: list[str], fiscal_year: str | None) -> None:
