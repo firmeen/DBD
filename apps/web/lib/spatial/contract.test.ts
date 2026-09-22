@@ -58,4 +58,19 @@ describe("spatial serving contract", () => {
       parseSpatialSnapshot(snapshotWithCoordinates([Number.POSITIVE_INFINITY, 13]))
     ).toThrow()
   })
+
+  it("rejects malformed H3 indexes before deck.gl receives them", () => {
+    const snapshot = snapshotWithCoordinates([100.5018, 13.7563])
+    snapshot.h3Cells = [
+      {
+        index: "not-an-h3-cell",
+        count: 1,
+        active: 1,
+        expired: 0,
+        prospect: 0,
+      },
+    ]
+
+    expect(() => parseSpatialSnapshot(snapshot)).toThrow()
+  })
 })

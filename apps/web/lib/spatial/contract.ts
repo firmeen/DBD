@@ -1,3 +1,4 @@
+import { isValidCell } from "h3-js"
 import { z } from "zod"
 
 import { MAX_SPATIAL_COMPANY_POINTS } from "./types"
@@ -28,7 +29,10 @@ const branchSchema = z.object({
 })
 
 const h3Schema = z.object({
-  index: z.string().min(1),
+  index: z
+    .string()
+    .min(1)
+    .refine(isValidCell, "Invalid H3 cell index"),
   count: z.number().int().nonnegative(),
   active: z.number().int().nonnegative(),
   expired: z.number().int().nonnegative(),
