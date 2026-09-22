@@ -30,8 +30,7 @@ async def new_fabric_run(repo, resources, *, count=1, fiscal_year=None):
         fiscal_year,
         scheduler_mode="fabric_v2",
     )
-    run = await repo.get_run(run_id)
-    fabric = repo.for_run(run)
+    fabric = repo.for_run({"scheduler_mode": "fabric_v2"})
     identities = _identities(count)
     await fabric.import_batch(run_id, identities, resources)
     await fabric.ready(run_id)
@@ -550,7 +549,7 @@ async def test_fabric_projection_parity_with_legacy_scheduler(repo):
         list(DEFAULT_PARTS),
         scheduler_mode="fabric_v2",
     )
-    fabric_repo = repo.for_run(await repo.get_run(fabric_run))
+    fabric_repo = repo.for_run({"scheduler_mode": "fabric_v2"})
     await fabric_repo.import_batch(fabric_run, [fabric_identity], resources)
     await fabric_repo.ready(fabric_run)
     assert await process(
