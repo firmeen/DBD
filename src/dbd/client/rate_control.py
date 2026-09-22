@@ -9,7 +9,7 @@ from uuid import uuid4
 
 from redis.asyncio import Redis
 
-from ..core.redis import create_async_redis, redis_pool_snapshot
+from ..core.redis import close_async_redis, create_async_redis, redis_pool_snapshot
 from ..core.settings import settings
 from ..core.telemetry import (
     EFFECTIVE_RATE,
@@ -159,7 +159,7 @@ return {tostring(new_rate), tostring(new_rate)}
 
     async def close(self) -> None:
         if self._redis is not None and self._owns_redis:
-            await self._redis.aclose()
+            await close_async_redis(self._redis)
             self._redis = None
         self._acquire_registered = None
         self._penalize_registered = None
@@ -612,7 +612,7 @@ return {
 
     async def close(self) -> None:
         if self._redis is not None and self._owns_redis:
-            await self._redis.aclose()
+            await close_async_redis(self._redis)
             self._redis = None
         elif self._global_shared is not None:
             await self._global_shared.close()
