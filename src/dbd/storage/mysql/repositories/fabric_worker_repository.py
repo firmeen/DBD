@@ -10,6 +10,8 @@ from ....core.telemetry import (
     REFRESH_PLAN_RESOURCES,
 )
 from ....runtime.collection_fabric import (
+    ENDPOINT_BITS,
+    ENDPOINT_ORDER,
     FINANCIAL_MASK,
     advance_state,
     derive_fiscal_year,
@@ -822,6 +824,65 @@ class FabricWorkerRepository(WorkerRepository):
                 )
             ).mappings().all()
             return [dict(row) for row in rows]
+
+    async def failure_diagnostics(self, run_id, limit: int = 8):
+        """Read-only failure aggregates with Fabric resource-bit semantics."""
+        limit = max(1, min(50, int(limit)))
+        async with self.engine.connect() as conn:
+            by_error = (
+                await conn.execute(
+                    text("""
+                    SELECT COALESCE(NULLIF(last_error,''),'unknown') AS value,COUNT(*) AS n
+                    FROM company_collection_state
+                    WHERE run_id=:id AND status='failed'
+                    GROUP BY COALESCE(NULLIF(last_error,''),'unknown')
+                    ORDER BY n DESC,value
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": limit},
+                )
+            ).mappings().all()
+            by_stage = (
+                await conn.execute(
+                    text("""
+                    SELECT stage AS value,COUNT(*) AS n
+                    FROM company_collection_state
+                    WHERE run_id=:id AND status='failed'
+                    GROUP BY stage ORDER BY n DESC,stage
+                    """),
+                    {"id": run_id},
+                )
+            ).mappings().all()
+
+            expressions = ",".join(
+                f"COALESCE(SUM((failed_mask & {int(ENDPOINT_BITS[name])})<>0),0) AS e{index}"
+                for index, name in enumerate(ENDPOINT_ORDER)
+            )
+            row = (
+                await conn.execute(
+                    text(
+                        f"SELECT {expressions} FROM company_collection_state "
+                        "WHERE run_id=:id AND failed_mask<>0"
+                    ),
+                    {"id": run_id},
+                )
+            ).mappings().one()
+
+        endpoint_rows = [
+            {"value": name, "n": int(row[f"e{index}"] or 0)}
+            for index, name in enumerate(ENDPOINT_ORDER)
+            if int(row[f"e{index}"] or 0)
+        ]
+        endpoint_rows.sort(key=lambda item: (-item["n"], item["value"]))
+        return {
+            "semantics": (
+                "Fabric failed resources come from failed_mask bits; stage/error counts are "
+                "failed company-state rows, so those units intentionally differ."
+            ),
+            "by_error": [dict(item) for item in by_error],
+            "by_endpoint": endpoint_rows[:limit],
+            "by_stage": [dict(item) for item in by_stage],
+        }
 
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
