@@ -568,7 +568,7 @@ def main():
             from .legacy import command_bulk
 
             with manager_lock():
-                command_bulk(None, args.run_id, [], args.limit)
+                command_bulk(None, args.run_id, [], args.limit, presenter=presenter)
         elif args.command == "discover-status":
             from ..storage.mysql.repositories.discovery_repository import discovery_summary
 
