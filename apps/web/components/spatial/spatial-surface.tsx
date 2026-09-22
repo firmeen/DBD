@@ -9,6 +9,7 @@ import { SpatialControlDeck } from "./spatial-control-deck"
 import { SpatialMap } from "./spatial-map"
 import { useGlobalLens } from "@/hooks/use-global-lens"
 import { fetchSpatialSnapshot } from "@/lib/spatial/adapter"
+import { canAggregateH3InBrowser } from "@/lib/spatial/h3"
 import {
   h3ResolutionForZoom,
   spatialLodForZoom,
@@ -217,6 +218,10 @@ export function SpatialSurface() {
         branchId={branchId}
         radiusKm={radiusKm}
         isFetching={query.isFetching}
+        densityFallbackAvailable={
+          snapshot.capabilities.preciseCompanyGeometry &&
+          canAggregateH3InBrowser(snapshot.companies.length)
+        }
         onToggleLayer={toggleLayer}
         onBranchChange={(nextBranchId) => {
           setBranchId(nextBranchId)
