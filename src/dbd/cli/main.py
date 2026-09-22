@@ -7,6 +7,7 @@ import os
 
 from ..contracts.identity import parse_code
 from ..core.exceptions import DbdError
+from ..core.prepare_dashboard import LiveCampaignPrepareDashboard
 from ..core.settings import settings
 from ..core.telemetry import configure
 from ..runtime.collection_fabric import mask_for_endpoints
@@ -192,8 +193,16 @@ async def worker_command(args, health=None):
 async def _prepare_campaign(args) -> int:
     engine = create_engine()
     repo = WorkerRepository(engine)
+    dashboard = LiveCampaignPrepareDashboard()
+    latest = None
+
+    def update(snapshot):
+        nonlocal latest
+        latest = snapshot
+        dashboard.render(snapshot)
+
     try:
-        return await prepare(
+        run_id = await prepare(
             repo,
             file=args.file,
             master=args.master,
@@ -202,7 +211,13 @@ async def _prepare_campaign(args) -> int:
             statuses=None if args.all_statuses else STATUS_OPERATING,
             scheduler_mode=args.scheduler_mode,
             force_refresh=args.force_refresh,
+            progress=update,
         )
+        dashboard.close(latest)
+        return run_id
+    except BaseException:
+        dashboard.close(latest)
+        raise
     finally:
         await engine.dispose()
 
