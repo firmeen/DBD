@@ -4,6 +4,7 @@ import argparse
 
 from ..client import DbdClient
 from ..pipelines import bulk, company_details, company_profile, financials
+from ..presentation import TerminalPresenter
 from ..storage.mysql.engine import connect
 from ..storage.mysql.repositories.run_repository import (
     create_run,
@@ -40,46 +41,78 @@ def command_check_db() -> None:
     TerminalPresenter().check_db(check_db_info())
 
 
-def command_fetch_company(company_code: str, parts: list[str], fiscal_year: str | None) -> None:
+def command_fetch_company(
+    company_code: str,
+    parts: list[str],
+    fiscal_year: str | None,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     if not company_code.isdigit() or len(company_code) != 14:
         raise SystemExit("company_code must be the 14-digit code used in /company/profile/<code> URLs")
 
     client = DbdClient()
 
+    payload = {"company_code": company_code}
     if "profile" in parts:
         result = company_profile.run(client, company_code)
-        print(f"profile          raw_response_id={result.raw_response_id}")
-        print(f"                 jp_no={result.jp_no} jp_type_code={result.jp_type_code}")
-        print(f"                 jp_name={result.jp_name}")
+        payload.update(
+            {
+                "raw_response_id": result.raw_response_id,
+                "jp_no": result.jp_no,
+                "jp_type_code": result.jp_type_code,
+                "jp_name": result.jp_name,
+            }
+        )
 
     if "details" in parts:
         counts = company_details.run(client, company_code)
-        for resource, rows in counts.items():
-            print(f"{resource:17}{rows} row(s)")
+        payload.update({f"{resource}_rows": rows for resource, rows in counts.items()})
 
     if "financials" in parts:
         fin = financials.run(client, company_code, fiscal_year)
-        print(f"financials       fiscal_year={fin.fiscal_year}")
-        print(
-            f"                 {fin.submissions} submission(s), {fin.statements} statement(s), {fin.items} item(s)"
+        payload.update(
+            {
+                "fiscal_year": fin.fiscal_year,
+                "financial_submissions": fin.submissions,
+                "financial_statements": fin.statements,
+                "financial_items": fin.items,
+                "industry_benchmark_items": fin.benchmark_items,
+            }
         )
-        print(f"industry_bench   {fin.benchmark_items} item(s)")
+
+    presenter.command_result("DBD · COMPANY FETCH", payload)
 
 
-def command_bulk(file: str | None, run_id: int | None, parts: list[str], limit: int | None) -> None:
+def command_bulk(
+    file: str | None,
+    run_id: int | None,
+    parts: list[str],
+    limit: int | None,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     if file:
         codes = bulk.read_codes(file)
         if not codes:
             raise SystemExit(f"No company codes found in {file}")
         run_id, enqueued = create_run(source_label=file, parts=parts, company_codes=codes)
-        print(f"run {run_id}: enqueued {enqueued} company code(s) from {file}")
+        presenter.command_result(
+            "DBD · LEGACY RUN",
+            {"run_id": run_id, "enqueued": enqueued, "source": file},
+        )
     elif run_id is None:
         run = latest_unfinished_run()
         if run is None:
             raise SystemExit("No unfinished run to resume. Start one with --file <codes.txt>")
         run_id = int(run["id"])
         parts = run["parts"].split(",")
-        print(f"resuming run {run_id} ({run['source_label']})")
+        presenter.message(
+            f"Resuming legacy run {run_id} ({run['source_label']})",
+            kind="info",
+        )
 
     from ..storage.mysql.repositories.run_repository import get_run
 
@@ -88,18 +121,23 @@ def command_bulk(file: str | None, run_id: int | None, parts: list[str], limit: 
         raise ValueError("Legacy run not found")
     parts = stored["parts"].split(",")
     progress = run_progress(run_id)
-    print(
-        f"run {run_id}: {progress['done']} done, {progress['failed']} failed, {progress['pending']} pending"
+    presenter.command_result(
+        "DBD · LEGACY RUN STATUS",
+        {"run_id": run_id, **progress},
     )
 
     result = bulk.process(run_id, parts, limit)
 
-    print(
-        f"\nrun {result.run_id}: processed {result.processed}, "
-        f"succeeded {result.succeeded}, failed {result.failed}, remaining {result.remaining}"
-    )
+    payload = {
+        "run_id": result.run_id,
+        "processed": result.processed,
+        "succeeded": result.succeeded,
+        "failed": result.failed,
+        "remaining": result.remaining,
+    }
     if result.remaining:
-        print(f"resume with: dbd-data bulk --run-id {result.run_id}")
+        payload["next_command"] = f"dbd-data bulk --run-id {result.run_id}"
+    presenter.command_result("DBD · LEGACY RUN RESULT", payload)
 
 
 def command_bulk_status(run_id: int | None) -> None:
@@ -126,11 +164,17 @@ def command_bulk_status(run_id: int | None) -> None:
         print(f"\nretry them with: dbd-data bulk-retry {run_id}")
 
 
-def command_bulk_retry(run_id: int) -> None:
+def command_bulk_retry(
+    run_id: int,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     count = requeue_failed(run_id)
-    print(f"re-queued {count} failed task(s) in run {run_id}")
+    payload = {"run_id": run_id, "requeued": count}
     if count:
-        print(f"now run: dbd-data bulk --run-id {run_id}")
+        payload["next_command"] = f"dbd-data bulk --run-id {run_id}"
+    presenter.command_result("DBD · LEGACY RETRY", payload)
 
 
 def command_discover(
