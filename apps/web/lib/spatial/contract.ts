@@ -3,7 +3,9 @@ import { z } from "zod"
 import { MAX_SPATIAL_COMPANY_POINTS } from "./types"
 import type { SpatialSnapshot } from "./types"
 
-const coordinateSchema = z.tuple([z.number(), z.number()])
+const longitudeSchema = z.number().finite().min(-180).max(180)
+const latitudeSchema = z.number().finite().min(-90).max(90)
+const coordinateSchema = z.tuple([longitudeSchema, latitudeSchema])
 
 const companySchema = z.object({
   id: z.string().min(1),

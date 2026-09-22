@@ -96,6 +96,22 @@ export function SpatialSurface() {
   )
   const [mapHover, setMapHover] = React.useState<MapHover | null>(null)
   const [railHoverId, setRailHoverId] = React.useState<string | null>(null)
+  const liveSnapshotRef = React.useRef(initialState)
+
+  liveSnapshotRef.current = {
+    viewState,
+    layers,
+    branchId,
+    radiusKm,
+    companyRailOpen,
+  }
+
+  React.useEffect(
+    () => () => {
+      saveSurfaceSnapshot("M", liveSnapshotRef.current)
+    },
+    [saveSurfaceSnapshot]
+  )
 
   React.useEffect(() => {
     const node = surfaceRef.current
