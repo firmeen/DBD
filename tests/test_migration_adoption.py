@@ -6,7 +6,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0008_campaign_runtime"
+HEAD = "0009_fabric_scheduler"
 
 
 def test_correctness_migration_adopts_existing_objects():
@@ -181,5 +181,13 @@ def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data()
             "WHERE table_schema=DATABASE() AND table_name='company_collection_state'"
         )
         assert cur.fetchone()["n"] == 1
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM information_schema.statistics
+            WHERE table_schema=DATABASE() AND table_name='company_collection_state'
+              AND index_name='idx_collection_active'
+            """
+        )
+        assert cur.fetchone()["n"] > 0
         cur.execute("SELECT bucket_key FROM discovery_buckets WHERE id=%s", (bucket_id,))
         assert cur.fetchone()["bucket_key"] == marker
