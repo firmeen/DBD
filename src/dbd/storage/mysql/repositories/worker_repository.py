@@ -74,20 +74,35 @@ class WorkerRepository:
             return FabricWorkerRepository(self.engine, archive_backend=self.archive_backend)
         raise ValueError(f"Unsupported scheduler mode {mode!r}")
 
-    async def create_run(self, source, parts, fiscal_year=None, *, scheduler_mode="legacy"):
+    async def create_run(
+        self,
+        source,
+        parts,
+        fiscal_year=None,
+        *,
+        scheduler_mode="legacy",
+        force_refresh_mask=0,
+    ):
         if scheduler_mode not in ("legacy", "fabric_v2"):
             raise ValueError("scheduler_mode must be legacy or fabric_v2")
+        force_refresh_mask = int(force_refresh_mask or 0)
+        if force_refresh_mask and scheduler_mode != "fabric_v2":
+            raise ValueError("force refresh requires scheduler_mode=fabric_v2")
         async with self.engine.begin() as conn:
             result = await conn.execute(
                 text("""
-                INSERT INTO worker_runs(source_label,parts,fiscal_year,scheduler_mode)
-                VALUES (:source,:parts,:year,:scheduler_mode)
+                INSERT INTO worker_runs(
+                  source_label,parts,fiscal_year,scheduler_mode,force_refresh_mask
+                ) VALUES (
+                  :source,:parts,:year,:scheduler_mode,:force_refresh_mask
+                )
                 """),
                 {
                     "source": source,
                     "parts": ",".join(parts),
                     "year": fiscal_year,
                     "scheduler_mode": scheduler_mode,
+                    "force_refresh_mask": force_refresh_mask,
                 },
             )
             return result.lastrowid
