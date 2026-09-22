@@ -10,7 +10,7 @@ from ..engine import connect, use_connection
 from .company_detail_repository import save_collection
 from .company_repository import save_company_profile
 from .financial_repository import save_benchmark, save_statements, save_submissions
-from .projection_scheduler import LeaseLost, projection_scheduler
+from .projection_scheduler import projection_scheduler
 
 
 class ProjectionOutcome(str):

@@ -23,7 +23,8 @@ from ..core.telemetry import (
     TASKS,
     log,
 )
-from ..storage.mysql.repositories.projection_repository import LeaseLost, project
+from ..storage.mysql.repositories.projection_repository import project
+from ..storage.mysql.repositories.projection_scheduler import LeaseLost
 from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 

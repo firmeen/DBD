@@ -565,7 +565,7 @@ class FabricWorkerRepository(WorkerRepository):
                     text("""
                     SELECT s.* FROM company_collection_state s
                     JOIN company_master m ON m.company_id=s.company_id
-                    WHERE s.run_id=:id AND s.failed_mask<>0
+                    WHERE s.run_id=:id AND s.status='failed' AND s.failed_mask<>0
                       AND m.identity_status<>'conflict'
                       AND COALESCE(s.last_error,'')<>'IdentityConflict'
                     FOR UPDATE
