@@ -9,6 +9,7 @@ from ..contracts.identity import parse_code
 from ..core.exceptions import DbdError
 from ..core.settings import settings
 from ..core.telemetry import configure
+from ..runtime.collection_fabric import mask_for_endpoints
 from ..runtime.locking import assert_manager_lock, manager_lock
 from ..runtime.resources import PARTS, endpoints
 from ..runtime.worker import STATUS_OPERATING, prepare, process
@@ -101,6 +102,11 @@ async def worker_command(args, health=None):
                         "scheduler_mode": scheduler_repo.scheduler_mode,
                         "status": await scheduler_repo.progress(args.run_id),
                         "stages": await scheduler_repo.progress_by_stage(args.run_id),
+                        "refresh": (
+                            await scheduler_repo.refresh_stats(args.run_id)
+                            if scheduler_repo.scheduler_mode == "fabric_v2"
+                            else None
+                        ),
                     },
                     indent=2,
                 )
@@ -118,14 +124,20 @@ async def worker_command(args, health=None):
             parsed = parse_code(args.company_code)
             selected = args.only or ["profile", "details", "financials"]
             scheduler_mode = getattr(args, "scheduler_mode", "legacy")
+            resources = endpoints(selected)
             run_id = await repo.create_run(
                 parsed.code,
                 selected,
                 args.fiscal_year,
                 scheduler_mode=scheduler_mode,
+                force_refresh_mask=(
+                    mask_for_endpoints(resources)
+                    if getattr(args, "force_refresh", False)
+                    else 0
+                ),
             )
             scheduler_repo = repo.for_run({"scheduler_mode": scheduler_mode})
-            await scheduler_repo.import_batch(run_id, [parsed], endpoints(selected))
+            await scheduler_repo.import_batch(run_id, [parsed], resources)
             await scheduler_repo.ready(run_id)
         elif args.file or args.master:
             run_id = await prepare(
@@ -136,6 +148,7 @@ async def worker_command(args, health=None):
                 fiscal_year=args.fiscal_year,
                 statuses=None if args.all_statuses else STATUS_OPERATING,
                 scheduler_mode=getattr(args, "scheduler_mode", "legacy"),
+                force_refresh=getattr(args, "force_refresh", False),
             )
             if args.master:
                 population = await repo.master_population()
@@ -147,6 +160,8 @@ async def worker_command(args, health=None):
                 population["scope"] = "all_statuses" if args.all_statuses else "operating_only"
                 print(json.dumps({"master_population": population}, indent=2), flush=True)
         else:
+            if getattr(args, "force_refresh", False):
+                raise ValueError("--force-refresh can only be set when creating a new run")
             run = await repo.get_run(args.run_id)
             if args.only is not None and args.only != run["parts"].split(","):
                 raise ValueError("Cannot change --only while resuming; create a new run")
@@ -186,6 +201,7 @@ async def _prepare_campaign(args) -> int:
             fiscal_year=args.fiscal_year,
             statuses=None if args.all_statuses else STATUS_OPERATING,
             scheduler_mode=args.scheduler_mode,
+            force_refresh=args.force_refresh,
         )
     finally:
         await engine.dispose()
@@ -352,6 +368,11 @@ def main():
         default="legacy",
         help="Durable scheduler backend for this new run",
     )
+    campaign_start.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Refresh every selected resource; requires --scheduler-mode fabric_v2",
+    )
     _add_campaign_worker_options(campaign_start)
     campaign_resume = campaign_sub.add_parser("resume", help="Resume one existing run with workers")
     campaign_resume.add_argument("run_id", type=positive)
@@ -370,6 +391,11 @@ def main():
             choices=("legacy", "fabric_v2"),
             default="legacy",
             help="Durable scheduler backend for a newly-created run",
+        )
+        p.add_argument(
+            "--force-refresh",
+            action="store_true",
+            help="Refresh every selected resource on a new fabric_v2 run",
         )
         p.add_argument("--concurrency", type=positive)
         p.add_argument("--rate", type=positive_rate)
