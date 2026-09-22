@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta
+from decimal import Decimal
 
 from dbd.contracts.company import CompanyProfile
 from dbd.runtime.collection_fabric import endpoint_bit, mask_for_endpoints
@@ -9,6 +10,7 @@ from dbd.runtime.delta import (
     change_mask,
     dirty_mask_for_change,
     master_components,
+    master_components_json,
     refresh_plan,
 )
 
@@ -42,6 +44,11 @@ def test_exact_master_change_mask_does_not_promote_small_change_to_all():
     assert change_mask(before, profile(jp_name="Beta")) == CHANGE_NAME
     assert change_mask(before, profile(pv_code="20")) == CHANGE_LOCATION
     assert change_mask(before, profile(submit_fin_year="2569")) == CHANGE_FISCAL
+
+
+def test_master_component_snapshot_round_trips_monetary_values_without_false_delta():
+    current = profile(cap_amt=Decimal("100.00"), paid_amt=Decimal("75.50"))
+    assert change_mask(master_components_json(current), current) == 0
 
 
 def test_change_groups_map_only_to_affected_resources():
