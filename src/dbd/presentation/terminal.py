@@ -249,7 +249,21 @@ class TerminalPresenter:
         retries = _num(metrics.get("http_retries"))
         rate_hits = _num(metrics.get("rate_limit_hits"))
         failed = _num(state.get("failed"))
+        last_failure = supervisor.get("last_worker_failure") or {}
 
+        if last_failure:
+            diagnostics.append(
+                (
+                    "WORKER",
+                    (
+                        f"Worker {last_failure.get('worker_index', '?')} "
+                        f"{last_failure.get('reason', 'failed')} "
+                        f"(restart {last_failure.get('restart_count', '?')}/"
+                        f"{last_failure.get('restart_budget', '?')})."
+                    ),
+                    "red" if exhausted else "yellow",
+                )
+            )
         if exhausted:
             diagnostics.append(
                 ("CRITICAL", f"Fleet lost {exhausted} worker capacity slot(s) after restart exhaustion.", "red")
@@ -450,6 +464,10 @@ class TerminalPresenter:
                     ("WORKERS MIN/MAX", f"{supervisor.get('workers_min', '--')} / {supervisor.get('workers_max', '--')}"),
                     ("DB BUDGET", supervisor.get("db_connections_budget", "--")),
                     ("REDIS BUDGET", supervisor.get("redis_connections_budget", "--")),
+                    (
+                        "LAST WORKER LOG",
+                        (supervisor.get("last_worker_failure") or {}).get("log_path") or "--",
+                    ),
                 )
             )
             body.extend((Text(""), Text("DEBUG CONTEXT", style="bold"), debug))
