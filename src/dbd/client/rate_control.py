@@ -134,6 +134,9 @@ return {tostring(new_rate), tostring(new_rate)}
         self._owns_redis = client is None
         self._max_connections = max_connections
         self._state_ttl_ms = 600_000
+        self._acquire_registered = None
+        self._penalize_registered = None
+        self._recover_registered = None
 
     @property
     def _keys(self) -> tuple[str, str, str, str, str]:
@@ -147,16 +150,36 @@ return {tostring(new_rate), tostring(new_rate)}
 
     async def open(self) -> None:
         if self._redis is None:
-            kwargs = {"decode_responses": True}
-            if self._max_connections is not None:
-                kwargs["max_connections"] = max(1, int(self._max_connections))
-            self._redis = Redis.from_url(self.url, **kwargs)
-            await self._redis.ping()
+            self._redis = create_async_redis(
+                self.url,
+                max_connections=self._max_connections,
+            )
+        await self._redis.ping()
+        await self.prepare_scripts()
 
     async def close(self) -> None:
         if self._redis is not None and self._owns_redis:
             await self._redis.aclose()
             self._redis = None
+        self._acquire_registered = None
+        self._penalize_registered = None
+        self._recover_registered = None
+
+    async def prepare_scripts(self) -> None:
+        if self._redis is None:
+            raise RuntimeError("RedisPacer is not open")
+        self._acquire_registered = self._redis.register_script(
+            self._ACQUIRE_SCRIPT
+        )
+        self._penalize_registered = self._redis.register_script(
+            self._PENALIZE_SCRIPT
+        )
+        self._recover_registered = self._redis.register_script(
+            self._RECOVER_SCRIPT
+        )
+        await self._redis.script_load(self._ACQUIRE_SCRIPT)
+        await self._redis.script_load(self._PENALIZE_SCRIPT)
+        await self._redis.script_load(self._RECOVER_SCRIPT)
 
     def set_rate(self, value: float) -> float:
         self.rate = self.target_rate = _positive_rate(value)
@@ -165,12 +188,13 @@ return {tostring(new_rate), tostring(new_rate)}
     async def acquire(self) -> float:
         if self._redis is None:
             raise RuntimeError("RedisPacer is not open")
-        wait_raw, rate_raw = await self._redis.eval(
-            self._ACQUIRE_SCRIPT,
-            len(self._keys),
-            *self._keys,
-            self.target_rate,
-            self._state_ttl_ms,
+        if self._acquire_registered is None:
+            self._acquire_registered = self._redis.register_script(
+                self._ACQUIRE_SCRIPT
+            )
+        wait_raw, rate_raw = await self._acquire_registered(
+            keys=list(self._keys),
+            args=[self.target_rate, self._state_ttl_ms],
         )
         self.rate = float(rate_raw)
         wait_ms = float(wait_raw)
@@ -187,15 +211,19 @@ return {tostring(new_rate), tostring(new_rate)}
     ) -> tuple[float, float]:
         if self._redis is None:
             raise RuntimeError("RedisPacer is not open")
-        old_raw, new_raw = await self._redis.eval(
-            self._PENALIZE_SCRIPT,
-            len(self._keys),
-            *self._keys,
-            self.target_rate,
-            factor,
-            floor,
-            max(0.0, float(cooldown_seconds)) * 1000.0,
-            self._state_ttl_ms,
+        if self._penalize_registered is None:
+            self._penalize_registered = self._redis.register_script(
+                self._PENALIZE_SCRIPT
+            )
+        old_raw, new_raw = await self._penalize_registered(
+            keys=list(self._keys),
+            args=[
+                self.target_rate,
+                factor,
+                floor,
+                max(0.0, float(cooldown_seconds)) * 1000.0,
+                self._state_ttl_ms,
+            ],
         )
         old_rate = float(old_raw)
         self.rate = float(new_raw)
@@ -210,15 +238,19 @@ return {tostring(new_rate), tostring(new_rate)}
     ) -> float | None:
         if self._redis is None:
             raise RuntimeError("RedisPacer is not open")
-        recovered_raw, current_raw = await self._redis.eval(
-            self._RECOVER_SCRIPT,
-            len(self._keys),
-            *self._keys,
-            self.target_rate,
-            factor,
-            step,
-            quiet_seconds * 1000.0,
-            self._state_ttl_ms,
+        if self._recover_registered is None:
+            self._recover_registered = self._redis.register_script(
+                self._RECOVER_SCRIPT
+            )
+        recovered_raw, current_raw = await self._recover_registered(
+            keys=list(self._keys),
+            args=[
+                self.target_rate,
+                factor,
+                step,
+                quiet_seconds * 1000.0,
+                self._state_ttl_ms,
+            ],
         )
         self.rate = float(current_raw)
         return float(recovered_raw) if recovered_raw else None
