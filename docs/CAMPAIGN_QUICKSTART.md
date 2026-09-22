@@ -163,6 +163,33 @@ dbd-data campaign status N
 dbd-data bulk-status N
 ```
 
+CLI ใช้ human-first terminal presentation เป็นค่าเริ่มต้น:
+
+- `campaign status N` = live operational view จาก Redis heartbeat/supervisor state
+- `bulk-status N` = exact durable scheduler view จาก MySQL พร้อม failure diagnostics
+- `--verbose` = เพิ่ม per-worker/detail rows
+- `--debug` = เพิ่ม safe diagnostic context เช่น resource budgets และ worker log path
+- `--json` = raw machine-readable output สำหรับ PowerShell/jq/automation
+- `--no-color` = layout เดิมแต่ปิด ANSI color
+
+ตัวอย่าง:
+
+```powershell
+dbd-data campaign status N --verbose
+dbd-data campaign status N --debug
+dbd-data campaign status N --json
+
+dbd-data bulk-status N
+dbd-data bulk-status N --json
+
+dbd-data master-status
+dbd-data discover-status
+```
+
+สำหรับ `fabric_v2` ค่า `failed` ใน progress เป็นจำนวน logical resource bits
+แต่ stage/error diagnostics นับ company-state rows ดังนั้นสองตัวเลขอาจไม่เท่ากันโดยตั้งใจ
+terminal view จะแสดง semantics นี้โดยตรงแทนการ dump JSON ให้ operator ตีความเอง
+
 ## 5. หยุดแบบ graceful
 
 ```powershell
