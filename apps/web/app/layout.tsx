@@ -1,15 +1,29 @@
-﻿import { Geist_Mono, Inter } from "next/font/google"
+import type { Metadata } from "next"
+import { Geist_Mono, Noto_Sans_Thai } from "next/font/google"
 
 import "./globals.css"
-import { ThemeProvider } from "@/components/theme-provider"
+import { AppProviders } from "@/components/providers"
 import { cn } from "@/lib/utils"
 
-const inter = Inter({ subsets: ["latin"], variable: "--font-sans" })
-
-const fontMono = Geist_Mono({
-  subsets: ["latin"],
-  variable: "--font-mono",
+const sans = Noto_Sans_Thai({
+  subsets: ["thai", "latin"],
+  weight: ["400", "500", "600", "700"],
+  variable: "--font-tipx-sans",
 })
+
+const mono = Geist_Mono({
+  subsets: ["latin"],
+  variable: "--font-tipx-mono",
+})
+
+export const metadata: Metadata = {
+  title: {
+    default: "TIPX Intelligence",
+    template: "%s · TIPX",
+  },
+  description:
+    "Cross-surface business intelligence workspace for company, people, spatial, relationship and analytical investigation.",
+}
 
 export default function RootLayout({
   children,
@@ -18,17 +32,12 @@ export default function RootLayout({
 }>) {
   return (
     <html
-      lang="en"
+      lang="th"
       suppressHydrationWarning
-      className={cn(
-        "antialiased",
-        fontMono.variable,
-        "font-sans",
-        inter.variable
-      )}
+      className={cn("antialiased", sans.variable, mono.variable)}
     >
       <body>
-        <ThemeProvider>{children}</ThemeProvider>
+        <AppProviders>{children}</AppProviders>
       </body>
     </html>
   )
