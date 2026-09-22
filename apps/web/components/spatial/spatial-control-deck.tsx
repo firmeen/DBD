@@ -12,6 +12,14 @@ import {
   Route,
 } from "lucide-react"
 
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select"
+import { Slider } from "@/components/ui/slider"
 import { spatialEndpointConfigured } from "@/lib/spatial/adapter"
 import { spatialLodLabel } from "@/lib/spatial/lod"
 import type {
@@ -49,6 +57,7 @@ export function SpatialControlDeck({
   branchId,
   radiusKm,
   isFetching,
+  densityFallbackAvailable,
   onToggleLayer,
   onBranchChange,
   onRadiusChange,
@@ -65,6 +74,7 @@ export function SpatialControlDeck({
   branchId: string | null
   radiusKm: number
   isFetching: boolean
+  densityFallbackAvailable: boolean
   onToggleLayer: (layer: SpatialLayerId) => void
   onBranchChange: (branchId: string | null) => void
   onRadiusChange: (radiusKm: number) => void
@@ -139,7 +149,9 @@ export function SpatialControlDeck({
             <div className="grid grid-cols-2 gap-1.5">
               {LAYER_DEFINITIONS.map((item) => {
                 const supported =
-                  !item.capability || capabilities[item.capability]
+                  !item.capability ||
+                  capabilities[item.capability] ||
+                  (item.id === "density" && densityFallbackAvailable)
                 const active = layers.includes(item.id)
 
                 return (
@@ -166,36 +178,55 @@ export function SpatialControlDeck({
 
             <SectionLabel icon={Route} label="Branch catchment" />
             <div className="grid gap-2">
-              <select
-                value={branchId ?? ""}
+              <Select
+                value={branchId ?? "__none__"}
                 disabled={!capabilities.branches || branches.length === 0}
-                onChange={(event) =>
-                  onBranchChange(event.target.value || null)
+                onValueChange={(value) =>
+                  onBranchChange(value === "__none__" ? null : value)
                 }
-                className="h-10 w-full rounded-xl border border-white/8 bg-white/[0.035] px-3 text-xs text-white outline-none disabled:cursor-not-allowed disabled:opacity-30"
               >
-                <option value="">No branch selected</option>
-                {branches.map((branch) => (
-                  <option key={branch.id} value={branch.id}>
-                    {branch.name}
-                  </option>
-                ))}
-              </select>
+                <SelectTrigger className="h-10 w-full rounded-xl border border-white/8 bg-white/[0.035] px-3 text-xs text-white hover:bg-white/[0.055] disabled:opacity-30">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent
+                  align="start"
+                  sideOffset={8}
+                  className="rounded-2xl border border-white/10 bg-[#0b1117]/98 text-white shadow-[0_24px_70px_rgba(0,0,0,.5)] backdrop-blur-2xl"
+                >
+                  <SelectItem
+                    value="__none__"
+                    className="rounded-xl text-xs text-white/55 focus:bg-white/8 focus:text-white"
+                  >
+                    No branch selected
+                  </SelectItem>
+                  {branches.map((branch) => (
+                    <SelectItem
+                      key={branch.id}
+                      value={branch.id}
+                      className="rounded-xl text-xs text-white/70 focus:bg-white/8 focus:text-white"
+                    >
+                      {branch.name}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
 
               <div className="rounded-xl border border-white/8 bg-white/[0.025] p-3">
-                <div className="mb-2 flex items-center justify-between text-[10px] text-white/45">
+                <div className="mb-3 flex items-center justify-between text-[10px] text-white/45">
                   <span>Catchment radius</span>
                   <span className="font-mono text-white/75">{radiusKm} km</span>
                 </div>
-                <input
-                  type="range"
+                <Slider
                   min={1}
                   max={50}
                   step={1}
-                  value={radiusKm}
+                  value={[radiusKm]}
                   disabled={!branchId}
-                  onChange={(event) => onRadiusChange(Number(event.target.value))}
-                  className="w-full accent-white disabled:opacity-25"
+                  onValueChange={(value) =>
+                    onRadiusChange(value[0] ?? radiusKm)
+                  }
+                  aria-label="Branch catchment radius"
+                  className="py-1"
                 />
               </div>
             </div>
