@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import os
 
+from .._version import __version__
 from ..contracts.identity import parse_code
 from ..core.exceptions import DbdError
 from ..core.prepare_dashboard import LiveCampaignPrepareDashboard
@@ -16,7 +17,6 @@ from ..runtime.resources import PARTS, endpoints
 from ..runtime.worker import STATUS_OPERATING, prepare, process
 from ..storage.mysql.async_engine import create_engine
 from ..storage.mysql.repositories.worker_repository import WorkerRepository
-from .._version import __version__
 
 
 def positive(value):
