@@ -123,8 +123,9 @@ def test_campaign_verbose_separates_exact_endpoint_failures_from_latest_errors()
     text = stream.getvalue()
     assert "EXACT · MySQL reconciliation" in text
     assert "WORKER DETAIL" in text
-    assert "FAILED RESOURCES BY ENDPOINT · EXACT" in text
-    assert "LATEST STATE ERROR CONTEXT · NOT PER-ENDPOINT" in text
+    assert "FAILED RESOURCES BY ENDPOINT" in text
+    assert "Exact durable endpoint-bit counts" in text
+    assert "LATEST STATE ERRORS · CONTEXT ONLY" in text
 
 
 def test_bulk_status_labels_resource_counts_and_company_stage_counts() -> None:
@@ -171,7 +172,7 @@ def test_bulk_status_labels_resource_counts_and_company_stage_counts() -> None:
     assert "FAILED RESOURCES" in text
     assert "COMPANY STATE / STAGE" in text
     assert "REFRESH PLAN" in text
-    assert "FAILED RESOURCES BY ENDPOINT · EXACT" in text
+    assert "FAILED RESOURCES BY ENDPOINT" in text
 
 
 def test_json_mode_preserves_machine_readable_status() -> None:
