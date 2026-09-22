@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 
 from ..contracts.identity import parse_code
@@ -10,6 +9,7 @@ from ..core.exceptions import DbdError
 from ..core.prepare_dashboard import LiveCampaignPrepareDashboard
 from ..core.settings import settings
 from ..core.telemetry import configure
+from ..presentation import TerminalPresenter
 from ..runtime.collection_fabric import mask_for_endpoints
 from ..runtime.locking import assert_manager_lock, manager_lock
 from ..runtime.resources import PARTS, endpoints
@@ -79,7 +79,11 @@ def safe_error(exc: BaseException) -> str:
     return type(exc).__name__
 
 
-async def worker_command(args, health=None):
+async def worker_command(args, health=None, presenter=None):
+    presenter = presenter or TerminalPresenter(
+        json_mode=bool(getattr(args, "json", False)),
+        verbose=bool(getattr(args, "verbose", False)),
+    )
     engine = create_engine()
     repo = WorkerRepository(engine)
     try:
@@ -93,32 +97,31 @@ async def worker_command(args, health=None):
                         .mappings()
                         .all()
                     )
-                    print(json.dumps([dict(r) for r in rows], default=str, indent=2))
+                    presenter.run_list([dict(r) for r in rows])
                 return
             run = await repo.get_run(args.run_id)
             scheduler_repo = repo.for_run(run)
-            print(
-                json.dumps(
-                    {
-                        "scheduler_mode": scheduler_repo.scheduler_mode,
-                        "status": await scheduler_repo.progress(args.run_id),
-                        "stages": await scheduler_repo.progress_by_stage(args.run_id),
-                        "refresh": (
-                            await scheduler_repo.refresh_stats(args.run_id)
-                            if scheduler_repo.scheduler_mode == "fabric_v2"
-                            else None
-                        ),
-                    },
-                    indent=2,
-                )
-            )
+            payload = {
+                "run_id": int(args.run_id),
+                "scheduler_mode": scheduler_repo.scheduler_mode,
+                "status": await scheduler_repo.progress(args.run_id),
+                "stages": await scheduler_repo.progress_by_stage(args.run_id),
+                "refresh": (
+                    await scheduler_repo.refresh_stats(args.run_id)
+                    if scheduler_repo.scheduler_mode == "fabric_v2"
+                    else None
+                ),
+                "failures": await scheduler_repo.failure_diagnostics(args.run_id),
+            }
+            presenter.bulk_status(payload)
             return
         if args.command == "bulk-retry":
             run = await repo.get_run(args.run_id)
             scheduler_repo = repo.for_run(run)
-            print(
-                f"Requeued {await scheduler_repo.retry_failed(args.run_id)} "
-                f"work item(s) in run {args.run_id}"
+            count = await scheduler_repo.retry_failed(args.run_id)
+            presenter.command_result(
+                "DBD · RETRY RESULT",
+                {"run_id": int(args.run_id), "requeued": int(count)},
             )
             return
         if args.command == "fetch-company":
@@ -159,7 +162,7 @@ async def worker_command(args, health=None):
                     else population["eligible_operating"]
                 )
                 population["scope"] = "all_statuses" if args.all_statuses else "operating_only"
-                print(json.dumps({"master_population": population}, indent=2), flush=True)
+                presenter.command_result("DBD · MASTER SELECTION", population)
         else:
             if getattr(args, "force_refresh", False):
                 raise ValueError("--force-refresh can only be set when creating a new run")
@@ -169,9 +172,12 @@ async def worker_command(args, health=None):
             if args.fiscal_year is not None and args.fiscal_year != run["fiscal_year"]:
                 raise ValueError("Cannot change fiscal year while resuming")
             run_id = run["id"]
-        print(f"run {run_id}: durable scheduler ready", flush=True)
+        presenter.message(f"Run {run_id}: durable scheduler ready", kind="success")
         if getattr(args, "enqueue_only", False):
-            print(f"Start with: dbd-data bulk --run-id {run_id}")
+            presenter.command_result(
+                "DBD · RUN READY",
+                {"run_id": int(run_id), "next_command": f"dbd-data bulk --run-id {run_id}"},
+            )
             return
         result = await process(
             repo,
@@ -183,7 +189,7 @@ async def worker_command(args, health=None):
             endpoint_rates=getattr(args, "endpoint_rates", None),
             distributed=getattr(args, "distributed", False),
         )
-        print(json.dumps({"run_id": run_id, **result}, indent=2))
+        presenter.command_result("DBD · WORKER RESULT", {"run_id": int(run_id), **result})
         if result.get("failed", 0):
             raise SystemExit(1)
     finally:
