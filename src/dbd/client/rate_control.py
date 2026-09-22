@@ -2,11 +2,22 @@ from __future__ import annotations
 
 import asyncio
 import math
+import time
 from collections.abc import Mapping
+from dataclasses import dataclass
+from uuid import uuid4
 
 from redis.asyncio import Redis
 
-from ..core.telemetry import EFFECTIVE_RATE, ENDPOINT_EFFECTIVE_RATE
+from ..core.redis import create_async_redis, redis_pool_snapshot
+from ..core.settings import settings
+from ..core.telemetry import (
+    EFFECTIVE_RATE,
+    ENDPOINT_EFFECTIVE_RATE,
+    REDIS_COMMANDS,
+    REDIS_POOL_CONNECTIONS,
+    REDIS_RTT,
+)
 from .circuit import AdaptiveCircuitBreaker
 from .rate_limit import TokenBucket
 
@@ -219,6 +230,13 @@ return {tostring(new_rate), tostring(new_rate)}
         await self._redis.delete(*self._keys)
 
 
+@dataclass(frozen=True)
+class AdmissionState:
+    global_state: str = "closed"
+    endpoint_state: str | None = None
+    shared: bool = False
+
+
 class EndpointRateController:
     """Hierarchical per-worker + shared fleet/endpoint adaptive admission.
 
@@ -238,6 +256,7 @@ class EndpointRateController:
         redis_key: str = "dbd:global-rate",
         shared_rate_ceiling: float | None = None,
         redis_max_connections: int | None = None,
+        redis_client: Redis | None = None,
         circuit_failure_threshold: int = 5,
         circuit_window_seconds: float = 30.0,
         circuit_open_seconds: float = 30.0,
@@ -252,10 +271,13 @@ class EndpointRateController:
         }
         self._redis_url = redis_url
         self._redis_key = redis_key
-        redis_kwargs = {"decode_responses": True}
-        if redis_max_connections is not None:
-            redis_kwargs["max_connections"] = max(1, int(redis_max_connections))
-        self._redis = Redis.from_url(redis_url, **redis_kwargs) if redis_url else None
+        self._redis = redis_client
+        self._owns_redis = redis_client is None and redis_url is not None
+        if self._redis is None and redis_url:
+            self._redis = create_async_redis(
+                redis_url,
+                max_connections=redis_max_connections,
+            )
         self._global_local = TokenBucket(self.target_rate)
         self._global_shared = (
             RedisPacer(
@@ -269,6 +291,13 @@ class EndpointRateController:
         )
         self._shared_endpoints: dict[str, RedisPacer] = {}
         self._endpoints: dict[str, TokenBucket] = {}
+        self._admission_script = None
+        self._success_script = None
+        self._next_shared_recovery_at = 0.0
+        self._global_recovery_needed = False
+        self._endpoint_recovery_needed: set[str] = set()
+        self.redis_commands = 0
+        self.redis_admissions = 0
         self._breaker = AdaptiveCircuitBreaker(
             redis=self._redis,
             namespace=f"{redis_key}:circuit",
@@ -284,15 +313,26 @@ class EndpointRateController:
     async def open(self) -> None:
         if self._redis is not None:
             await self._redis.ping()
+            self._admission_script = self._redis.register_script(
+                self._ADMISSION_SCRIPT
+            )
+            self._success_script = self._redis.register_script(
+                self._SUCCESS_RECOVERY_SCRIPT
+            )
+            # Preload once so the hot path is EVALSHA from the first request.
+            await self._redis.script_load(self._ADMISSION_SCRIPT)
+            await self._redis.script_load(self._SUCCESS_RECOVERY_SCRIPT)
         elif self._global_shared is not None:
             await self._global_shared.open()
 
     async def close(self) -> None:
-        if self._redis is not None:
+        if self._redis is not None and self._owns_redis:
             await self._redis.aclose()
             self._redis = None
         elif self._global_shared is not None:
             await self._global_shared.close()
+        self._admission_script = None
+        self._success_script = None
 
     def _target_for(self, endpoint: str) -> float:
         return min(self.target_rate, self._endpoint_targets.get(endpoint, self.target_rate))
