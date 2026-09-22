@@ -10,7 +10,7 @@ from ....runtime.collection_fabric import (
     next_endpoint,
     remaining_mask,
 )
-from .worker_repository import WorkerRepository, transaction_retry
+from .worker_repository import FinishResult, WorkerRepository, transaction_retry
 
 
 class FabricWorkerRepository(WorkerRepository):
@@ -359,7 +359,7 @@ class FabricWorkerRepository(WorkerRepository):
         async with self.engine.begin() as conn:
             row = await self._owned_state(conn, task)
             if row is None:
-                return False
+                return FinishResult(False)
             unresolved = remaining_mask(
                 int(row["required_mask"]),
                 int(row["done_mask"]),
@@ -399,7 +399,12 @@ class FabricWorkerRepository(WorkerRepository):
                     """),
                     {"archive": archive_id, "error": error},
                 )
-            return True
+            count = int(unresolved).bit_count()
+            return FinishResult(
+                True,
+                completed_delta=count,
+                failed_delta=count,
+            )
 
     @transaction_retry
     async def finish(self, task, status, error=None):
@@ -411,7 +416,7 @@ class FabricWorkerRepository(WorkerRepository):
         async with self.engine.begin() as conn:
             row = await self._owned_state(conn, task)
             if row is None:
-                return False
+                return FinishResult(False)
             if status == "retry_wait":
                 result = await conn.execute(
                     text("""
@@ -430,7 +435,7 @@ class FabricWorkerRepository(WorkerRepository):
                         "version": row["lease_version"],
                     },
                 )
-                return result.rowcount == 1
+                return FinishResult(result.rowcount == 1)
             outcome = "not_available" if status == "not_available" else (
                 "done" if status == "done" else "failed"
             )
@@ -444,8 +449,24 @@ class FabricWorkerRepository(WorkerRepository):
                 dirty_mask=int(row["dirty_mask"]),
                 fiscal_year=row["fiscal_year"],
             )
+            done_delta = (
+                int(transition.done_mask) & ~int(row["done_mask"])
+            ).bit_count()
+            na_delta = (
+                int(transition.not_available_mask)
+                & ~int(row["not_available_mask"])
+            ).bit_count()
+            failed_delta = (
+                int(transition.failed_mask) & ~int(row["failed_mask"])
+            ).bit_count()
             await self._apply_transition(conn, row, transition, error=error)
-            return True
+            return FinishResult(
+                True,
+                completed_delta=done_delta + na_delta + failed_delta,
+                done_delta=done_delta,
+                not_available_delta=na_delta,
+                failed_delta=failed_delta,
+            )
 
     @transaction_retry
     async def release(self, owner):

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from sqlalchemy import bindparam, text
@@ -36,6 +37,18 @@ def transaction_retry(fn):
 
 def now():
     return datetime.now(timezone.utc).replace(tzinfo=None)
+
+
+@dataclass(frozen=True)
+class FinishResult:
+    owned: bool
+    completed_delta: int = 0
+    done_delta: int = 0
+    not_available_delta: int = 0
+    failed_delta: int = 0
+
+    def __bool__(self) -> bool:
+        return self.owned
 
 
 class WorkerRepository:
@@ -383,7 +396,7 @@ class WorkerRepository:
                 },
             )
             if result.rowcount != 1:
-                return False
+                return FinishResult(False)
             await conn.execute(
                 text("UPDATE company_master SET identity_status='conflict' WHERE company_id=:company"),
                 {"company": task["company_id"]},
@@ -396,7 +409,7 @@ class WorkerRepository:
                 """),
                     {"archive": archive_id, "error": error},
                 )
-            return True
+            return FinishResult(True, completed_delta=1, failed_delta=1)
 
     @transaction_retry
     async def finish(self, task, status, error=None):
@@ -423,7 +436,15 @@ class WorkerRepository:
                     "version": task["lease_version"],
                 },
             )
-            return result.rowcount == 1
+            if result.rowcount != 1:
+                return FinishResult(False)
+            if status == "retry_wait":
+                return FinishResult(True)
+            if status == "failed":
+                return FinishResult(True, completed_delta=1, failed_delta=1)
+            if status == "not_available":
+                return FinishResult(True, completed_delta=1, not_available_delta=1)
+            return FinishResult(True, completed_delta=1, done_delta=1)
 
     @transaction_retry
     async def release(self, owner):
