@@ -331,7 +331,11 @@ def test_resource_plan_bounds_maximum_fleet() -> None:
     assert plan.archive_workers_effective_max == 20
     assert plan.projection_workers_per_worker == 2
     assert plan.projection_workers_effective_max == 40
-    assert plan.redis_connections_per_client == 3
+    # PR3 shares one Redis pool per worker, so the same fleet budget can
+    # preserve the configured 4-connection pool instead of splitting it across
+    # two independent worker clients.
+    assert plan.redis_connections_per_client == 4
+    assert plan.redis_connections_effective_max == 84
     assert plan.redis_connections_effective_max <= 128
 
 
