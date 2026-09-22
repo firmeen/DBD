@@ -604,6 +604,174 @@ return {
         shared = self._global_shared
         return shared.rate if shared is not None else self._global_local.rate
 
+    def _shared_keys(self, endpoint: str | None) -> list[str]:
+        if self._global_shared is None:
+            raise RuntimeError("Shared Redis admission is not configured")
+        global_pacer = list(self._global_shared._keys)
+        global_circuit = list(self._breaker._keys("__global__"))
+        if endpoint is None:
+            endpoint_pacer = global_pacer
+            endpoint_circuit = global_circuit
+        else:
+            shared_endpoint = self._shared_endpoint(endpoint)
+            if shared_endpoint is None:
+                raise RuntimeError("Shared endpoint admission is not configured")
+            endpoint_pacer = list(shared_endpoint._keys)
+            endpoint_circuit = list(self._breaker._keys(endpoint))
+        return [
+            *global_pacer,
+            *endpoint_pacer,
+            *global_circuit,
+            *endpoint_circuit,
+        ]
+
+    def _observe_redis_command(self, operation: str, started: float) -> None:
+        REDIS_RTT.labels(operation).observe(time.perf_counter() - started)
+        REDIS_COMMANDS.labels(operation).inc()
+        self.redis_commands += 1
+        if self._redis is not None:
+            snapshot = redis_pool_snapshot(self._redis)
+            for state in ("in_use", "available", "created", "max"):
+                REDIS_POOL_CONNECTIONS.labels(state).set(snapshot[state])
+
+    async def _shared_admit(self, endpoint: str | None) -> AdmissionState:
+        if self._redis is None:
+            raise RuntimeError("Shared Redis admission is not configured")
+        if self._admission_script is None:
+            self._admission_script = self._redis.register_script(
+                self._ADMISSION_SCRIPT
+            )
+
+        shared_endpoint = self._shared_endpoint(endpoint) if endpoint else None
+        endpoint_ceiling = (
+            self._shared_target_for(endpoint)
+            if endpoint is not None
+            else self.shared_rate_ceiling
+        )
+        keys = self._shared_keys(endpoint)
+
+        while True:
+            started = time.perf_counter()
+            try:
+                result = await self._admission_script(
+                    keys=keys,
+                    args=[
+                        "1" if endpoint is not None else "0",
+                        self.shared_rate_ceiling,
+                        endpoint_ceiling,
+                        self._global_shared._state_ttl_ms,
+                        uuid4().hex,
+                        int(self._breaker.probe_seconds * 1000),
+                        self._breaker._state_ttl_ms,
+                    ],
+                )
+            finally:
+                self._observe_redis_command("admission", started)
+
+            wait_ms = max(0.0, float(result[0]))
+            mode = str(result[3])
+            global_state = str(result[4])
+            endpoint_state = str(result[5]) if endpoint is not None else None
+            if mode == "circuit":
+                await asyncio.sleep(min(max(wait_ms / 1000.0, 0.001), 1.0))
+                continue
+
+            global_rate = float(result[1])
+            self._global_shared.rate = global_rate
+            if global_rate < self.shared_rate_ceiling:
+                self._global_recovery_needed = True
+            if shared_endpoint is not None and result[2] != "":
+                endpoint_rate = float(result[2])
+                shared_endpoint.rate = endpoint_rate
+                if endpoint_rate < self._shared_target_for(endpoint):
+                    self._endpoint_recovery_needed.add(endpoint)
+                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
+            EFFECTIVE_RATE.set(global_rate)
+            self.redis_admissions += 1
+            if wait_ms > 0:
+                await asyncio.sleep(wait_ms / 1000.0)
+            return AdmissionState(
+                global_state=global_state,
+                endpoint_state=endpoint_state,
+                shared=True,
+            )
+
+    async def _shared_success_recovery(
+        self,
+        endpoint: str | None,
+        admission: AdmissionState,
+    ) -> tuple[float | None, float | None]:
+        if self._redis is None:
+            return None, None
+        half_open = admission.global_state == "half_open" or (
+            admission.endpoint_state == "half_open"
+        )
+        endpoint_needs_recovery = (
+            endpoint is not None and endpoint in self._endpoint_recovery_needed
+        )
+        now = time.monotonic()
+        if (
+            not half_open
+            and not self._global_recovery_needed
+            and not endpoint_needs_recovery
+        ):
+            return None, None
+        if not half_open and now < self._next_shared_recovery_at:
+            return None, None
+
+        if self._success_script is None:
+            self._success_script = self._redis.register_script(
+                self._SUCCESS_RECOVERY_SCRIPT
+            )
+        endpoint_ceiling = (
+            self._shared_target_for(endpoint)
+            if endpoint is not None
+            else self.shared_rate_ceiling
+        )
+        started = time.perf_counter()
+        try:
+            result = await self._success_script(
+                keys=self._shared_keys(endpoint),
+                args=[
+                    "1" if endpoint is not None else "0",
+                    self.shared_rate_ceiling,
+                    endpoint_ceiling,
+                    self._global_shared._state_ttl_ms,
+                    30_000,
+                    1.25,
+                    0.5,
+                    admission.global_state,
+                    admission.endpoint_state or "closed",
+                ],
+            )
+        finally:
+            self._observe_redis_command("success_recovery", started)
+
+        self._next_shared_recovery_at = (
+            now + float(settings.dbd_redis_recovery_interval_seconds)
+        )
+        previous_global = self._global_shared.rate
+        global_rate = float(result[0])
+        self._global_shared.rate = global_rate
+        self._global_recovery_needed = global_rate < self.shared_rate_ceiling
+        global_changed = global_rate if global_rate != previous_global else None
+
+        endpoint_changed = None
+        if endpoint is not None and result[1] != "":
+            shared_endpoint = self._shared_endpoint(endpoint)
+            previous_endpoint = shared_endpoint.rate
+            endpoint_rate = float(result[1])
+            shared_endpoint.rate = endpoint_rate
+            if endpoint_rate >= self._shared_target_for(endpoint):
+                self._endpoint_recovery_needed.discard(endpoint)
+            else:
+                self._endpoint_recovery_needed.add(endpoint)
+            if endpoint_rate != previous_endpoint:
+                endpoint_changed = endpoint_rate
+            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
+        EFFECTIVE_RATE.set(global_rate)
+        return endpoint_changed, global_changed
+
     def set_target_rate(self, value: float) -> float:
         """Retarget the local per-worker cap without erasing shared fleet penalties."""
         self.target_rate = _positive_rate(value)
