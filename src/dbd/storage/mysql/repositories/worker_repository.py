@@ -533,6 +533,29 @@ class WorkerRepository:
             ).mappings().all()
             return [dict(row) for row in rows]
 
+    async def failure_diagnostics(self, run_id, limit=8):
+        """Read-only durable failure summary for legacy endpoint tasks."""
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text("""
+                    SELECT
+                      COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                      endpoint,
+                      stage,
+                      COUNT(*) AS n,
+                      COUNT(*) AS resources
+                    FROM endpoint_tasks
+                    WHERE run_id=:id AND status='failed'
+                    GROUP BY error_code,endpoint,stage
+                    ORDER BY n DESC,error_code
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": max(1, int(limit))},
+                )
+            ).mappings().all()
+            return [dict(row) for row in rows]
+
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
             await conn.execute(
