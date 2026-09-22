@@ -223,7 +223,11 @@ export function SpatialControlDeck({
                   value={[radiusKm]}
                   disabled={!branchId}
                   onValueChange={(value) =>
-                    onRadiusChange(value[0] ?? radiusKm)
+                    onRadiusChange(
+                      typeof value === "number"
+                        ? value
+                        : (value[0] ?? radiusKm)
+                    )
                   }
                   aria-label="Branch catchment radius"
                   className="py-1"
