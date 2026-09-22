@@ -28,6 +28,20 @@ PIPELINE_BATCH_SIZE = Histogram(
 ARCHIVE_BYTES = Counter(
     "dbd_archive_bytes_total", "Archive bytes before/after optional compression", ["kind"]
 )
+REFRESH_PLAN_COMPANIES = Counter(
+    "dbd_refresh_plan_companies_total",
+    "Companies evaluated by the fabric incremental refresh planner",
+    ["reason"],
+)
+REFRESH_PLAN_RESOURCES = Counter(
+    "dbd_refresh_plan_resources_total",
+    "Resources selected by the fabric incremental refresh planner",
+    ["reason"],
+)
+REFRESH_HTTP_CALLS_PER_COMPANY = Gauge(
+    "dbd_refresh_http_calls_per_company",
+    "Durable archived endpoint HTTP calls per company in the last observed fabric run",
+)
 
 REDIS_RTT = Histogram(
     "dbd_redis_rtt_seconds",
