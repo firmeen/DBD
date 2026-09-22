@@ -553,14 +553,17 @@ def main():
             from ..runtime.replay import replay_archive
 
             with manager_lock():
-                replay_archive(args.archive_id)
+                replay_result = replay_archive(args.archive_id)
+            presenter.command_result("DBD · REPLAY RESULT", replay_result)
         elif args.command in ("discover-retry", "discover-refresh"):
             from ..storage.mysql.repositories.discovery_repository import reset_discovery
 
             with manager_lock():
-                reset_discovery(
-                    refresh=args.command == "discover-refresh", bucket_id=getattr(args, "bucket_id", None)
+                reset_result = reset_discovery(
+                    refresh=args.command == "discover-refresh",
+                    bucket_id=getattr(args, "bucket_id", None),
                 )
+            presenter.command_result("DBD · DISCOVERY CONTROL", reset_result)
         elif args.command == "legacy-bulk":
             from .legacy import command_bulk
 
