@@ -110,9 +110,16 @@ async def worker_command(args, health=None):
         if args.command == "fetch-company":
             parsed = parse_code(args.company_code)
             selected = args.only or ["profile", "details", "financials"]
-            run_id = await repo.create_run(parsed.code, selected, args.fiscal_year)
-            await repo.import_batch(run_id, [parsed], endpoints(selected))
-            await repo.ready(run_id)
+            scheduler_mode = getattr(args, "scheduler_mode", "legacy")
+            run_id = await repo.create_run(
+                parsed.code,
+                selected,
+                args.fiscal_year,
+                scheduler_mode=scheduler_mode,
+            )
+            scheduler_repo = repo.for_run({"scheduler_mode": scheduler_mode})
+            await scheduler_repo.import_batch(run_id, [parsed], endpoints(selected))
+            await scheduler_repo.ready(run_id)
         elif args.file or args.master:
             run_id = await prepare(
                 repo,
@@ -121,6 +128,7 @@ async def worker_command(args, health=None):
                 parts=args.only,
                 fiscal_year=args.fiscal_year,
                 statuses=None if args.all_statuses else STATUS_OPERATING,
+                scheduler_mode=getattr(args, "scheduler_mode", "legacy"),
             )
             if args.master:
                 population = await repo.master_population()
@@ -138,7 +146,7 @@ async def worker_command(args, health=None):
             if args.fiscal_year is not None and args.fiscal_year != run["fiscal_year"]:
                 raise ValueError("Cannot change fiscal year while resuming")
             run_id = run["id"]
-        print(f"run {run_id}: durable endpoint queue ready", flush=True)
+        print(f"run {run_id}: durable scheduler ready", flush=True)
         if getattr(args, "enqueue_only", False):
             print(f"Start with: dbd-data bulk --run-id {run_id}")
             return
@@ -170,6 +178,7 @@ async def _prepare_campaign(args) -> int:
             parts=args.only,
             fiscal_year=args.fiscal_year,
             statuses=None if args.all_statuses else STATUS_OPERATING,
+            scheduler_mode=args.scheduler_mode,
         )
     finally:
         await engine.dispose()
@@ -330,6 +339,12 @@ def main():
     campaign_start.add_argument("--only", type=parts)
     campaign_start.add_argument("--fiscal-year")
     campaign_start.add_argument("--all-statuses", action="store_true")
+    campaign_start.add_argument(
+        "--scheduler-mode",
+        choices=("legacy", "fabric_v2"),
+        default="legacy",
+        help="Durable scheduler backend for this new run",
+    )
     _add_campaign_worker_options(campaign_start)
     campaign_resume = campaign_sub.add_parser("resume", help="Resume one existing run with workers")
     campaign_resume.add_argument("run_id", type=positive)
@@ -343,6 +358,12 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("--only", type=parts)
         p.add_argument("--fiscal-year")
+        p.add_argument(
+            "--scheduler-mode",
+            choices=("legacy", "fabric_v2"),
+            default="legacy",
+            help="Durable scheduler backend for a newly-created run",
+        )
         p.add_argument("--concurrency", type=positive)
         p.add_argument("--rate", type=positive_rate)
         p.add_argument(

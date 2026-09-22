@@ -10,10 +10,31 @@ from ..engine import connect, use_connection
 from .company_detail_repository import save_collection
 from .company_repository import save_company_profile
 from .financial_repository import save_benchmark, save_statements, save_submissions
+from .projection_scheduler import LeaseLost, projection_scheduler
 
 
-class LeaseLost(RuntimeError):
-    pass
+class ProjectionOutcome(str):
+    """String-compatible projection result with logical progress deltas."""
+
+    def __new__(cls, value: str, *, transition=None, task: dict | None = None):
+        item = str.__new__(cls, value)
+        if transition is None or task is None:
+            item.done_delta = 0 if value == "not_available" else 1
+            item.not_available_delta = 1 if value == "not_available" else 0
+            item.failed_delta = 0
+        else:
+            before_done = int(task.get("done_mask", 0))
+            before_na = int(task.get("not_available_mask", 0))
+            before_failed = int(task.get("failed_mask", 0))
+            item.done_delta = (int(transition.done_mask) & ~before_done).bit_count()
+            item.not_available_delta = (
+                int(transition.not_available_mask) & ~before_na
+            ).bit_count()
+            item.failed_delta = (int(transition.failed_mask) & ~before_failed).bit_count()
+        item.completed_delta = (
+            item.done_delta + item.not_available_delta + item.failed_delta
+        )
+        return item
 
 
 def _company_key(task: dict, endpoint: str) -> str:
@@ -120,13 +141,17 @@ def project(
     requested_at: datetime,
     path: str,
     scope: str = "",
-) -> str:
+    scheduler_mode: str | None = None,
+) -> ProjectionOutcome:
     """Fence projection and task acknowledgement in one MySQL transaction.
 
     V2 requires stage=project here. That invariant proves the response archive was
     durably committed before any relational projection can acknowledge the task.
     """
     endpoint = task["endpoint"]
+    scheduler = projection_scheduler(
+        scheduler_mode or str(task.get("scheduler_mode") or "legacy")
+    )
     normalized = normalize_resource(endpoint, payload)
     if endpoint == "profile" and (normalized.jp_no, normalized.jp_type_code) != (
         task["jp_no"],
@@ -138,16 +163,7 @@ def project(
     with connect() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT id FROM endpoint_tasks WHERE id=%s AND stage='project' AND status='running'
-                      AND lease_owner=%s AND lease_version=%s AND lease_expires_at>UTC_TIMESTAMP(6)
-                    FOR UPDATE
-                    """,
-                    (task["id"], task["lease_owner"], task["lease_version"]),
-                )
-                if cur.fetchone() is None:
-                    raise LeaseLost("Project-stage task lease is no longer owned")
+                scheduler_state = scheduler.lock(cur, task)
                 cur.execute(
                     "SELECT company_id FROM company_master WHERE company_id=%s FOR UPDATE",
                     (task["company_id"],),
@@ -241,29 +257,24 @@ def project(
                     archive_id,
                     outcome,
                 )
-                task_status = "not_available" if outcome == "not_available" else "done"
-                cur.execute(
-                    """
-                    UPDATE endpoint_tasks SET status=%s,raw_response_id=%s,finished_at=UTC_TIMESTAMP(6),
-                      last_error=%s,lease_owner=NULL,lease_expires_at=NULL WHERE id=%s
-                    """,
-                    (
-                        task_status,
-                        archive_id,
-                        "stale_replay_skipped" if outcome == "stale_skipped" else None,
-                        task["id"],
-                    ),
+                transition = scheduler.finish(
+                    cur,
+                    task,
+                    scheduler_state,
+                    outcome,
+                    archive_id,
+                    normalized_for_write,
                 )
                 cur.execute(
                     "UPDATE response_archive SET processing_status=%s,error_code=%s WHERE id=%s",
                     (
-                        "processed" if task_status == "done" else "not_available",
+                        "not_available" if outcome == "not_available" else "processed",
                         "stale_replay_skipped" if outcome == "stale_skipped" else None,
                         archive_id,
                     ),
                 )
             conn.commit()
-            return outcome
+            return ProjectionOutcome(outcome, transition=transition, task=task)
         except BaseException:
             conn.rollback()
             raise

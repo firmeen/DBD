@@ -70,20 +70,21 @@ async def prepare(
         fiscal_year,
         scheduler_mode=scheduler_mode,
     )
+    scheduler_repo = repo.for_run({"scheduler_mode": scheduler_mode})
     if file:
         for batch in code_batches(file, settings.dbd_write_batch_size):
-            await repo.import_batch(run_id, batch, resources)
+            await scheduler_repo.import_batch(run_id, batch, resources)
     elif master:
         after = 0
         while (
-            after := await repo.enqueue_master(
+            after := await scheduler_repo.enqueue_master(
                 run_id, resources, after, settings.dbd_write_batch_size, statuses
             )
         ) is not None:
             pass
     else:
         raise ValueError("Choose --file or --master")
-    await repo.ready(run_id)
+    await scheduler_repo.ready(run_id)
     return run_id
 
 
@@ -169,6 +170,8 @@ async def process(
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed workers require DBD_REDIS_URL for one shared global rate cap")
 
+    run = await repo.get_run(run_id)
+    repo = repo.for_run(run)
     _ = repo.archive_backend
 
     projection_workers = min(settings.dbd_projection_workers, settings.db_pool_size)
@@ -536,15 +539,25 @@ async def process(
                 scope = params.get("fiscalYear", "")
                 async with writes:
                     outcome = await asyncio.to_thread(
-                        project, task, archive_id, payload, requested_at, path, scope
+                        project,
+                        task,
+                        archive_id,
+                        payload,
+                        requested_at,
+                        path,
+                        scope,
+                        repo.scheduler_mode,
                     )
                 TASKS.labels(task["endpoint"], outcome).inc()
                 PIPELINE_STAGE_TOTAL.labels("project", outcome).inc()
-                runtime_stats["completed"] += 1
-                if outcome == "not_available":
-                    runtime_stats["not_available"] += 1
-                else:
-                    runtime_stats["done"] += 1
+                runtime_stats["completed"] += int(
+                    getattr(outcome, "completed_delta", 1)
+                )
+                runtime_stats["done"] += int(getattr(outcome, "done_delta", 0))
+                runtime_stats["not_available"] += int(
+                    getattr(outcome, "not_available_delta", 0)
+                )
+                runtime_stats["failed"] += int(getattr(outcome, "failed_delta", 0))
             except asyncio.CancelledError:
                 raise
             except LeaseLost:
