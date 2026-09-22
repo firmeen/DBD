@@ -49,6 +49,21 @@ function sameEntity(left: EntityRef, right: EntityRef) {
   return left.kind === right.kind && left.id === right.id
 }
 
+function sameEntityValue(left: EntityRef, right: EntityRef) {
+  return (
+    sameEntity(left, right) &&
+    left.label === right.label &&
+    left.secondary === right.secondary
+  )
+}
+
+function sameEntityList(left: EntityRef[], right: EntityRef[]) {
+  return (
+    left.length === right.length &&
+    left.every((entity, index) => sameEntityValue(entity, right[index]))
+  )
+}
+
 function snapshotOf(state: WorkspaceState): WorkspaceCheckpoint {
   return {
     surface: state.activeSurface,
@@ -92,10 +107,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         state.focus === focus ||
         (state.focus !== null &&
           focus !== null &&
-          state.focus.kind === focus.kind &&
-          state.focus.id === focus.id &&
-          state.focus.label === focus.label &&
-          state.focus.secondary === focus.secondary)
+          sameEntityValue(state.focus, focus))
 
       return unchanged
         ? state
@@ -106,10 +118,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     }),
 
   setSelection: (selection) =>
-    set((state) => ({
-      ...recordBeforeMutation(state),
-      selection,
-    })),
+    set((state) =>
+      sameEntityList(state.selection, selection)
+        ? state
+        : {
+            ...recordBeforeMutation(state),
+            selection,
+          }
+    ),
 
   toggleSelection: (entity) =>
     set((state) => ({
@@ -158,7 +174,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           : state
     ),
 
-  setLensOpen: (lensOpen) => set({ lensOpen }),
+  setLensOpen: (lensOpen) =>
+    set((state) =>
+      lensOpen
+        ? { lensOpen: true, commandOpen: false }
+        : state.lensOpen
+          ? { lensOpen: false }
+          : state
+    ),
 
   saveSurfaceSnapshot: (surface, payload) =>
     set((state) => ({

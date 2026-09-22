@@ -43,11 +43,28 @@ describe("workspace history invariants", () => {
     expect(useWorkspaceStore.getState().focus).toEqual(COMPANY)
   })
 
-  it("never leaves the lens layered over an opened command center", () => {
+  it("preserves redo history when selection is already unchanged", () => {
+    useWorkspaceStore.getState().setFocus(COMPANY)
+    useWorkspaceStore.getState().undoContext()
+
+    expect(useWorkspaceStore.getState().historyFuture).toHaveLength(1)
+
+    useWorkspaceStore.getState().setSelection([])
+
+    expect(useWorkspaceStore.getState().historyPast).toHaveLength(0)
+    expect(useWorkspaceStore.getState().historyFuture).toHaveLength(1)
+  })
+
+  it("keeps command center and Global Lens mutually exclusive", () => {
     useWorkspaceStore.getState().setLensOpen(true)
     useWorkspaceStore.getState().setCommandOpen(true)
 
     expect(useWorkspaceStore.getState().commandOpen).toBe(true)
     expect(useWorkspaceStore.getState().lensOpen).toBe(false)
+
+    useWorkspaceStore.getState().setLensOpen(true)
+
+    expect(useWorkspaceStore.getState().lensOpen).toBe(true)
+    expect(useWorkspaceStore.getState().commandOpen).toBe(false)
   })
 })
