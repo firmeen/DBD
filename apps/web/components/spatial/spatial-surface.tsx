@@ -25,7 +25,6 @@ import {
   type SpatialCompanyPoint,
   type SpatialLayerId,
   type SpatialSnapshot,
-  type SpatialViewState,
 } from "@/lib/spatial/types"
 import { useWorkspaceStore } from "@/stores/workspace-store"
 
@@ -98,13 +97,15 @@ export function SpatialSurface() {
   const [railHoverId, setRailHoverId] = React.useState<string | null>(null)
   const liveSnapshotRef = React.useRef(initialState)
 
-  liveSnapshotRef.current = {
-    viewState,
-    layers,
-    branchId,
-    radiusKm,
-    companyRailOpen,
-  }
+  React.useLayoutEffect(() => {
+    liveSnapshotRef.current = {
+      viewState,
+      layers,
+      branchId,
+      radiusKm,
+      companyRailOpen,
+    }
+  }, [branchId, companyRailOpen, layers, radiusKm, viewState])
 
   React.useEffect(
     () => () => {
