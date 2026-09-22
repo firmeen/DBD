@@ -335,7 +335,8 @@ class TerminalPresenter:
         by_endpoint = list(diagnostics.get("by_endpoint") or [])
         latest_errors = list(diagnostics.get("latest_errors") or [])
         if by_endpoint:
-            table = Table(title="FAILED RESOURCES BY ENDPOINT · EXACT", box=box.SIMPLE_HEAVY)
+            table = Table(title="FAILED RESOURCES BY ENDPOINT", box=box.SIMPLE_HEAVY)
+            table.caption = "Exact durable endpoint-bit counts"
             table.add_column("ENDPOINT")
             table.add_column("STATES", justify="right")
             table.add_column("RESOURCES", justify="right")
@@ -350,9 +351,9 @@ class TerminalPresenter:
         if latest_errors:
             scope = str(diagnostics.get("error_scope") or "")
             title = (
-                "LATEST STATE ERROR CONTEXT · NOT PER-ENDPOINT"
+                "LATEST STATE ERRORS · CONTEXT ONLY"
                 if scope == "state_latest_error_not_per_endpoint"
-                else "FAILED TASK ERRORS · EXACT"
+                else "FAILED TASK ERRORS"
             )
             table = Table(title=title, box=box.SIMPLE_HEAVY)
             for name in ("ERROR", "STAGE", "STATUS", "STATES"):
