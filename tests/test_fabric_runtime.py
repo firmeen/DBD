@@ -364,3 +364,201 @@ async def test_historical_fabric_archive_replays_without_rewinding_state(repo):
             )
         ).mappings().one()
     assert after == before
+
+
+
+async def test_expired_fabric_lease_is_fenced_and_reclaimed(repo):
+    fabric, run_id, _ = await new_fabric_run(repo, ("profile",))
+    first = await fabric.claim(run_id, "fabric-first")
+    assert first is not None
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE company_collection_state "
+                "SET lease_expires_at=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6)) "
+                "WHERE id=:id"
+            ),
+            {"id": first["id"]},
+        )
+
+    await fabric.maintain(run_id)
+    second = await fabric.claim(run_id, "fabric-second")
+    assert second is not None
+    assert second["lease_version"] > first["lease_version"]
+    assert not await fabric.finish(first, "done")
+    assert await fabric.finish(second, "done")
+
+
+async def test_fabric_retry_reopens_only_failed_resource_bits(repo):
+    class BrokenCommitteeApi(FullFabricApi):
+        calls = 0
+
+        async def fetch(self, method, path, **kwargs):
+            type(self).calls += 1
+            result = await super().fetch(method, path, **kwargs)
+            if "/committees/" in path:
+                result.data = [{"renamedSequence": 1}]
+            return result
+
+    resources = ("profile", "committees", "transformations")
+    fabric, run_id, _ = await new_fabric_run(repo, resources)
+    assert await process(
+        repo,
+        run_id,
+        concurrency=2,
+        client_factory=BrokenCommitteeApi,
+    ) == {"failed": 1, "done": 2}
+
+    assert await fabric.retry_failed(run_id) == 1
+    FullFabricApi.calls = 0
+    assert await process(
+        repo,
+        run_id,
+        concurrency=1,
+        client_factory=FullFabricApi,
+    ) == {"done": 3}
+    assert FullFabricApi.calls == 1
+
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT BIT_COUNT(done_mask) done_count,failed_mask,status "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+    assert state["done_count"] == 3
+    assert state["failed_mask"] == 0
+    assert state["status"] == "done"
+
+
+async def test_fabric_external_archive_resumes_without_refetch(repo):
+    from test_external_archive_mysql import NoFetchApi as ExternalNoFetchApi
+    from test_external_archive_mysql import external_backend
+
+    from dbd.storage.mysql.repositories.worker_repository import WorkerRepository
+
+    ExternalNoFetchApi.calls = 0
+    external_repo = WorkerRepository(repo.engine, archive_backend=external_backend())
+    fabric, run_id, identities = await new_fabric_run(external_repo, ("profile",))
+    task = await fabric.claim(run_id, "fabric-external-first")
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    response = ApiResponse(
+        {
+            "jpNo": identities[0].jp_no,
+            "jpTypeCode": identities[0].jp_type_code,
+            "jpName": "External Fabric",
+            "submitFinYear": None,
+        },
+        200,
+        now,
+        now,
+    )
+    archive_id = await fabric.archive(task, response, "/synthetic/profile", None)
+    await fabric.release("fabric-external-first")
+
+    async with repo.engine.connect() as conn:
+        archive = (
+            await conn.execute(
+                text(
+                    "SELECT task_id,run_id,payload_backend,payload_object_key "
+                    "FROM response_archive WHERE id=:id"
+                ),
+                {"id": archive_id},
+            )
+        ).mappings().one()
+    assert archive["task_id"] is None
+    assert archive["run_id"] == run_id
+    assert archive["payload_backend"] == "s3"
+    assert archive["payload_object_key"]
+
+    assert await process(
+        external_repo,
+        run_id,
+        concurrency=2,
+        client_factory=ExternalNoFetchApi,
+    ) == {"done": 1}
+    assert ExternalNoFetchApi.calls == 0
+
+
+async def _semantic_snapshot(repo, identity):
+    async with repo.engine.connect() as conn:
+        company = (
+            await conn.execute(
+                text(
+                    "SELECT jp_name,submit_fin_year,business_size_code,submit_obj_code "
+                    "FROM companies WHERE jp_no=:no"
+                ),
+                {"no": identity.jp_no},
+            )
+        ).mappings().one()
+        counts = {}
+        for name, table in (
+            ("committees", "company_committees"),
+            ("committee_signs", "company_committee_signs"),
+            ("transformations", "company_transformations"),
+            ("financial_submissions", "financial_submissions"),
+            ("financial_statement_items", "financial_statement_items"),
+        ):
+            counts[name] = int(
+                (
+                    await conn.execute(
+                        text(f"SELECT COUNT(*) FROM {table} WHERE jp_no=:no"),
+                        {"no": identity.jp_no},
+                    )
+                ).scalar_one()
+            )
+        assets = (
+            await conn.execute(
+                text(
+                    "SELECT amount FROM financial_statement_items "
+                    "WHERE jp_no=:no AND fiscal_year='2568' AND item_code='assets'"
+                ),
+                {"no": identity.jp_no},
+            )
+        ).scalar_one()
+    return {
+        "company": dict(company),
+        "counts": counts,
+        "assets": str(assets),
+    }
+
+
+async def test_fabric_projection_parity_with_legacy_scheduler(repo):
+    resources = endpoints(list(DEFAULT_PARTS))
+    legacy_identity, fabric_identity = _identities(2)
+
+    legacy_run = await repo.create_run(
+        "fabric-parity-legacy-" + uuid4().hex,
+        list(DEFAULT_PARTS),
+        scheduler_mode="legacy",
+    )
+    await repo.import_batch(legacy_run, [legacy_identity], resources)
+    await repo.ready(legacy_run)
+    assert await process(
+        repo,
+        legacy_run,
+        concurrency=3,
+        client_factory=FullFabricApi,
+    ) == {"done": len(resources)}
+    legacy_snapshot = await _semantic_snapshot(repo, legacy_identity)
+
+    fabric_run = await repo.create_run(
+        "fabric-parity-v2-" + uuid4().hex,
+        list(DEFAULT_PARTS),
+        scheduler_mode="fabric_v2",
+    )
+    fabric_repo = repo.for_run(await repo.get_run(fabric_run))
+    await fabric_repo.import_batch(fabric_run, [fabric_identity], resources)
+    await fabric_repo.ready(fabric_run)
+    assert await process(
+        repo,
+        fabric_run,
+        concurrency=3,
+        client_factory=FullFabricApi,
+    ) == {"done": len(resources)}
+    fabric_snapshot = await _semantic_snapshot(repo, fabric_identity)
+
+    assert fabric_snapshot == legacy_snapshot
