@@ -554,6 +554,7 @@ return {
             # Preload once so the hot path is EVALSHA from the first request.
             await self._redis.script_load(self._ADMISSION_SCRIPT)
             await self._redis.script_load(self._SUCCESS_RECOVERY_SCRIPT)
+            await self._breaker.prepare_scripts()
         elif self._global_shared is not None:
             await self._global_shared.open()
 
