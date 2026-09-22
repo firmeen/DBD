@@ -600,6 +600,7 @@ def main():
                         concurrency=args.concurrency,
                         rate=args.rate,
                         max_buckets=args.max_buckets,
+                        verbose=not bool(getattr(args, "json", False)),
                         distributed=True,
                     )
                 )
@@ -612,6 +613,7 @@ def main():
                             concurrency=args.concurrency,
                             rate=args.rate,
                             max_buckets=args.max_buckets,
+                            verbose=not bool(getattr(args, "json", False)),
                             health=lambda: assert_manager_lock(conn),
                         )
                     )
