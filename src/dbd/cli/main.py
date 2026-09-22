@@ -10,6 +10,7 @@ from ..core.exceptions import DbdError
 from ..core.prepare_dashboard import LiveCampaignPrepareDashboard
 from ..core.settings import settings
 from ..core.telemetry import configure
+from ..presentation import TerminalPresenter
 from ..runtime.collection_fabric import mask_for_endpoints
 from ..runtime.locking import assert_manager_lock, manager_lock
 from ..runtime.resources import PARTS, endpoints
@@ -68,6 +69,31 @@ def endpoint_rate_map(value):
     return result
 
 
+def _add_output_options(parser) -> None:
+    group = parser.add_argument_group("output")
+    group.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the human terminal view",
+    )
+    group.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show expanded operator detail such as per-worker rows",
+    )
+    group.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show additional safe diagnostic context; never prints credentials or tokens",
+    )
+    group.add_argument(
+        "--no-color",
+        action="store_true",
+        help="Disable ANSI color while keeping the structured terminal layout",
+    )
+
+
 def safe_error(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
         messages = list(dict.fromkeys(safe_error(child) for child in exc.exceptions))
@@ -82,6 +108,7 @@ def safe_error(exc: BaseException) -> str:
 async def worker_command(args, health=None):
     engine = create_engine()
     repo = WorkerRepository(engine)
+    presenter = TerminalPresenter.from_args(args)
     try:
         if args.command == "bulk-status":
             if args.run_id is None:
@@ -93,33 +120,31 @@ async def worker_command(args, health=None):
                         .mappings()
                         .all()
                     )
-                    print(json.dumps([dict(r) for r in rows], default=str, indent=2))
+                    presenter.bulk_runs(rows)
                 return
             run = await repo.get_run(args.run_id)
             scheduler_repo = repo.for_run(run)
-            print(
-                json.dumps(
-                    {
-                        "scheduler_mode": scheduler_repo.scheduler_mode,
-                        "status": await scheduler_repo.progress(args.run_id),
-                        "stages": await scheduler_repo.progress_by_stage(args.run_id),
-                        "refresh": (
-                            await scheduler_repo.refresh_stats(args.run_id)
-                            if scheduler_repo.scheduler_mode == "fabric_v2"
-                            else None
-                        ),
-                    },
-                    indent=2,
-                )
-            )
+            payload = {
+                "scheduler_mode": scheduler_repo.scheduler_mode,
+                "status": await scheduler_repo.progress(args.run_id),
+                "stages": await scheduler_repo.progress_by_stage(args.run_id),
+                "refresh": (
+                    await scheduler_repo.refresh_stats(args.run_id)
+                    if scheduler_repo.scheduler_mode == "fabric_v2"
+                    else None
+                ),
+                "diagnostics": await scheduler_repo.failure_diagnostics(
+                    args.run_id,
+                    limit=20 if presenter.options.verbose or presenter.options.debug else 8,
+                ),
+            }
+            presenter.bulk_status(args.run_id, payload)
             return
         if args.command == "bulk-retry":
             run = await repo.get_run(args.run_id)
             scheduler_repo = repo.for_run(run)
-            print(
-                f"Requeued {await scheduler_repo.retry_failed(args.run_id)} "
-                f"work item(s) in run {args.run_id}"
-            )
+            count = await scheduler_repo.retry_failed(args.run_id)
+            presenter.bulk_retry(args.run_id, count)
             return
         if args.command == "fetch-company":
             parsed = parse_code(args.company_code)
@@ -159,7 +184,8 @@ async def worker_command(args, health=None):
                     else population["eligible_operating"]
                 )
                 population["scope"] = "all_statuses" if args.all_statuses else "operating_only"
-                print(json.dumps({"master_population": population}, indent=2), flush=True)
+                if not presenter.options.json:
+                    presenter.master_population(population)
         else:
             if getattr(args, "force_refresh", False):
                 raise ValueError("--force-refresh can only be set when creating a new run")
@@ -169,10 +195,15 @@ async def worker_command(args, health=None):
             if args.fiscal_year is not None and args.fiscal_year != run["fiscal_year"]:
                 raise ValueError("Cannot change fiscal year while resuming")
             run_id = run["id"]
-        print(f"run {run_id}: durable scheduler ready", flush=True)
         if getattr(args, "enqueue_only", False):
-            print(f"Start with: dbd-data bulk --run-id {run_id}")
+            presenter.success(
+                "DURABLE SCHEDULER READY",
+                fields={"run": run_id, "next": f"dbd-data bulk --run-id {run_id}"},
+                raw={"run_id": run_id, "status": "ready", "enqueue_only": True},
+            )
             return
+        if not presenter.options.json:
+            presenter.success("DURABLE SCHEDULER READY", fields={"run": run_id})
         result = await process(
             repo,
             run_id,
@@ -183,7 +214,7 @@ async def worker_command(args, health=None):
             endpoint_rates=getattr(args, "endpoint_rates", None),
             distributed=getattr(args, "distributed", False),
         )
-        print(json.dumps({"run_id": run_id, **result}, indent=2))
+        presenter.process_result(run_id, result)
         if result.get("failed", 0):
             raise SystemExit(1)
     finally:
@@ -193,7 +224,7 @@ async def worker_command(args, health=None):
 async def _prepare_campaign(args) -> int:
     engine = create_engine()
     repo = WorkerRepository(engine)
-    dashboard = LiveCampaignPrepareDashboard()
+    dashboard = LiveCampaignPrepareDashboard(enabled=not bool(getattr(args, "json_output", False)))
     latest = None
 
     def update(snapshot):
@@ -308,12 +339,13 @@ def _add_campaign_worker_options(parser):
 def _campaign_command(args) -> None:
     from ..runtime.supervisor import campaign_status, request_campaign_stop, supervise_campaign
 
+    presenter = TerminalPresenter.from_args(args)
     if args.campaign_command == "status":
-        print(json.dumps(campaign_status(args.run_id), indent=2, default=str))
+        presenter.campaign_status(campaign_status(args.run_id))
         return
     if args.campaign_command == "stop":
         request_campaign_stop(args.run_id)
-        print(f"Graceful stop requested for campaign {args.run_id}")
+        presenter.campaign_stop(args.run_id)
         return
     if not settings.dbd_redis_url:
         raise ValueError("campaign requires DBD_REDIS_URL")
@@ -329,7 +361,7 @@ def _campaign_command(args) -> None:
         with manager_lock() as conn:
             run_id = asyncio.run(_prepare_campaign(args))
             assert_manager_lock(conn)
-        print(f"Campaign run {run_id} prepared", flush=True)
+        presenter.campaign_prepared(run_id)
     else:
         run_id = args.run_id
         asyncio.run(_validate_campaign_run(run_id))
@@ -358,15 +390,25 @@ def main():
     parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
     parser.add_argument("--version", action="version", version="dbd-data 0.3.0")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("check-db", help="Check database connectivity")
-    sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)")
-    sub.add_parser("master-status", help="Count discovered and verified company identities")
-    sub.add_parser("discover-status", help="Show discovery coverage")
-    sub.add_parser("discover-retry", help="Requeue failed discovery buckets")
+    check_db = sub.add_parser("check-db", help="Check database connectivity")
+    migrate_parser = sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)")
+    master_status_parser = sub.add_parser("master-status", help="Count discovered and verified company identities")
+    discover_status_parser = sub.add_parser("discover-status", help="Show discovery coverage")
+    discover_retry_parser = sub.add_parser("discover-retry", help="Requeue failed discovery buckets")
     reset = sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
     reset.add_argument("--bucket-id", type=positive)
     replay = sub.add_parser("replay", help="Reprocess an archived endpoint payload without HTTP")
     replay.add_argument("archive_id", type=positive)
+    for output_parser in (
+        check_db,
+        migrate_parser,
+        master_status_parser,
+        discover_status_parser,
+        discover_retry_parser,
+        reset,
+        replay,
+    ):
+        _add_output_options(output_parser)
 
     campaign = sub.add_parser("campaign", help="Supervise a coordinated local worker fleet")
     campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
@@ -394,8 +436,10 @@ def main():
     _add_campaign_worker_options(campaign_resume)
     campaign_status_parser = campaign_sub.add_parser("status", help="Show fleet and durable queue status")
     campaign_status_parser.add_argument("run_id", type=positive)
+    _add_output_options(campaign_status_parser)
     campaign_stop = campaign_sub.add_parser("stop", help="Request graceful draining of all workers")
     campaign_stop.add_argument("run_id", type=positive)
+    _add_output_options(campaign_stop)
 
     for name in ("fetch-company", "bulk"):
         p = sub.add_parser(name)
@@ -420,6 +464,7 @@ def main():
             help="Optional adaptive targets such as profile=20,industry_benchmark=8",
         )
         p.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+        _add_output_options(p)
         if name == "fetch-company":
             p.add_argument("company_code")
         else:
@@ -442,9 +487,11 @@ def main():
     for name in ("bulk-status", "bulk-retry"):
         p = sub.add_parser(name)
         p.add_argument("run_id", type=positive, nargs="?" if name.endswith("status") else None)
+        _add_output_options(p)
     legacy = sub.add_parser("legacy-bulk", help="Resume pre-0.2 company-level runs")
     legacy.add_argument("--run-id", type=positive)
     legacy.add_argument("--limit", type=positive)
+    _add_output_options(legacy)
     disc = sub.add_parser("discover", help="Discover companies with durable per-page checkpoints")
     disc.add_argument("seeds", nargs="*")
     disc.add_argument("--seed-file")
@@ -458,17 +505,19 @@ def main():
         help="Claim buckets across processes with Redis-shared Search pacing",
     )
     disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+    _add_output_options(disc)
     args = parser.parse_args()
+    presenter = TerminalPresenter.from_args(args)
     try:
         if args.command == "migrate":
             from ..storage.mysql.migrations import migrate
 
             migrate()
-            print("Schema is current")
+            presenter.success("DATABASE SCHEMA", fields={"status": "current"}, raw={"status": "current"})
         elif args.command == "check-db":
             from .legacy import command_check_db
 
-            command_check_db()
+            command_check_db(presenter=presenter)
         elif args.command == "master-status":
             from ..storage.mysql.engine import connect
 
@@ -484,7 +533,7 @@ def main():
                     """
                 )
                 row = cur.fetchone()
-            print(json.dumps({key: int(value or 0) for key, value in row.items()}, indent=2))
+            presenter.master_status({key: int(value or 0) for key, value in row.items()})
         elif args.command == "campaign":
             _campaign_command(args)
         elif args.command in ("bulk-status", "bulk-retry"):
@@ -508,23 +557,25 @@ def main():
             from ..runtime.replay import replay_archive
 
             with manager_lock():
-                replay_archive(args.archive_id)
+                replay_status = replay_archive(args.archive_id)
+            presenter.replay_result(args.archive_id, replay_status)
         elif args.command in ("discover-retry", "discover-refresh"):
             from ..storage.mysql.repositories.discovery_repository import reset_discovery
 
             with manager_lock():
-                reset_discovery(
+                reset_result = reset_discovery(
                     refresh=args.command == "discover-refresh", bucket_id=getattr(args, "bucket_id", None)
                 )
+            presenter.discovery_reset(args.command, reset_result)
         elif args.command == "legacy-bulk":
             from .legacy import command_bulk
 
             with manager_lock():
-                command_bulk(None, args.run_id, [], args.limit)
+                command_bulk(None, args.run_id, [], args.limit, presenter=presenter)
         elif args.command == "discover-status":
             from ..storage.mysql.repositories.discovery_repository import discovery_summary
 
-            print(json.dumps(discovery_summary(), indent=2, default=str))
+            presenter.discovery_status(discovery_summary())
         elif args.command == "discover":
             from ..pipelines import discovery
 
@@ -560,12 +611,10 @@ def main():
                             health=lambda: assert_manager_lock(conn),
                         )
                     )
-            print(
-                f"buckets {result.buckets_processed}, pages {result.pages_fetched}, "
-                f"companies {result.companies_written}, requests {result.requests_made}"
-            )
+            presenter.discovery_result(result)
     except KeyboardInterrupt:
-        print("Interrupted. Durable checkpoints remain recoverable.")
+        presenter.interrupted()
         raise SystemExit(130) from None
     except Exception as exc:
-        parser.exit(1, f"dbd-data: {safe_error(exc)}\n")
+        presenter.error(safe_error(exc))
+        raise SystemExit(1) from None
