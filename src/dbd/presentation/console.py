@@ -201,6 +201,19 @@ class TerminalPresenter:
             _bool(identity.get("version_match")),
         )
 
+        profile_table = Table.grid(padding=(0, 2))
+        profile_table.add_column(style="dim", no_wrap=True)
+        profile_table.add_column()
+        profile_table.add_row("SUMMARY", str(identity.get("summary") or "—"))
+        profile_table.add_row("HOME", str(identity.get("home_page") or "—"))
+        author = str(identity.get("author") or "")
+        author_email = str(identity.get("author_email") or "")
+        author_label = author
+        if author_email:
+            author_label = f"{author_label} · {author_email}" if author_label else author_email
+        profile_table.add_row("AUTHOR", author_label or "—")
+        profile_table.add_row("LICENSE", str(identity.get("license") or "—"))
+
         runtime_table = Table.grid(padding=(0, 2))
         runtime_table.add_column(style="dim", no_wrap=True)
         runtime_table.add_column()
@@ -254,6 +267,9 @@ class TerminalPresenter:
             Text("Package identity, runtime and installation integrity", style="dim"),
             Text(""),
             version,
+            Text(""),
+            Text("PACKAGE PROFILE", style="bold cyan"),
+            profile_table,
             Text(""),
             Text("RUNTIME", style="bold cyan"),
             runtime_table,
