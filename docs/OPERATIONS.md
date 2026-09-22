@@ -51,6 +51,46 @@ for the configured `workers-max`. A budget that cannot support at least one unit
 per maximum worker fails closed instead of allowing connection or writer growth to
 become unbounded. The sync MySQL pool uses zero overflow so the configured pool size
 is a real upper bound rather than a soft target.
+## Campaign live dashboard
+
+Interactive campaign supervisors render a fixed terminal dashboard instead of a
+single growing debug line. The dashboard is presentation-only: it consumes values
+already present in the supervisor loop and does not own Redis/MySQL/HTTP clients or
+issue additional runtime queries.
+
+The live view includes:
+
+- overall durable/live progress and load bar;
+- fetch/archive/project queue pressure and active stage counts;
+- worker active/draining/stale/restart/capacity state;
+- observed/effective/target/ceiling HTTP rate plus retries and 429/503;
+- shared Redis pool occupancy and command pressure;
+- control-plane health, heartbeat age, moving throughput and ETA;
+- bounded latest-event and latest-warning slots.
+
+Interactive output redraws the same ANSI terminal region at no more than about
+2 Hz. Events replace the bounded event/warning slots instead of permanently
+appending one console line per runtime change.
+
+Redirected output and CI automatically use compact newline-delimited snapshots, for
+example:
+
+```text
+CAMPAIGN 7 | RUNNING | 68.41% | 6,298,144/9,206,715 | remaining=2,908,571 | workers=6/6 | q=286/74/153 | rate=11.80/s | 429/503=0 | failed=128
+```
+
+Worker files under `data/logs` remain structured runtime logs and are independent
+from the dashboard. A terminal-rendering failure is isolated and degrades to compact
+output; it is never allowed to terminate a campaign.
+
+The CI timing guard exercises the full wide renderer without terminal I/O:
+
+```powershell
+python scripts/benchmark_terminal_dashboard.py `
+  --iterations 2000 `
+  --max-average-ms 2 `
+  --max-p95-ms 5
+```
 
 ## Rate control and distributed workers
 
