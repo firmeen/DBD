@@ -29,19 +29,13 @@ const tipOptions = [
 
 export function GlobalLens() {
   const reduceMotion = useReducedMotion()
-  const externalOpen = useWorkspaceStore((state) => state.lensOpen)
-  const setExternalOpen = useWorkspaceStore((state) => state.setLensOpen)
+  const open = useWorkspaceStore((state) => state.lensOpen)
+  const setOpen = useWorkspaceStore((state) => state.setLensOpen)
   const { lens, setLens, clearLens, activeCount } = useGlobalLens()
-  const [open, setOpen] = React.useState(externalOpen)
-
-  React.useEffect(() => setOpen(externalOpen), [externalOpen])
 
   const { refs, floatingStyles, context } = useFloating({
     open,
-    onOpenChange(next) {
-      setOpen(next)
-      setExternalOpen(next)
-    },
+    onOpenChange: setOpen,
     placement: "top-start",
     whileElementsMounted: autoUpdate,
     middleware: [offset(10), flip({ padding: 12 }), shift({ padding: 12 })],
@@ -55,12 +49,20 @@ export function GlobalLens() {
     dismiss,
     role,
   ])
+  const setReference = React.useCallback(
+    (node: HTMLElement | null) => refs.setReference(node),
+    [refs]
+  )
+  const setFloating = React.useCallback(
+    (node: HTMLElement | null) => refs.setFloating(node),
+    [refs]
+  )
 
   return (
     <>
       <div className="pointer-events-auto fixed bottom-5 left-5 z-40 sm:bottom-7 sm:left-7">
         <button
-          ref={refs.setReference}
+          ref={setReference}
           type="button"
           {...getReferenceProps()}
           className={cn(
@@ -93,7 +95,7 @@ export function GlobalLens() {
         <AnimatePresence>
           {open ? (
             <motion.div
-              ref={refs.setFloating}
+              ref={setFloating}
               style={floatingStyles}
               {...getFloatingProps()}
               initial={
