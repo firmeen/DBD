@@ -334,7 +334,9 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
     from ..runtime.supervisor import campaign_status, request_campaign_stop, supervise_campaign
 
     if args.campaign_command == "status":
-        presenter.campaign_status(campaign_status(args.run_id))
+        presenter.campaign_status(
+            campaign_status(args.run_id, diagnostics=presenter.verbose)
+        )
         return
     if args.campaign_command == "stop":
         request_campaign_stop(args.run_id)
