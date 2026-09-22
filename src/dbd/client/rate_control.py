@@ -266,6 +266,7 @@ return {tostring(new_rate), tostring(new_rate)}
 class AdmissionState:
     global_state: str = "closed"
     endpoint_state: str | None = None
+    probe_token: str | None = None
     shared: bool = False
 
 
@@ -457,10 +458,21 @@ local factor = tonumber(ARGV[6])
 local step = tonumber(ARGV[7])
 local global_admission_state = ARGV[8]
 local endpoint_admission_state = ARGV[9]
+local probe_token = ARGV[10]
 
-local function close_half_open(state_key, opened_key, failures_key, window_key, probe_key)
-  redis.call('PSETEX', state_key, ttl_ms, 'closed')
-  redis.call('DEL', opened_key, failures_key, window_key, probe_key)
+local function close_half_open(
+  state_key,
+  opened_key,
+  failures_key,
+  window_key,
+  probe_key
+)
+  local state = redis.call('GET', state_key) or 'closed'
+  local owner = redis.call('GET', probe_key)
+  if state == 'half_open' and owner == probe_token then
+    redis.call('PSETEX', state_key, ttl_ms, 'closed')
+    redis.call('DEL', opened_key, failures_key, window_key, probe_key)
+  end
 end
 
 if global_admission_state == 'half_open' then
@@ -684,6 +696,7 @@ return {
         keys = self._shared_keys(endpoint)
 
         while True:
+            probe_token = uuid4().hex
             started = time.perf_counter()
             try:
                 result = await self._admission_script(
@@ -693,7 +706,7 @@ return {
                         self.shared_rate_ceiling,
                         endpoint_ceiling,
                         self._global_shared._state_ttl_ms,
-                        uuid4().hex,
+                        probe_token,
                         int(self._breaker.probe_seconds * 1000),
                         self._breaker._state_ttl_ms,
                     ],
@@ -726,6 +739,7 @@ return {
             return AdmissionState(
                 global_state=global_state,
                 endpoint_state=endpoint_state,
+                probe_token=probe_token,
                 shared=True,
             )
 
@@ -775,6 +789,7 @@ return {
                     0.5,
                     admission.global_state,
                     admission.endpoint_state or "closed",
+                    admission.probe_token or "",
                 ],
             )
         finally:
