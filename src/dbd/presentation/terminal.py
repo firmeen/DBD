@@ -140,7 +140,7 @@ class TerminalPresenter:
         if self.options.json:
             self.json(raw if raw is not None else {"status": "success", **dict(fields or {})})
             return
-        rows = [("STATUS", "[bold green]SUCCESS[/bold green]")]
+        rows = [("STATUS", "[bold green]SUCCESS[/]")]
         rows.extend((str(k).upper(), v) for k, v in (fields or {}).items())
         self._panel(title, self._kv(rows), border_style="green")
 
@@ -343,7 +343,7 @@ class TerminalPresenter:
 
         summary = self._kv(
             (
-                ("STATUS", f"[{_status_style(run_status)}]{run_status}[/{_status_style(run_status)}]"),
+                ("STATUS", f"[{_status_style(run_status)}]{run_status}[/]"),
                 ("SOURCE", source_label),
                 ("RUN", run_id),
                 ("RUN STATUS", state.get("run_status", "--")),
