@@ -1170,6 +1170,7 @@ def supervise_campaign(
     children: list[WorkerProcess] = []
     next_index = 1
     exhausted_capacity = 0
+    restart_events = 0
     graceful_stop = False
     exit_code = 0
     lease_acquired = False
@@ -1232,7 +1233,7 @@ def supervise_campaign(
             retired_metrics[key] = int(retired_metrics.get(key, 0)) + int(row.get(key, 0) or 0)
 
     def replacement_for(worker: WorkerProcess, reason: str) -> WorkerProcess | None:
-        nonlocal exhausted_capacity
+        nonlocal exhausted_capacity, restart_events
         if worker.restarts >= max_restarts:
             exhausted_capacity += 1
             progress.event(
@@ -1250,6 +1251,7 @@ def supervise_campaign(
                 f"worker {worker.index} restart failed ({type(exc).__name__}); fleet capacity reduced by 1"
             )
             return None
+        restart_events += 1
         progress.event(
             f"worker {worker.index} {reason}; restarted ({replacement.restarts}/{max_restarts})"
         )
@@ -1628,7 +1630,7 @@ def supervise_campaign(
                     workers_stale=stale_registered,
                     workers_min=minimum,
                     workers_max=maximum,
-                    restarts=sum(worker.restarts for worker in children),
+                    restarts=restart_events,
                     exhausted_capacity=exhausted_capacity,
                     observed_http_rate=observed_http_rate,
                     effective_rate=effective,
@@ -1769,7 +1771,7 @@ def supervise_campaign(
                             workers_stale=0,
                             workers_min=minimum,
                             workers_max=maximum,
-                            restarts=sum(worker.restarts for worker in children),
+                            restarts=restart_events,
                             exhausted_capacity=exhausted_capacity,
                             observed_http_rate=observed_http_rate,
                             effective_rate=last_effective_rate,
