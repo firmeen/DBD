@@ -9,6 +9,7 @@ from dbd.runtime.supervisor import (
     AutoscaleController,
     CampaignResourcePlan,
     WorkerProcess,
+    _campaign_terminal_snapshot,
     _drain_registered_workers,
     _fleet_rate_target,
     _force_kill_worker,
@@ -422,3 +423,62 @@ def test_autoscale_freezes_on_downstream_backlog() -> None:
         fetch_queue=0, archive_queue=0, project_queue=500,
         observed_http_rate=4.0, rate_target=12.0, rate_limit_delta=0,
     ) == 4
+
+
+
+def test_campaign_terminal_snapshot_uses_existing_loop_values_only() -> None:
+    snap = _campaign_terminal_snapshot(
+        7,
+        status="running",
+        live_progress={
+            "terminal": 250,
+            "total": 1000,
+            "done_only": 200,
+            "not_available": 40,
+            "failed": 10,
+            "remaining": 750,
+            "pending_estimate": 700,
+            "inflight": 50,
+        },
+        live_metrics={
+            "fetch_queue": 300,
+            "archive_queue": 20,
+            "project_queue": 10,
+            "fetch_active": 24,
+            "archive_active": 4,
+            "project_active": 8,
+            "redis_pool_in_use": 6,
+            "redis_pool_max": 24,
+        },
+        campaign_metrics={
+            "requests": 10000,
+            "http_retries": 12,
+            "rate_limit_hits": 0,
+            "redis_commands": 10000,
+            "redis_admissions": 10000,
+        },
+        workers_registered=6,
+        workers_target=6,
+        workers_active=6,
+        workers_draining=0,
+        workers_stale=0,
+        workers_min=3,
+        workers_max=6,
+        restarts=1,
+        exhausted_capacity=0,
+        observed_http_rate=11.8,
+        effective_rate=12.0,
+        target_rate=12.0,
+        rate_ceiling=20.0,
+        control_healthy=True,
+        heartbeat_age_seconds=0.4,
+        elapsed_seconds=3600,
+    )
+
+    assert snap.current == 250
+    assert snap.fetch_queue == 300
+    assert snap.queue_capacity == supervisor.settings.dbd_pipeline_queue_size * 6
+    assert snap.redis_pool_in_use == 6
+    assert snap.redis_commands == 10000
+    assert snap.http_rate == 11.8
+    assert snap.control_healthy is True
