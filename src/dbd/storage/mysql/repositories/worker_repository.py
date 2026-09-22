@@ -533,6 +533,56 @@ class WorkerRepository:
             ).mappings().all()
             return [dict(row) for row in rows]
 
+    async def failure_diagnostics(self, run_id, limit: int = 8):
+        """Read-only terminal failure aggregates for operator diagnostics."""
+        limit = max(1, min(50, int(limit)))
+        async with self.engine.connect() as conn:
+            by_error = (
+                await conn.execute(
+                    text("""
+                    SELECT COALESCE(NULLIF(last_error,''),'unknown') AS value,COUNT(*) AS n
+                    FROM endpoint_tasks
+                    WHERE run_id=:id AND status='failed'
+                    GROUP BY COALESCE(NULLIF(last_error,''),'unknown')
+                    ORDER BY n DESC,value
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": limit},
+                )
+            ).mappings().all()
+            by_endpoint = (
+                await conn.execute(
+                    text("""
+                    SELECT endpoint AS value,COUNT(*) AS n
+                    FROM endpoint_tasks
+                    WHERE run_id=:id AND status='failed'
+                    GROUP BY endpoint ORDER BY n DESC,endpoint
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": limit},
+                )
+            ).mappings().all()
+            by_stage = (
+                await conn.execute(
+                    text("""
+                    SELECT stage AS value,COUNT(*) AS n
+                    FROM endpoint_tasks
+                    WHERE run_id=:id AND status='failed'
+                    GROUP BY stage ORDER BY n DESC,stage
+                    """),
+                    {"id": run_id},
+                )
+            ).mappings().all()
+        return {
+            "semantics": (
+                "Legacy scheduler failure counts are endpoint-task rows; one failed row "
+                "represents one logical resource."
+            ),
+            "by_error": [dict(row) for row in by_error],
+            "by_endpoint": [dict(row) for row in by_endpoint],
+            "by_stage": [dict(row) for row in by_stage],
+        }
+
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
             await conn.execute(
