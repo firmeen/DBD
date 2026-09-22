@@ -30,6 +30,7 @@ const h3Schema = z.object({
   active: z.number().int().nonnegative(),
   expired: z.number().int().nonnegative(),
   prospect: z.number().int().nonnegative(),
+  opportunityScore: z.number().min(0).max(1).nullable().optional(),
 })
 
 const polygonCoordinatesSchema = z.array(z.array(coordinateSchema))

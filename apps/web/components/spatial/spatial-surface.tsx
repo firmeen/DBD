@@ -1,0 +1,310 @@
+"use client"
+
+import * as React from "react"
+import { useQuery } from "@tanstack/react-query"
+import { AlertTriangle, Database, LoaderCircle } from "lucide-react"
+
+import { SpatialCompanyRail } from "./spatial-company-rail"
+import { SpatialControlDeck } from "./spatial-control-deck"
+import { SpatialMap } from "./spatial-map"
+import { useGlobalLens } from "@/hooks/use-global-lens"
+import { fetchSpatialSnapshot } from "@/lib/spatial/adapter"
+import {
+  h3ResolutionForZoom,
+  spatialLodForZoom,
+} from "@/lib/spatial/lod"
+import {
+  defaultSpatialSurfaceSnapshot,
+  parseSpatialSurfaceSnapshot,
+} from "@/lib/spatial/surface-snapshot"
+import {
+  companyToEntityRef,
+  branchToEntityRef,
+  type SpatialCompanyPoint,
+  type SpatialLayerId,
+  type SpatialSnapshot,
+  type SpatialViewState,
+} from "@/lib/spatial/types"
+import { useWorkspaceStore } from "@/stores/workspace-store"
+
+type MapHover = {
+  company: SpatialCompanyPoint
+  x: number
+  y: number
+}
+
+const PENDING_SNAPSHOT: SpatialSnapshot = {
+  availability: "partial",
+  message: "Loading spatial serving state…",
+  generatedAt: null,
+  capabilities: {
+    administrativeGeometry: false,
+    preciseCompanyGeometry: false,
+    branches: false,
+    h3Aggregates: false,
+    opportunityOverlay: false,
+  },
+  totals: {
+    companies: null,
+    active: null,
+    expired: null,
+    prospect: null,
+  },
+  companies: [],
+  branches: [],
+  h3Cells: [],
+  areas: [],
+}
+
+export function SpatialSurface() {
+  const { lens } = useGlobalLens()
+  const snapshotPayload = useWorkspaceStore(
+    (state) => state.surfaceSnapshots.M?.payload
+  )
+  const saveSurfaceSnapshot = useWorkspaceStore(
+    (state) => state.saveSurfaceSnapshot
+  )
+  const selection = useWorkspaceStore((state) => state.selection)
+  const setFocus = useWorkspaceStore((state) => state.setFocus)
+  const toggleSelection = useWorkspaceStore((state) => state.toggleSelection)
+  const setActiveSurface = useWorkspaceStore((state) => state.setActiveSurface)
+
+  const initialState = React.useMemo(
+    () =>
+      parseSpatialSurfaceSnapshot(snapshotPayload) ??
+      defaultSpatialSurfaceSnapshot(),
+    [snapshotPayload]
+  )
+
+  const [viewState, setViewState] = React.useState(initialState.viewState)
+  const [queryViewState, setQueryViewState] = React.useState(
+    initialState.viewState
+  )
+  const [layers, setLayers] = React.useState(initialState.layers)
+  const [branchId, setBranchId] = React.useState(initialState.branchId)
+  const [radiusKm, setRadiusKm] = React.useState(initialState.radiusKm)
+  const [companyRailOpen, setCompanyRailOpen] = React.useState(
+    initialState.companyRailOpen
+  )
+  const [mapHover, setMapHover] = React.useState<MapHover | null>(null)
+  const [railHoverId, setRailHoverId] = React.useState<string | null>(null)
+
+  React.useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setQueryViewState(viewState)
+    }, 220)
+
+    return () => window.clearTimeout(timeout)
+  }, [viewState])
+
+  React.useEffect(() => {
+    saveSurfaceSnapshot("M", {
+      viewState: queryViewState,
+      layers,
+      branchId,
+      radiusKm,
+      companyRailOpen,
+    })
+  }, [
+    branchId,
+    companyRailOpen,
+    layers,
+    queryViewState,
+    radiusKm,
+    saveSurfaceSnapshot,
+  ])
+
+  const lod = spatialLodForZoom(queryViewState.zoom)
+  const h3Resolution = h3ResolutionForZoom(queryViewState.zoom)
+
+  const spatialQuery = React.useMemo(
+    () => ({
+      viewport: queryViewState,
+      lod,
+      h3Resolution,
+      lens,
+      layers,
+      branchId,
+      radiusKm,
+    }),
+    [
+      branchId,
+      h3Resolution,
+      layers,
+      lens,
+      lod,
+      queryViewState,
+      radiusKm,
+    ]
+  )
+
+  const query = useQuery({
+    queryKey: ["tipx", "spatial", spatialQuery],
+    queryFn: ({ signal }) => fetchSpatialSnapshot(spatialQuery, signal),
+    staleTime: 30_000,
+    placeholderData: (previous) => previous,
+    retry: 1,
+  })
+
+  const snapshot = query.data ?? PENDING_SNAPSHOT
+  const selectedCompanyIds = React.useMemo(
+    () =>
+      selection
+        .filter((entity) => entity.kind === "company")
+        .map((entity) => entity.id),
+    [selection]
+  )
+  const selectedCompanySet = React.useMemo(
+    () => new Set(selectedCompanyIds),
+    [selectedCompanyIds]
+  )
+
+  const hoveredCompanyId = mapHover?.company.id ?? railHoverId
+
+  function toggleLayer(layer: SpatialLayerId) {
+    setLayers((current) =>
+      current.includes(layer)
+        ? current.filter((candidate) => candidate !== layer)
+        : [...current, layer]
+    )
+  }
+
+  function focusCompany(company: SpatialCompanyPoint) {
+    setFocus(companyToEntityRef(company))
+  }
+
+  function focusBranch(id: string) {
+    const branch = snapshot.branches.find((item) => item.id === id)
+    if (branch) setFocus(branchToEntityRef(branch))
+  }
+
+  return (
+    <main className="relative min-h-svh overflow-hidden bg-[#070a0d] text-white">
+      <div className="absolute inset-0">
+        <SpatialMap
+          snapshot={snapshot}
+          viewState={viewState}
+          layers={layers}
+          branchId={branchId}
+          radiusKm={radiusKm}
+          selectedCompanyIds={selectedCompanyIds}
+          hoveredCompanyId={hoveredCompanyId}
+          onViewStateChange={setViewState}
+          onHoverCompany={setMapHover}
+          onFocusCompany={focusCompany}
+          onFocusBranch={(branch) => {
+            setBranchId(branch.id)
+            setFocus(branchToEntityRef(branch))
+          }}
+        />
+      </div>
+
+      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,rgba(7,10,13,.20),transparent_18%,transparent_76%,rgba(7,10,13,.42))]" />
+
+      <SpatialControlDeck
+        lod={lod}
+        zoom={queryViewState.zoom}
+        availability={snapshot.availability}
+        message={
+          query.error instanceof Error
+            ? query.error.message
+            : snapshot.message
+        }
+        capabilities={snapshot.capabilities}
+        totals={snapshot.totals}
+        layers={layers}
+        branches={snapshot.branches}
+        branchId={branchId}
+        radiusKm={radiusKm}
+        isFetching={query.isFetching}
+        onToggleLayer={toggleLayer}
+        onBranchChange={(nextBranchId) => {
+          setBranchId(nextBranchId)
+          if (nextBranchId) focusBranch(nextBranchId)
+        }}
+        onRadiusChange={setRadiusKm}
+        onHandoff={setActiveSurface}
+      />
+
+      <SpatialCompanyRail
+        companies={snapshot.companies}
+        open={companyRailOpen}
+        hoveredCompanyId={hoveredCompanyId}
+        selectedCompanyIds={selectedCompanySet}
+        onOpenChange={setCompanyRailOpen}
+        onHoverCompany={(company) => setRailHoverId(company?.id ?? null)}
+        onFocusCompany={focusCompany}
+        onToggleSelection={(company) =>
+          toggleSelection(companyToEntityRef(company))
+        }
+      />
+
+      {mapHover ? (
+        <div
+          className="pointer-events-none absolute z-[42] w-60 rounded-xl border border-white/12 bg-[#071017]/94 px-3 py-2.5 shadow-2xl backdrop-blur-xl"
+          style={{
+            left: Math.min(mapHover.x + 14, window.innerWidth - 260),
+            top: Math.min(mapHover.y + 14, window.innerHeight - 150),
+          }}
+        >
+          <p className="truncate text-[11px] font-semibold text-white/82">
+            {mapHover.company.name}
+          </p>
+          <p className="mt-1 truncate text-[9px] text-white/35">
+            {[
+              mapHover.company.businessType,
+              mapHover.company.district,
+              mapHover.company.province,
+            ]
+              .filter(Boolean)
+              .join(" · ") || "Company entity"}
+          </p>
+          <div className="mt-2 flex items-center gap-2 text-[9px] uppercase tracking-[0.12em] text-white/28">
+            <span>{mapHover.company.tipStatus ?? "TIP status unknown"}</span>
+            {mapHover.company.boardCount !== null &&
+            mapHover.company.boardCount !== undefined ? (
+              <span>· {mapHover.company.boardCount} board</span>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
+
+      {query.isPending ? (
+        <SpatialStatePill
+          icon={LoaderCircle}
+          label="Loading spatial contract"
+          spinning
+        />
+      ) : query.isError ? (
+        <SpatialStatePill
+          icon={AlertTriangle}
+          label="Spatial serving request unavailable"
+        />
+      ) : snapshot.availability === "unavailable" ? (
+        <SpatialStatePill
+          icon={Database}
+          label="Basemap live · analytical geometry unavailable"
+        />
+      ) : null}
+    </main>
+  )
+}
+
+function SpatialStatePill({
+  icon: Icon,
+  label,
+  spinning = false,
+}: {
+  icon: typeof Database
+  label: string
+  spinning?: boolean
+}) {
+  return (
+    <div className="pointer-events-none fixed left-1/2 top-6 z-[39] -translate-x-1/2 rounded-full border border-white/9 bg-[#081016]/82 px-3 py-2 text-[9px] uppercase tracking-[0.14em] text-white/36 shadow-xl backdrop-blur-xl">
+      <span className="flex items-center gap-2">
+        <Icon className={`size-3 ${spinning ? "animate-spin" : ""}`} />
+        {label}
+      </span>
+    </div>
+  )
+}

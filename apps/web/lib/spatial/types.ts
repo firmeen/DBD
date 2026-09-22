@@ -3,6 +3,7 @@ import type { LensState, EntityRef } from "@/lib/intelligence/types"
 export const SPATIAL_LAYER_IDS = [
   "administrative",
   "density",
+  "opportunity",
   "companies",
   "branches",
   "catchment",
@@ -57,6 +58,7 @@ export interface SpatialH3Cell {
   active: number
   expired: number
   prospect: number
+  opportunityScore?: number | null
 }
 
 export interface SpatialArea {
