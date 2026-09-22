@@ -136,14 +136,26 @@ class FabricProjectionScheduler:
             profile_submit_fin_year=profile_year,
         )
         bit = endpoint_bit(task["endpoint"])
-        if int(state.get("change_dirty_mask") or 0) & bit:
+        acknowledged_change_mask = int(state.get("change_dirty_mask") or 0) & bit
+        if task["endpoint"] == "profile":
+            acknowledged_change_mask |= (
+                int(state.get("change_dirty_mask") or 0)
+                & int(transition.not_available_mask)
+            )
+        if acknowledged_change_mask:
             cur.execute(
                 """
                 UPDATE company_master
-                SET pending_dirty_mask=pending_dirty_mask-(pending_dirty_mask & %s)
+                SET pending_dirty_mask=(
+                  pending_dirty_mask-(pending_dirty_mask & %s)
+                )
                 WHERE company_id=%s AND master_hash <=> %s
                 """,
-                (bit, task["company_id"], state.get("master_hash")),
+                (
+                    acknowledged_change_mask,
+                    task["company_id"],
+                    state.get("master_hash"),
+                ),
             )
 
         terminal = transition.status in ("done", "failed")
