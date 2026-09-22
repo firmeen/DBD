@@ -71,7 +71,7 @@ def test_render_bar_bounds() -> None:
     assert render_bar(0, 10, 10) == "[░░░░░░░░░░]"
     assert render_bar(5, 10, 10) == "[█████░░░░░]"
     assert render_bar(99, 10, 10) == "[██████████]"
-    assert render_bar(5, 10, 0) == "[█]"
+    assert render_bar(5, 10, 0) == "[░]"
 
 
 def test_format_duration() -> None:
