@@ -140,28 +140,51 @@ def command_bulk(
     presenter.command_result("DBD · LEGACY RUN RESULT", payload)
 
 
-def command_bulk_status(run_id: int | None) -> None:
+def command_bulk_status(
+    run_id: int | None,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     if run_id is None:
         rows = list_runs()
         if not rows:
-            print("No ingestion runs yet.")
+            presenter.message("No ingestion runs yet.", kind="info")
             return
-        print(f"{'run':>4}  {'done':>5} {'fail':>5} {'pend':>5}  {'created':19}  source")
-        for r in rows:
-            print(
-                f"{r['id']:>4}  {int(r['done'] or 0):>5} {int(r['failed'] or 0):>5} "
-                f"{int(r['pending'] or 0):>5}  {str(r['created_at'])[:19]:19}  {r['source_label']}"
-            )
+        presenter.table(
+            "DBD · LEGACY RUNS",
+            ("RUN", "DONE", "FAILED", "PENDING", "CREATED", "SOURCE"),
+            (
+                (
+                    r["id"],
+                    int(r["done"] or 0),
+                    int(r["failed"] or 0),
+                    int(r["pending"] or 0),
+                    str(r["created_at"])[:19],
+                    r["source_label"],
+                )
+                for r in rows
+            ),
+        )
         return
 
     progress = run_progress(run_id)
-    print(f"run {run_id}: {progress}")
+    presenter.command_result("DBD · LEGACY RUN STATUS", {"run_id": run_id, **progress})
     rows = failed_tasks(run_id)
     if rows:
-        print(f"\n{len(rows)} failed task(s):")
-        for r in rows:
-            print(f"  {r['company_code']}  attempts={r['attempts']}  {str(r['last_error'])[:120]}")
-        print(f"\nretry them with: dbd-data bulk-retry {run_id}")
+        presenter.table(
+            "FAILED TASKS",
+            ("COMPANY", "ATTEMPTS", "LAST ERROR"),
+            (
+                (
+                    r["company_code"],
+                    r["attempts"],
+                    str(r["last_error"])[:120],
+                )
+                for r in rows
+            ),
+            caption=f"Retry with: dbd-data bulk-retry {run_id}",
+        )
 
 
 def command_bulk_retry(
@@ -207,46 +230,39 @@ def command_discover(
     command_discover_status()
 
 
-def command_discover_status() -> None:
+def command_discover_status(
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
     from ..pipelines import discovery
 
+    presenter = presenter or TerminalPresenter()
     s = discovery.summary()
-    print("\ndiscovery so far:")
-    print(f"  unique companies : {int(s['unique_companies']):,}")
-    print(f"  rows fetched      : {int(s['rows_fetched']):,}")
-    print(
-        f"  buckets           : {s['buckets']} total "
-        f"({s['buckets_done']} done, {s['buckets_split']} split, "
-        f"{s['buckets_open']} open, {s['buckets_failed']} failed)"
-    )
-    print(
-        f"  bucket backlog    : {int(s.get('buckets_uncounted') or 0):,} uncounted; "
-        f"{int(s.get('remaining_counted_pages') or 0):,} known pages remaining"
-    )
-    print(
-        f"  page checkpoints  : {int(s.get('pages_done') or 0):,} done, "
-        f"{int(s.get('pages_failed') or 0):,} failed, "
-        f"{int(s.get('pages_partial') or 0):,} partial"
-    )
-    print(f"  quarantined rows  : {int(s.get('unresolved_rejections') or 0):,} unresolved")
-    if int(s["partitions_lossy"] or 0):
-        print(
-            f"  BLOCKER: {s['partitions_lossy']} split partition(s) have SUM(children) != parent. "
-            "Completeness is not established until they are reconciled."
+    presenter.discovery_status(s)
+
+    if int(s.get("partitions_lossy") or 0):
+        presenter.message(
+            f"{int(s['partitions_lossy']):,} lossy split partition(s) block completeness.",
+            kind="error",
         )
 
     # Observed prefix gaps are a useful negative check, not a proof that every
     # company was discoverable through the chosen seeds.
     gaps = discovery.coverage_gaps()
     if gaps:
-        print(
-            f"\n  COVERAGE GAP: {len(gaps)} observed company-number prefix(es) have no matching seed bucket:"
+        presenter.command_result(
+            "DBD · DISCOVERY COVERAGE GAP",
+            {
+                "gap_count": len(gaps),
+                "prefixes": ", ".join(gaps[:20]) + (" ..." if len(gaps) > 20 else ""),
+                "next_command": "dbd-data discover " + " ".join(gaps[:5]),
+            },
         )
-        print(f"    {', '.join(gaps[:20])}{' ...' if len(gaps) > 20 else ''}")
-        print("    Seed these prefixes explicitly: dbd-data discover " + " ".join(gaps[:5]))
     else:
-        print("  observed prefixes : all currently seen prefixes have matching seeds")
-        print("  completeness       : still requires partition and population reconciliation")
+        presenter.message(
+            "Observed prefixes have matching seeds; full completeness still requires partition and population reconciliation.",
+            kind="info",
+        )
 
 
 def main() -> None:
