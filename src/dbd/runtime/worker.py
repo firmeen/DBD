@@ -25,6 +25,7 @@ from ..core.telemetry import (
 )
 from ..storage.mysql.repositories.projection_repository import project
 from ..storage.mysql.repositories.projection_scheduler import LeaseLost
+from .collection_fabric import mask_for_endpoints
 from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
@@ -63,13 +64,16 @@ async def prepare(
     fiscal_year=None,
     statuses=None,
     scheduler_mode="legacy",
+    force_refresh=False,
 ):
     resources = endpoints(list(parts or DEFAULT_PARTS))
+    force_refresh_mask = mask_for_endpoints(resources) if force_refresh else 0
     run_id = await repo.create_run(
         str(Path(file).resolve()) if file else "company_master",
         list(parts or DEFAULT_PARTS),
         fiscal_year,
         scheduler_mode=scheduler_mode,
+        force_refresh_mask=force_refresh_mask,
     )
     scheduler_repo = repo.for_run({"scheduler_mode": scheduler_mode})
     if file:
