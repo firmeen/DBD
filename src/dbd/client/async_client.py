@@ -10,8 +10,8 @@ from email.utils import parsedate_to_datetime
 from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
-from redis.asyncio import Redis
 from curl_cffi.requests.exceptions import RequestException as RequestsError
+from redis.asyncio import Redis
 from tenacity import (
     AsyncRetrying,
     retry_if_exception_type,
