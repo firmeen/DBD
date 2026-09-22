@@ -824,17 +824,12 @@ class FabricWorkerRepository(WorkerRepository):
             return [dict(row) for row in rows]
 
     async def failure_diagnostics(self, run_id, limit=8):
-        """Read-only durable failure summary for operator-facing status output."""
+        """Read-only durable failure diagnostics without inventing endpoint/error links."""
         async with self.engine.connect() as conn:
-            rows = (
+            by_endpoint = (
                 await conn.execute(
                     text("""
-                    SELECT
-                      COALESCE(NULLIF(s.last_error,''),'unknown') AS error_code,
-                      e.endpoint,
-                      s.stage,
-                      COUNT(DISTINCT s.id) AS n,
-                      COUNT(*) AS resources
+                    SELECT e.endpoint,COUNT(DISTINCT s.id) AS states,COUNT(*) AS resources
                     FROM company_collection_state s
                     JOIN (
                       SELECT 'profile' AS endpoint, 1 AS bit
@@ -850,14 +845,32 @@ class FabricWorkerRepository(WorkerRepository):
                       UNION ALL SELECT 'capital_history' AS endpoint, 1024 AS bit
                     ) e ON (s.failed_mask & ~s.dirty_mask & e.bit)<>0
                     WHERE s.run_id=:id
-                    GROUP BY error_code,e.endpoint,s.stage
-                    ORDER BY resources DESC,n DESC,error_code,e.endpoint
+                    GROUP BY e.endpoint
+                    ORDER BY resources DESC,e.endpoint
                     LIMIT :limit
                     """),
                     {"id": run_id, "limit": max(1, int(limit))},
                 )
             ).mappings().all()
-            return [dict(row) for row in rows]
+            by_error = (
+                await conn.execute(
+                    text("""
+                    SELECT COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                           stage,status,COUNT(*) AS states
+                    FROM company_collection_state
+                    WHERE run_id=:id AND last_error IS NOT NULL AND last_error<>''
+                    GROUP BY error_code,stage,status
+                    ORDER BY states DESC,error_code
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": max(1, int(limit))},
+                )
+            ).mappings().all()
+        return {
+            "by_endpoint": [dict(row) for row in by_endpoint],
+            "latest_errors": [dict(row) for row in by_error],
+            "error_scope": "state_latest_error_not_per_endpoint",
+        }
 
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
