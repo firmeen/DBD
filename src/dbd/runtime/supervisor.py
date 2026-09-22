@@ -744,7 +744,7 @@ def _campaign_terminal_snapshot(
         fetch_queue=int(live_metrics.get("fetch_queue", 0)),
         archive_queue=int(live_metrics.get("archive_queue", 0)),
         project_queue=int(live_metrics.get("project_queue", 0)),
-        queue_capacity=settings.dbd_pipeline_queue_size,
+        queue_capacity=settings.dbd_pipeline_queue_size * max(1, workers_registered),
         fetch_active=int(live_metrics.get("fetch_active", 0)),
         archive_active=int(live_metrics.get("archive_active", 0)),
         project_active=int(live_metrics.get("project_active", 0)),
