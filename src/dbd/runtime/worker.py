@@ -204,18 +204,22 @@ async def process(
             settings.dbd_redis_url,
             max_connections=settings.dbd_redis_max_connections,
         )
-        await redis_client.ping()
-        coordinator = CampaignCoordinator(
-            settings.dbd_redis_url,
-            run_id,
-            max_connections=settings.dbd_redis_max_connections,
-            client=redis_client,
-        )
-        await coordinator.open()
-        identity = WorkerIdentity(owner, int(run_id), os.getpid())
-        registration_status = await coordinator.register_worker(identity)
-        if registration_status == "draining":
-            drain_requested.set()
+        try:
+            await redis_client.ping()
+            coordinator = CampaignCoordinator(
+                settings.dbd_redis_url,
+                run_id,
+                max_connections=settings.dbd_redis_max_connections,
+                client=redis_client,
+            )
+            await coordinator.open()
+            identity = WorkerIdentity(owner, int(run_id), os.getpid())
+            registration_status = await coordinator.register_worker(identity)
+            if registration_status == "draining":
+                drain_requested.set()
+        except BaseException:
+            await close_async_redis(redis_client)
+            raise
 
     def queue_metrics():
         PIPELINE_QUEUE_DEPTH.labels("fetch").set(fetch_queue.qsize())
@@ -283,11 +287,21 @@ async def process(
     async def publish_heartbeat(*, status: str | None = None) -> str | None:
         if coordinator is None or identity is None:
             return None
-        resolved = await coordinator.heartbeat_worker(
-            identity,
-            status=status or ("draining" if drain_requested.is_set() else "active"),
-            metrics=heartbeat_metrics(),
-        )
+        try:
+            resolved = await coordinator.heartbeat_worker(
+                identity,
+                status=status or ("draining" if drain_requested.is_set() else "active"),
+                metrics=heartbeat_metrics(),
+            )
+        except Exception as exc:
+            # Redis is an ephemeral control plane. A transient heartbeat failure
+            # must not cancel MySQL-owned in-flight work.
+            log.warning(
+                "redis_heartbeat_failed",
+                worker_id=owner,
+                error_code=type(exc).__name__,
+            )
+            return None
         # The heartbeat Lua transition evaluates stop + targeted drain atomically.
         # This replaces the separate 0.5s control polling Redis round trip.
         if resolved == "draining":
@@ -321,9 +335,18 @@ async def process(
             if now >= maintenance_at:
                 should_maintain = True
                 if coordinator is not None and identity is not None:
-                    should_maintain = await coordinator.acquire_maintenance_slot(
-                        identity, ttl_seconds=_MAINTENANCE_LEASE_SECONDS
-                    )
+                    try:
+                        should_maintain = await coordinator.acquire_maintenance_slot(
+                            identity,
+                            ttl_seconds=_MAINTENANCE_LEASE_SECONDS,
+                        )
+                    except Exception as exc:
+                        should_maintain = False
+                        log.warning(
+                            "redis_maintenance_slot_failed",
+                            worker_id=owner,
+                            error_code=type(exc).__name__,
+                        )
                 if should_maintain:
                     await repo.maintain(run_id)
                 maintenance_at = now + _MAINTENANCE_INTERVAL_SECONDS
