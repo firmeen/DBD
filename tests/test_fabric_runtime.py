@@ -7,10 +7,10 @@ from uuid import uuid4
 import pytest
 from sqlalchemy import text
 
+import dbd.storage.mysql.repositories.projection_repository as projection_repository
 from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
 from dbd.core.exceptions import ContractError
-import dbd.storage.mysql.repositories.projection_repository as projection_repository
 from dbd.runtime.collection_fabric import endpoint_bit
 from dbd.runtime.replay import replay_archive
 from dbd.runtime.resources import DEFAULT_PARTS, endpoints
