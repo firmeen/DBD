@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import os
 
 from ..contracts.identity import parse_code
@@ -431,9 +430,11 @@ def main():
         help="Refresh every selected resource; requires --scheduler-mode fabric_v2",
     )
     _add_campaign_worker_options(campaign_start)
+    _add_output_options(campaign_start)
     campaign_resume = campaign_sub.add_parser("resume", help="Resume one existing run with workers")
     campaign_resume.add_argument("run_id", type=positive)
     _add_campaign_worker_options(campaign_resume)
+    _add_output_options(campaign_resume)
     campaign_status_parser = campaign_sub.add_parser("status", help="Show fleet and durable queue status")
     campaign_status_parser.add_argument("run_id", type=positive)
     _add_output_options(campaign_status_parser)
@@ -543,7 +544,11 @@ def main():
             else:
                 asyncio.run(worker_command(args))
         elif args.command in ("bulk", "fetch-company"):
-            configure(args.metrics_port)
+            configure(
+                args.metrics_port,
+                debug=bool(getattr(args, "debug", False)),
+                no_color=bool(getattr(args, "no_color", False)),
+            )
             if args.command == "bulk" and args.distributed:
                 if args.run_id is None or args.master or args.file or args.enqueue_only:
                     raise ValueError("--distributed requires an existing --run-id and cannot build a run")
@@ -585,7 +590,11 @@ def main():
                     seeds.extend(s.strip() for s in handle if s.strip() and not s.lstrip().startswith("#"))
             if any(len(seed) < 3 for seed in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
-            configure(args.metrics_port)
+            configure(
+                args.metrics_port,
+                debug=bool(getattr(args, "debug", False)),
+                no_color=bool(getattr(args, "no_color", False)),
+            )
             if args.distributed:
                 if not settings.dbd_redis_url:
                     raise ValueError("--distributed discovery requires DBD_REDIS_URL")
