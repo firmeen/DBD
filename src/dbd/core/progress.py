@@ -200,7 +200,7 @@ class LiveCampaignDashboard:
         self._latest_warning: tuple[float, str] | None = None
         self._samples: deque[tuple[float, int]] = deque(maxlen=1200)
         self._renderer_failed = False
-        if self._tty:
+        if self._tty and tty is None:
             self._tty = self._enable_virtual_terminal()
 
     def _detect_tty(self) -> bool:
