@@ -333,7 +333,11 @@ class TerminalPresenter:
         if self.verbose:
             dependencies = list(installation.get("dependencies") or [])
             if dependencies:
-                table = Table(title="DIRECT DEPENDENCIES", box=box.SIMPLE_HEAVY)
+                table = Table(
+                    title="DIRECT DEPENDENCIES",
+                    box=box.SIMPLE_HEAVY,
+                    expand=True,
+                )
                 table.add_column("#", justify="right", style="dim")
                 table.add_column("PACKAGE")
                 for index, dependency in enumerate(dependencies, 1):
