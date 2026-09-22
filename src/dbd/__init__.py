@@ -1,5 +1,3 @@
-from .version import package_version
-
-__version__ = package_version()
+from ._version import __version__
 
 __all__ = ["__version__"]
