@@ -128,7 +128,10 @@ dbd-data discover-status
 | [Redis setup](docs/setup/REDIS.md) | ใช้ Campaign หรือ distributed mode |
 | [DBeaver setup](docs/setup/DBEAVER.md) | ต้องการเปิดดูฐานข้อมูลและรัน SQL ผ่าน GUI |
 | [Web app setup](docs/setup/WEB_APP.md) | ต้องการรัน/พัฒนา `apps/web` |
-| [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) | ให้เครื่องอื่นหรือทีมอื่นต่อ MySQL |
+| [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) | เลือก Direct LAN หรือ Remote Gateway |
+| [DBD Remote Client](docs/DBD_REMOTE_CLIENT.md) | คู่มือฝั่ง Client ตั้งแต่ clone repo ถึงต่อ VS Code/DBeaver |
+| [DBD Remote Server](docs/DBD_REMOTE_SERVER.md) | คู่มือฝั่ง Server สำหรับ MySQL + cloudflared + gateway |
+| [DBD Remote Gateway](docs/DBD_REMOTE_GATEWAY.md) | ภาพรวม architecture และเลือกคู่มือ Client/Server |
 | [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md) | Canary, production campaign, status, stop และ resume |
 
 ---
@@ -423,7 +426,10 @@ Integration tests ต้องใช้ disposable test database ที่ชื
 - [Operations](docs/OPERATIONS.md) — configuration และ failure handling
 - [Validation](docs/VALIDATION.md) — สิ่งที่พิสูจน์แล้วและสิ่งที่ยังต้องวัดจริง
 - [Execution plan](docs/EXECUTION_PLAN_TH.md) — production acceptance / 48-hour plan
-- [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) — remote database client access
+- [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) — เลือก Direct LAN หรือ Python Remote Gateway
+- [DBD Remote Client](docs/DBD_REMOTE_CLIENT.md) — คู่มือใช้งานฝั่ง Client แบบ step-by-step
+- [DBD Remote Server](docs/DBD_REMOTE_SERVER.md) — คู่มือใช้งานฝั่ง Server และ security boundary
+- [DBD Remote Gateway](docs/DBD_REMOTE_GATEWAY.md) — ภาพรวม Python gateway ผ่าน WSS/Cloudflare Tunnel
 
 ---
 

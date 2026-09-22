@@ -9,6 +9,8 @@ from dataclasses import dataclass, field
 from uuid import uuid4
 
 from redis import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ..core.progress import ProgressLine
 from ..core.settings import PROJECT_ROOT, settings
@@ -23,10 +25,14 @@ _AUTOSCALE_DOWN_COOLDOWN_SECONDS = 15.0
 _AUTOSCALE_LOW_PRESSURE_OBSERVATIONS = 2
 _FAILURE_DRAIN_SECONDS = 10.0
 _COMPLETE_DRAIN_SECONDS = 10.0
-_WORKER_STATE_REFRESH_SECONDS = 2.0
 _DURABLE_WORK_CHECK_SECONDS = 1.0
+_WORKER_STATE_REFRESH_SECONDS = 2.0
 _ORPHAN_DRAIN_TIMEOUT_SECONDS = 30.0
 _ORPHAN_DRAIN_POLL_SECONDS = 0.25
+_REDIS_RETRY_SECONDS = 1.0
+_SUPERVISOR_LEASE_FAILURE_BUDGET_SECONDS = 20.0
+_REDIS_SOCKET_TIMEOUT_SECONDS = 5.0
+_REDIS_CONNECT_TIMEOUT_SECONDS = 5.0
 _WORKER_STARTUP_GRACE_SECONDS = 20.0
 _WORKER_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 _WORKER_DRAIN_TIMEOUT_SECONDS = 90.0
@@ -153,11 +159,7 @@ class AutoscaleController:
             or rate_target is None
             or observed_http_rate < (float(rate_target) * 0.90)
         )
-        if (
-            current < effective_maximum
-            and high_pending
-            and (queue_starved or under_rate)
-        ):
+        if current < effective_maximum and high_pending and (queue_starved or under_rate):
             self.low_pressure_observations = 0
             self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
             return current + 1
@@ -194,13 +196,9 @@ def build_rate_plan(
 
     independent = fleet_rate_initial is not None or fleet_rate_max is not None
     if independent:
-        ceiling = float(
-            fleet_rate_max if fleet_rate_max is not None else fleet_rate_initial
-        )
+        ceiling = float(fleet_rate_max if fleet_rate_max is not None else fleet_rate_initial)
         initial = float(
-            fleet_rate_initial
-            if fleet_rate_initial is not None
-            else min(worker_rate, ceiling)
+            fleet_rate_initial if fleet_rate_initial is not None else min(worker_rate, ceiling)
         )
         if initial <= 0 or ceiling <= 0 or initial > ceiling:
             raise ValueError("fleet rate must satisfy 0 < initial <= max")
@@ -238,27 +236,57 @@ def build_resource_plan(
         raise ValueError("worker/resource defaults must be positive")
 
     supervisor_db_pool = db_pool_size
-    db_budget = int(db_connections_max if db_connections_max is not None else supervisor_db_pool + (max_workers * _DB_POOLS_PER_WORKER * db_pool_size))
-    db_per_worker = min(db_pool_size, (db_budget - supervisor_db_pool) // (max_workers * _DB_POOLS_PER_WORKER))
+    db_budget = int(
+        db_connections_max
+        if db_connections_max is not None
+        else supervisor_db_pool + (max_workers * _DB_POOLS_PER_WORKER * db_pool_size)
+    )
+    db_per_worker = min(
+        db_pool_size,
+        (db_budget - supervisor_db_pool) // (max_workers * _DB_POOLS_PER_WORKER),
+    )
     if db_per_worker < 1:
         minimum = supervisor_db_pool + (max_workers * _DB_POOLS_PER_WORKER)
-        raise ValueError(f"fleet DB connection budget {db_budget} is too small; need at least {minimum} for workers-max={max_workers}")
+        raise ValueError(
+            f"fleet DB connection budget {db_budget} is too small; "
+            f"need at least {minimum} for workers-max={max_workers}"
+        )
 
-    archive_budget = int(archive_workers_max if archive_workers_max is not None else max_workers * archive_workers)
+    archive_budget = int(
+        archive_workers_max if archive_workers_max is not None else max_workers * archive_workers
+    )
     archive_per_worker = min(archive_workers, archive_budget // max_workers, db_per_worker)
     if archive_per_worker < 1:
-        raise ValueError(f"fleet archive-worker budget {archive_budget} is too small; need at least {max_workers}")
+        raise ValueError(
+            f"fleet archive-worker budget {archive_budget} is too small; need at least {max_workers}"
+        )
 
-    projection_budget = int(projection_workers_max if projection_workers_max is not None else max_workers * min(projection_workers, db_pool_size))
-    projection_per_worker = min(projection_workers, projection_budget // max_workers, db_per_worker)
+    projection_budget = int(
+        projection_workers_max
+        if projection_workers_max is not None
+        else max_workers * min(projection_workers, db_pool_size)
+    )
+    projection_per_worker = min(
+        projection_workers, projection_budget // max_workers, db_per_worker
+    )
     if projection_per_worker < 1:
-        raise ValueError(f"fleet projection-worker budget {projection_budget} is too small; need at least {max_workers}")
+        raise ValueError(
+            f"fleet projection-worker budget {projection_budget} is too small; "
+            f"need at least {max_workers}"
+        )
 
     redis_clients = _REDIS_SUPERVISOR_CLIENTS + (_REDIS_CLIENTS_PER_WORKER * max_workers)
-    redis_budget = int(redis_connections_max if redis_connections_max is not None else redis_clients * redis_max_connections)
+    redis_budget = int(
+        redis_connections_max
+        if redis_connections_max is not None
+        else redis_clients * redis_max_connections
+    )
     redis_per_client = min(redis_max_connections, redis_budget // redis_clients)
     if redis_per_client < 1:
-        raise ValueError(f"fleet Redis connection budget {redis_budget} is too small; need at least {redis_clients} for workers-max={max_workers}")
+        raise ValueError(
+            f"fleet Redis connection budget {redis_budget} is too small; "
+            f"need at least {redis_clients} for workers-max={max_workers}"
+        )
 
     return CampaignResourcePlan(
         max_workers=max_workers,
@@ -350,7 +378,7 @@ def _task_progress(run_id: int) -> dict[str, int]:
 
 
 def _has_active_work(run_id: int) -> bool:
-    """Cheap indexed existence probe used for completion detection."""
+    """Use the queue index for a cheap completion probe instead of aggregating the run."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -589,6 +617,22 @@ def _registered_workers(redis: Redis, run_id: int) -> int:
     return len(_registered_worker_states(redis, run_id))
 
 
+def _redis_client(max_connections: int | None = None) -> Redis:
+    kwargs = {
+        "decode_responses": True,
+        "socket_timeout": _REDIS_SOCKET_TIMEOUT_SECONDS,
+        "socket_connect_timeout": _REDIS_CONNECT_TIMEOUT_SECONDS,
+        "health_check_interval": 15,
+    }
+    if max_connections is not None:
+        kwargs["max_connections"] = max(1, int(max_connections))
+    return Redis.from_url(settings.dbd_redis_url, **kwargs)
+
+
+def _is_transient_redis_error(exc: BaseException) -> bool:
+    return isinstance(exc, (RedisConnectionError, RedisTimeoutError, OSError))
+
+
 def _worker_metrics(states: list[dict]) -> dict[str, int]:
     summed = (
         "claimed",
@@ -632,7 +676,7 @@ def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict
 
 
 def _live_progress(baseline: dict[str, int], metrics: dict[str, int]) -> dict[str, int]:
-    """Overlay ephemeral worker counters on one exact lifecycle baseline."""
+    """Overlay ephemeral worker counters on one durable lifecycle baseline."""
     total = int(baseline.get("total", 0))
     done_only = int(baseline.get("done", 0)) + int(metrics.get("done", 0))
     not_available = int(baseline.get("not_available", 0)) + int(
@@ -640,18 +684,49 @@ def _live_progress(baseline: dict[str, int], metrics: dict[str, int]) -> dict[st
     )
     failed = int(baseline.get("failed", 0)) + int(metrics.get("failed", 0))
     terminal = min(total, done_only + not_available + failed)
-    inflight = max(0, int(metrics.get("inflight", 0)))
     remaining = max(0, total - terminal)
-    inflight = min(inflight, remaining)
+    inflight = min(max(0, int(metrics.get("inflight", 0))), remaining)
     return {
         "total": total,
-        "done_only": done_only,
-        "not_available": not_available,
-        "failed": failed,
+        "done_only": min(done_only, total),
+        "not_available": min(not_available, total),
+        "failed": min(failed, total),
         "terminal": terminal,
         "remaining": remaining,
         "inflight": inflight,
         "pending_estimate": max(0, remaining - inflight),
+    }
+
+
+def _runtime_progress_baseline(redis: Redis, run_id: int) -> dict[str, int] | None:
+    """Reuse the last supervisor snapshot on resume to avoid a multi-million-row scan."""
+    try:
+        runtime = _read_runtime_state(redis, run_id)
+    except Exception as exc:
+        if _is_transient_redis_error(exc):
+            return None
+        raise
+    if not runtime:
+        return None
+    try:
+        total = int(runtime.get("total", 0) or 0)
+        done = int(runtime.get("done_only", runtime.get("done", 0)) or 0)
+        not_available = int(runtime.get("not_available", 0) or 0)
+        failed = int(runtime.get("failed", 0) or 0)
+        pending = int(runtime.get("pending", 0) or 0)
+        running = int(runtime.get("running", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    if total <= 0:
+        return None
+    return {
+        "total": total,
+        "pending": pending,
+        "retry_wait": 0,
+        "running": running,
+        "failed": failed,
+        "done": done,
+        "not_available": not_available,
     }
 
 
@@ -683,6 +758,30 @@ def _drain_registered_workers(
             f"Campaign {run_id} still has registered worker(s) after supervisor handoff: {ids}"
         )
     return len(worker_ids)
+
+
+def _refresh_lease_with_grace(
+    redis: Redis,
+    run_id: int,
+    token: str,
+    *,
+    now: float,
+    last_confirmed: float,
+) -> tuple[float, BaseException | None]:
+    """Tolerate a short Redis outage, but fail closed before the 30s lease can expire."""
+    try:
+        _refresh_supervisor_lease(redis, run_id, token)
+    except Exception as exc:
+        if not _is_transient_redis_error(exc):
+            raise
+        unavailable_for = max(0.0, now - last_confirmed)
+        if unavailable_for >= _SUPERVISOR_LEASE_FAILURE_BUDGET_SECONDS:
+            raise RuntimeError(
+                f"Campaign {run_id} Redis control plane unavailable for "
+                f"{unavailable_for:.1f}s; stopping before supervisor lease expiry"
+            ) from exc
+        return last_confirmed, exc
+    return now, None
 
 
 def _acquire_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
@@ -990,11 +1089,7 @@ def supervise_campaign(
     )
     controller = AutoscaleController(minimum, maximum, worker_concurrency)
 
-    redis = Redis.from_url(
-        settings.dbd_redis_url,
-        decode_responses=True,
-        max_connections=resource_plan.redis_connections_per_client,
-    )
+    redis = _redis_client(resource_plan.redis_connections_per_client)
     token = f"{os.getpid()}-{uuid4().hex}"
     children: list[WorkerProcess] = []
     next_index = 1
@@ -1008,6 +1103,9 @@ def supervise_campaign(
     next_work_check = 0.0
     next_worker_refresh = 0.0
     last_rate_target: float | None = None
+    last_effective_rate = plan.initial
+    last_lease_confirmed = 0.0
+    last_redis_warning_at = 0.0
     baseline: dict[str, int] = {}
     has_work = True
     reconciled_at: float | None = None
@@ -1082,29 +1180,34 @@ def supervise_campaign(
         redis.ping()
         _acquire_supervisor_lease(redis, run_id, token)
         lease_acquired = True
+
         orphaned = _drain_registered_workers(redis, run_id)
         if orphaned:
             progress.event(
                 f"supervisor handoff: drained {orphaned} previously registered worker(s)"
             )
 
-        # Reconcile only after predecessor workers have drained so their final
-        # durable transitions are part of the new supervisor's baseline.
-        baseline = _task_progress(run_id)
-        reconciled_at = time.time()
-        has_work = (
-            baseline.get("pending", 0)
-            + baseline.get("retry_wait", 0)
-            + baseline.get("running", 0)
-            > 0
-        )
+        # Resume from the last supervisor snapshot when available. This avoids
+        # re-aggregating a multi-million-row endpoint queue just to redraw progress.
+        baseline = _runtime_progress_baseline(redis, run_id)
+        if baseline is None:
+            try:
+                baseline = _task_progress(run_id)
+                reconciled_at = time.time()
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Campaign {run_id} startup durable progress reconciliation failed: "
+                    f"{type(exc).__name__}"
+                ) from exc
+        has_work = _has_active_work(run_id)
 
         now = time.monotonic()
         http_sample_at = now
         if autoscale:
             controller.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
+        last_lease_confirmed = now
         next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
-        next_work_check = now
+        next_work_check = now + _DURABLE_WORK_CHECK_SECONDS
         next_worker_refresh = now
         _clear_stop(redis, run_id)
         initial_rate_target = _fleet_rate_target(plan, initial_workers)
@@ -1151,15 +1254,40 @@ def supervise_campaign(
         while True:
             now = time.monotonic()
             now_wall = time.time()
+            control_plane_degraded = False
+
             if now >= next_lease_refresh:
-                _refresh_supervisor_lease(redis, run_id, token)
-                next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
+                last_lease_confirmed, lease_error = _refresh_lease_with_grace(
+                    redis,
+                    run_id,
+                    token,
+                    now=now,
+                    last_confirmed=last_lease_confirmed,
+                )
+                if lease_error is not None:
+                    control_plane_degraded = True
+                    next_lease_refresh = now + _REDIS_RETRY_SECONDS
+                    if now - last_redis_warning_at >= 5.0:
+                        progress.event(
+                            f"Redis control plane timeout; preserving workers and retrying lease "
+                            f"({now - last_lease_confirmed:.1f}s degraded)"
+                        )
+                        last_redis_warning_at = now
+                else:
+                    next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
 
             worker_state_refreshed = False
             if now >= next_worker_refresh:
-                registered_states = _registered_worker_states(redis, run_id)
-                next_worker_refresh = now + _WORKER_STATE_REFRESH_SECONDS
-                worker_state_refreshed = True
+                try:
+                    registered_states = _registered_worker_states(redis, run_id)
+                except Exception as exc:
+                    if not _is_transient_redis_error(exc):
+                        raise
+                    control_plane_degraded = True
+                    next_worker_refresh = now + _REDIS_RETRY_SECONDS
+                else:
+                    next_worker_refresh = now + _WORKER_STATE_REFRESH_SECONDS
+                    worker_state_refreshed = True
 
             live_metrics = _worker_metrics(registered_states)
             campaign_metrics = _with_retired_metrics(live_metrics, retired_metrics)
@@ -1167,12 +1295,9 @@ def supervise_campaign(
                 elapsed = max(0.001, now - http_sample_at)
                 current_requests = int(campaign_metrics.get("requests", 0))
                 current_rate_limit_hits = int(campaign_metrics.get("rate_limit_hits", 0))
-                observed_http_rate = (
-                    max(0, current_requests - http_sample_requests) / elapsed
-                )
+                observed_http_rate = max(0, current_requests - http_sample_requests) / elapsed
                 recent_rate_limit_delta = max(
-                    0,
-                    current_rate_limit_hits - http_sample_rate_limit_hits,
+                    0, current_rate_limit_hits - http_sample_rate_limit_hits
                 )
                 http_sample_at = now
                 http_sample_requests = current_requests
@@ -1185,16 +1310,29 @@ def supervise_campaign(
             done = live_progress["done_only"] + live_progress["not_available"]
 
             if now >= next_work_check:
-                has_work = _has_active_work(run_id)
+                try:
+                    has_work = _has_active_work(run_id)
+                except Exception:
+                    # Completion observation must not kill a healthy fleet.
+                    pass
                 next_work_check = now + _DURABLE_WORK_CHECK_SECONDS
             active_work = has_work
+
             state_by_id = {
                 str(row.get("worker_id")): row
                 for row in registered_states
                 if row.get("worker_id")
             }
 
-            if _stop_requested(redis, run_id) and not graceful_stop:
+            stop_requested = False
+            if not control_plane_degraded:
+                try:
+                    stop_requested = _stop_requested(redis, run_id)
+                except Exception as exc:
+                    if not _is_transient_redis_error(exc):
+                        raise
+                    control_plane_degraded = True
+            if stop_requested and not graceful_stop:
                 graceful_stop = True
                 _request_local_drain(redis, run_id, children, "campaign_stop")
                 progress.event("campaign stop requested: draining workers without claiming new work")
@@ -1204,11 +1342,15 @@ def supervise_campaign(
                 row = state_by_id.get(worker.worker_id)
                 code = worker.process.poll()
                 if code is None:
-                    reason = _worker_unresponsive_reason(
-                        worker,
-                        row,
-                        now_wall=now_wall,
-                        now_mono=now,
+                    reason = (
+                        None
+                        if control_plane_degraded
+                        else _worker_unresponsive_reason(
+                            worker,
+                            row,
+                            now_wall=now_wall,
+                            now_mono=now,
+                        )
                     )
                     if reason is None:
                         survivors.append(worker)
@@ -1275,12 +1417,10 @@ def supervise_campaign(
 
             target = len(active_live)
             current_effective_rate = None
-            if autoscale and not graceful_stop:
+            if autoscale and not graceful_stop and not control_plane_degraded:
                 if plan.independent:
                     current_effective_rate = _effective_rate(
-                        redis,
-                        settings.dbd_redis_rate_key,
-                        plan.initial,
+                        redis, settings.dbd_redis_rate_key, plan.initial
                     )
                 target = controller.target(
                     pending=pending,
@@ -1351,11 +1491,27 @@ def supervise_campaign(
             # remain part of the upstream budget until their process exits.
             rate_workers = len([worker for worker in live if not worker.capacity_lost])
             rate_target = _fleet_rate_target(plan, rate_workers)
-            if rate_target != last_rate_target or now >= next_state_write:
-                effective = _set_rate_target(redis, settings.dbd_redis_rate_key, rate_target)
-                last_rate_target = rate_target
-            else:
-                effective = _effective_rate(redis, settings.dbd_redis_rate_key, plan.initial)
+            effective = last_effective_rate
+            if not control_plane_degraded:
+                try:
+                    if rate_target != last_rate_target or now >= next_state_write:
+                        effective = _set_rate_target(
+                            redis,
+                            settings.dbd_redis_rate_key,
+                            rate_target,
+                        )
+                        last_rate_target = rate_target
+                    else:
+                        effective = _effective_rate(
+                            redis,
+                            settings.dbd_redis_rate_key,
+                            last_effective_rate,
+                        )
+                    last_effective_rate = effective
+                except Exception as exc:
+                    if not _is_transient_redis_error(exc):
+                        raise
+                    control_plane_degraded = True
 
             registered = len(registered_states)
             registered_draining = sum(
@@ -1374,67 +1530,71 @@ def supervise_campaign(
                 else f"{registered}/{initial_workers}"
             )
             progress.update(
-                done + failed,
+                live_progress["terminal"],
                 total,
                 detail=(
                     f"workers {worker_label} | rate {effective:.2f}/{rate_target:.2f}/{plan.ceiling:.2f}/s | "
                     f"q {live_metrics.get('fetch_queue', 0)}/{live_metrics.get('archive_queue', 0)}/"
                     f"{live_metrics.get('project_queue', 0)} | http {campaign_metrics.get('requests', 0):,} "
                     f"429/503 {campaign_metrics.get('rate_limit_hits', 0):,} | "
-                    f"remaining {live_progress['remaining']:,} inflight {running:,} failed {failed:,}"
+                    f"pending~ {pending:,} running~ {running:,} failed~ {failed:,}"
                 ),
             )
 
-            if now >= next_state_write:
-                _write_runtime_state(
-                    redis,
-                    run_id,
-                    supervisor_pid=os.getpid(),
-                    status="draining" if graceful_stop else "running",
-                    autoscale=autoscale,
-                    workers_initial=initial_workers,
-                    workers_min=minimum,
-                    workers_max=maximum,
-                    workers_target=target,
-                    workers_active=len(active_live),
-                    workers_draining=len(draining_live),
-                    workers_registered=registered,
-                    workers_stale=stale_registered,
-                    exhausted_capacity=exhausted_capacity,
-                    effective_worker_max=effective_maximum,
-                    worker_concurrency=worker_concurrency,
-                    worker_rate=plan.worker_rate,
-                    rate_mode=rate_mode,
-                    rate_independent=plan.independent,
-                    fleet_rate_initial=plan.initial,
-                    fleet_rate_max=plan.ceiling,
-                    rate_effective=effective,
-                    rate_target=rate_target,
-                    rate_ceiling=plan.ceiling,
-                    http_rate_observed=observed_http_rate,
-                    rate_limit_delta=recent_rate_limit_delta,
-                    db_connections_budget=resource_plan.db_connections_budget,
-                    db_connections_effective_max=resource_plan.db_connections_effective_max,
-                    db_pool_per_worker=resource_plan.db_pool_per_worker,
-                    archive_workers_budget=resource_plan.archive_workers_budget,
-                    archive_workers_per_worker=resource_plan.archive_workers_per_worker,
-                    projection_workers_budget=resource_plan.projection_workers_budget,
-                    projection_workers_per_worker=resource_plan.projection_workers_per_worker,
-                    redis_connections_budget=resource_plan.redis_connections_budget,
-                    redis_connections_effective_max=resource_plan.redis_connections_effective_max,
-                    redis_connections_per_client=resource_plan.redis_connections_per_client,
-                    worker_metrics=campaign_metrics,
-                    progress_source="redis_worker_heartbeat",
-                    reconciled_at=reconciled_at,
-                    pending=pending,
-                    running=running,
-                    done=done,
-                    done_only=live_progress["done_only"],
-                    not_available=live_progress["not_available"],
-                    failed=failed,
-                    remaining=live_progress["remaining"],
-                    total=total,
-                )
+            if now >= next_state_write and not control_plane_degraded:
+                try:
+                    _write_runtime_state(
+                        redis,
+                        run_id,
+                        supervisor_pid=os.getpid(),
+                        status="draining" if graceful_stop else "running",
+                        autoscale=autoscale,
+                        workers_initial=initial_workers,
+                        workers_min=minimum,
+                        workers_max=maximum,
+                        workers_target=target,
+                        workers_active=len(active_live),
+                        workers_draining=len(draining_live),
+                        workers_registered=registered,
+                        workers_stale=stale_registered,
+                        exhausted_capacity=exhausted_capacity,
+                        effective_worker_max=effective_maximum,
+                        worker_concurrency=worker_concurrency,
+                        worker_rate=plan.worker_rate,
+                        rate_mode=rate_mode,
+                        rate_independent=plan.independent,
+                        fleet_rate_initial=plan.initial,
+                        fleet_rate_max=plan.ceiling,
+                        rate_effective=effective,
+                        rate_target=rate_target,
+                        rate_ceiling=plan.ceiling,
+                        http_rate_observed=observed_http_rate,
+                        rate_limit_delta=recent_rate_limit_delta,
+                        db_connections_budget=resource_plan.db_connections_budget,
+                        db_connections_effective_max=resource_plan.db_connections_effective_max,
+                        db_pool_per_worker=resource_plan.db_pool_per_worker,
+                        archive_workers_budget=resource_plan.archive_workers_budget,
+                        archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+                        projection_workers_budget=resource_plan.projection_workers_budget,
+                        projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+                        redis_connections_budget=resource_plan.redis_connections_budget,
+                        redis_connections_effective_max=resource_plan.redis_connections_effective_max,
+                        redis_connections_per_client=resource_plan.redis_connections_per_client,
+                        worker_metrics=campaign_metrics,
+                        progress_source="redis_worker_heartbeat",
+                        reconciled_at=reconciled_at,
+                        pending=pending,
+                        running=running,
+                        done=done,
+                        done_only=live_progress["done_only"],
+                        not_available=live_progress["not_available"],
+                        failed=failed,
+                        remaining=live_progress["remaining"],
+                        total=total,
+                    )
+                except Exception as exc:
+                    if not _is_transient_redis_error(exc):
+                        raise
                 next_state_write = now + 1.0
 
             if not active_work:
@@ -1510,7 +1670,7 @@ def supervise_campaign(
         finally:
             exit_code = 130
 
-    except Exception:
+    except Exception as exc:
         supervisor_error = True
         _contain_local_fleet(
             redis,
@@ -1519,8 +1679,17 @@ def supervise_campaign(
             "supervisor_failure",
             grace_seconds=_FAILURE_DRAIN_SECONDS,
         )
-        progress.close(message=f"Campaign {run_id} supervisor failed; local workers are stopped")
-        raise
+        progress.close(
+            message=(
+                f"Campaign {run_id} supervisor failed; local workers are stopped "
+                f"({type(exc).__name__})"
+            )
+        )
+        detail = str(exc).strip()
+        detail = f": {detail[:300]}" if detail else ""
+        raise RuntimeError(
+            f"Campaign {run_id} supervisor failure [{type(exc).__name__}]{detail}"
+        ) from exc
 
     finally:
         for worker in children:
@@ -1633,11 +1802,7 @@ def campaign_status(run_id: int) -> dict:
 
     if settings.dbd_redis_url:
         try:
-            redis = Redis.from_url(
-                settings.dbd_redis_url,
-                decode_responses=True,
-                max_connections=settings.dbd_redis_max_connections,
-            )
+            redis = _redis_client(settings.dbd_redis_max_connections)
             redis.ping()
             runtime = _read_runtime_state(redis, run_id)
             supervisor_active = bool(redis.exists(_supervisor_lease_key(run_id)))
@@ -1649,7 +1814,7 @@ def campaign_status(run_id: int) -> dict:
                     "retry_wait": 0,
                     "running": int(runtime.get("running", 0) or 0),
                     "failed": int(runtime.get("failed", 0) or 0),
-                    "done": int(runtime.get("done_only", 0) or 0),
+                    "done": int(runtime.get("done_only", runtime.get("done", 0)) or 0),
                     "not_available": int(runtime.get("not_available", 0) or 0),
                     "progress_source": runtime.get(
                         "progress_source", "redis_worker_heartbeat"
@@ -1725,11 +1890,7 @@ def campaign_status(run_id: int) -> dict:
 def request_campaign_stop(run_id: int) -> None:
     if not settings.dbd_redis_url:
         raise ValueError("Campaign stop requires DBD_REDIS_URL")
-    redis = Redis.from_url(
-        settings.dbd_redis_url,
-        decode_responses=True,
-        max_connections=settings.dbd_redis_max_connections,
-    )
+    redis = _redis_client(settings.dbd_redis_max_connections)
     try:
         redis.ping()
         _request_stop(redis, run_id, "operator_command")

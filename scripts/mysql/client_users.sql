@@ -1,229 +1,122 @@
 -- ============================================================================
 -- DBD REMOTE CLIENT USER MANAGEMENT
 -- ============================================================================
--- Naming convention:
---   dbd-<team>
+-- This file is intentionally FAIL-CLOSED.
 --
--- MySQL account identity is:
---   '<username>'@'<client-ip>'
+-- Every CREATE/ALTER/GRANT/REVOKE/DROP example below is commented out.
+-- Copy only the statements you intend to run, replace all placeholders first,
+-- and never commit real passwords.
 --
--- Example:
---   'dbd-tipdi'@'172.24.114.41'
---
--- Recommended default for remote clients:
---   SELECT only on dbd.*
---
--- CREATE USER / GRANT / REVOKE / DROP USER take effect immediately.
--- FLUSH PRIVILEGES is not required when using these account-management commands.
+-- Recommended default privilege for normal DBD clients:
+--   SELECT ON dbd.*
 -- ============================================================================
 
 
 -- ============================================================================
--- 1. CREATE A READ-ONLY CLIENT USER
+-- 1. DIRECT LAN CLIENT
 -- ============================================================================
--- Edit TEAM, CLIENT_IP, and password before running.
-
-CREATE USER 'dbd-tipdi'@'172.24.114.41'
-IDENTIFIED BY 'CHANGE_ME_TEAM_PASSWORD';
-
-GRANT SELECT
-ON dbd.*
-TO 'dbd-tipdi'@'172.24.114.41';
-
-
--- ============================================================================
--- 2. ADD ANOTHER MACHINE FOR THE SAME TEAM
--- ============================================================================
--- Same username and team password can be used for another approved IP.
+-- Use a specific approved client IP when the client reaches MySQL directly.
 --
--- Example:
---
--- CREATE USER 'dbd-tipdi'@'172.24.114.42'
--- IDENTIFIED BY 'CHANGE_ME_TEAM_PASSWORD';
+-- CREATE USER 'dbd-<team>'@'<CLIENT_IP>'
+-- IDENTIFIED BY '<STRONG_TEAM_PASSWORD>';
 --
 -- GRANT SELECT
 -- ON dbd.*
--- TO 'dbd-tipdi'@'172.24.114.42';
+-- TO 'dbd-<team>'@'<CLIENT_IP>';
 
 
 -- ============================================================================
--- 3. CREATE A USER FOR ANOTHER TEAM
+-- 2. PYTHON REMOTE GATEWAY CLIENT
 -- ============================================================================
--- Naming pattern:
---   dbd-<team>
+-- dbd_gateway.py connects to MySQL through:
+--   127.0.0.1:3307
 --
--- Example:
+-- Therefore MySQL matches a loopback account, not the original remote
+-- workstation IP.
 --
--- CREATE USER 'dbd-dataeng'@'172.24.115.10'
--- IDENTIFIED BY 'CHANGE_ME_DATAENG_PASSWORD';
+-- CREATE USER 'dbd-<team>'@'127.0.0.1'
+-- IDENTIFIED BY '<STRONG_TEAM_PASSWORD>';
 --
 -- GRANT SELECT
 -- ON dbd.*
--- TO 'dbd-dataeng'@'172.24.115.10';
+-- TO 'dbd-<team>'@'127.0.0.1';
+--
+-- Optional connection cap:
+--
+-- ALTER USER 'dbd-<team>'@'127.0.0.1'
+-- WITH MAX_USER_CONNECTIONS 10;
 
 
 -- ============================================================================
--- 4. COMMON MYSQL PRIVILEGES
--- ============================================================================
---
--- SELECT
---   Read/query rows.
---   Recommended default for normal DBD clients.
---
--- INSERT
---   Add new rows.
---
--- UPDATE
---   Modify existing rows.
---
--- DELETE
---   Delete existing rows.
---
--- CREATE
---   Create databases/tables.
---
--- ALTER
---   Change table structure.
---
--- DROP
---   Delete databases/tables.
---
--- INDEX
---   Create/drop indexes.
---
--- CREATE VIEW
---   Create SQL views.
---
--- SHOW VIEW
---   View definitions of SQL views.
---
--- CREATE TEMPORARY TABLES
---   Create temporary tables for the session.
---
--- LOCK TABLES
---   Explicitly lock tables.
---
--- EXECUTE
---   Execute stored procedures/functions.
---
--- TRIGGER
---   Create/drop triggers.
---
--- EVENT
---   Create/alter/drop MySQL scheduled events.
---
--- REFERENCES
---   Used for foreign-key reference privileges in applicable operations.
---
--- ALL PRIVILEGES
---   Grants nearly all privileges available at the selected scope.
---   DO NOT grant this to normal remote clients.
---
--- GRANT OPTION
---   Allows the account to grant its own privileges to other accounts.
---   DO NOT grant this to normal remote clients.
-
-
--- ============================================================================
--- 5. READY-TO-COPY GRANT PATTERNS
+-- 3. VERIFY ACCOUNTS
 -- ============================================================================
 
--- Read-only client (recommended default):
---
--- GRANT SELECT
--- ON dbd.*
--- TO 'dbd-tipdi'@'172.24.114.41';
-
-
--- Read/write application account:
---
--- GRANT SELECT, INSERT, UPDATE, DELETE
--- ON dbd.*
--- TO 'dbd-app'@'<CLIENT_IP>';
-
-
--- Read + temporary analytical work:
---
--- GRANT SELECT, CREATE TEMPORARY TABLES
--- ON dbd.*
--- TO 'dbd-analytics'@'<CLIENT_IP>';
-
-
--- Schema-management account (privileged; use only when explicitly required):
---
--- GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP
--- ON dbd.*
--- TO 'dbd-schema'@'<CLIENT_IP>';
-
-
--- DANGEROUS: full database privileges.
--- Do not use for ordinary remote users.
---
--- GRANT ALL PRIVILEGES
--- ON dbd.*
--- TO 'dbd-admin'@'<CLIENT_IP>';
-
-
--- ============================================================================
--- 6. VERIFY USERS AND PRIVILEGES
--- ============================================================================
-
--- List DBD team/client accounts:
-SELECT User, Host
+SELECT User, Host, account_locked
 FROM mysql.user
 WHERE User LIKE 'dbd-%'
 ORDER BY User, Host;
 
+-- Direct LAN example:
+-- SHOW GRANTS FOR 'dbd-<team>'@'<CLIENT_IP>';
 
--- Check one account:
-SHOW GRANTS FOR 'dbd-tipdi'@'172.24.114.41';
+-- Gateway example:
+-- SHOW GRANTS FOR 'dbd-<team>'@'127.0.0.1';
 
 
 -- ============================================================================
--- 7. CHANGE A TEAM PASSWORD
+-- 4. VERIFY EFFECTIVE CONNECTION IDENTITY
 -- ============================================================================
--- Because each username@host is a separate MySQL account, update every
--- approved IP for that team when rotating a shared team password.
+-- Run this after connecting as the client account:
 --
--- ALTER USER 'dbd-tipdi'@'172.24.114.41'
--- IDENTIFIED BY 'NEW_TEAM_PASSWORD';
+-- SELECT
+--     DATABASE(),
+--     USER(),
+--     CURRENT_USER(),
+--     CONNECTION_ID(),
+--     NOW();
 --
--- ALTER USER 'dbd-tipdi'@'172.24.114.42'
--- IDENTIFIED BY 'NEW_TEAM_PASSWORD';
+-- Gateway mode should normally show CURRENT_USER() similar to:
+--   dbd-<team>@127.0.0.1
 
 
 -- ============================================================================
--- 8. REVOKE PRIVILEGES
+-- 5. PASSWORD ROTATION
 -- ============================================================================
 
--- Remove SELECT while keeping the account:
---
+-- ALTER USER 'dbd-<team>'@'127.0.0.1'
+-- IDENTIFIED BY '<NEW_STRONG_PASSWORD>';
+
+-- ALTER USER 'dbd-<team>'@'<CLIENT_IP>'
+-- IDENTIFIED BY '<NEW_STRONG_PASSWORD>';
+
+
+-- ============================================================================
+-- 6. REVOKE OR REMOVE ACCESS
+-- ============================================================================
+
 -- REVOKE SELECT
 -- ON dbd.*
--- FROM 'dbd-tipdi'@'172.24.114.41';
+-- FROM 'dbd-<team>'@'127.0.0.1';
+
+-- DROP USER IF EXISTS 'dbd-<team>'@'127.0.0.1';
+
+-- REVOKE SELECT
+-- ON dbd.*
+-- FROM 'dbd-<team>'@'<CLIENT_IP>';
+
+-- DROP USER IF EXISTS 'dbd-<team>'@'<CLIENT_IP>';
 
 
 -- ============================================================================
--- 9. REMOVE A CLIENT MACHINE
--- ============================================================================
-
--- Remove only the account for the specified source IP:
---
--- DROP USER 'dbd-tipdi'@'172.24.114.41';
-
-
--- ============================================================================
--- 10. SECURITY NOTES
+-- 7. SECURITY NOTES
 -- ============================================================================
 -- Prefer:
---   'dbd-<team>'@'<specific-client-ip>'
+--   'dbd-<team>'@'<specific-client-ip>'   for direct LAN
+--   'dbd-<team>'@'127.0.0.1'             for Python gateway
 --
 -- Avoid:
 --   'dbd-<team>'@'%'
 --
--- '%' permits that username to authenticate from any source host that can
--- reach the MySQL server, subject to password/authentication requirements.
---
--- Keep collector/internal credentials such as dbd-data separate from remote
--- client/team credentials.
+-- Do not grant ALL PRIVILEGES or GRANT OPTION to ordinary client accounts.
+-- Keep collector/runtime credentials separate from analyst/team credentials.
 -- ============================================================================
