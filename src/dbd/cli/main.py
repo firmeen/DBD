@@ -430,11 +430,9 @@ def main():
         help="Refresh every selected resource; requires --scheduler-mode fabric_v2",
     )
     _add_campaign_worker_options(campaign_start)
-    _add_output_options(campaign_start)
     campaign_resume = campaign_sub.add_parser("resume", help="Resume one existing run with workers")
     campaign_resume.add_argument("run_id", type=positive)
     _add_campaign_worker_options(campaign_resume)
-    _add_output_options(campaign_resume)
     campaign_status_parser = campaign_sub.add_parser("status", help="Show fleet and durable queue status")
     campaign_status_parser.add_argument("run_id", type=positive)
     _add_output_options(campaign_status_parser)
