@@ -785,23 +785,31 @@ return {
         EFFECTIVE_RATE.set(self._global_effective())
         return self.target_rate
 
-    async def acquire(self, endpoint: str | None) -> None:
-        # Circuit checks do not consume a pacing reservation. Endpoint admission
-        # still happens before global admission so a slow endpoint never reserves a
-        # scarce global slot while waiting for its own budget.
-        await self._breaker.before("__global__")
-        if endpoint is not None:
-            await self._breaker.before(endpoint)
-            await self._bucket(endpoint).acquire()
-            shared_endpoint = self._shared_endpoint(endpoint)
-            if shared_endpoint is not None:
-                await shared_endpoint.acquire()
-            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(self._endpoint_effective(endpoint))
+    async def acquire(self, endpoint: str | None) -> AdmissionState:
+        if self._redis is None:
+            global_state = await self._breaker.before("__global__")
+            endpoint_state = None
+            if endpoint is not None:
+                endpoint_state = await self._breaker.before(endpoint)
+                await self._bucket(endpoint).acquire()
+                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(
+                    self._endpoint_effective(endpoint)
+                )
+            await self._global_local.acquire()
+            EFFECTIVE_RATE.set(self._global_effective())
+            return AdmissionState(
+                global_state=global_state,
+                endpoint_state=endpoint_state,
+                shared=False,
+            )
 
+        # Local buckets protect one process. The Redis script then atomically
+        # evaluates both circuits and reserves endpoint/global fleet pacing for
+        # the same admission timestamp, avoiding four healthy-path Redis RTTs.
+        if endpoint is not None:
+            await self._bucket(endpoint).acquire()
         await self._global_local.acquire()
-        if self._global_shared is not None:
-            await self._global_shared.acquire()
-        EFFECTIVE_RATE.set(self._global_effective())
+        return await self._shared_admit(endpoint)
 
     async def penalize(
         self,
@@ -809,6 +817,7 @@ return {
         cooldown_seconds: float,
     ) -> tuple[float, float, float, float, bool]:
         await self._breaker.failure(endpoint)
+        self._endpoint_recovery_needed.add(endpoint)
         endpoint_bucket = self._bucket(endpoint)
         shared_endpoint = self._shared_endpoint(endpoint)
         old_endpoint = self._endpoint_effective(endpoint)
@@ -824,6 +833,7 @@ return {
         old_global = self._global_effective()
         global_escalated = await self._breaker.record_endpoint_pressure(endpoint)
         if global_escalated:
+            self._global_recovery_needed = True
             await self._breaker.failure("__global__")
             self._global_local.slow_down()
             self._global_local.cooldown(cooldown_seconds)
@@ -836,6 +846,7 @@ return {
         return old_endpoint, new_endpoint, old_global, new_global, global_escalated
 
     async def penalize_global(self, cooldown_seconds: float) -> tuple[float, float]:
+        self._global_recovery_needed = True
         await self._breaker.failure("__global__")
         old_global = self._global_effective()
         self._global_local.slow_down()
@@ -848,42 +859,66 @@ return {
         EFFECTIVE_RATE.set(new_global)
         return old_global, new_global
 
-    async def recover(self, endpoint: str) -> tuple[float | None, float | None]:
-        await self._breaker.success(endpoint)
-        await self._breaker.success("__global__")
+    async def recover(
+        self,
+        endpoint: str,
+        admission: AdmissionState | None = None,
+    ) -> tuple[float | None, float | None]:
         endpoint_bucket = self._bucket(endpoint)
         local_endpoint_recovered = endpoint_bucket.recover()
-        shared_endpoint = self._shared_endpoint(endpoint)
-        shared_endpoint_recovered = None
-        if shared_endpoint is not None:
-            shared_endpoint_recovered = await shared_endpoint.recover()
-        endpoint_changed = local_endpoint_recovered is not None or shared_endpoint_recovered is not None
-        endpoint_effective = self._endpoint_effective(endpoint)
-        ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_effective)
-
         local_global_recovered = self._global_local.recover()
-        shared_global_recovered = None
-        if self._global_shared is not None:
-            shared_global_recovered = await self._global_shared.recover()
-        global_changed = local_global_recovered is not None or shared_global_recovered is not None
-        global_effective = self._global_effective()
-        EFFECTIVE_RATE.set(global_effective)
 
+        if self._redis is None:
+            await self._breaker.success(endpoint)
+            await self._breaker.success("__global__")
+            endpoint_effective = self._endpoint_effective(endpoint)
+            global_effective = self._global_effective()
+            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_effective)
+            EFFECTIVE_RATE.set(global_effective)
+            return (
+                endpoint_effective if local_endpoint_recovered is not None else None,
+                global_effective if local_global_recovered is not None else None,
+            )
+
+        shared_endpoint_changed, shared_global_changed = (
+            await self._shared_success_recovery(
+                endpoint,
+                admission or AdmissionState(shared=True),
+            )
+        )
+        endpoint_effective = self._endpoint_effective(endpoint)
+        global_effective = self._global_effective()
+        ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_effective)
+        EFFECTIVE_RATE.set(global_effective)
         return (
-            endpoint_effective if endpoint_changed else None,
-            global_effective if global_changed else None,
+            endpoint_effective
+            if local_endpoint_recovered is not None
+            or shared_endpoint_changed is not None
+            else None,
+            global_effective
+            if local_global_recovered is not None
+            or shared_global_changed is not None
+            else None,
         )
 
-    async def recover_global(self) -> float | None:
-        await self._breaker.success("__global__")
+    async def recover_global(
+        self,
+        admission: AdmissionState | None = None,
+    ) -> float | None:
         local_recovered = self._global_local.recover()
-        shared_recovered = None
-        if self._global_shared is not None:
-            shared_recovered = await self._global_shared.recover()
-        changed = local_recovered is not None or shared_recovered is not None
+        if self._redis is None:
+            await self._breaker.success("__global__")
+            effective = self._global_effective()
+            EFFECTIVE_RATE.set(effective)
+            return effective if local_recovered is not None else None
+
+        _, shared_recovered = await self._shared_success_recovery(
+            None,
+            admission or AdmissionState(shared=True),
+        )
         effective = self._global_effective()
         EFFECTIVE_RATE.set(effective)
-        return effective if changed else None
+        return effective if local_recovered is not None or shared_recovered is not None else None
 
     def effective_rate(self, endpoint: str) -> float:
         return self._endpoint_effective(endpoint)
