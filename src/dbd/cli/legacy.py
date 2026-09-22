@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from ..client import DbdClient
+from ..presentation import TerminalPresenter
 from ..pipelines import bulk, company_details, company_profile, financials
 from ..storage.mysql.engine import connect
 from ..storage.mysql.repositories.run_repository import (
@@ -27,14 +28,15 @@ def _parse_parts(only: str | None) -> list[str]:
     return parts
 
 
-def command_check_db() -> None:
+def command_check_db(*, presenter: TerminalPresenter | None = None) -> dict:
+    presenter = presenter or TerminalPresenter()
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT DATABASE() AS db, CURRENT_USER() AS user, VERSION() AS version")
             row = cur.fetchone()
-    print(f"Database: {row['db']}")
-    print(f"User: {row['user']}")
-    print(f"MySQL: {row['version']}")
+    info = dict(row)
+    presenter.check_db(info)
+    return info
 
 
 def command_fetch_company(company_code: str, parts: list[str], fiscal_year: str | None) -> None:
@@ -63,20 +65,36 @@ def command_fetch_company(company_code: str, parts: list[str], fiscal_year: str 
         print(f"industry_bench   {fin.benchmark_items} item(s)")
 
 
-def command_bulk(file: str | None, run_id: int | None, parts: list[str], limit: int | None) -> None:
+def command_bulk(
+    file: str | None,
+    run_id: int | None,
+    parts: list[str],
+    limit: int | None,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     if file:
         codes = bulk.read_codes(file)
         if not codes:
             raise SystemExit(f"No company codes found in {file}")
         run_id, enqueued = create_run(source_label=file, parts=parts, company_codes=codes)
-        print(f"run {run_id}: enqueued {enqueued} company code(s) from {file}")
+        if not presenter.options.json:
+            presenter.success(
+                "LEGACY RUN ENQUEUED",
+                fields={"run": run_id, "companies": enqueued, "source": file},
+            )
     elif run_id is None:
         run = latest_unfinished_run()
         if run is None:
             raise SystemExit("No unfinished run to resume. Start one with --file <codes.txt>")
         run_id = int(run["id"])
         parts = run["parts"].split(",")
-        print(f"resuming run {run_id} ({run['source_label']})")
+        if not presenter.options.json:
+            presenter.success(
+                "LEGACY RUN RESUME",
+                fields={"run": run_id, "source": run["source_label"]},
+            )
 
     from ..storage.mysql.repositories.run_repository import get_run
 
@@ -85,18 +103,26 @@ def command_bulk(file: str | None, run_id: int | None, parts: list[str], limit: 
         raise ValueError("Legacy run not found")
     parts = stored["parts"].split(",")
     progress = run_progress(run_id)
-    print(
-        f"run {run_id}: {progress['done']} done, {progress['failed']} failed, {progress['pending']} pending"
-    )
+    if not presenter.options.json:
+        presenter.process_result(
+            run_id,
+            {
+                "done": int(progress["done"] or 0),
+                "failed": int(progress["failed"] or 0),
+                "pending": int(progress["pending"] or 0),
+            },
+        )
 
     result = bulk.process(run_id, parts, limit)
-
-    print(
-        f"\nrun {result.run_id}: processed {result.processed}, "
-        f"succeeded {result.succeeded}, failed {result.failed}, remaining {result.remaining}"
+    presenter.process_result(
+        result.run_id,
+        {
+            "processed": result.processed,
+            "succeeded": result.succeeded,
+            "failed": result.failed,
+            "remaining": result.remaining,
+        },
     )
-    if result.remaining:
-        print(f"resume with: dbd-data bulk --run-id {result.run_id}")
 
 
 def command_bulk_status(run_id: int | None) -> None:
