@@ -3,15 +3,23 @@ from __future__ import annotations
 from sqlalchemy import bindparam, text
 
 from ....core.settings import settings
-from ....core.telemetry import PIPELINE_BATCH_SIZE
+from ....core.telemetry import (
+    PIPELINE_BATCH_SIZE,
+    REFRESH_HTTP_CALLS_PER_COMPANY,
+    REFRESH_PLAN_COMPANIES,
+    REFRESH_PLAN_RESOURCES,
+)
 from ....runtime.collection_fabric import (
+    FINANCIAL_MASK,
     advance_state,
+    derive_fiscal_year,
     endpoint_bit,
     mask_for_endpoints,
     next_endpoint,
     remaining_mask,
 )
-from .worker_repository import FinishResult, WorkerRepository, transaction_retry
+from ....runtime.delta import refresh_plan
+from .worker_repository import FinishResult, WorkerRepository, now, transaction_retry
 
 
 class FabricWorkerRepository(WorkerRepository):
@@ -30,47 +38,169 @@ class FabricWorkerRepository(WorkerRepository):
             return super().for_run(run)
         return self
 
-    async def _run_fiscal_year(self, conn, run_id: int) -> str | None:
-        return (
+    async def _run_policy(self, conn, run_id: int) -> tuple[str | None, int]:
+        row = (
             await conn.execute(
-                text("SELECT fiscal_year FROM worker_runs WHERE id=:id"),
+                text(
+                    "SELECT fiscal_year,force_refresh_mask "
+                    "FROM worker_runs WHERE id=:id"
+                ),
                 {"id": run_id},
             )
-        ).scalar_one_or_none()
+        ).mappings().one()
+        return row["fiscal_year"], int(row.get("force_refresh_mask") or 0)
+
+    async def _latest_endpoint_state(self, conn, company_ids, resources):
+        if not company_ids or not resources:
+            return {}
+        query = text(
+            """
+            SELECT company_id,endpoint,requested_at,status
+            FROM company_endpoint_state
+            WHERE company_id IN :ids AND endpoint IN :endpoints
+            ORDER BY company_id,endpoint,requested_at DESC
+            """
+        ).bindparams(
+            bindparam("ids", expanding=True),
+            bindparam("endpoints", expanding=True),
+        )
+        rows = (
+            await conn.execute(
+                query,
+                {"ids": list(company_ids), "endpoints": list(resources)},
+            )
+        ).mappings().all()
+        latest = {}
+        for row in rows:
+            key = (int(row["company_id"]), str(row["endpoint"]))
+            latest.setdefault(key, dict(row))
+        return latest
 
     async def _materialize_states(self, conn, run_id, rows, resources) -> None:
         if not rows:
             return
         required = mask_for_endpoints(resources)
-        fiscal_year = await self._run_fiscal_year(conn, run_id)
-        first_endpoint = next_endpoint(
-            required,
-            0,
-            0,
-            fiscal_year=fiscal_year,
+        run_fiscal_year, force_mask = await self._run_policy(conn, run_id)
+        timestamp = now()
+        company_ids = [int(row["company_id"]) for row in rows]
+        endpoint_state = await self._latest_endpoint_state(
+            conn,
+            company_ids,
+            resources,
         )
-        await conn.execute(
-            text("""
-            INSERT INTO company_collection_state(
-              run_id,company_id,required_mask,dirty_mask,next_endpoint,
-              fiscal_year,master_hash
-            ) VALUES (
-              :run,:company,:required,:dirty,:endpoint,:year,:master_hash
+        values = []
+
+        for row in rows:
+            company_id = int(row["company_id"])
+            freshness = {
+                endpoint: (
+                    endpoint_state[(company_id, endpoint)]["requested_at"]
+                    if (company_id, endpoint) in endpoint_state
+                    else None
+                )
+                for endpoint in resources
+            }
+            plan = refresh_plan(
+                required,
+                pending_dirty_mask=int(row.get("pending_dirty_mask") or 0),
+                freshness=freshness,
+                force_mask=force_mask,
+                now=timestamp,
+                stale_after_hours=settings.dbd_refresh_stale_hours,
             )
-            ON DUPLICATE KEY UPDATE id=id
-            """),
-            [
+
+            change_dirty = int(plan.change_dirty_mask)
+            stale_dirty = int(plan.stale_dirty_mask)
+            forced_dirty = int(plan.forced_dirty_mask)
+            dirty = int(plan.dirty_mask)
+            fiscal_year = run_fiscal_year or derive_fiscal_year(
+                row.get("submit_fin_year")
+            )
+
+            profile_bit = endpoint_bit("profile")
+            if not fiscal_year and not (dirty & profile_bit):
+                financial = required & FINANCIAL_MASK
+                change_dirty &= ~financial
+                stale_dirty &= ~financial
+                forced_dirty &= ~financial
+                dirty &= ~financial
+
+            done_mask = 0
+            not_available_mask = 0
+            for endpoint in resources:
+                bit = endpoint_bit(endpoint)
+                if dirty & bit:
+                    continue
+                previous = endpoint_state.get((company_id, endpoint))
+                if previous and previous.get("status") == "not_available":
+                    not_available_mask |= bit
+                else:
+                    done_mask |= bit
+
+            if not fiscal_year and not (dirty & profile_bit):
+                financial = required & FINANCIAL_MASK
+                not_available_mask |= financial
+                done_mask &= ~financial
+
+            first_endpoint = next_endpoint(
+                required,
+                done_mask,
+                not_available_mask,
+                fiscal_year=fiscal_year,
+            )
+            if dirty and first_endpoint is None:
+                raise RuntimeError(
+                    f"Incremental planner produced unreachable dirty work for company {company_id}"
+                )
+            status = "pending" if dirty else "done"
+
+            values.append(
                 {
                     "run": run_id,
-                    "company": int(row["company_id"]),
+                    "company": company_id,
                     "required": required,
-                    "dirty": required,
+                    "done": done_mask,
+                    "na": not_available_mask,
+                    "dirty": dirty,
+                    "change_dirty": change_dirty,
+                    "stale_dirty": stale_dirty,
+                    "forced_dirty": forced_dirty,
                     "endpoint": first_endpoint,
                     "year": fiscal_year,
                     "master_hash": row.get("master_hash"),
+                    "status": status,
+                    "finished": timestamp if status == "done" else None,
                 }
-                for row in rows
-            ],
+            )
+
+            if change_dirty:
+                REFRESH_PLAN_COMPANIES.labels("changed").inc()
+                REFRESH_PLAN_RESOURCES.labels("changed").inc(change_dirty.bit_count())
+            else:
+                REFRESH_PLAN_COMPANIES.labels("unchanged").inc()
+            if stale_dirty:
+                REFRESH_PLAN_COMPANIES.labels("stale").inc()
+                REFRESH_PLAN_RESOURCES.labels("stale").inc(stale_dirty.bit_count())
+            if forced_dirty:
+                REFRESH_PLAN_COMPANIES.labels("forced").inc()
+                REFRESH_PLAN_RESOURCES.labels("forced").inc(forced_dirty.bit_count())
+            if not dirty:
+                REFRESH_PLAN_COMPANIES.labels("skipped").inc()
+
+        await conn.execute(
+            text("""
+            INSERT INTO company_collection_state(
+              run_id,company_id,required_mask,done_mask,not_available_mask,
+              dirty_mask,change_dirty_mask,stale_dirty_mask,forced_dirty_mask,
+              next_endpoint,fiscal_year,master_hash,status,finished_at
+            ) VALUES (
+              :run,:company,:required,:done,:na,
+              :dirty,:change_dirty,:stale_dirty,:forced_dirty,
+              :endpoint,:year,:master_hash,:status,:finished
+            )
+            ON DUPLICATE KEY UPDATE id=id
+            """),
+            values,
         )
 
     @transaction_retry
@@ -93,8 +223,10 @@ class FabricWorkerRepository(WorkerRepository):
             rows = (
                 await conn.execute(
                     text(
-                        "SELECT company_id,master_hash FROM company_master "
-                        "WHERE (jp_type_code,jp_no) IN (" + ",".join(predicates) + ")"
+                        "SELECT m.company_id,m.master_hash,m.pending_dirty_mask,"
+                        "c.submit_fin_year FROM company_master m "
+                        "LEFT JOIN companies c ON c.jp_no=m.jp_no AND c.jp_type_code=m.jp_type_code "
+                        "WHERE (m.jp_type_code,m.jp_no) IN (" + ",".join(predicates) + ")"
                     ),
                     parameters,
                 )
@@ -109,7 +241,9 @@ class FabricWorkerRepository(WorkerRepository):
             clause = " AND m.observed_jp_stat_code IN :statuses"
             params["statuses"] = tuple(statuses)
         query = text(
-            "SELECT m.company_id,m.master_hash FROM company_master m "
+            "SELECT m.company_id,m.master_hash,m.pending_dirty_mask,c.submit_fin_year "
+            "FROM company_master m "
+            "LEFT JOIN companies c ON c.jp_no=m.jp_no AND c.jp_type_code=m.jp_type_code "
             "WHERE m.company_id>:after AND m.identity_status<>'conflict'"
             + clause
             + " ORDER BY m.company_id LIMIT :size"
@@ -586,6 +720,49 @@ class FabricWorkerRepository(WorkerRepository):
             for key in ("pending", "retry_wait", "running", "failed", "done", "not_available")
             if result[key]
         }
+
+    async def refresh_stats(self, run_id):
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                    SELECT
+                      COUNT(*) AS companies,
+                      COALESCE(SUM(change_dirty_mask<>0),0) AS changed,
+                      COALESCE(SUM(change_dirty_mask=0),0) AS unchanged,
+                      COALESCE(SUM(stale_dirty_mask<>0),0) AS stale,
+                      COALESCE(SUM(forced_dirty_mask<>0),0) AS forced,
+                      COALESCE(SUM(dirty_mask=0),0) AS skipped,
+                      COALESCE(SUM(BIT_COUNT(required_mask)),0) AS selected_resources,
+                      COALESCE(SUM(BIT_COUNT(
+                        change_dirty_mask|stale_dirty_mask|forced_dirty_mask
+                      )),0) AS planned_resources
+                    FROM company_collection_state
+                    WHERE run_id=:id
+                    """),
+                    {"id": run_id},
+                )
+            ).mappings().one()
+            calls = int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM response_archive "
+                            "WHERE run_id=:id AND endpoint<>'search_page'"
+                        ),
+                        {"id": run_id},
+                    )
+                ).scalar_one()
+                or 0
+            )
+        result = {key: int(value or 0) for key, value in row.items()}
+        result["http_calls"] = calls
+        companies = result["companies"]
+        result["http_calls_per_company"] = (
+            round(calls / companies, 4) if companies else 0.0
+        )
+        REFRESH_HTTP_CALLS_PER_COMPANY.set(result["http_calls_per_company"])
+        return result
 
     async def progress_by_stage(self, run_id):
         async with self.engine.connect() as conn:
