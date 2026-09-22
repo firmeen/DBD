@@ -183,7 +183,7 @@ def test_non_tty_uses_compact_line_oriented_output() -> None:
     stream = StringIO()
     dashboard = LiveCampaignDashboard(7, interval=0, stream=stream, tty=False)
     dashboard.render(snapshot())
-    dashboard.render(snapshot(current=260, remaining=740))
+    dashboard.render(snapshot(current=260, remaining=740), force=True)
     lines = stream.getvalue().splitlines()
     assert len(lines) == 2
     assert all(line.startswith("CAMPAIGN 7 | RUNNING |") for line in lines)
