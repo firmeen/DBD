@@ -28,6 +28,7 @@ dependencies = [
   "orjson>=3.10,<4",
   "zstandard>=0.23,<1",
   "boto3>=1.35,<2",
+  "rich>=14,<15",
 ]
 
 [project.optional-dependencies]
