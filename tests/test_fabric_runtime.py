@@ -11,6 +11,7 @@ import dbd.storage.mysql.repositories.projection_repository as projection_reposi
 from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
 from dbd.core.exceptions import ContractError
+from dbd.core.settings import settings
 from dbd.runtime.collection_fabric import endpoint_bit
 from dbd.runtime.replay import replay_archive
 from dbd.runtime.resources import DEFAULT_PARTS, endpoints
@@ -650,10 +651,10 @@ async def test_fabric_projection_parity_with_legacy_scheduler(repo):
 
 
 
-async def test_fabric_retry_batches_large_failed_population(repo, monkeypatch):
-    monkeypatch.setattr("dbd.core.settings.settings.dbd_write_batch_size", 25)
+async def test_fabric_retry_batches_large_failed_population(repo):
     resources = ("profile",)
-    fabric, run_id, _ = await new_fabric_run(repo, resources, count=61)
+    population = int(settings.dbd_write_batch_size) + 11
+    fabric, run_id, _ = await new_fabric_run(repo, resources, count=population)
     bit = endpoint_bit("profile")
 
     async with repo.engine.begin() as conn:
@@ -674,7 +675,7 @@ async def test_fabric_retry_batches_large_failed_population(repo, monkeypatch):
             {"run": run_id},
         )
 
-    assert await fabric.retry_failed(run_id) == 61
+    assert await fabric.retry_failed(run_id) == population
 
     async with repo.engine.connect() as conn:
         rows = (
@@ -696,8 +697,8 @@ async def test_fabric_retry_batches_large_failed_population(repo, monkeypatch):
             )
         ).scalar_one()
 
-    assert rows["total"] == 61
-    assert rows["pending"] == 61
-    assert rows["profile_next"] == 61
-    assert rows["retry_dirty"] == 61
+    assert rows["total"] == population
+    assert rows["pending"] == population
+    assert rows["profile_next"] == population
+    assert rows["retry_dirty"] == population
     assert run_status == "ready"
