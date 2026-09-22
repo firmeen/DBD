@@ -23,7 +23,8 @@ from ..core.telemetry import (
     TASKS,
     log,
 )
-from ..storage.mysql.repositories.projection_repository import LeaseLost, project
+from ..storage.mysql.repositories.projection_repository import project
+from ..storage.mysql.repositories.projection_scheduler import LeaseLost
 from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
@@ -70,24 +71,25 @@ async def prepare(
         fiscal_year,
         scheduler_mode=scheduler_mode,
     )
+    scheduler_repo = repo.for_run({"scheduler_mode": scheduler_mode})
     if file:
         for batch in code_batches(file, settings.dbd_write_batch_size):
-            await repo.import_batch(run_id, batch, resources)
+            await scheduler_repo.import_batch(run_id, batch, resources)
     elif master:
         after = 0
         while (
-            after := await repo.enqueue_master(
+            after := await scheduler_repo.enqueue_master(
                 run_id, resources, after, settings.dbd_write_batch_size, statuses
             )
         ) is not None:
             pass
     else:
         raise ValueError("Choose --file or --master")
-    await repo.ready(run_id)
+    await scheduler_repo.ready(run_id)
     return run_id
 
 
-async def _finish_if_owned(repo, task, status, error=None) -> bool:
+async def _finish_if_owned(repo, task, status, error=None):
     finished = await repo.finish(task, status, error)
     if not finished:
         log.warning("lease_lost_before_finish", task_id=task["id"], endpoint=task["endpoint"])
@@ -100,7 +102,41 @@ def _attempt_count(task) -> int:
     return int(task["attempts"])
 
 
-async def _fail_task(repo, task, exc, archive_id=None) -> str | None:
+class FailureOutcome(str):
+    def __new__(cls, value: str, finish_result=None):
+        item = str.__new__(cls, value)
+        fallback_completed = 0 if value == "retry_wait" else 1
+        item.completed_delta = int(
+            getattr(finish_result, "completed_delta", fallback_completed)
+        )
+        item.done_delta = int(getattr(finish_result, "done_delta", 0))
+        item.not_available_delta = int(
+            getattr(finish_result, "not_available_delta", 0)
+        )
+        item.failed_delta = int(
+            getattr(
+                finish_result,
+                "failed_delta",
+                1 if value == "failed" else 0,
+            )
+        )
+        return item
+
+
+def _apply_failure_stats(runtime_stats, outcome) -> None:
+    if outcome is None:
+        return
+    runtime_stats["completed"] += int(getattr(outcome, "completed_delta", 0))
+    runtime_stats["done"] += int(getattr(outcome, "done_delta", 0))
+    runtime_stats["not_available"] += int(
+        getattr(outcome, "not_available_delta", 0)
+    )
+    runtime_stats["failed"] += int(getattr(outcome, "failed_delta", 0))
+    if outcome == "retry_wait":
+        runtime_stats["retry_wait"] += 1
+
+
+async def _fail_task(repo, task, exc, archive_id=None) -> FailureOutcome | None:
     if isinstance(exc, IdentityConflict):
         code = type(exc).__name__
         finished = await repo.finish_identity_conflict(task, archive_id, code)
@@ -114,7 +150,7 @@ async def _fail_task(repo, task, exc, archive_id=None) -> str | None:
                 endpoint=task["endpoint"],
                 error_code=code,
             )
-            return "failed"
+            return FailureOutcome("failed", finished)
         return None
 
     terminal = isinstance(exc, (ContractError, DbdForbiddenError, DbdAuthError, ValueError, TypeError))
@@ -125,7 +161,8 @@ async def _fail_task(repo, task, exc, archive_id=None) -> str | None:
         await repo.mark_archive(
             archive_id, "invalid" if isinstance(exc, ContractError) else "failed", code
         )
-    if await _finish_if_owned(repo, task, status, code):
+    finished = await _finish_if_owned(repo, task, status, code)
+    if finished:
         TASKS.labels(task["endpoint"], status).inc()
         PIPELINE_STAGE_TOTAL.labels(task.get("stage", "fetch"), status).inc()
         log.warning(
@@ -136,7 +173,7 @@ async def _fail_task(repo, task, exc, archive_id=None) -> str | None:
             error_code=code,
             status=status,
         )
-        return status
+        return FailureOutcome(status, finished)
     return None
 
 
@@ -170,6 +207,8 @@ async def process(
         raise ValueError("Distributed workers require DBD_REDIS_URL for one shared global rate cap")
 
     _ = repo.archive_backend
+    run = await repo.get_run(run_id)
+    repo = repo.for_run(run)
 
     projection_workers = min(settings.dbd_projection_workers, settings.db_pool_size)
     archive_workers = settings.dbd_archive_workers
@@ -431,11 +470,27 @@ async def process(
                 endpoint = task["endpoint"]
                 year = await repo.fiscal_year(task) if endpoint in FINANCIAL else None
                 if endpoint in FINANCIAL and year is None:
-                    if await _finish_if_owned(repo, task, "not_available", "no_submitted_fiscal_year"):
+                    finished = await _finish_if_owned(
+                        repo,
+                        task,
+                        "not_available",
+                        "no_submitted_fiscal_year",
+                    )
+                    if finished:
                         TASKS.labels(endpoint, "not_available").inc()
                         PIPELINE_STAGE_TOTAL.labels("fetch", "not_available").inc()
-                        runtime_stats["completed"] += 1
-                        runtime_stats["not_available"] += 1
+                        runtime_stats["completed"] += int(
+                            getattr(finished, "completed_delta", 1)
+                        )
+                        runtime_stats["done"] += int(
+                            getattr(finished, "done_delta", 0)
+                        )
+                        runtime_stats["not_available"] += int(
+                            getattr(finished, "not_available_delta", 1)
+                        )
+                        runtime_stats["failed"] += int(
+                            getattr(finished, "failed_delta", 0)
+                        )
                     IN_FLIGHT.dec()
                     continue
                 path = request_path(endpoint, task["jp_type_code"], task["jp_no"])
@@ -449,10 +504,7 @@ async def process(
                 raise
             except Exception as exc:
                 status = await _fail_task(repo, task, exc)
-                if status == "failed":
-                    runtime_stats["failed"] += 1
-                elif status == "retry_wait":
-                    runtime_stats["retry_wait"] += 1
+                _apply_failure_stats(runtime_stats, status)
                 IN_FLIGHT.dec()
             finally:
                 runtime_stats["fetch_active"] -= 1
@@ -491,10 +543,7 @@ async def process(
             except Exception as exc:
                 for item in batch:
                     status = await _fail_task(repo, item["task"], exc)
-                    if status == "failed":
-                        runtime_stats["failed"] += 1
-                    elif status == "retry_wait":
-                        runtime_stats["retry_wait"] += 1
+                    _apply_failure_stats(runtime_stats, status)
                     IN_FLIGHT.dec()
             finally:
                 runtime_stats["archive_active"] -= len(batch)
@@ -536,15 +585,25 @@ async def process(
                 scope = params.get("fiscalYear", "")
                 async with writes:
                     outcome = await asyncio.to_thread(
-                        project, task, archive_id, payload, requested_at, path, scope
+                        project,
+                        task,
+                        archive_id,
+                        payload,
+                        requested_at,
+                        path,
+                        scope,
+                        repo.scheduler_mode,
                     )
                 TASKS.labels(task["endpoint"], outcome).inc()
                 PIPELINE_STAGE_TOTAL.labels("project", outcome).inc()
-                runtime_stats["completed"] += 1
-                if outcome == "not_available":
-                    runtime_stats["not_available"] += 1
-                else:
-                    runtime_stats["done"] += 1
+                runtime_stats["completed"] += int(
+                    getattr(outcome, "completed_delta", 1)
+                )
+                runtime_stats["done"] += int(getattr(outcome, "done_delta", 0))
+                runtime_stats["not_available"] += int(
+                    getattr(outcome, "not_available_delta", 0)
+                )
+                runtime_stats["failed"] += int(getattr(outcome, "failed_delta", 0))
             except asyncio.CancelledError:
                 raise
             except LeaseLost:
@@ -552,10 +611,7 @@ async def process(
                 log.warning("lease_lost", task_id=task["id"], endpoint=task["endpoint"])
             except Exception as exc:
                 status = await _fail_task(repo, task, exc, archive_id)
-                if status == "failed":
-                    runtime_stats["failed"] += 1
-                elif status == "retry_wait":
-                    runtime_stats["retry_wait"] += 1
+                _apply_failure_stats(runtime_stats, status)
             finally:
                 runtime_stats["project_active"] -= 1
                 IN_FLIGHT.dec()
