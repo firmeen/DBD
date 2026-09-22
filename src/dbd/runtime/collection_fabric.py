@@ -44,8 +44,17 @@ def mask_for_parts(parts) -> int:
     return mask_for_endpoints(endpoints(list(parts)))
 
 
-def remaining_mask(required: int, done: int, not_available: int) -> int:
-    return int(required) & ~(int(done) | int(not_available))
+def resolved_mask(done: int, not_available: int, failed: int = 0) -> int:
+    return int(done) | int(not_available) | int(failed)
+
+
+def remaining_mask(
+    required: int,
+    done: int,
+    not_available: int,
+    failed: int = 0,
+) -> int:
+    return int(required) & ~resolved_mask(done, not_available, failed)
 
 
 def derive_fiscal_year(value) -> str | None:
@@ -58,9 +67,10 @@ def next_endpoint(
     done: int,
     not_available: int,
     *,
+    failed: int = 0,
     fiscal_year: str | None,
 ) -> str | None:
-    remaining = remaining_mask(required, done, not_available)
+    remaining = remaining_mask(required, done, not_available, failed)
     if remaining == 0:
         return None
     for endpoint in ENDPOINT_ORDER:
@@ -75,6 +85,7 @@ def next_endpoint(
 
 @dataclass(frozen=True)
 class CollectionTransition:
+    required_mask: int
     done_mask: int
     not_available_mask: int
     failed_mask: int
@@ -96,34 +107,62 @@ def advance_state(
     fiscal_year: str | None = None,
     profile_submit_fin_year=None,
 ) -> CollectionTransition:
-    """Advance one company without materializing one durable row per endpoint."""
+    """Advance one company without materializing one durable row per endpoint.
+
+    A terminal endpoint failure resolves only that resource so independent work can
+    continue. Profile failure is special because fiscal endpoints depend on profile:
+    those resources become dependency failures, not not-available observations.
+
+    An explicitly supplied fiscal year wins over profile-derived fiscal metadata,
+    matching the legacy worker behavior.
+    """
     bit = endpoint_bit(endpoint)
     if outcome == "not_available":
         not_available_mask |= bit
     elif outcome in ("done", "stale"):
         done_mask |= bit
+    elif outcome == "failed":
+        failed_mask |= bit
     else:
         raise ValueError(f"Unsupported collection outcome {outcome!r}")
     dirty_mask &= ~bit
 
     if endpoint == "profile":
-        fiscal_year = derive_fiscal_year(profile_submit_fin_year)
-        if not fiscal_year:
-            not_available_mask |= required_mask & FINANCIAL_MASK
+        financial_required = required_mask & FINANCIAL_MASK
+        if outcome == "failed":
+            failed_mask |= financial_required
+            dirty_mask &= ~financial_required
+        else:
+            if fiscal_year is None:
+                fiscal_year = derive_fiscal_year(profile_submit_fin_year)
+            if not fiscal_year:
+                not_available_mask |= financial_required
+                dirty_mask &= ~financial_required
 
     next_item = next_endpoint(
         required_mask,
         done_mask,
         not_available_mask,
+        failed=failed_mask,
         fiscal_year=fiscal_year,
     )
-    complete = remaining_mask(required_mask, done_mask, not_available_mask) == 0
+    complete = remaining_mask(
+        required_mask,
+        done_mask,
+        not_available_mask,
+        failed_mask,
+    ) == 0
+    if complete:
+        status = "failed" if failed_mask else "done"
+    else:
+        status = "pending"
     return CollectionTransition(
+        required_mask=required_mask,
         done_mask=done_mask,
         not_available_mask=not_available_mask,
         failed_mask=failed_mask,
         dirty_mask=dirty_mask,
         fiscal_year=fiscal_year,
         next_endpoint=next_item,
-        status="done" if complete else "pending",
+        status=status,
     )
