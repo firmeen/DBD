@@ -48,6 +48,46 @@ dbd-data campaign status 8 --debug
 The extended campaign view includes worker-level heartbeat/counter rows and durable
 failure diagnostics.
 
+## Package intelligence
+
+Use the package/environment health view instead of parsing `pip show` manually:
+
+```powershell
+dbd-data about
+```
+
+The default human view summarizes:
+
+- source release version vs installed distribution metadata
+- package profile metadata
+- Python implementation/version and active executable
+- virtual environment path
+- editable vs standard installation mode
+- project/package/site-packages/dist-info locations
+- dependency and reverse-dependency counts
+- invalid `~*` distribution remnants such as interrupted pip metadata
+- recommended remediation when an inconsistency is detected
+
+A source/metadata disagreement is explicitly labeled `VERSION MISMATCH`. Invalid
+distribution remnants without a version mismatch are labeled `CLEANUP NEEDED`.
+A clean environment is labeled `HEALTHY`.
+
+For the expanded direct dependency inventory:
+
+```powershell
+dbd-data about --verbose
+dbd-data about --debug
+```
+
+For automation:
+
+```powershell
+dbd-data about --json
+```
+
+The command is read-only. It does not run pip, delete site-packages entries, mutate
+the virtual environment, connect to MySQL, or contact Redis/DBD services.
+
 ## Campaign status semantics
 
 `campaign status` prefers the live Redis supervisor/worker heartbeat snapshot while
