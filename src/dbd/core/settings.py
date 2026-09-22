@@ -65,6 +65,11 @@ class Settings(BaseSettings):
     dbd_redis_rate_key: str = "dbd:global-rate"
     dbd_redis_max_connections: int = Field(4, ge=1, le=128)
     dbd_fleet_redis_connections_max: int = Field(128, ge=1, le=10000)
+    dbd_redis_pool_wait_seconds: float = Field(5.0, gt=0, le=60)
+    dbd_redis_socket_timeout_seconds: float = Field(5.0, gt=0, le=60)
+    dbd_redis_connect_timeout_seconds: float = Field(5.0, gt=0, le=60)
+    dbd_redis_health_check_interval_seconds: int = Field(15, ge=0, le=300)
+    dbd_redis_recovery_interval_seconds: float = Field(5.0, gt=0, le=60)
 
 
 settings = Settings()
