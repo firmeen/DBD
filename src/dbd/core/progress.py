@@ -215,16 +215,15 @@ class LiveCampaignDashboard:
         try:
             import ctypes
 
-            handle = ctypes.windll.kernel32.GetStdHandle(-11)
-            mode = ctypes.c_uint()
-            if not ctypes.windll.kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            kernel32 = ctypes.windll.kernel32
+            kernel32.GetStdHandle.restype = ctypes.c_void_p
+            handle = kernel32.GetStdHandle(-11)
+            if not handle:
                 return False
-            return bool(
-                ctypes.windll.kernel32.SetConsoleMode(
-                    handle,
-                    mode.value | 0x0004,
-                )
-            )
+            mode = ctypes.c_uint()
+            if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+                return False
+            return bool(kernel32.SetConsoleMode(handle, mode.value | 0x0004))
         except Exception:
             return False
 
