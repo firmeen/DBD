@@ -507,7 +507,7 @@ def main():
     args = parser.parse_args()
     presenter = TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
-        verbose=bool(getattr(args, "verbose", False)),
+        verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
     )
     try:
         if args.command == "about":
