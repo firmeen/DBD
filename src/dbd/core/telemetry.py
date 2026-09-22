@@ -1,4 +1,6 @@
 import logging
+import os
+import sys
 
 import structlog
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
@@ -124,9 +126,29 @@ def observe_discovery(summary: dict) -> None:
 
 
 def configure(port: int = 0) -> None:
+    """Configure logs for operators without sacrificing machine-readable worker files.
+
+    DBD_LOG_FORMAT=auto (default) uses a readable console renderer on interactive
+    terminals and JSON when stdout/stderr are redirected (for example headless
+    campaign worker log files). Explicit values: console, json.
+    """
     logging.basicConfig(level=logging.INFO, format="%(message)s")
+    mode = os.environ.get("DBD_LOG_FORMAT", "auto").strip().lower()
+    if mode not in {"auto", "console", "json"}:
+        mode = "auto"
+    interactive = bool(getattr(sys.stderr, "isatty", lambda: False)())
+    use_json = mode == "json" or (mode == "auto" and not interactive)
+    renderer = (
+        structlog.processors.JSONRenderer()
+        if use_json
+        else structlog.dev.ConsoleRenderer(colors=interactive)
+    )
     structlog.configure(
-        processors=[structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()]
+        processors=[
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.add_log_level,
+            renderer,
+        ]
     )
     if port:
         start_http_server(port, addr="127.0.0.1")

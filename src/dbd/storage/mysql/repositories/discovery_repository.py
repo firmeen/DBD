@@ -686,6 +686,13 @@ def page_progress(bucket_id):
 
 
 def reset_discovery(refresh=False, bucket_id=None):
+    result = {
+        "action": "refresh" if refresh else "retry",
+        "bucket_id": bucket_id,
+        "buckets_updated": 0,
+        "rejections_resolved": 0,
+        "pages_deleted": 0,
+    }
     with connect() as conn, conn.cursor() as cur:
         if refresh:
             parameters = (bucket_id,) if bucket_id else ()
@@ -696,15 +703,18 @@ def reset_discovery(refresh=False, bucket_id=None):
                 + ("WHERE id=%s AND status<>'split'" if bucket_id else "WHERE status<>'split'"),
                 parameters,
             )
+            result["buckets_updated"] = int(cur.rowcount or 0)
             cur.execute(
                 "UPDATE discovery_rejections SET resolved_at=UTC_TIMESTAMP(6) "
                 + ("WHERE bucket_id=%s AND resolved_at IS NULL" if bucket_id else "WHERE resolved_at IS NULL"),
                 parameters,
             )
+            result["rejections_resolved"] = int(cur.rowcount or 0)
             cur.execute(
                 "DELETE FROM discovery_pages" + (" WHERE bucket_id=%s" if bucket_id else ""),
                 parameters,
             )
+            result["pages_deleted"] = int(cur.rowcount or 0)
         else:
             cur.execute(
                 """
@@ -714,4 +724,6 @@ def reset_discovery(refresh=False, bucket_id=None):
                 WHERE status='failed'
                 """
             )
+            result["buckets_updated"] = int(cur.rowcount or 0)
         conn.commit()
+    return result

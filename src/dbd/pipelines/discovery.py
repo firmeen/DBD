@@ -523,8 +523,12 @@ def validate_splits(verbose: bool = True) -> int:
         update_bucket(int(row["id"]), partition_lossless=lossless)
         checked += 1
         if verbose and not lossless:
-            print(
-                f"bucket {row['id']}: SUM(children)={children:,} vs parent={parent_total:,}; completeness blocked"
+            from ..presentation import TerminalPresenter
+
+            TerminalPresenter().message(
+                f"Bucket {row['id']}: SUM(children)={children:,} vs parent={parent_total:,}; "
+                "completeness blocked",
+                kind="error",
             )
     return checked
 

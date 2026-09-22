@@ -4,6 +4,7 @@ import argparse
 
 from ..client import DbdClient
 from ..pipelines import bulk, company_details, company_profile, financials
+from ..presentation import TerminalPresenter
 from ..storage.mysql.engine import connect
 from ..storage.mysql.repositories.run_repository import (
     create_run,
@@ -27,56 +28,91 @@ def _parse_parts(only: str | None) -> list[str]:
     return parts
 
 
-def command_check_db() -> None:
+def check_db_info() -> dict:
     with connect() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT DATABASE() AS db, CURRENT_USER() AS user, VERSION() AS version")
-            row = cur.fetchone()
-    print(f"Database: {row['db']}")
-    print(f"User: {row['user']}")
-    print(f"MySQL: {row['version']}")
+            return dict(cur.fetchone())
 
 
-def command_fetch_company(company_code: str, parts: list[str], fiscal_year: str | None) -> None:
+def command_check_db() -> None:
+    from ..presentation import TerminalPresenter
+
+    TerminalPresenter().check_db(check_db_info())
+
+
+def command_fetch_company(
+    company_code: str,
+    parts: list[str],
+    fiscal_year: str | None,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     if not company_code.isdigit() or len(company_code) != 14:
         raise SystemExit("company_code must be the 14-digit code used in /company/profile/<code> URLs")
 
     client = DbdClient()
 
+    payload = {"company_code": company_code}
     if "profile" in parts:
         result = company_profile.run(client, company_code)
-        print(f"profile          raw_response_id={result.raw_response_id}")
-        print(f"                 jp_no={result.jp_no} jp_type_code={result.jp_type_code}")
-        print(f"                 jp_name={result.jp_name}")
+        payload.update(
+            {
+                "raw_response_id": result.raw_response_id,
+                "jp_no": result.jp_no,
+                "jp_type_code": result.jp_type_code,
+                "jp_name": result.jp_name,
+            }
+        )
 
     if "details" in parts:
         counts = company_details.run(client, company_code)
-        for resource, rows in counts.items():
-            print(f"{resource:17}{rows} row(s)")
+        payload.update({f"{resource}_rows": rows for resource, rows in counts.items()})
 
     if "financials" in parts:
         fin = financials.run(client, company_code, fiscal_year)
-        print(f"financials       fiscal_year={fin.fiscal_year}")
-        print(
-            f"                 {fin.submissions} submission(s), {fin.statements} statement(s), {fin.items} item(s)"
+        payload.update(
+            {
+                "fiscal_year": fin.fiscal_year,
+                "financial_submissions": fin.submissions,
+                "financial_statements": fin.statements,
+                "financial_items": fin.items,
+                "industry_benchmark_items": fin.benchmark_items,
+            }
         )
-        print(f"industry_bench   {fin.benchmark_items} item(s)")
+
+    presenter.command_result("DBD · COMPANY FETCH", payload)
 
 
-def command_bulk(file: str | None, run_id: int | None, parts: list[str], limit: int | None) -> None:
+def command_bulk(
+    file: str | None,
+    run_id: int | None,
+    parts: list[str],
+    limit: int | None,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     if file:
         codes = bulk.read_codes(file)
         if not codes:
             raise SystemExit(f"No company codes found in {file}")
         run_id, enqueued = create_run(source_label=file, parts=parts, company_codes=codes)
-        print(f"run {run_id}: enqueued {enqueued} company code(s) from {file}")
+        presenter.command_result(
+            "DBD · LEGACY RUN",
+            {"run_id": run_id, "enqueued": enqueued, "source": file},
+        )
     elif run_id is None:
         run = latest_unfinished_run()
         if run is None:
             raise SystemExit("No unfinished run to resume. Start one with --file <codes.txt>")
         run_id = int(run["id"])
         parts = run["parts"].split(",")
-        print(f"resuming run {run_id} ({run['source_label']})")
+        presenter.message(
+            f"Resuming legacy run {run_id} ({run['source_label']})",
+            kind="info",
+        )
 
     from ..storage.mysql.repositories.run_repository import get_run
 
@@ -85,49 +121,83 @@ def command_bulk(file: str | None, run_id: int | None, parts: list[str], limit: 
         raise ValueError("Legacy run not found")
     parts = stored["parts"].split(",")
     progress = run_progress(run_id)
-    print(
-        f"run {run_id}: {progress['done']} done, {progress['failed']} failed, {progress['pending']} pending"
+    presenter.command_result(
+        "DBD · LEGACY RUN STATUS",
+        {"run_id": run_id, **progress},
     )
 
     result = bulk.process(run_id, parts, limit)
 
-    print(
-        f"\nrun {result.run_id}: processed {result.processed}, "
-        f"succeeded {result.succeeded}, failed {result.failed}, remaining {result.remaining}"
-    )
+    payload = {
+        "run_id": result.run_id,
+        "processed": result.processed,
+        "succeeded": result.succeeded,
+        "failed": result.failed,
+        "remaining": result.remaining,
+    }
     if result.remaining:
-        print(f"resume with: dbd-data bulk --run-id {result.run_id}")
+        payload["next_command"] = f"dbd-data bulk --run-id {result.run_id}"
+    presenter.command_result("DBD · LEGACY RUN RESULT", payload)
 
 
-def command_bulk_status(run_id: int | None) -> None:
+def command_bulk_status(
+    run_id: int | None,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     if run_id is None:
         rows = list_runs()
         if not rows:
-            print("No ingestion runs yet.")
+            presenter.message("No ingestion runs yet.", kind="info")
             return
-        print(f"{'run':>4}  {'done':>5} {'fail':>5} {'pend':>5}  {'created':19}  source")
-        for r in rows:
-            print(
-                f"{r['id']:>4}  {int(r['done'] or 0):>5} {int(r['failed'] or 0):>5} "
-                f"{int(r['pending'] or 0):>5}  {str(r['created_at'])[:19]:19}  {r['source_label']}"
-            )
+        presenter.table(
+            "DBD · LEGACY RUNS",
+            ("RUN", "DONE", "FAILED", "PENDING", "CREATED", "SOURCE"),
+            (
+                (
+                    r["id"],
+                    int(r["done"] or 0),
+                    int(r["failed"] or 0),
+                    int(r["pending"] or 0),
+                    str(r["created_at"])[:19],
+                    r["source_label"],
+                )
+                for r in rows
+            ),
+        )
         return
 
     progress = run_progress(run_id)
-    print(f"run {run_id}: {progress}")
+    presenter.command_result("DBD · LEGACY RUN STATUS", {"run_id": run_id, **progress})
     rows = failed_tasks(run_id)
     if rows:
-        print(f"\n{len(rows)} failed task(s):")
-        for r in rows:
-            print(f"  {r['company_code']}  attempts={r['attempts']}  {str(r['last_error'])[:120]}")
-        print(f"\nretry them with: dbd-data bulk-retry {run_id}")
+        presenter.table(
+            "FAILED TASKS",
+            ("COMPANY", "ATTEMPTS", "LAST ERROR"),
+            (
+                (
+                    r["company_code"],
+                    r["attempts"],
+                    str(r["last_error"])[:120],
+                )
+                for r in rows
+            ),
+            caption=f"Retry with: dbd-data bulk-retry {run_id}",
+        )
 
 
-def command_bulk_retry(run_id: int) -> None:
+def command_bulk_retry(
+    run_id: int,
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
+    presenter = presenter or TerminalPresenter()
     count = requeue_failed(run_id)
-    print(f"re-queued {count} failed task(s) in run {run_id}")
+    payload = {"run_id": run_id, "requeued": count}
     if count:
-        print(f"now run: dbd-data bulk --run-id {run_id}")
+        payload["next_command"] = f"dbd-data bulk --run-id {run_id}"
+    presenter.command_result("DBD · LEGACY RETRY", payload)
 
 
 def command_discover(
@@ -137,7 +207,10 @@ def command_discover(
     rate: float | None,
     max_buckets: int | None,
     health=None,
+    *,
+    presenter: TerminalPresenter | None = None,
 ) -> None:
+    presenter = presenter or TerminalPresenter()
     import asyncio
 
     from ..pipelines import discovery
@@ -153,53 +226,51 @@ def command_discover(
         )
     )
 
-    print(
-        f"\nbuckets {result.buckets_processed}, pages {result.pages_fetched}, "
-        f"companies written {result.companies_written}, requests {result.requests_made}"
+    presenter.command_result(
+        "DBD · DISCOVERY RESULT",
+        {
+            "buckets": result.buckets_processed,
+            "pages": result.pages_fetched,
+            "companies": result.companies_written,
+            "requests": result.requests_made,
+        },
     )
-    command_discover_status()
+    command_discover_status(presenter=presenter)
 
 
-def command_discover_status() -> None:
+def command_discover_status(
+    *,
+    presenter: TerminalPresenter | None = None,
+) -> None:
     from ..pipelines import discovery
 
+    presenter = presenter or TerminalPresenter()
     s = discovery.summary()
-    print("\ndiscovery so far:")
-    print(f"  unique companies : {int(s['unique_companies']):,}")
-    print(f"  rows fetched      : {int(s['rows_fetched']):,}")
-    print(
-        f"  buckets           : {s['buckets']} total "
-        f"({s['buckets_done']} done, {s['buckets_split']} split, "
-        f"{s['buckets_open']} open, {s['buckets_failed']} failed)"
-    )
-    print(
-        f"  bucket backlog    : {int(s.get('buckets_uncounted') or 0):,} uncounted; "
-        f"{int(s.get('remaining_counted_pages') or 0):,} known pages remaining"
-    )
-    print(
-        f"  page checkpoints  : {int(s.get('pages_done') or 0):,} done, "
-        f"{int(s.get('pages_failed') or 0):,} failed, "
-        f"{int(s.get('pages_partial') or 0):,} partial"
-    )
-    print(f"  quarantined rows  : {int(s.get('unresolved_rejections') or 0):,} unresolved")
-    if int(s["partitions_lossy"] or 0):
-        print(
-            f"  BLOCKER: {s['partitions_lossy']} split partition(s) have SUM(children) != parent. "
-            "Completeness is not established until they are reconciled."
+    presenter.discovery_status(s)
+
+    if int(s.get("partitions_lossy") or 0):
+        presenter.message(
+            f"{int(s['partitions_lossy']):,} lossy split partition(s) block completeness.",
+            kind="error",
         )
 
     # Observed prefix gaps are a useful negative check, not a proof that every
     # company was discoverable through the chosen seeds.
     gaps = discovery.coverage_gaps()
     if gaps:
-        print(
-            f"\n  COVERAGE GAP: {len(gaps)} observed company-number prefix(es) have no matching seed bucket:"
+        presenter.command_result(
+            "DBD · DISCOVERY COVERAGE GAP",
+            {
+                "gap_count": len(gaps),
+                "prefixes": ", ".join(gaps[:20]) + (" ..." if len(gaps) > 20 else ""),
+                "next_command": "dbd-data discover " + " ".join(gaps[:5]),
+            },
         )
-        print(f"    {', '.join(gaps[:20])}{' ...' if len(gaps) > 20 else ''}")
-        print("    Seed these prefixes explicitly: dbd-data discover " + " ".join(gaps[:5]))
     else:
-        print("  observed prefixes : all currently seen prefixes have matching seeds")
-        print("  completeness       : still requires partition and population reconciliation")
+        presenter.message(
+            "Observed prefixes have matching seeds; full completeness still requires partition and population reconciliation.",
+            kind="info",
+        )
 
 
 def main() -> None:

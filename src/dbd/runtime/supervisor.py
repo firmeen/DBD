@@ -421,6 +421,84 @@ def _task_progress(run_id: int) -> dict[str, int]:
         }
 
 
+def _failure_diagnostics(run_id: int, limit: int = 8) -> dict:
+    """Read-only diagnostics for explicit status; never infer per-endpoint error causes."""
+    mode = _scheduler_mode(run_id)
+    with connect() as conn, conn.cursor() as cur:
+        if mode == "fabric_v2":
+            cur.execute(
+                """
+                SELECT e.endpoint,COUNT(DISTINCT s.id) AS states,COUNT(*) AS resources
+                FROM company_collection_state s
+                JOIN (
+                  SELECT 'profile' AS endpoint, 1 AS bit
+                  UNION ALL SELECT 'financial_submissions' AS endpoint, 2 AS bit
+                  UNION ALL SELECT 'financial_statements' AS endpoint, 4 AS bit
+                  UNION ALL SELECT 'industry_benchmark' AS endpoint, 8 AS bit
+                  UNION ALL SELECT 'committees' AS endpoint, 16 AS bit
+                  UNION ALL SELECT 'committee_signs' AS endpoint, 32 AS bit
+                  UNION ALL SELECT 'transformations' AS endpoint, 64 AS bit
+                  UNION ALL SELECT 'nations' AS endpoint, 128 AS bit
+                  UNION ALL SELECT 'nation_history' AS endpoint, 256 AS bit
+                  UNION ALL SELECT 'name_history' AS endpoint, 512 AS bit
+                  UNION ALL SELECT 'capital_history' AS endpoint, 1024 AS bit
+                ) e ON (s.failed_mask & ~s.dirty_mask & e.bit)<>0
+                WHERE s.run_id=%s
+                GROUP BY e.endpoint
+                ORDER BY resources DESC,e.endpoint
+                LIMIT %s
+                """,
+                (run_id, max(1, int(limit))),
+            )
+            by_endpoint = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                       stage,status,COUNT(*) AS states
+                FROM company_collection_state
+                WHERE run_id=%s AND last_error IS NOT NULL AND last_error<>''
+                GROUP BY error_code,stage,status
+                ORDER BY states DESC,error_code
+                LIMIT %s
+                """,
+                (run_id, max(1, int(limit))),
+            )
+            latest_errors = [dict(row) for row in cur.fetchall()]
+            scope = "state_latest_error_not_per_endpoint"
+        else:
+            cur.execute(
+                """
+                SELECT endpoint,COUNT(*) AS states,COUNT(*) AS resources
+                FROM endpoint_tasks
+                WHERE run_id=%s AND status='failed'
+                GROUP BY endpoint
+                ORDER BY resources DESC,endpoint
+                LIMIT %s
+                """,
+                (run_id, max(1, int(limit))),
+            )
+            by_endpoint = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                       stage,status,COUNT(*) AS states
+                FROM endpoint_tasks
+                WHERE run_id=%s AND status='failed'
+                GROUP BY error_code,stage,status
+                ORDER BY states DESC,error_code
+                LIMIT %s
+                """,
+                (run_id, max(1, int(limit))),
+            )
+            latest_errors = [dict(row) for row in cur.fetchall()]
+            scope = "task_error_exact"
+    return {
+        "by_endpoint": by_endpoint,
+        "latest_errors": latest_errors,
+        "error_scope": scope,
+    }
+
+
 def _has_active_work(run_id: int) -> bool:
     """Use scheduler indexes for a cheap completion probe without aggregating the run."""
     with connect() as conn, conn.cursor() as cur:
@@ -1971,8 +2049,8 @@ def supervise_campaign(
     return final_code
 
 
-def campaign_status(run_id: int) -> dict:
-    """Prefer the live Redis snapshot while supervised; fall back to exact MySQL."""
+def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
+    """Prefer live Redis state; only scan durable failure diagnostics on request."""
     state: dict | None = None
     redis = None
     workers: list[dict] = []
@@ -2016,6 +2094,8 @@ def campaign_status(run_id: int) -> dict:
 
     state["run_id"] = int(run_id)
     state["run_status"] = _run_status(run_id)
+    if diagnostics:
+        state["failure_diagnostics"] = _failure_diagnostics(run_id)
 
     if redis is not None:
         try:
