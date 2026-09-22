@@ -14,7 +14,7 @@ from ..core.exceptions import (
     DbdForbiddenError,
     IdentityConflict,
 )
-from ..core.redis import create_async_redis, redis_pool_snapshot
+from ..core.redis import close_async_redis, create_async_redis, redis_pool_snapshot
 from ..core.settings import settings
 from ..core.telemetry import (
     IN_FLIGHT,
@@ -571,7 +571,7 @@ async def process(
             await coordinator.unregister_worker(identity)
             await coordinator.close()
         if redis_client is not None:
-            await redis_client.aclose()
+            await close_async_redis(redis_client)
 
     await repo.close_if_complete(run_id)
     return await repo.progress(run_id)
