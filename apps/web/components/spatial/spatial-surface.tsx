@@ -72,6 +72,7 @@ export function SpatialSurface() {
     (state) => state.saveSurfaceSnapshot
   )
   const selection = useWorkspaceStore((state) => state.selection)
+  const focus = useWorkspaceStore((state) => state.focus)
   const setFocus = useWorkspaceStore((state) => state.setFocus)
   const toggleSelection = useWorkspaceStore((state) => state.toggleSelection)
   const setActiveSurface = useWorkspaceStore((state) => state.setActiveSurface)
@@ -271,18 +272,20 @@ export function SpatialSurface() {
         onHandoff={setActiveSurface}
       />
 
-      <SpatialCompanyRail
-        companies={snapshot.companies}
-        open={companyRailOpen}
-        hoveredCompanyId={hoveredCompanyId}
-        selectedCompanyIds={selectedCompanySet}
-        onOpenChange={setCompanyRailOpen}
-        onHoverCompany={(company) => setRailHoverId(company?.id ?? null)}
-        onFocusCompany={focusCompany}
-        onToggleSelection={(company) =>
-          toggleSelection(companyToEntityRef(company))
-        }
-      />
+      {focus ? null : (
+        <SpatialCompanyRail
+          companies={snapshot.companies}
+          open={companyRailOpen}
+          hoveredCompanyId={hoveredCompanyId}
+          selectedCompanyIds={selectedCompanySet}
+          onOpenChange={setCompanyRailOpen}
+          onHoverCompany={(company) => setRailHoverId(company?.id ?? null)}
+          onFocusCompany={focusCompany}
+          onToggleSelection={(company) =>
+            toggleSelection(companyToEntityRef(company))
+          }
+        />
+      )}
 
       {mapHover ? (
         <div
