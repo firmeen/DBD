@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dbd-data"
-version = "0.3.0"
+version = "0.4.0"
 description = "DBD DataWarehouse company data ingestion into MySQL"
 requires-python = ">=3.11"
 dependencies = [
