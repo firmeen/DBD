@@ -26,11 +26,18 @@ class ProjectionOutcome(str):
             before_done = int(task.get("done_mask", 0))
             before_na = int(task.get("not_available_mask", 0))
             before_failed = int(task.get("failed_mask", 0))
+            before_dirty = int(task.get("dirty_mask", 0))
+            before_terminal_failed = before_failed & ~before_dirty
+            after_terminal_failed = int(transition.failed_mask) & ~int(
+                transition.dirty_mask
+            )
             item.done_delta = (int(transition.done_mask) & ~before_done).bit_count()
             item.not_available_delta = (
                 int(transition.not_available_mask) & ~before_na
             ).bit_count()
-            item.failed_delta = (int(transition.failed_mask) & ~before_failed).bit_count()
+            item.failed_delta = (
+                after_terminal_failed & ~before_terminal_failed
+            ).bit_count()
         item.completed_delta = (
             item.done_delta + item.not_available_delta + item.failed_delta
         )

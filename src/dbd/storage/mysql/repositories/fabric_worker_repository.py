@@ -6,6 +6,7 @@ from ....core.settings import settings
 from ....core.telemetry import PIPELINE_BATCH_SIZE
 from ....runtime.collection_fabric import (
     advance_state,
+    endpoint_bit,
     mask_for_endpoints,
     next_endpoint,
     remaining_mask,
@@ -142,18 +143,53 @@ class FabricWorkerRepository(WorkerRepository):
             )
         ).mappings().first()
 
+    async def _retry_archive(self, conn, row, endpoint: str | None):
+        if not endpoint:
+            return None
+        bit = endpoint_bit(endpoint)
+        if not (int(row["failed_mask"]) & int(row["dirty_mask"]) & bit):
+            return None
+        return (
+            await conn.execute(
+                text("""
+                SELECT id FROM response_archive
+                WHERE run_id=:run AND company_id=:company AND endpoint=:endpoint
+                  AND processing_status IN ('pending','invalid','failed')
+                ORDER BY id DESC LIMIT 1
+                """),
+                {
+                    "run": row["run_id"],
+                    "company": row["company_id"],
+                    "endpoint": endpoint,
+                },
+            )
+        ).scalar_one_or_none()
+
     async def _apply_transition(self, conn, row, transition, *, archive_id=None, error=None):
         terminal = transition.status in ("done", "failed")
+        retry_row = dict(row)
+        retry_row["failed_mask"] = transition.failed_mask
+        retry_row["dirty_mask"] = transition.dirty_mask
+        retry_archive = await self._retry_archive(
+            conn,
+            retry_row,
+            transition.next_endpoint,
+        )
+        next_stage = "project" if retry_archive is not None else "fetch"
+        if transition.next_endpoint is None:
+            next_raw = archive_id if archive_id is not None else row.get("raw_response_id")
+        else:
+            next_raw = retry_archive
         await conn.execute(
             text("""
             UPDATE company_collection_state
             SET required_mask=:required,done_mask=:done,not_available_mask=:na,
               failed_mask=:failed,dirty_mask=:dirty,next_endpoint=:next,
-              fiscal_year=:year,stage='fetch',status=:status,
+              fiscal_year=:year,stage=:stage,status=:status,
               attempts=0,project_attempts=0,
               available_at=UTC_TIMESTAMP(6),
               lease_owner=NULL,lease_expires_at=NULL,
-              raw_response_id=COALESCE(:archive,raw_response_id),
+              raw_response_id=:raw_response,
               last_error=:error,
               updated_at=UTC_TIMESTAMP(6),
               finished_at=IF(:terminal,UTC_TIMESTAMP(6),NULL)
@@ -168,7 +204,8 @@ class FabricWorkerRepository(WorkerRepository):
                 "next": transition.next_endpoint,
                 "year": transition.fiscal_year,
                 "status": transition.status,
-                "archive": archive_id,
+                "stage": next_stage,
+                "raw_response": next_raw,
                 "error": error,
                 "terminal": 1 if terminal else 0,
                 "id": row["id"],
@@ -524,7 +561,7 @@ class FabricWorkerRepository(WorkerRepository):
                       COALESCE(SUM(BIT_COUNT(required_mask)),0) AS total,
                       COALESCE(SUM(BIT_COUNT(done_mask)),0) AS done,
                       COALESCE(SUM(BIT_COUNT(not_available_mask)),0) AS not_available,
-                      COALESCE(SUM(BIT_COUNT(failed_mask)),0) AS failed,
+                      COALESCE(SUM(BIT_COUNT(failed_mask & ~dirty_mask)),0) AS failed,
                       COALESCE(SUM(status='running'),0) AS running,
                       COALESCE(SUM(status='retry_wait'),0) AS retry_wait
                     FROM company_collection_state WHERE run_id=:id
@@ -599,26 +636,33 @@ class FabricWorkerRepository(WorkerRepository):
                 failed_mask = int(row["failed_mask"])
                 if not failed_mask:
                     continue
+                retry_dirty = int(row["dirty_mask"]) | failed_mask
                 next_item = next_endpoint(
                     int(row["required_mask"]),
                     int(row["done_mask"]),
                     int(row["not_available_mask"]),
-                    failed=0,
+                    failed=failed_mask,
+                    dirty=retry_dirty,
                     fiscal_year=row["fiscal_year"],
                 )
+                retry_row = dict(row)
+                retry_row["dirty_mask"] = retry_dirty
+                retry_archive = await self._retry_archive(conn, retry_row, next_item)
                 await conn.execute(
                     text("""
                     UPDATE company_collection_state
-                    SET failed_mask=0,dirty_mask=dirty_mask|:retry_mask,
-                      next_endpoint=:next,stage='fetch',status='pending',
+                    SET dirty_mask=:dirty,next_endpoint=:next,stage=:stage,status='pending',
                       attempts=0,project_attempts=0,available_at=UTC_TIMESTAMP(6),
+                      raw_response_id=:archive,
                       lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,
                       finished_at=NULL,updated_at=UTC_TIMESTAMP(6)
                     WHERE id=:state
                     """),
                     {
-                        "retry_mask": failed_mask,
+                        "dirty": retry_dirty,
                         "next": next_item,
+                        "stage": "project" if retry_archive is not None else "fetch",
+                        "archive": retry_archive,
                         "state": row["id"],
                     },
                 )

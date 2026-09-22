@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from ....runtime.collection_fabric import advance_state
+from ....runtime.collection_fabric import advance_state, endpoint_bit
 
 
 class LeaseLost(RuntimeError):
@@ -24,6 +24,24 @@ class LegacyProjectionScheduler:
         if cur.fetchone() is None:
             raise LeaseLost("Project-stage task lease is no longer owned")
         return None
+
+    def _retry_archive(self, cur, task, state, endpoint):
+        if not endpoint:
+            return None
+        bit = endpoint_bit(endpoint)
+        if not (int(state["failed_mask"]) & int(state["dirty_mask"]) & bit):
+            return None
+        cur.execute(
+            """
+            SELECT id FROM response_archive
+            WHERE run_id=%s AND company_id=%s AND endpoint=%s
+              AND processing_status IN ('pending','invalid','failed')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task["run_id"], task["company_id"], endpoint),
+        )
+        row = cur.fetchone()
+        return row["id"] if row else None
 
     def finish(self, cur, task, state, outcome, archive_id, normalized):
         task_status = "not_available" if outcome == "not_available" else "done"
@@ -118,12 +136,23 @@ class FabricProjectionScheduler:
             profile_submit_fin_year=profile_year,
         )
         terminal = transition.status in ("done", "failed")
+        retry_state = dict(state)
+        retry_state["failed_mask"] = transition.failed_mask
+        retry_state["dirty_mask"] = transition.dirty_mask
+        retry_archive = self._retry_archive(
+            cur,
+            task,
+            retry_state,
+            transition.next_endpoint,
+        )
+        next_stage = "project" if retry_archive is not None else "fetch"
+        next_raw = archive_id if transition.next_endpoint is None else retry_archive
         cur.execute(
             """
             UPDATE company_collection_state
             SET required_mask=%s,done_mask=%s,not_available_mask=%s,
               failed_mask=%s,dirty_mask=%s,next_endpoint=%s,fiscal_year=%s,
-              stage='fetch',status=%s,attempts=0,project_attempts=0,
+              stage=%s,status=%s,attempts=0,project_attempts=0,
               available_at=UTC_TIMESTAMP(6),raw_response_id=%s,
               last_error=%s,lease_owner=NULL,lease_expires_at=NULL,
               updated_at=UTC_TIMESTAMP(6),
@@ -138,8 +167,9 @@ class FabricProjectionScheduler:
                 transition.dirty_mask,
                 transition.next_endpoint,
                 transition.fiscal_year,
+                next_stage,
                 transition.status,
-                archive_id,
+                next_raw,
                 "stale_replay_skipped" if outcome == "stale_skipped" else None,
                 1 if terminal else 0,
                 task["id"],

@@ -366,7 +366,7 @@ def _task_progress(run_id: int) -> dict[str, int]:
                   COALESCE(SUM(BIT_COUNT(required_mask)),0) AS total,
                   COALESCE(SUM(BIT_COUNT(done_mask)),0) AS done,
                   COALESCE(SUM(BIT_COUNT(not_available_mask)),0) AS not_available,
-                  COALESCE(SUM(BIT_COUNT(failed_mask)),0) AS failed,
+                  COALESCE(SUM(BIT_COUNT(failed_mask & ~dirty_mask)),0) AS failed,
                   COALESCE(SUM(status='running'),0) AS running,
                   COALESCE(SUM(status='retry_wait'),0) AS retry_wait
                 FROM company_collection_state WHERE run_id=%s

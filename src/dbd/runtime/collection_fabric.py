@@ -62,20 +62,34 @@ def derive_fiscal_year(value) -> str | None:
     return max(years) if years else None
 
 
+def work_mask(
+    required: int,
+    done: int,
+    not_available: int,
+    failed: int = 0,
+    dirty: int = 0,
+) -> int:
+    """Unresolved resources plus failed resources explicitly reopened for retry."""
+    return remaining_mask(required, done, not_available, failed) | (
+        int(failed) & int(dirty)
+    )
+
+
 def next_endpoint(
     required: int,
     done: int,
     not_available: int,
     *,
     failed: int = 0,
+    dirty: int = 0,
     fiscal_year: str | None,
 ) -> str | None:
-    remaining = remaining_mask(required, done, not_available, failed)
-    if remaining == 0:
+    candidates = work_mask(required, done, not_available, failed, dirty)
+    if candidates == 0:
         return None
     for endpoint in ENDPOINT_ORDER:
         bit = ENDPOINT_BITS[endpoint]
-        if not remaining & bit:
+        if not candidates & bit:
             continue
         if endpoint in FINANCIAL_ENDPOINTS and not fiscal_year:
             continue
@@ -119,10 +133,16 @@ def advance_state(
     bit = endpoint_bit(endpoint)
     if outcome == "not_available":
         not_available_mask |= bit
+        done_mask &= ~bit
+        failed_mask &= ~bit
     elif outcome in ("done", "stale"):
         done_mask |= bit
+        not_available_mask &= ~bit
+        failed_mask &= ~bit
     elif outcome == "failed":
         failed_mask |= bit
+        done_mask &= ~bit
+        not_available_mask &= ~bit
     else:
         raise ValueError(f"Unsupported collection outcome {outcome!r}")
     dirty_mask &= ~bit
@@ -137,6 +157,8 @@ def advance_state(
                 fiscal_year = derive_fiscal_year(profile_submit_fin_year)
             if not fiscal_year:
                 not_available_mask |= financial_required
+                done_mask &= ~financial_required
+                failed_mask &= ~financial_required
                 dirty_mask &= ~financial_required
 
     next_item = next_endpoint(
@@ -144,13 +166,15 @@ def advance_state(
         done_mask,
         not_available_mask,
         failed=failed_mask,
+        dirty=dirty_mask,
         fiscal_year=fiscal_year,
     )
-    complete = remaining_mask(
+    complete = work_mask(
         required_mask,
         done_mask,
         not_available_mask,
         failed_mask,
+        dirty_mask,
     ) == 0
     if complete:
         status = "failed" if failed_mask else "done"
