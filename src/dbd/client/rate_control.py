@@ -383,16 +383,17 @@ local function pacing_state(
   local base_ms = math.max(now_ms, cooldown_until)
   local next_ms = tonumber(redis.call('GET', next_key) or base_ms)
   if next_ms < base_ms then next_ms = base_ms end
-  return rate, next_ms
+  return rate, next_ms, target
 end
 
-local global_rate, global_next = pacing_state(
+local global_rate, global_next, global_target = pacing_state(
   KEYS[1], KEYS[2], KEYS[3], KEYS[5], global_ceiling
 )
 local endpoint_rate = 0
 local endpoint_next = now_ms
+local endpoint_target = endpoint_ceiling
 if has_endpoint then
-  endpoint_rate, endpoint_next = pacing_state(
+  endpoint_rate, endpoint_next, endpoint_target = pacing_state(
     KEYS[6], KEYS[7], KEYS[8], KEYS[10], endpoint_ceiling
   )
 end
@@ -442,7 +443,9 @@ return {
   has_endpoint and tostring(endpoint_rate) or '',
   'paced',
   gstate,
-  estate
+  estate,
+  tostring(global_target),
+  has_endpoint and tostring(endpoint_target) or ''
 }
 """
 
@@ -497,7 +500,7 @@ local function recover_rate(rate_key, cooldown_key, penalty_key, target_key, cei
     or now_ms < cooldown_until
     or (now_ms - last_penalty) < quiet_ms then
     redis.call('PSETEX', rate_key, ttl_ms, tostring(rate))
-    return rate
+    return rate, target
   end
   local recovered = math.min(target, math.max(rate + step, rate * factor))
   if recovered > rate then
@@ -505,21 +508,24 @@ local function recover_rate(rate_key, cooldown_key, penalty_key, target_key, cei
     redis.call('PSETEX', rate_key, ttl_ms, tostring(rate))
     redis.call('PSETEX', penalty_key, ttl_ms, tostring(now_ms))
   end
-  return rate
+  return rate, target
 end
 
-local global_rate = recover_rate(
+local global_rate, global_target = recover_rate(
   KEYS[2], KEYS[3], KEYS[4], KEYS[5], global_ceiling
 )
 local endpoint_rate = 0
+local endpoint_target = endpoint_ceiling
 if has_endpoint then
-  endpoint_rate = recover_rate(
+  endpoint_rate, endpoint_target = recover_rate(
     KEYS[7], KEYS[8], KEYS[9], KEYS[10], endpoint_ceiling
   )
 end
 return {
   tostring(global_rate),
-  has_endpoint and tostring(endpoint_rate) or ''
+  has_endpoint and tostring(endpoint_rate) or '',
+  tostring(global_target),
+  has_endpoint and tostring(endpoint_target) or ''
 }
 """
 
@@ -571,7 +577,9 @@ return {
         self._success_script = None
         self._next_shared_recovery_at = 0.0
         self._global_recovery_needed = False
+        self._global_recovery_target = self.shared_rate_ceiling
         self._endpoint_recovery_needed: set[str] = set()
+        self._endpoint_recovery_targets: dict[str, float] = {}
         self.redis_commands = 0
         self.redis_admissions = 0
         self._breaker = AdaptiveCircuitBreaker(
@@ -723,13 +731,16 @@ return {
                 continue
 
             global_rate = float(result[1])
+            global_target = float(result[6])
             self._global_shared.rate = global_rate
-            if global_rate < self.shared_rate_ceiling:
-                self._global_recovery_needed = True
+            self._global_recovery_target = global_target
+            self._global_recovery_needed = global_rate < global_target
             if shared_endpoint is not None and result[2] != "":
                 endpoint_rate = float(result[2])
+                endpoint_target = float(result[7])
                 shared_endpoint.rate = endpoint_rate
-                if endpoint_rate < self._shared_target_for(endpoint):
+                self._endpoint_recovery_targets[endpoint] = endpoint_target
+                if endpoint_rate < endpoint_target:
                     self._endpoint_recovery_needed.add(endpoint)
                 ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
             EFFECTIVE_RATE.set(global_rate)
@@ -800,8 +811,10 @@ return {
         )
         previous_global = self._global_shared.rate
         global_rate = float(result[0])
+        global_target = float(result[2])
         self._global_shared.rate = global_rate
-        self._global_recovery_needed = global_rate < self.shared_rate_ceiling
+        self._global_recovery_target = global_target
+        self._global_recovery_needed = global_rate < global_target
         global_changed = global_rate if global_rate != previous_global else None
 
         endpoint_changed = None
@@ -809,8 +822,10 @@ return {
             shared_endpoint = self._shared_endpoint(endpoint)
             previous_endpoint = shared_endpoint.rate
             endpoint_rate = float(result[1])
+            endpoint_target = float(result[3])
             shared_endpoint.rate = endpoint_rate
-            if endpoint_rate >= self._shared_target_for(endpoint):
+            self._endpoint_recovery_targets[endpoint] = endpoint_target
+            if endpoint_rate >= endpoint_target:
                 self._endpoint_recovery_needed.discard(endpoint)
             else:
                 self._endpoint_recovery_needed.add(endpoint)
