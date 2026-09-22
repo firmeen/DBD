@@ -1595,10 +1595,6 @@ def supervise_campaign(
                     control_plane_degraded = True
 
             registered = len(registered_states)
-            registered_draining = sum(
-                str(worker.get("status", "")).lower() == "draining"
-                for worker in registered_states
-            )
             stale_registered = sum(
                 now_wall - float(worker.get("heartbeat_at") or now_wall)
                 > _WORKER_HEARTBEAT_TIMEOUT_SECONDS
