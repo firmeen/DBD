@@ -65,7 +65,11 @@ def master_components(profile) -> dict:
         "name": [profile.jp_name, profile.jp_name_e, profile.jp_search_name],
         "location": [profile.pv_code, profile.ampur_code, profile.tumbon_code, profile.zip_code],
         "industry": [profile.business_type_code, profile.setup_obj_code, profile.submit_obj_code],
-        "size_capital": [profile.business_size_code, profile.cap_amt, profile.paid_amt],
+        "size_capital": [
+            profile.business_size_code,
+            None if profile.cap_amt is None else str(profile.cap_amt),
+            None if profile.paid_amt is None else str(profile.paid_amt),
+        ],
         "fiscal": profile.submit_fin_year,
     }
 
