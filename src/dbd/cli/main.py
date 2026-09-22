@@ -57,7 +57,12 @@ def _add_output_options(parser):
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Show extended diagnostic detail when available",
+        help="Show extended operator detail when available",
+    )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Show diagnostic detail; implies --verbose for terminal presentation",
     )
     return parser
 
@@ -96,7 +101,7 @@ def safe_error(exc: BaseException) -> str:
 async def worker_command(args, health=None, presenter=None):
     presenter = presenter or TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
-        verbose=bool(getattr(args, "verbose", False)),
+        verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
     )
     engine = create_engine()
     repo = WorkerRepository(engine)
@@ -429,7 +434,7 @@ def main():
     campaign_stop.add_argument("run_id", type=positive)
 
     for name in ("fetch-company", "bulk"):
-        p = sub.add_parser(name)
+        p = _add_output_options(sub.add_parser(name))
         p.add_argument("--only", type=parts)
         p.add_argument("--fiscal-year")
         p.add_argument(
