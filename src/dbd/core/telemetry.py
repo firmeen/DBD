@@ -1,4 +1,5 @@
 import logging
+import sys
 
 import structlog
 from prometheus_client import Counter, Gauge, Histogram, start_http_server
@@ -123,10 +124,24 @@ def observe_discovery(summary: dict) -> None:
     DISCOVERY_UNCOUNTED_BUCKETS.set(int(summary.get("buckets_uncounted") or 0))
 
 
-def configure(port: int = 0) -> None:
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
-    structlog.configure(
-        processors=[structlog.processors.TimeStamper(fmt="iso"), structlog.processors.JSONRenderer()]
-    )
+def configure(port: int = 0, *, debug: bool = False, no_color: bool = False) -> None:
+    """Configure structured logs for people on a TTY and JSON for redirected logs.
+
+    Worker log files remain machine-readable JSON. Interactive CMD/PowerShell
+    sessions get a concise structured console renderer. Credentials and tokens are
+    never added here; callers remain responsible for logging only safe fields.
+    """
+    level = logging.DEBUG if debug else logging.INFO
+    logging.basicConfig(level=level, format="%(message)s", force=True)
+    interactive = bool(getattr(sys.stderr, "isatty", lambda: False)())
+    processors = [
+        structlog.processors.TimeStamper(fmt="%H:%M:%S"),
+        structlog.processors.add_log_level,
+    ]
+    if interactive:
+        processors.append(structlog.dev.ConsoleRenderer(colors=not no_color))
+    else:
+        processors.append(structlog.processors.JSONRenderer())
+    structlog.configure(processors=processors)
     if port:
         start_http_server(port, addr="127.0.0.1")
