@@ -15,7 +15,6 @@ from http import HTTPStatus
 from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosed
 
-
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = int(os.getenv("DBD_BRIDGE_PORT", "8787"))
 MYSQL_HOST = os.getenv("DBD_MYSQL_HOST", "127.0.0.1")

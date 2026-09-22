@@ -1,3 +1,4 @@
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -6,12 +7,14 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
     WorkerProcess,
+    _drain_registered_workers,
     _force_kill_worker,
     _live_progress,
     _refresh_lease_with_grace,
     _runtime_progress_baseline,
     _seed_rate,
     _terminate_workers,
+    _with_retired_metrics,
     _worker_command,
     build_rate_plan,
 )
@@ -138,11 +141,12 @@ def test_live_progress_uses_heartbeat_delta_from_durable_baseline() -> None:
     }
     live = _live_progress(
         baseline,
-        {"completed": 20, "failed": 1, "inflight": 30},
+        {"done": 15, "not_available": 5, "failed": 1, "inflight": 30},
     )
 
     assert live["terminal"] == 173
-    assert live["done"] == 170
+    assert live["done_only"] == 115
+    assert live["not_available"] == 55
     assert live["failed"] == 3
     assert live["inflight"] == 30
     assert live["pending_estimate"] == 797
@@ -188,3 +192,115 @@ def test_resume_progress_falls_back_when_redis_snapshot_times_out() -> None:
             raise RedisTimeoutError("temporary")
 
     assert _runtime_progress_baseline(TimeoutRedis(), 7) is None
+
+
+
+def test_replacement_supervisor_refuses_to_spawn_over_registered_workers(monkeypatch) -> None:
+    states = [{"worker_id": "old-worker", "status": "active"}]
+    drains = []
+
+    monkeypatch.setattr(
+        supervisor,
+        "_registered_worker_states",
+        lambda redis, run_id: list(states),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_request_worker_drain",
+        lambda redis, run_id, worker_id, reason: drains.append(
+            (run_id, worker_id, reason)
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="old-worker"):
+        _drain_registered_workers(object(), 7, timeout_seconds=0)
+
+    assert drains == [(7, "old-worker", "supervisor_replacement")]
+
+
+def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) -> None:
+    runtime = {
+        "total": 1000,
+        "pending": 700,
+        "running": 8,
+        "done_only": 180,
+        "not_available": 100,
+        "failed": 12,
+        "progress_source": "redis_worker_heartbeat",
+    }
+    worker = {
+        "worker_id": "worker-a",
+        "status": "active",
+        "heartbeat_at": 1.0,
+        "done": 10,
+        "not_available": 2,
+        "failed": 0,
+    }
+
+    class FakeRedis:
+        def ping(self):
+            return True
+
+        def get(self, key):
+            if key.endswith(":supervisor:state"):
+                return json.dumps(runtime)
+            if key.endswith(":effective-rate"):
+                return "11.5"
+            if key.endswith(":target-rate"):
+                return "12"
+            return None
+
+        def exists(self, key):
+            return key.endswith(":supervisor:lease")
+
+        def smembers(self, key):
+            return {"worker-a"}
+
+        def mget(self, keys):
+            return [json.dumps(worker)]
+
+        def srem(self, *args):
+            return 0
+
+        def close(self):
+            pass
+
+    fake = FakeRedis()
+    monkeypatch.setattr(supervisor, "_redis_client", lambda: fake)
+    monkeypatch.setattr(
+        supervisor,
+        "settings",
+        SimpleNamespace(
+            dbd_redis_url="redis://test",
+            dbd_redis_rate_key="dbd:test:rate",
+            dbd_rate_per_second=1.0,
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_task_progress",
+        lambda run_id: (_ for _ in ()).throw(
+            AssertionError("active campaign status must not run an exact aggregate scan")
+        ),
+    )
+    monkeypatch.setattr(supervisor, "_run_status", lambda run_id: "ready")
+
+    state = supervisor.campaign_status(7)
+
+    assert state["progress_source"] == "redis_worker_heartbeat"
+    assert state["progress_exact"] is False
+    assert state["done"] == 180
+    assert state["not_available"] == 100
+    assert state["failed"] == 12
+    assert state["workers"] == 1
+    assert state["supervisor_active"] is True
+
+
+def test_retired_terminal_metrics_preserve_done_progress() -> None:
+    merged = _with_retired_metrics(
+        {"done": 3, "not_available": 1, "failed": 0},
+        {"done": 7, "not_available": 2, "failed": 1},
+    )
+    assert merged["done"] == 10
+    assert merged["not_available"] == 3
+    assert merged["failed"] == 1

@@ -49,11 +49,21 @@ class WorkerRepository:
             self._archive_backend = build_archive_backend()
         return self._archive_backend
 
-    async def create_run(self, source, parts, fiscal_year=None):
+    async def create_run(self, source, parts, fiscal_year=None, *, scheduler_mode="legacy"):
+        if scheduler_mode not in ("legacy", "fabric_v2"):
+            raise ValueError("scheduler_mode must be legacy or fabric_v2")
         async with self.engine.begin() as conn:
             result = await conn.execute(
-                text("INSERT INTO worker_runs(source_label,parts,fiscal_year) VALUES (:source,:parts,:year)"),
-                {"source": source, "parts": ",".join(parts), "year": fiscal_year},
+                text("""
+                INSERT INTO worker_runs(source_label,parts,fiscal_year,scheduler_mode)
+                VALUES (:source,:parts,:year,:scheduler_mode)
+                """),
+                {
+                    "source": source,
+                    "parts": ",".join(parts),
+                    "year": fiscal_year,
+                    "scheduler_mode": scheduler_mode,
+                },
             )
             return result.lastrowid
 
@@ -436,7 +446,23 @@ class WorkerRepository:
                 or 0
             )
 
+    async def has_active_work(self, run_id):
+        """Cheap completion probe; avoid aggregating a multi-million-row run."""
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                    SELECT 1 FROM endpoint_tasks
+                    WHERE run_id=:id AND status IN ('pending','running','retry_wait')
+                    LIMIT 1
+                    """),
+                    {"id": run_id},
+                )
+            ).first()
+            return row is not None
+
     async def progress(self, run_id):
+        """Exact durable status counts for lifecycle reconciliation and explicit status."""
         async with self.engine.connect() as conn:
             rows = (
                 await conn.execute(
@@ -600,12 +626,12 @@ class WorkerRepository:
                 result = await conn.execute(
                     text("""
                     INSERT INTO response_archive(
-                      task_id,company_id,endpoint,request_path,request_context,
+                      task_id,run_id,company_id,endpoint,request_path,request_context,
                       http_status,requested_at,received_at,payload,payload_codec,payload_backend,
                       payload_object_key,payload_nonce,payload_key_id,payload_cipher_sha256,
                       payload_zstd,payload_original_bytes,payload_stored_bytes,payload_sha256
                     ) VALUES (
-                      :task,:company,:endpoint,:path,:context,
+                      :task,:run,:company,:endpoint,:path,:context,
                       :status,:requested,:received,:payload,:codec,:backend,
                       :object_key,:nonce,:key_id,:cipher_sha,
                       :payload_zstd,:original_bytes,:stored_bytes,:sha
@@ -613,6 +639,7 @@ class WorkerRepository:
                 """),
                     {
                         "task": task["id"],
+                        "run": task["run_id"],
                         "company": task["company_id"],
                         "endpoint": task["endpoint"],
                         "path": item["path"],

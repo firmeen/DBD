@@ -41,12 +41,33 @@ async def test_claim_fencing_and_expired_lease(repo):
     assert await repo.finish(second, "done")
 
 
+async def test_run_persists_scheduler_mode_and_rejects_unknown_mode(repo):
+    legacy = await repo.create_run("scheduler-default-" + uuid4().hex, ["profile"])
+    fabric = await repo.create_run(
+        "scheduler-fabric-" + uuid4().hex,
+        ["profile"],
+        scheduler_mode="fabric_v2",
+    )
+    await repo.ready(legacy)
+    await repo.ready(fabric)
+    assert (await repo.get_run(legacy))["scheduler_mode"] == "legacy"
+    assert (await repo.get_run(fabric))["scheduler_mode"] == "fabric_v2"
+    with pytest.raises(ValueError, match="scheduler_mode"):
+        await repo.create_run(
+            "scheduler-invalid-" + uuid4().hex,
+            ["profile"],
+            scheduler_mode="bad",
+        )
+
+
 async def test_duplicate_import_and_retry_reopens_run(repo):
     run, ids = await new_run(repo)
     await repo.import_batch(run, ids, ("profile",))
     assert await repo.progress(run) == {"pending": 1}
+    assert await repo.has_active_work(run) is True
     task = await repo.claim(run, "test")
     await repo.finish(task, "failed", "test")
+    assert await repo.has_active_work(run) is False
     await repo.close_if_complete(run)
     assert (await repo.get_run(run))["status"] == "failed"
     assert await repo.retry_failed(run) == 1

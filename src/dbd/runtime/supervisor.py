@@ -27,6 +27,8 @@ _FAILURE_DRAIN_SECONDS = 10.0
 _COMPLETE_DRAIN_SECONDS = 10.0
 _DURABLE_WORK_CHECK_SECONDS = 1.0
 _WORKER_STATE_REFRESH_SECONDS = 2.0
+_ORPHAN_DRAIN_TIMEOUT_SECONDS = 30.0
+_ORPHAN_DRAIN_POLL_SECONDS = 0.25
 _REDIS_RETRY_SECONDS = 1.0
 _SUPERVISOR_LEASE_FAILURE_BUDGET_SECONDS = 20.0
 _REDIS_SOCKET_TIMEOUT_SECONDS = 5.0
@@ -182,7 +184,7 @@ def _rate_target_key(rate_key: str) -> str:
 
 
 def _task_progress(run_id: int) -> dict[str, int]:
-    """Read one durable queue snapshot with a single aggregate scan."""
+    """Exact durable reconciliation snapshot; never use this as the live hot path."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
@@ -462,6 +464,7 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
     summed = (
         "claimed",
         "completed",
+        "done",
         "failed",
         "retry_wait",
         "not_available",
@@ -487,6 +490,7 @@ def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict
     for key in (
         "claimed",
         "completed",
+        "done",
         "failed",
         "retry_wait",
         "not_available",
@@ -499,19 +503,20 @@ def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict
 
 
 def _live_progress(baseline: dict[str, int], metrics: dict[str, int]) -> dict[str, int]:
-    """Overlay worker heartbeat counters on one durable lifecycle baseline."""
+    """Overlay ephemeral worker counters on one durable lifecycle baseline."""
     total = int(baseline.get("total", 0))
-    baseline_done = int(baseline.get("done", 0)) + int(
-        baseline.get("not_available", 0)
+    done_only = int(baseline.get("done", 0)) + int(metrics.get("done", 0))
+    not_available = int(baseline.get("not_available", 0)) + int(
+        metrics.get("not_available", 0)
     )
-    done = baseline_done + int(metrics.get("completed", 0))
     failed = int(baseline.get("failed", 0)) + int(metrics.get("failed", 0))
-    terminal = min(total, done + failed)
+    terminal = min(total, done_only + not_available + failed)
     remaining = max(0, total - terminal)
     inflight = min(max(0, int(metrics.get("inflight", 0))), remaining)
     return {
         "total": total,
-        "done": min(done, total),
+        "done_only": min(done_only, total),
+        "not_available": min(not_available, total),
         "failed": min(failed, total),
         "terminal": terminal,
         "remaining": remaining,
@@ -532,7 +537,8 @@ def _runtime_progress_baseline(redis: Redis, run_id: int) -> dict[str, int] | No
         return None
     try:
         total = int(runtime.get("total", 0) or 0)
-        done = int(runtime.get("done", 0) or 0)
+        done = int(runtime.get("done_only", runtime.get("done", 0)) or 0)
+        not_available = int(runtime.get("not_available", 0) or 0)
         failed = int(runtime.get("failed", 0) or 0)
         pending = int(runtime.get("pending", 0) or 0)
         running = int(runtime.get("running", 0) or 0)
@@ -547,8 +553,38 @@ def _runtime_progress_baseline(redis: Redis, run_id: int) -> dict[str, int] | No
         "running": running,
         "failed": failed,
         "done": done,
-        "not_available": 0,
+        "not_available": not_available,
     }
+
+
+def _drain_registered_workers(
+    redis: Redis,
+    run_id: int,
+    *,
+    timeout_seconds: float = _ORPHAN_DRAIN_TIMEOUT_SECONDS,
+) -> int:
+    """Fence a replacement supervisor from workers left by a previous supervisor."""
+    states = _registered_worker_states(redis, run_id)
+    if not states:
+        return 0
+    worker_ids = [str(row.get("worker_id")) for row in states if row.get("worker_id")]
+    for worker_id in worker_ids:
+        _request_worker_drain(redis, run_id, worker_id, "supervisor_replacement")
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        states = _registered_worker_states(redis, run_id)
+        if not states:
+            return len(worker_ids)
+        time.sleep(_ORPHAN_DRAIN_POLL_SECONDS)
+
+    remaining = _registered_worker_states(redis, run_id)
+    if remaining:
+        ids = ", ".join(str(row.get("worker_id") or "unknown") for row in remaining)
+        raise RuntimeError(
+            f"Campaign {run_id} still has registered worker(s) after supervisor handoff: {ids}"
+        )
+    return len(worker_ids)
 
 
 def _refresh_lease_with_grace(
@@ -859,6 +895,8 @@ def supervise_campaign(
     last_redis_warning_at = 0.0
     baseline: dict[str, int] = {}
     has_work = True
+    reconciled_at: float | None = None
+    final_snapshot: dict[str, int] | None = None
     registered_states: list[dict] = []
     retired_metrics: dict[str, int] = {}
     progress = ProgressLine(f"CAMPAIGN {run_id}", interval=0.75)
@@ -885,6 +923,7 @@ def supervise_campaign(
         for key in (
             "claimed",
             "completed",
+            "done",
             "failed",
             "retry_wait",
             "not_available",
@@ -923,12 +962,19 @@ def supervise_campaign(
         _acquire_supervisor_lease(redis, run_id, token)
         lease_acquired = True
 
+        orphaned = _drain_registered_workers(redis, run_id)
+        if orphaned:
+            progress.event(
+                f"supervisor handoff: drained {orphaned} previously registered worker(s)"
+            )
+
         # Resume from the last supervisor snapshot when available. This avoids
         # re-aggregating a multi-million-row endpoint queue just to redraw progress.
         baseline = _runtime_progress_baseline(redis, run_id)
         if baseline is None:
             try:
                 baseline = _task_progress(run_id)
+                reconciled_at = time.time()
             except Exception as exc:
                 raise RuntimeError(
                     f"Campaign {run_id} startup durable progress reconciliation failed: "
@@ -1013,7 +1059,7 @@ def supervise_campaign(
             pending = live_progress["pending_estimate"]
             running = live_progress["inflight"]
             failed = live_progress["failed"]
-            done = live_progress["done"]
+            done = live_progress["done_only"] + live_progress["not_available"]
 
             if now >= next_work_check:
                 try:
@@ -1262,10 +1308,14 @@ def supervise_campaign(
                         rate_ceiling=plan.ceiling,
                         worker_metrics=campaign_metrics,
                         progress_source="redis_worker_heartbeat",
+                        reconciled_at=reconciled_at,
                         pending=pending,
                         running=running,
                         done=done,
+                        done_only=live_progress["done_only"],
+                        not_available=live_progress["not_available"],
                         failed=failed,
+                        remaining=live_progress["remaining"],
                         total=total,
                     )
                 except Exception as exc:
@@ -1316,15 +1366,16 @@ def supervise_campaign(
             )
             try:
                 while any(worker.process.poll() is None for worker in children):
-                    state = _task_progress(run_id)
-                    running = state.get("running", 0)
-                    registered = _registered_workers(redis, run_id)
+                    states = _registered_worker_states(redis, run_id)
+                    metrics = _with_retired_metrics(_worker_metrics(states), retired_metrics)
+                    current = _live_progress(baseline, metrics)
                     progress.update(
-                        state.get("done", 0)
-                        + state.get("not_available", 0)
-                        + state.get("failed", 0),
-                        state.get("total", 0),
-                        detail=f"draining | workers {registered} | running {running:,}",
+                        current["terminal"],
+                        current["total"],
+                        detail=(
+                            f"draining | workers {len(states)} | "
+                            f"inflight {current['inflight']:,}"
+                        ),
                         force=True,
                     )
                     time.sleep(0.75)
@@ -1369,6 +1420,7 @@ def supervise_campaign(
         if lease_acquired:
             try:
                 snapshot = _task_progress(run_id)
+                final_snapshot = snapshot
                 remaining = (
                     snapshot.get("pending", 0)
                     + snapshot.get("retry_wait", 0)
@@ -1404,10 +1456,15 @@ def supervise_campaign(
                     worker_metrics=_with_retired_metrics(
                         _worker_metrics(registered_states), retired_metrics
                     ),
+                    progress_source="mysql_reconciled",
+                    reconciled_at=time.time(),
                     pending=snapshot.get("pending", 0) + snapshot.get("retry_wait", 0),
                     running=snapshot.get("running", 0),
                     done=snapshot.get("done", 0) + snapshot.get("not_available", 0),
+                    done_only=snapshot.get("done", 0),
+                    not_available=snapshot.get("not_available", 0),
                     failed=snapshot.get("failed", 0),
+                    remaining=remaining,
                     total=snapshot.get("total", 0),
                 )
                 if remaining == 0 and not supervisor_error:
@@ -1421,7 +1478,7 @@ def supervise_campaign(
         except Exception:
             pass
 
-    state = _task_progress(run_id)
+    state = final_snapshot or _task_progress(run_id)
     failed = state.get("failed", 0)
     if exit_code == 130:
         progress.close(
@@ -1442,14 +1499,53 @@ def supervise_campaign(
 
 
 def campaign_status(run_id: int) -> dict:
-    state = _task_progress(run_id)
+    """Prefer the live Redis snapshot while supervised; fall back to exact MySQL."""
+    state: dict | None = None
+    redis = None
+    workers: list[dict] = []
+    runtime = None
+    supervisor_active = False
+
+    if settings.dbd_redis_url:
+        try:
+            redis = _redis_client()
+            redis.ping()
+            runtime = _read_runtime_state(redis, run_id)
+            supervisor_active = bool(redis.exists(_supervisor_lease_key(run_id)))
+            workers = _registered_worker_states(redis, run_id)
+            if runtime is not None and supervisor_active and runtime.get("total") is not None:
+                state = {
+                    "total": int(runtime.get("total", 0) or 0),
+                    "pending": int(runtime.get("pending", 0) or 0),
+                    "retry_wait": 0,
+                    "running": int(runtime.get("running", 0) or 0),
+                    "failed": int(runtime.get("failed", 0) or 0),
+                    "done": int(runtime.get("done_only", runtime.get("done", 0)) or 0),
+                    "not_available": int(runtime.get("not_available", 0) or 0),
+                    "progress_source": runtime.get(
+                        "progress_source", "redis_worker_heartbeat"
+                    ),
+                    "progress_exact": False,
+                    "pending_includes_retry_wait": True,
+                }
+        except Exception:
+            if redis is not None:
+                try:
+                    redis.close()
+                except Exception:
+                    pass
+            redis = None
+
+    if state is None:
+        state = _task_progress(run_id)
+        state["progress_source"] = "mysql_reconciled"
+        state["progress_exact"] = True
+
     state["run_id"] = int(run_id)
     state["run_status"] = _run_status(run_id)
-    if settings.dbd_redis_url:
-        redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+
+    if redis is not None:
         try:
-            redis.ping()
-            workers = _registered_worker_states(redis, run_id)
             now = time.time()
             worker_details = []
             for row in workers:
@@ -1489,8 +1585,7 @@ def campaign_status(run_id: int) -> dict:
             except (TypeError, ValueError):
                 state["rate_target"] = None
             state["stop_requested"] = _stop_requested(redis, run_id)
-            state["supervisor_active"] = bool(redis.exists(_supervisor_lease_key(run_id)))
-            runtime = _read_runtime_state(redis, run_id)
+            state["supervisor_active"] = supervisor_active
             if runtime is not None:
                 state["supervisor"] = runtime
         finally:
