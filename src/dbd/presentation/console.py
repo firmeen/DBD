@@ -197,7 +197,6 @@ class TerminalPresenter:
         failed = _int(state.get("failed"))
         terminal = min(total, done + na + failed)
         remaining = max(0, total - terminal)
-        source = str(state.get("progress_source") or "unknown")
         exact = bool(state.get("progress_exact"))
         run_id = _int(state.get("run_id"))
         run_status = str(state.get("run_status") or "unknown").upper()
