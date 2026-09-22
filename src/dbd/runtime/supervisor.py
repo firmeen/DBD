@@ -12,7 +12,7 @@ from redis import Redis
 from redis.exceptions import ConnectionError as RedisConnectionError
 from redis.exceptions import TimeoutError as RedisTimeoutError
 
-from ..core.progress import ProgressLine
+from ..core.progress import LiveCampaignDashboard, TerminalSnapshot
 from ..core.settings import PROJECT_ROOT, settings
 from ..storage.mysql.engine import connect
 
@@ -651,6 +651,11 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
         "requests",
         "http_retries",
         "rate_limit_hits",
+        "redis_commands",
+        "redis_admissions",
+        "redis_pool_in_use",
+        "redis_pool_created",
+        "redis_pool_max",
     )
     return {
         key: sum(int(row.get(key, 0) or 0) for row in states)
@@ -670,6 +675,8 @@ def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict
         "requests",
         "http_retries",
         "rate_limit_hits",
+        "redis_commands",
+        "redis_admissions",
     ):
         result[key] = int(result.get(key, 0)) + int(retired.get(key, 0))
     return result
@@ -696,6 +703,75 @@ def _live_progress(baseline: dict[str, int], metrics: dict[str, int]) -> dict[st
         "inflight": inflight,
         "pending_estimate": max(0, remaining - inflight),
     }
+
+
+def _campaign_terminal_snapshot(
+    run_id: int,
+    *,
+    status: str,
+    live_progress: dict[str, int],
+    live_metrics: dict[str, int],
+    campaign_metrics: dict[str, int],
+    workers_registered: int,
+    workers_target: int,
+    workers_active: int,
+    workers_draining: int,
+    workers_stale: int,
+    workers_min: int,
+    workers_max: int,
+    restarts: int,
+    exhausted_capacity: int,
+    observed_http_rate: float | None,
+    effective_rate: float,
+    target_rate: float,
+    rate_ceiling: float,
+    control_healthy: bool,
+    heartbeat_age_seconds: float | None,
+    elapsed_seconds: float,
+) -> TerminalSnapshot:
+    """Build presentation state from values already present in the supervisor loop."""
+    return TerminalSnapshot(
+        run_id=run_id,
+        status=status,
+        current=int(live_progress.get("terminal", 0)),
+        total=int(live_progress.get("total", 0)),
+        done=int(live_progress.get("done_only", 0)),
+        not_available=int(live_progress.get("not_available", 0)),
+        failed=int(live_progress.get("failed", 0)),
+        remaining=int(live_progress.get("remaining", 0)),
+        pending=int(live_progress.get("pending_estimate", 0)),
+        running=int(live_progress.get("inflight", 0)),
+        fetch_queue=int(live_metrics.get("fetch_queue", 0)),
+        archive_queue=int(live_metrics.get("archive_queue", 0)),
+        project_queue=int(live_metrics.get("project_queue", 0)),
+        queue_capacity=settings.dbd_pipeline_queue_size * max(1, workers_registered),
+        fetch_active=int(live_metrics.get("fetch_active", 0)),
+        archive_active=int(live_metrics.get("archive_active", 0)),
+        project_active=int(live_metrics.get("project_active", 0)),
+        workers_registered=workers_registered,
+        workers_target=workers_target,
+        workers_active=workers_active,
+        workers_draining=workers_draining,
+        workers_stale=workers_stale,
+        workers_min=workers_min,
+        workers_max=workers_max,
+        restarts=restarts,
+        exhausted_capacity=exhausted_capacity,
+        http_rate=observed_http_rate,
+        rate_effective=effective_rate,
+        rate_target=target_rate,
+        rate_ceiling=rate_ceiling,
+        requests=int(campaign_metrics.get("requests", 0)),
+        http_retries=int(campaign_metrics.get("http_retries", 0)),
+        rate_limit_hits=int(campaign_metrics.get("rate_limit_hits", 0)),
+        redis_pool_in_use=int(live_metrics.get("redis_pool_in_use", 0)),
+        redis_pool_max=int(live_metrics.get("redis_pool_max", 0)),
+        redis_commands=int(campaign_metrics.get("redis_commands", 0)),
+        redis_admissions=int(campaign_metrics.get("redis_admissions", 0)),
+        control_healthy=control_healthy,
+        heartbeat_age_seconds=heartbeat_age_seconds,
+        elapsed_seconds=elapsed_seconds,
+    )
 
 
 def _runtime_progress_baseline(redis: Redis, run_id: int) -> dict[str, int] | None:
@@ -1094,6 +1170,7 @@ def supervise_campaign(
     children: list[WorkerProcess] = []
     next_index = 1
     exhausted_capacity = 0
+    restart_events = 0
     graceful_stop = False
     exit_code = 0
     lease_acquired = False
@@ -1117,7 +1194,8 @@ def supervise_campaign(
     http_sample_rate_limit_hits = 0
     observed_http_rate: float | None = None
     recent_rate_limit_delta = 0
-    progress = ProgressLine(f"CAMPAIGN {run_id}", interval=0.75)
+    dashboard_started_at = time.monotonic()
+    progress = LiveCampaignDashboard(run_id, interval=0.5)
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
         nonlocal next_index
@@ -1149,11 +1227,13 @@ def supervise_campaign(
             "requests",
             "http_retries",
             "rate_limit_hits",
+            "redis_commands",
+            "redis_admissions",
         ):
             retired_metrics[key] = int(retired_metrics.get(key, 0)) + int(row.get(key, 0) or 0)
 
     def replacement_for(worker: WorkerProcess, reason: str) -> WorkerProcess | None:
-        nonlocal exhausted_capacity
+        nonlocal exhausted_capacity, restart_events
         if worker.restarts >= max_restarts:
             exhausted_capacity += 1
             progress.event(
@@ -1171,6 +1251,7 @@ def supervise_campaign(
                 f"worker {worker.index} restart failed ({type(exc).__name__}); fleet capacity reduced by 1"
             )
             return None
+        restart_events += 1
         progress.event(
             f"worker {worker.index} {reason}; restarted ({replacement.restarts}/{max_restarts})"
         )
@@ -1514,31 +1595,47 @@ def supervise_campaign(
                     control_plane_degraded = True
 
             registered = len(registered_states)
-            registered_draining = sum(
-                str(worker.get("status", "")).lower() == "draining"
-                for worker in registered_states
-            )
             stale_registered = sum(
                 now_wall - float(worker.get("heartbeat_at") or now_wall)
                 > _WORKER_HEARTBEAT_TIMEOUT_SECONDS
                 for worker in registered_states
             )
-            worker_label = (
-                f"{registered} active={max(0, registered - registered_draining)} "
-                f"draining={registered_draining} range={minimum}-{maximum}"
-                if autoscale
-                else f"{registered}/{initial_workers}"
-            )
-            progress.update(
-                live_progress["terminal"],
-                total,
-                detail=(
-                    f"workers {worker_label} | rate {effective:.2f}/{rate_target:.2f}/{plan.ceiling:.2f}/s | "
-                    f"q {live_metrics.get('fetch_queue', 0)}/{live_metrics.get('archive_queue', 0)}/"
-                    f"{live_metrics.get('project_queue', 0)} | http {campaign_metrics.get('requests', 0):,} "
-                    f"429/503 {campaign_metrics.get('rate_limit_hits', 0):,} | "
-                    f"pending~ {pending:,} running~ {running:,} failed~ {failed:,}"
-                ),
+            heartbeat_ages = [
+                max(0.0, now_wall - float(worker.get("heartbeat_at") or now_wall))
+                for worker in registered_states
+                if worker.get("heartbeat_at")
+            ]
+            heartbeat_age = max(heartbeat_ages) if heartbeat_ages else None
+            progress.render(
+                _campaign_terminal_snapshot(
+                    run_id,
+                    status=(
+                        "draining"
+                        if graceful_stop
+                        else "degraded"
+                        if control_plane_degraded
+                        else "running"
+                    ),
+                    live_progress=live_progress,
+                    live_metrics=live_metrics,
+                    campaign_metrics=campaign_metrics,
+                    workers_registered=registered,
+                    workers_target=target,
+                    workers_active=len(active_live),
+                    workers_draining=len(draining_live),
+                    workers_stale=stale_registered,
+                    workers_min=minimum,
+                    workers_max=maximum,
+                    restarts=restart_events,
+                    exhausted_capacity=exhausted_capacity,
+                    observed_http_rate=observed_http_rate,
+                    effective_rate=effective,
+                    target_rate=rate_target,
+                    rate_ceiling=plan.ceiling,
+                    control_healthy=not control_plane_degraded,
+                    heartbeat_age_seconds=heartbeat_age,
+                    elapsed_seconds=max(0.0, now - dashboard_started_at),
+                )
             )
 
             if now >= next_state_write and not control_plane_degraded:
@@ -1650,12 +1747,35 @@ def supervise_campaign(
                     states = _registered_worker_states(redis, run_id)
                     metrics = _with_retired_metrics(_worker_metrics(states), retired_metrics)
                     current = _live_progress(baseline, metrics)
-                    progress.update(
-                        current["terminal"],
-                        current["total"],
-                        detail=(
-                            f"draining | workers {len(states)} | "
-                            f"inflight {current['inflight']:,}"
+                    progress.render(
+                        _campaign_terminal_snapshot(
+                            run_id,
+                            status="draining",
+                            live_progress=current,
+                            live_metrics=_worker_metrics(states),
+                            campaign_metrics=metrics,
+                            workers_registered=len(states),
+                            workers_target=0,
+                            workers_active=sum(
+                                str(row.get("status", "")).lower() == "active"
+                                for row in states
+                            ),
+                            workers_draining=sum(
+                                str(row.get("status", "")).lower() == "draining"
+                                for row in states
+                            ),
+                            workers_stale=0,
+                            workers_min=minimum,
+                            workers_max=maximum,
+                            restarts=restart_events,
+                            exhausted_capacity=exhausted_capacity,
+                            observed_http_rate=observed_http_rate,
+                            effective_rate=last_effective_rate,
+                            target_rate=float(last_rate_target or plan.initial),
+                            rate_ceiling=plan.ceiling,
+                            control_healthy=True,
+                            heartbeat_age_seconds=None,
+                            elapsed_seconds=max(0.0, time.monotonic() - dashboard_started_at),
                         ),
                         force=True,
                     )

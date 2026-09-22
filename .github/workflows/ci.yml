@@ -68,3 +68,9 @@ jobs:
           python scripts/benchmark_redis_fast_path.py
           --redis-url "$DBD_REDIS_TEST_URL"
           --iterations 50
+      - name: Terminal dashboard benchmark
+        run: >-
+          python scripts/benchmark_terminal_dashboard.py
+          --iterations 2000
+          --max-average-ms 2
+          --max-p95-ms 5
