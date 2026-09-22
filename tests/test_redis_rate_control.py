@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from dbd.client.rate_control import EndpointRateController, RedisPacer
+from dbd.client.rate_control import AdmissionState, EndpointRateController, RedisPacer
 
 REDIS_URL = os.getenv("DBD_REDIS_TEST_URL")
 pytestmark = pytest.mark.skipif(not REDIS_URL, reason="DBD_REDIS_TEST_URL is not configured")
@@ -131,3 +131,51 @@ async def test_endpoint_penalty_is_immediately_visible_to_another_controller():
                 await endpoint.clear_state()
         await first.close()
         await second.close()
+
+
+
+async def test_half_open_success_is_fenced_to_probe_owner():
+    key = "dbd:test-half-open-owner:" + uuid4().hex
+    controller = EndpointRateController(
+        100,
+        redis_url=REDIS_URL,
+        redis_key=key,
+        shared_rate_ceiling=100,
+    )
+    await controller.open()
+    try:
+        state_key, opened_key, failures_key, window_key, probe_key = (
+            controller._breaker._keys("__global__")
+        )
+        await controller._redis.set(state_key, "half_open", px=60_000)
+        await controller._redis.set(probe_key, "real-owner", px=60_000)
+
+        await controller._shared_success_recovery(
+            None,
+            AdmissionState(
+                global_state="half_open",
+                probe_token="wrong-owner",
+                shared=True,
+            ),
+        )
+        assert await controller._redis.get(state_key) == "half_open"
+        assert await controller._redis.get(probe_key) == "real-owner"
+
+        await controller._shared_success_recovery(
+            None,
+            AdmissionState(
+                global_state="half_open",
+                probe_token="real-owner",
+                shared=True,
+            ),
+        )
+        assert await controller._redis.get(state_key) == "closed"
+        assert await controller._redis.get(probe_key) is None
+        assert await controller._redis.get(opened_key) is None
+        assert await controller._redis.get(failures_key) is None
+        assert await controller._redis.get(window_key) is None
+    finally:
+        await controller._redis.delete(
+            *controller._breaker._keys("__global__"),
+        )
+        await controller.close()
