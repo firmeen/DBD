@@ -271,7 +271,7 @@ def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) ->
             pass
 
     fake = FakeRedis()
-    monkeypatch.setattr(supervisor, "_redis_client", lambda: fake)
+    monkeypatch.setattr(supervisor, "_redis_client", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         supervisor,
         "settings",
