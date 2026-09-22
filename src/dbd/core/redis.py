@@ -35,3 +35,13 @@ def redis_pool_snapshot(client: Redis) -> dict[str, int]:
         "created": in_use + available,
         "max": maximum,
     }
+
+
+
+async def close_async_redis(client: Redis) -> None:
+    """Close a client and the worker-owned pool across supported redis-py versions."""
+    try:
+        await client.aclose(close_connection_pool=True)
+    except TypeError:
+        await client.aclose()
+        await client.connection_pool.disconnect()
