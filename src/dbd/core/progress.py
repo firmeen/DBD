@@ -255,7 +255,13 @@ class LiveCampaignDashboard:
         if not self._samples or now > self._samples[-1][0]:
             self._samples.append((now, int(snapshot.current)))
 
-    def _window_rate(self, now: float, window: float) -> float | None:
+    def _window_rate(
+        self,
+        now: float,
+        window: float,
+        *,
+        minimum_elapsed: float = 2.0,
+    ) -> float | None:
         if len(self._samples) < 2:
             return None
         latest_t, latest_value = self._samples[-1]
@@ -270,15 +276,19 @@ class LiveCampaignDashboard:
         start_t, start_value = candidate
         elapsed = latest_t - start_t
         delta = latest_value - start_value
-        if elapsed < min(2.0, window) or delta <= 0:
+        if elapsed < min(minimum_elapsed, window) or delta <= 0:
             return None
         return delta / elapsed
 
-    def _throughput(self, snapshot: TerminalSnapshot, now: float) -> tuple[float | None, float | None, float | None]:
+    def _throughput(
+        self,
+        snapshot: TerminalSnapshot,
+        now: float,
+    ) -> tuple[float | None, float | None, float | None]:
         self._remember_sample(snapshot, now)
-        current = self._window_rate(now, 5.0)
-        one_minute = self._window_rate(now, 60.0)
-        five_minutes = self._window_rate(now, 300.0)
+        current = self._window_rate(now, 5.0, minimum_elapsed=2.0)
+        one_minute = self._window_rate(now, 60.0, minimum_elapsed=10.0)
+        five_minutes = self._window_rate(now, 300.0, minimum_elapsed=30.0)
         return current, one_minute, five_minutes
 
     def _eta(
@@ -513,11 +523,9 @@ class LiveCampaignDashboard:
         if not self.enabled or self._closed:
             return
         try:
-            if self._tty and self._region_height:
-                self.stream.write(f"\x1b[{self._region_height}F")
-                for _ in range(self._region_height):
-                    self.stream.write("\x1b[2K\n")
-                self._region_height = 0
+            # _paint_region leaves the cursor directly below the fixed dashboard.
+            # Keep the final dashboard visible for post-run inspection and append
+            # only the terminal summary below it.
             if message:
                 self.stream.write(message.rstrip() + "\n")
             self.stream.flush()
