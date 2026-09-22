@@ -47,6 +47,10 @@ class FabricWorkerRepository(WorkerRepository):
     def preparation_metrics(self):
         return dict(self._preparation_metrics)
 
+    def _record_preparation_metrics(self, metrics):
+        for key in self._preparation_metrics:
+            self._preparation_metrics[key] += int(metrics.get(key, 0))
+
     def for_run(self, run):
         mode = str(run.get("scheduler_mode") or "legacy")
         if mode != self.scheduler_mode:
@@ -96,9 +100,17 @@ class FabricWorkerRepository(WorkerRepository):
             latest.setdefault(key, dict(row))
         return latest
 
-    async def _materialize_states(self, conn, run_id, rows, resources) -> None:
+    async def _materialize_states(self, conn, run_id, rows, resources):
+        batch_metrics = {
+            "companies": 0,
+            "changed": 0,
+            "stale": 0,
+            "forced": 0,
+            "skipped": 0,
+            "work_bearing": 0,
+        }
         if not rows:
-            return
+            return batch_metrics
         required = mask_for_endpoints(resources)
         run_fiscal_year, force_mask = await self._run_policy(conn, run_id)
         timestamp = now()
@@ -207,12 +219,12 @@ class FabricWorkerRepository(WorkerRepository):
             if not dirty:
                 REFRESH_PLAN_COMPANIES.labels("skipped").inc()
 
-            self._preparation_metrics["companies"] += 1
-            self._preparation_metrics["changed"] += int(bool(change_dirty))
-            self._preparation_metrics["stale"] += int(bool(stale_dirty))
-            self._preparation_metrics["forced"] += int(bool(forced_dirty))
-            self._preparation_metrics["skipped"] += int(not dirty)
-            self._preparation_metrics["work_bearing"] += int(bool(dirty))
+            batch_metrics["companies"] += 1
+            batch_metrics["changed"] += int(bool(change_dirty))
+            batch_metrics["stale"] += int(bool(stale_dirty))
+            batch_metrics["forced"] += int(bool(forced_dirty))
+            batch_metrics["skipped"] += int(not dirty)
+            batch_metrics["work_bearing"] += int(bool(dirty))
 
         await conn.execute(
             text("""
@@ -229,9 +241,11 @@ class FabricWorkerRepository(WorkerRepository):
             """),
             values,
         )
+        return batch_metrics
 
     @transaction_retry
     async def import_batch(self, run_id, identities, resources):
+        batch_metrics = None
         async with self.engine.begin() as conn:
             await conn.execute(
                 text("""
@@ -258,7 +272,8 @@ class FabricWorkerRepository(WorkerRepository):
                     parameters,
                 )
             ).mappings().all()
-            await self._materialize_states(conn, run_id, rows, resources)
+            batch_metrics = await self._materialize_states(conn, run_id, rows, resources)
+        self._record_preparation_metrics(batch_metrics or {})
 
     @transaction_retry
     async def enqueue_master(self, run_id, resources, after_id, batch_size, statuses=None):
@@ -277,10 +292,14 @@ class FabricWorkerRepository(WorkerRepository):
         )
         if statuses:
             query = query.bindparams(bindparam("statuses", expanding=True))
+        batch_metrics = None
+        last_id = None
         async with self.engine.begin() as conn:
             rows = (await conn.execute(query, params)).mappings().all()
-            await self._materialize_states(conn, run_id, rows, resources)
-            return int(rows[-1]["company_id"]) if rows else None
+            batch_metrics = await self._materialize_states(conn, run_id, rows, resources)
+            last_id = int(rows[-1]["company_id"]) if rows else None
+        self._record_preparation_metrics(batch_metrics or {})
+        return last_id
 
     async def _owned_state(self, conn, task, *, stage=None):
         stage = task.get("stage") if stage is None else stage
