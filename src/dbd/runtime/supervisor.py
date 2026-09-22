@@ -421,6 +421,47 @@ def _task_progress(run_id: int) -> dict[str, int]:
         }
 
 
+def _failure_diagnostics(run_id: int, limit: int = 8) -> list[dict]:
+    """Read-only top durable failure groups for explicit operator status commands."""
+    mode = _scheduler_mode(run_id)
+    with connect() as conn, conn.cursor() as cur:
+        if mode == "fabric_v2":
+            cur.execute(
+                """
+                SELECT
+                  COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                  COALESCE(NULLIF(next_endpoint,''),'resolved') AS endpoint,
+                  stage,
+                  COUNT(*) AS n,
+                  COALESCE(SUM(BIT_COUNT(failed_mask & ~dirty_mask)),0) AS resources
+                FROM company_collection_state
+                WHERE run_id=%s AND (status='failed' OR (failed_mask & ~dirty_mask)<>0)
+                GROUP BY error_code,endpoint,stage
+                ORDER BY resources DESC,n DESC,error_code
+                LIMIT %s
+                """,
+                (run_id, max(1, int(limit))),
+            )
+        else:
+            cur.execute(
+                """
+                SELECT
+                  COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                  endpoint,
+                  stage,
+                  COUNT(*) AS n,
+                  COUNT(*) AS resources
+                FROM endpoint_tasks
+                WHERE run_id=%s AND status='failed'
+                GROUP BY error_code,endpoint,stage
+                ORDER BY n DESC,error_code
+                LIMIT %s
+                """,
+                (run_id, max(1, int(limit))),
+            )
+        return [dict(row) for row in cur.fetchall()]
+
+
 def _has_active_work(run_id: int) -> bool:
     """Use scheduler indexes for a cheap completion probe without aggregating the run."""
     with connect() as conn, conn.cursor() as cur:
@@ -2016,6 +2057,7 @@ def campaign_status(run_id: int) -> dict:
 
     state["run_id"] = int(run_id)
     state["run_status"] = _run_status(run_id)
+    state["failure_diagnostics"] = _failure_diagnostics(run_id)
 
     if redis is not None:
         try:
