@@ -133,6 +133,64 @@ def test_discovery_keeps_exact_latest_delta_separate_from_pending_work():
     assert repeated["master_hash"] == changed_row["master_hash"]
 
 
+def test_older_search_observation_cannot_rewind_master_delta_state():
+    identity = _identity()
+    bucket = upsert_bucket(SearchFilters("delta-order-" + uuid4().hex))
+    t0 = datetime.now(timezone.utc).replace(tzinfo=None)
+
+    alpha = _profile(identity, name="Alpha")
+    save_page(
+        bucket_id=bucket,
+        profiles=[alpha],
+        archive_id=_archive(bucket, t0),
+        requested_at=t0,
+    )
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "UPDATE company_master SET pending_dirty_mask=0 "
+            "WHERE jp_type_code=%s AND jp_no=%s",
+            (identity.jp_type_code, identity.jp_no),
+        )
+        conn.commit()
+
+    t2 = t0 + timedelta(minutes=2)
+    beta_archive = _archive(bucket, t2)
+    beta = _profile(identity, name="Beta")
+    save_page(
+        bucket_id=bucket,
+        profiles=[beta],
+        archive_id=beta_archive,
+        requested_at=t2,
+    )
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT master_hash,change_mask,pending_dirty_mask,"
+            "master_observed_at,latest_search_archive_id "
+            "FROM company_master WHERE jp_type_code=%s AND jp_no=%s",
+            (identity.jp_type_code, identity.jp_no),
+        )
+        newest = cur.fetchone()
+
+    older = t0 + timedelta(minutes=1)
+    save_page(
+        bucket_id=bucket,
+        profiles=[_profile(identity, name="Older Gamma")],
+        archive_id=_archive(bucket, older),
+        requested_at=older,
+    )
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT master_hash,change_mask,pending_dirty_mask,"
+            "master_observed_at,latest_search_archive_id "
+            "FROM company_master WHERE jp_type_code=%s AND jp_no=%s",
+            (identity.jp_type_code, identity.jp_no),
+        )
+        after = cur.fetchone()
+
+    assert after == newest
+    assert after["latest_search_archive_id"] == beta_archive
+
+
 async def test_fabric_skips_fresh_unchanged_resources_without_http(repo):
     identity = _identity()
     resources = ("profile", "committees")
