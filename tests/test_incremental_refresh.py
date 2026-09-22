@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
-from test_fabric_runtime import FullFabricApi, NoFetchApi
+from test_fabric_runtime import FabricApi, FullFabricApi, NoFetchApi
 
 from dbd.client.endpoints.search import SearchFilters
 from dbd.contracts.company import CompanyProfile
@@ -239,6 +239,44 @@ async def test_successful_projection_clears_change_bits_only_for_planned_master_
     _, run_id = await _fabric_run(repo, identity, resources)
     await process(repo, run_id, concurrency=1, client_factory=FullFabricApi)
 
+    async with repo.engine.connect() as conn:
+        pending = (
+            await conn.execute(
+                text(
+                    "SELECT pending_dirty_mask FROM company_master "
+                    "WHERE jp_type_code=:kind AND jp_no=:no"
+                ),
+                {"kind": identity.jp_type_code, "no": identity.jp_no},
+            )
+        ).scalar_one()
+    assert int(pending) == 0
+
+
+async def test_profile_without_fiscal_acknowledges_implicit_financial_change_bits(repo):
+    identity = _identity()
+    resources = ("profile", "financial_statements")
+    dirty = mask_for_endpoints(resources)
+
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "INSERT INTO company_master("
+                "jp_no,jp_type_code,master_hash,pending_dirty_mask,first_seen_at,last_seen_at"
+                ") VALUES (:no,:kind,'stable-master',:dirty,UTC_TIMESTAMP(6),UTC_TIMESTAMP(6))"
+            ),
+            {
+                "no": identity.jp_no,
+                "kind": identity.jp_type_code,
+                "dirty": dirty,
+            },
+        )
+
+    FabricApi.calls = 0
+    _, run_id = await _fabric_run(repo, identity, resources)
+    result = await process(repo, run_id, concurrency=1, client_factory=FabricApi)
+
+    assert result == {"not_available": 1, "done": 1}
+    assert FabricApi.calls == 1
     async with repo.engine.connect() as conn:
         pending = (
             await conn.execute(
