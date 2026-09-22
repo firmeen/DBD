@@ -686,6 +686,7 @@ def page_progress(bucket_id):
 
 
 def reset_discovery(refresh=False, bucket_id=None):
+    """Reset discovery work and return an operator-visible mutation summary."""
     with connect() as conn, conn.cursor() as cur:
         if refresh:
             parameters = (bucket_id,) if bucket_id else ()
@@ -696,15 +697,24 @@ def reset_discovery(refresh=False, bucket_id=None):
                 + ("WHERE id=%s AND status<>'split'" if bucket_id else "WHERE status<>'split'"),
                 parameters,
             )
+            buckets_reset = int(cur.rowcount or 0)
             cur.execute(
                 "UPDATE discovery_rejections SET resolved_at=UTC_TIMESTAMP(6) "
                 + ("WHERE bucket_id=%s AND resolved_at IS NULL" if bucket_id else "WHERE resolved_at IS NULL"),
                 parameters,
             )
+            rejections_resolved = int(cur.rowcount or 0)
             cur.execute(
                 "DELETE FROM discovery_pages" + (" WHERE bucket_id=%s" if bucket_id else ""),
                 parameters,
             )
+            pages_deleted = int(cur.rowcount or 0)
+            result = {
+                "bucket_id": bucket_id,
+                "buckets_reset": buckets_reset,
+                "rejections_resolved": rejections_resolved,
+                "pages_deleted": pages_deleted,
+            }
         else:
             cur.execute(
                 """
@@ -714,4 +724,6 @@ def reset_discovery(refresh=False, bucket_id=None):
                 WHERE status='failed'
                 """
             )
+            result = {"buckets_requeued": int(cur.rowcount or 0)}
         conn.commit()
+        return result
