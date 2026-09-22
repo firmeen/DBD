@@ -44,6 +44,18 @@ class LegacyProjectionScheduler:
         return None
 
 
+class ReplayProjectionScheduler:
+    """Freshness-protected historical replay without mutating scheduler state."""
+
+    mode = "replay"
+
+    def lock(self, cur, task: dict):
+        return None
+
+    def finish(self, cur, task, state, outcome, archive_id, normalized):
+        return None
+
+
 class FabricProjectionScheduler:
     mode = "fabric_v2"
 
@@ -145,4 +157,6 @@ def projection_scheduler(mode: str):
         return LegacyProjectionScheduler()
     if mode == "fabric_v2":
         return FabricProjectionScheduler()
+    if mode == "replay":
+        return ReplayProjectionScheduler()
     raise ValueError(f"Unsupported scheduler mode {mode!r}")

@@ -93,19 +93,26 @@ async def worker_command(args, health=None):
                     )
                     print(json.dumps([dict(r) for r in rows], default=str, indent=2))
                 return
+            run = await repo.get_run(args.run_id)
+            scheduler_repo = repo.for_run(run)
             print(
                 json.dumps(
                     {
-                        "status": await repo.progress(args.run_id),
-                        "stages": await repo.progress_by_stage(args.run_id),
+                        "scheduler_mode": scheduler_repo.scheduler_mode,
+                        "status": await scheduler_repo.progress(args.run_id),
+                        "stages": await scheduler_repo.progress_by_stage(args.run_id),
                     },
                     indent=2,
                 )
             )
             return
         if args.command == "bulk-retry":
-            await repo.get_run(args.run_id)
-            print(f"Requeued {await repo.retry_failed(args.run_id)} tasks in run {args.run_id}")
+            run = await repo.get_run(args.run_id)
+            scheduler_repo = repo.for_run(run)
+            print(
+                f"Requeued {await scheduler_repo.retry_failed(args.run_id)} "
+                f"work item(s) in run {args.run_id}"
+            )
             return
         if args.command == "fetch-company":
             parsed = parse_code(args.company_code)

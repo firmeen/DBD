@@ -346,9 +346,53 @@ def _rate_target_key(rate_key: str) -> str:
     return f"{rate_key}:target-rate"
 
 
-def _task_progress(run_id: int) -> dict[str, int]:
-    """Exact durable reconciliation snapshot; never use this as the live hot path."""
+def _scheduler_mode(run_id: int) -> str:
     with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT scheduler_mode FROM worker_runs WHERE id=%s", (run_id,))
+        row = cur.fetchone()
+    if row is None:
+        raise ValueError(f"Run {run_id} not found")
+    return str(row["scheduler_mode"] or "legacy")
+
+
+def _task_progress(run_id: int) -> dict[str, int]:
+    """Exact logical-resource reconciliation; never use this as the live hot path."""
+    mode = _scheduler_mode(run_id)
+    with connect() as conn, conn.cursor() as cur:
+        if mode == "fabric_v2":
+            cur.execute(
+                """
+                SELECT
+                  COALESCE(SUM(BIT_COUNT(required_mask)),0) AS total,
+                  COALESCE(SUM(BIT_COUNT(done_mask)),0) AS done,
+                  COALESCE(SUM(BIT_COUNT(not_available_mask)),0) AS not_available,
+                  COALESCE(SUM(BIT_COUNT(failed_mask)),0) AS failed,
+                  COALESCE(SUM(status='running'),0) AS running,
+                  COALESCE(SUM(status='retry_wait'),0) AS retry_wait
+                FROM company_collection_state WHERE run_id=%s
+                """,
+                (run_id,),
+            )
+            row = cur.fetchone() or {}
+            result = {
+                key: int(row.get(key) or 0)
+                for key in (
+                    "total",
+                    "retry_wait",
+                    "running",
+                    "failed",
+                    "done",
+                    "not_available",
+                )
+            }
+            terminal = result["done"] + result["not_available"] + result["failed"]
+            result["pending"] = max(
+                0,
+                result["total"] - terminal - result["running"] - result["retry_wait"],
+            )
+            return result
+        if mode != "legacy":
+            raise ValueError(f"Unsupported scheduler mode {mode!r}")
         cur.execute(
             """
             SELECT COUNT(*) AS total,
@@ -378,12 +422,25 @@ def _task_progress(run_id: int) -> dict[str, int]:
 
 
 def _has_active_work(run_id: int) -> bool:
-    """Use the queue index for a cheap completion probe instead of aggregating the run."""
+    """Use scheduler indexes for a cheap completion probe without aggregating the run."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT 1 FROM endpoint_tasks
-            WHERE run_id=%s AND status IN ('pending','running','retry_wait')
+            SELECT 1
+            FROM worker_runs r
+            WHERE r.id=%s AND (
+              (r.scheduler_mode='legacy' AND EXISTS(
+                SELECT 1 FROM endpoint_tasks t
+                WHERE t.run_id=r.id AND t.status IN ('pending','running','retry_wait')
+                LIMIT 1
+              ))
+              OR
+              (r.scheduler_mode='fabric_v2' AND EXISTS(
+                SELECT 1 FROM company_collection_state s
+                WHERE s.run_id=r.id AND s.status IN ('pending','running','retry_wait')
+                LIMIT 1
+              ))
+            )
             LIMIT 1
             """,
             (run_id,),
@@ -975,27 +1032,29 @@ def _terminate_workers(workers: list[WorkerProcess]) -> None:
 
 
 def _release_dead_worker_leases(run_id: int, worker_id: str) -> int:
-    """Immediately reclaim only after the local process tree is confirmed dead."""
+    """Immediately reclaim leases from either scheduler after process death."""
     try:
         with connect() as conn, conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE endpoint_tasks
-                SET status='pending',lease_owner=NULL,lease_expires_at=NULL,
-                  attempts=CASE
-                    WHEN stage='fetch' AND attempts>0 THEN attempts-1
-                    ELSE attempts
-                  END,
-                  project_attempts=CASE
-                    WHEN stage='project' AND project_attempts>0 THEN project_attempts-1
-                    ELSE project_attempts
-                  END,
-                  available_at=UTC_TIMESTAMP(6),last_error='worker_process_lost'
-                WHERE run_id=%s AND lease_owner=%s AND status='running'
-                """,
-                (run_id, worker_id),
-            )
-            reclaimed = int(cur.rowcount or 0)
+            reclaimed = 0
+            for table in ("endpoint_tasks", "company_collection_state"):
+                cur.execute(
+                    f"""
+                    UPDATE {table}
+                    SET status='pending',lease_owner=NULL,lease_expires_at=NULL,
+                      attempts=CASE
+                        WHEN stage='fetch' AND attempts>0 THEN attempts-1
+                        ELSE attempts
+                      END,
+                      project_attempts=CASE
+                        WHEN stage='project' AND project_attempts>0
+                        THEN project_attempts-1 ELSE project_attempts
+                      END,
+                      available_at=UTC_TIMESTAMP(6),last_error='worker_process_lost'
+                    WHERE run_id=%s AND lease_owner=%s AND status='running'
+                    """,
+                    (run_id, worker_id),
+                )
+                reclaimed += int(cur.rowcount or 0)
             conn.commit()
             return reclaimed
     except Exception:
