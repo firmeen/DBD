@@ -12,7 +12,6 @@ from urllib.parse import urlsplit
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-
 LOCAL_HOST = "127.0.0.1"
 LOCAL_PORT = int(os.getenv("DBD_CLIENT_LOCAL_PORT", "13307"))
 CHUNK_SIZE = 64 * 1024
