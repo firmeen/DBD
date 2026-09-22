@@ -202,15 +202,54 @@ def _add_campaign_worker_options(parser):
         help="Maximum local worker processes; scale-down is always graceful",
     )
     parser.add_argument("--worker-concurrency", type=positive, default=8)
-    parser.add_argument("--worker-rate", type=positive_rate, default=settings.dbd_rate_per_second)
+    parser.add_argument(
+        "--worker-rate",
+        type=positive_rate,
+        default=settings.dbd_rate_per_second,
+        help="Legacy/local rate input; explicit fleet-rate options decouple the fleet ceiling",
+    )
     parser.add_argument(
         "--rate-mode",
         choices=("shared", "multiply", "adaptive"),
         default="adaptive",
         help=(
-            "shared=fleet cap, multiply=worker-rate x workers-max, "
-            "adaptive=scaled ceiling with conservative initial rate"
+            "Legacy rate derivation when fleet-rate options are omitted. "
+            "Explicit fleet-rate options keep the HTTP budget independent of worker count."
         ),
+    )
+    parser.add_argument(
+        "--fleet-rate-initial",
+        type=positive_rate,
+        help="Initial shared fleet rate; enables worker-independent fleet admission",
+    )
+    parser.add_argument(
+        "--fleet-rate-max",
+        type=positive_rate,
+        help="Hard shared fleet rate ceiling, independent of workers-max",
+    )
+    parser.add_argument(
+        "--fleet-db-connections-max",
+        type=positive,
+        default=settings.dbd_fleet_db_connections_max,
+        help="Maximum long-lived campaign MySQL connections across supervisor + max workers",
+    )
+    parser.add_argument(
+        "--fleet-archive-workers-max",
+        type=positive,
+        default=settings.dbd_fleet_archive_workers_max,
+        help="Maximum archive worker slots across the configured maximum fleet",
+    )
+    parser.add_argument(
+        "--fleet-projection-workers-max",
+        type=positive,
+        default=settings.dbd_fleet_projection_workers_max,
+        help="Maximum projection worker slots across the configured maximum fleet",
+    )
+    parser.add_argument(
+        "--fleet-redis-connections-max",
+        type=positive,
+        default=settings.dbd_fleet_redis_connections_max,
+        help="Maximum Redis pool connections reserved by the long-lived campaign fleet",
     )
     parser.add_argument("--max-restarts", type=non_negative, default=3)
     display = parser.add_mutually_exclusive_group()
@@ -255,6 +294,12 @@ def _campaign_command(args) -> None:
         worker_concurrency=args.worker_concurrency,
         worker_rate=args.worker_rate,
         rate_mode=args.rate_mode,
+        fleet_rate_initial=args.fleet_rate_initial,
+        fleet_rate_max=args.fleet_rate_max,
+        fleet_db_connections_max=args.fleet_db_connections_max,
+        fleet_archive_workers_max=args.fleet_archive_workers_max,
+        fleet_projection_workers_max=args.fleet_projection_workers_max,
+        fleet_redis_connections_max=args.fleet_redis_connections_max,
         open_powershell=args.open_powershell,
         max_restarts=args.max_restarts,
     )

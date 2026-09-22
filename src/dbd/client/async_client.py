@@ -86,6 +86,7 @@ class AsyncDbdClient:
             redis_url=redis_url,
             redis_key=redis_key or settings.dbd_redis_rate_key,
             shared_rate_ceiling=settings.dbd_fleet_rate_ceiling,
+            redis_max_connections=settings.dbd_redis_max_connections,
             circuit_failure_threshold=settings.dbd_circuit_failure_threshold,
             circuit_window_seconds=settings.dbd_circuit_window_seconds,
             circuit_open_seconds=settings.dbd_circuit_open_seconds,

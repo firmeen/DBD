@@ -199,7 +199,11 @@ async def process(
     }
 
     if distributed:
-        coordinator = CampaignCoordinator(settings.dbd_redis_url, run_id)
+        coordinator = CampaignCoordinator(
+            settings.dbd_redis_url,
+            run_id,
+            max_connections=settings.dbd_redis_max_connections,
+        )
         await coordinator.open()
         identity = WorkerIdentity(owner, int(run_id), os.getpid())
         registration_status = await coordinator.register_worker(identity)

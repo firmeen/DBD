@@ -113,6 +113,7 @@ return {tostring(new_rate), tostring(new_rate)}
         rate_per_second: float,
         *,
         client: Redis | None = None,
+        max_connections: int | None = None,
     ):
         self.url = url
         self.key = key
@@ -120,6 +121,7 @@ return {tostring(new_rate), tostring(new_rate)}
         self.target_rate = self.rate
         self._redis: Redis | None = client
         self._owns_redis = client is None
+        self._max_connections = max_connections
         self._state_ttl_ms = 600_000
 
     @property
@@ -134,7 +136,10 @@ return {tostring(new_rate), tostring(new_rate)}
 
     async def open(self) -> None:
         if self._redis is None:
-            self._redis = Redis.from_url(self.url, decode_responses=True)
+            kwargs = {"decode_responses": True}
+            if self._max_connections is not None:
+                kwargs["max_connections"] = max(1, int(self._max_connections))
+            self._redis = Redis.from_url(self.url, **kwargs)
             await self._redis.ping()
 
     async def close(self) -> None:
@@ -232,6 +237,7 @@ class EndpointRateController:
         redis_url: str | None = None,
         redis_key: str = "dbd:global-rate",
         shared_rate_ceiling: float | None = None,
+        redis_max_connections: int | None = None,
         circuit_failure_threshold: int = 5,
         circuit_window_seconds: float = 30.0,
         circuit_open_seconds: float = 30.0,
@@ -246,7 +252,10 @@ class EndpointRateController:
         }
         self._redis_url = redis_url
         self._redis_key = redis_key
-        self._redis = Redis.from_url(redis_url, decode_responses=True) if redis_url else None
+        redis_kwargs = {"decode_responses": True}
+        if redis_max_connections is not None:
+            redis_kwargs["max_connections"] = max(1, int(redis_max_connections))
+        self._redis = Redis.from_url(redis_url, **redis_kwargs) if redis_url else None
         self._global_local = TokenBucket(self.target_rate)
         self._global_shared = (
             RedisPacer(

@@ -38,6 +38,9 @@ _WORKER_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 _WORKER_DRAIN_TIMEOUT_SECONDS = 90.0
 _WORKER_KILL_WAIT_SECONDS = 5.0
 _RATE_STATE_TTL_SECONDS = 600
+_DB_POOLS_PER_WORKER = 2
+_REDIS_CLIENTS_PER_WORKER = 2
+_REDIS_SUPERVISOR_CLIENTS = 1
 
 
 @dataclass
@@ -62,6 +65,41 @@ class CampaignRatePlan:
     workers: int
     ceiling: float
     initial: float
+    independent: bool = False
+
+
+@dataclass(frozen=True)
+class CampaignResourcePlan:
+    max_workers: int
+    supervisor_db_pool: int
+    db_connections_budget: int
+    db_pool_per_worker: int
+    archive_workers_budget: int
+    archive_workers_per_worker: int
+    projection_workers_budget: int
+    projection_workers_per_worker: int
+    redis_connections_budget: int
+    redis_connections_per_client: int
+
+    @property
+    def db_connections_effective_max(self) -> int:
+        return self.supervisor_db_pool + (
+            self.db_pool_per_worker * _DB_POOLS_PER_WORKER * self.max_workers
+        )
+
+    @property
+    def archive_workers_effective_max(self) -> int:
+        return self.archive_workers_per_worker * self.max_workers
+
+    @property
+    def projection_workers_effective_max(self) -> int:
+        return self.projection_workers_per_worker * self.max_workers
+
+    @property
+    def redis_connections_effective_max(self) -> int:
+        return self.redis_connections_per_client * (
+            _REDIS_SUPERVISOR_CLIENTS + _REDIS_CLIENTS_PER_WORKER * self.max_workers
+        )
 
 
 @dataclass
@@ -80,11 +118,20 @@ class AutoscaleController:
         current: int,
         effective_maximum: int,
         now: float,
+        fetch_queue: int = 0,
+        archive_queue: int = 0,
+        project_queue: int = 0,
+        observed_http_rate: float | None = None,
+        rate_target: float | None = None,
+        rate_limit_delta: int = 0,
     ) -> int:
-        """Return at most one safe fleet-size step with asymmetric hysteresis."""
+        """Scale only when the pipeline needs capacity and downstream is healthy."""
         current = max(0, int(current))
         pending = max(0, int(pending))
         running = max(0, int(running))
+        fetch_queue = max(0, int(fetch_queue))
+        archive_queue = max(0, int(archive_queue))
+        project_queue = max(0, int(project_queue))
         effective_maximum = max(0, min(int(effective_maximum), self.maximum))
         minimum = min(self.minimum, effective_maximum)
         capacity = max(1, int(self.worker_concurrency))
@@ -96,7 +143,23 @@ class AutoscaleController:
         if now < self.next_decision_at:
             return current
 
-        if current < effective_maximum and pending > max(capacity, current * capacity * 4):
+        downstream_limit = max(capacity * 2, current * capacity * 2)
+        downstream_backlog = (
+            archive_queue > downstream_limit or project_queue > downstream_limit
+        )
+        if rate_limit_delta > 0 or downstream_backlog:
+            self.low_pressure_observations = 0
+            self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
+            return current
+
+        high_pending = pending > max(capacity, current * capacity * 4)
+        queue_starved = fetch_queue <= max(capacity, current * capacity)
+        under_rate = (
+            observed_http_rate is None
+            or rate_target is None
+            or observed_http_rate < (float(rate_target) * 0.90)
+        )
+        if current < effective_maximum and high_pending and (queue_starved or under_rate):
             self.low_pressure_observations = 0
             self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
             return current + 1
@@ -120,6 +183,8 @@ def build_rate_plan(
     workers: int,
     *,
     initial_workers: int | None = None,
+    fleet_rate_initial: float | None = None,
+    fleet_rate_max: float | None = None,
 ) -> CampaignRatePlan:
     if mode not in _RATE_MODES:
         raise ValueError(f"rate mode must be one of {sorted(_RATE_MODES)}")
@@ -128,6 +193,17 @@ def build_rate_plan(
     initial_workers = workers if initial_workers is None else int(initial_workers)
     if worker_rate <= 0 or workers < 1 or not 1 <= initial_workers <= workers:
         raise ValueError("worker rate/count and initial worker count must be positive and ordered")
+
+    independent = fleet_rate_initial is not None or fleet_rate_max is not None
+    if independent:
+        ceiling = float(fleet_rate_max if fleet_rate_max is not None else fleet_rate_initial)
+        initial = float(
+            fleet_rate_initial if fleet_rate_initial is not None else min(worker_rate, ceiling)
+        )
+        if initial <= 0 or ceiling <= 0 or initial > ceiling:
+            raise ValueError("fleet rate must satisfy 0 < initial <= max")
+        return CampaignRatePlan(mode, ceiling, workers, ceiling, initial, True)
+
     if mode == "shared":
         ceiling = initial = worker_rate
     elif mode == "multiply":
@@ -136,7 +212,94 @@ def build_rate_plan(
     else:
         ceiling = worker_rate * workers
         initial = worker_rate
-    return CampaignRatePlan(mode, worker_rate, workers, ceiling, initial)
+    return CampaignRatePlan(mode, worker_rate, workers, ceiling, initial, False)
+
+
+def build_resource_plan(
+    max_workers: int,
+    *,
+    db_pool_size: int,
+    archive_workers: int,
+    projection_workers: int,
+    redis_max_connections: int,
+    db_connections_max: int | None = None,
+    archive_workers_max: int | None = None,
+    projection_workers_max: int | None = None,
+    redis_connections_max: int | None = None,
+) -> CampaignResourcePlan:
+    max_workers = int(max_workers)
+    db_pool_size = int(db_pool_size)
+    archive_workers = int(archive_workers)
+    projection_workers = int(projection_workers)
+    redis_max_connections = int(redis_max_connections)
+    if min(max_workers, db_pool_size, archive_workers, projection_workers, redis_max_connections) < 1:
+        raise ValueError("worker/resource defaults must be positive")
+
+    supervisor_db_pool = db_pool_size
+    db_budget = int(
+        db_connections_max
+        if db_connections_max is not None
+        else supervisor_db_pool + (max_workers * _DB_POOLS_PER_WORKER * db_pool_size)
+    )
+    db_per_worker = min(
+        db_pool_size,
+        (db_budget - supervisor_db_pool) // (max_workers * _DB_POOLS_PER_WORKER),
+    )
+    if db_per_worker < 1:
+        minimum = supervisor_db_pool + (max_workers * _DB_POOLS_PER_WORKER)
+        raise ValueError(
+            f"fleet DB connection budget {db_budget} is too small; "
+            f"need at least {minimum} for workers-max={max_workers}"
+        )
+
+    archive_budget = int(
+        archive_workers_max if archive_workers_max is not None else max_workers * archive_workers
+    )
+    archive_per_worker = min(archive_workers, archive_budget // max_workers, db_per_worker)
+    if archive_per_worker < 1:
+        raise ValueError(
+            f"fleet archive-worker budget {archive_budget} is too small; need at least {max_workers}"
+        )
+
+    projection_budget = int(
+        projection_workers_max
+        if projection_workers_max is not None
+        else max_workers * min(projection_workers, db_pool_size)
+    )
+    projection_per_worker = min(
+        projection_workers, projection_budget // max_workers, db_per_worker
+    )
+    if projection_per_worker < 1:
+        raise ValueError(
+            f"fleet projection-worker budget {projection_budget} is too small; "
+            f"need at least {max_workers}"
+        )
+
+    redis_clients = _REDIS_SUPERVISOR_CLIENTS + (_REDIS_CLIENTS_PER_WORKER * max_workers)
+    redis_budget = int(
+        redis_connections_max
+        if redis_connections_max is not None
+        else redis_clients * redis_max_connections
+    )
+    redis_per_client = min(redis_max_connections, redis_budget // redis_clients)
+    if redis_per_client < 1:
+        raise ValueError(
+            f"fleet Redis connection budget {redis_budget} is too small; "
+            f"need at least {redis_clients} for workers-max={max_workers}"
+        )
+
+    return CampaignResourcePlan(
+        max_workers=max_workers,
+        supervisor_db_pool=supervisor_db_pool,
+        db_connections_budget=db_budget,
+        db_pool_per_worker=db_per_worker,
+        archive_workers_budget=archive_budget,
+        archive_workers_per_worker=archive_per_worker,
+        projection_workers_budget=projection_budget,
+        projection_workers_per_worker=projection_per_worker,
+        redis_connections_budget=redis_budget,
+        redis_connections_per_client=redis_per_client,
+    )
 
 
 def _next_worker_target(
@@ -263,6 +426,7 @@ def _spawn_worker(
     rate: float,
     fleet_rate_ceiling: float | None,
     open_powershell: bool,
+    resource_plan: CampaignResourcePlan | None = None,
     restart_count: int = 0,
 ) -> WorkerProcess:
     """Spawn one worker atomically; no log handle survives a failed Popen."""
@@ -271,6 +435,11 @@ def _spawn_worker(
     env["DBD_WORKER_ID"] = worker_id
     if fleet_rate_ceiling is not None:
         env["DBD_FLEET_RATE_CEILING"] = str(float(fleet_rate_ceiling))
+    if resource_plan is not None:
+        env["DB_POOL_SIZE"] = str(resource_plan.db_pool_per_worker)
+        env["DBD_ARCHIVE_WORKERS"] = str(resource_plan.archive_workers_per_worker)
+        env["DBD_PROJECTION_WORKERS"] = str(resource_plan.projection_workers_per_worker)
+        env["DBD_REDIS_MAX_CONNECTIONS"] = str(resource_plan.redis_connections_per_client)
     command = _worker_command(run_id, concurrency=concurrency, rate=rate)
     creationflags = 0
     start_new_session = False
@@ -412,6 +581,8 @@ def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
 
 
 def _fleet_rate_target(plan: CampaignRatePlan, rate_workers: int) -> float:
+    if plan.independent:
+        return plan.ceiling
     if plan.mode == "shared":
         return plan.worker_rate
     return min(plan.ceiling, plan.worker_rate * max(1, int(rate_workers)))
@@ -446,14 +617,16 @@ def _registered_workers(redis: Redis, run_id: int) -> int:
     return len(_registered_worker_states(redis, run_id))
 
 
-def _redis_client() -> Redis:
-    return Redis.from_url(
-        settings.dbd_redis_url,
-        decode_responses=True,
-        socket_timeout=_REDIS_SOCKET_TIMEOUT_SECONDS,
-        socket_connect_timeout=_REDIS_CONNECT_TIMEOUT_SECONDS,
-        health_check_interval=15,
-    )
+def _redis_client(max_connections: int | None = None) -> Redis:
+    kwargs = {
+        "decode_responses": True,
+        "socket_timeout": _REDIS_SOCKET_TIMEOUT_SECONDS,
+        "socket_connect_timeout": _REDIS_CONNECT_TIMEOUT_SECONDS,
+        "health_check_interval": 15,
+    }
+    if max_connections is not None:
+        kwargs["max_connections"] = max(1, int(max_connections))
+    return Redis.from_url(settings.dbd_redis_url, **kwargs)
 
 
 def _is_transient_redis_error(exc: BaseException) -> bool:
@@ -854,6 +1027,12 @@ def supervise_campaign(
     worker_concurrency: int,
     worker_rate: float,
     rate_mode: str = "adaptive",
+    fleet_rate_initial: float | None = None,
+    fleet_rate_max: float | None = None,
+    fleet_db_connections_max: int | None = None,
+    fleet_archive_workers_max: int | None = None,
+    fleet_projection_workers_max: int | None = None,
+    fleet_redis_connections_max: int | None = None,
     open_powershell: bool = False,
     max_restarts: int = 3,
     workers_min: int | None = None,
@@ -873,10 +1052,44 @@ def supervise_campaign(
 
     initial_workers = requested_workers
     autoscale = minimum != maximum
-    plan = build_rate_plan(rate_mode, worker_rate, maximum, initial_workers=initial_workers)
+    plan = build_rate_plan(
+        rate_mode,
+        worker_rate,
+        maximum,
+        initial_workers=initial_workers,
+        fleet_rate_initial=fleet_rate_initial,
+        fleet_rate_max=fleet_rate_max,
+    )
+    resource_plan = build_resource_plan(
+        maximum,
+        db_pool_size=settings.db_pool_size,
+        archive_workers=settings.dbd_archive_workers,
+        projection_workers=settings.dbd_projection_workers,
+        redis_max_connections=settings.dbd_redis_max_connections,
+        db_connections_max=(
+            settings.dbd_fleet_db_connections_max
+            if fleet_db_connections_max is None
+            else fleet_db_connections_max
+        ),
+        archive_workers_max=(
+            settings.dbd_fleet_archive_workers_max
+            if fleet_archive_workers_max is None
+            else fleet_archive_workers_max
+        ),
+        projection_workers_max=(
+            settings.dbd_fleet_projection_workers_max
+            if fleet_projection_workers_max is None
+            else fleet_projection_workers_max
+        ),
+        redis_connections_max=(
+            settings.dbd_fleet_redis_connections_max
+            if fleet_redis_connections_max is None
+            else fleet_redis_connections_max
+        ),
+    )
     controller = AutoscaleController(minimum, maximum, worker_concurrency)
 
-    redis = _redis_client()
+    redis = _redis_client(resource_plan.redis_connections_per_client)
     token = f"{os.getpid()}-{uuid4().hex}"
     children: list[WorkerProcess] = []
     next_index = 1
@@ -899,6 +1112,11 @@ def supervise_campaign(
     final_snapshot: dict[str, int] | None = None
     registered_states: list[dict] = []
     retired_metrics: dict[str, int] = {}
+    http_sample_at = 0.0
+    http_sample_requests = 0
+    http_sample_rate_limit_hits = 0
+    observed_http_rate: float | None = None
+    recent_rate_limit_delta = 0
     progress = ProgressLine(f"CAMPAIGN {run_id}", interval=0.75)
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
@@ -911,6 +1129,7 @@ def supervise_campaign(
             rate=plan.worker_rate,
             fleet_rate_ceiling=plan.ceiling,
             open_powershell=open_powershell,
+            resource_plan=resource_plan,
             restart_count=restarts,
         )
         if restart_index is None:
@@ -983,6 +1202,9 @@ def supervise_campaign(
         has_work = _has_active_work(run_id)
 
         now = time.monotonic()
+        http_sample_at = now
+        if autoscale:
+            controller.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
         last_lease_confirmed = now
         next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
         next_work_check = now + _DURABLE_WORK_CHECK_SECONDS
@@ -1010,10 +1232,23 @@ def supervise_campaign(
             workers_draining=0,
             exhausted_capacity=0,
             worker_concurrency=worker_concurrency,
-            worker_rate=worker_rate,
+            worker_rate=plan.worker_rate,
             rate_mode=rate_mode,
+            rate_independent=plan.independent,
+            fleet_rate_initial=plan.initial,
+            fleet_rate_max=plan.ceiling,
             rate_target=initial_rate_target,
             rate_ceiling=plan.ceiling,
+            db_connections_budget=resource_plan.db_connections_budget,
+            db_connections_effective_max=resource_plan.db_connections_effective_max,
+            db_pool_per_worker=resource_plan.db_pool_per_worker,
+            archive_workers_budget=resource_plan.archive_workers_budget,
+            archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+            projection_workers_budget=resource_plan.projection_workers_budget,
+            projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+            redis_connections_budget=resource_plan.redis_connections_budget,
+            redis_connections_effective_max=resource_plan.redis_connections_effective_max,
+            redis_connections_per_client=resource_plan.redis_connections_per_client,
         )
 
         while True:
@@ -1041,6 +1276,7 @@ def supervise_campaign(
                 else:
                     next_lease_refresh = now + _SUPERVISOR_REFRESH_SECONDS
 
+            worker_state_refreshed = False
             if now >= next_worker_refresh:
                 try:
                     registered_states = _registered_worker_states(redis, run_id)
@@ -1051,9 +1287,21 @@ def supervise_campaign(
                     next_worker_refresh = now + _REDIS_RETRY_SECONDS
                 else:
                     next_worker_refresh = now + _WORKER_STATE_REFRESH_SECONDS
+                    worker_state_refreshed = True
 
             live_metrics = _worker_metrics(registered_states)
             campaign_metrics = _with_retired_metrics(live_metrics, retired_metrics)
+            if worker_state_refreshed:
+                elapsed = max(0.001, now - http_sample_at)
+                current_requests = int(campaign_metrics.get("requests", 0))
+                current_rate_limit_hits = int(campaign_metrics.get("rate_limit_hits", 0))
+                observed_http_rate = max(0, current_requests - http_sample_requests) / elapsed
+                recent_rate_limit_delta = max(
+                    0, current_rate_limit_hits - http_sample_rate_limit_hits
+                )
+                http_sample_at = now
+                http_sample_requests = current_requests
+                http_sample_rate_limit_hits = current_rate_limit_hits
             live_progress = _live_progress(baseline, campaign_metrics)
             total = live_progress["total"]
             pending = live_progress["pending_estimate"]
@@ -1168,13 +1416,24 @@ def supervise_campaign(
                 break
 
             target = len(active_live)
+            current_effective_rate = None
             if autoscale and not graceful_stop and not control_plane_degraded:
+                if plan.independent:
+                    current_effective_rate = _effective_rate(
+                        redis, settings.dbd_redis_rate_key, plan.initial
+                    )
                 target = controller.target(
                     pending=pending,
                     running=running,
                     current=len(active_live),
                     effective_maximum=effective_maximum,
                     now=now,
+                    fetch_queue=live_metrics.get("fetch_queue", 0),
+                    archive_queue=live_metrics.get("archive_queue", 0),
+                    project_queue=live_metrics.get("project_queue", 0),
+                    observed_http_rate=observed_http_rate if plan.independent else None,
+                    rate_target=current_effective_rate if plan.independent else None,
+                    rate_limit_delta=recent_rate_limit_delta,
                 )
                 if target > len(active_live) and len(live) < effective_maximum:
                     try:
@@ -1301,11 +1560,26 @@ def supervise_campaign(
                         exhausted_capacity=exhausted_capacity,
                         effective_worker_max=effective_maximum,
                         worker_concurrency=worker_concurrency,
-                        worker_rate=worker_rate,
+                        worker_rate=plan.worker_rate,
                         rate_mode=rate_mode,
+                        rate_independent=plan.independent,
+                        fleet_rate_initial=plan.initial,
+                        fleet_rate_max=plan.ceiling,
                         rate_effective=effective,
                         rate_target=rate_target,
                         rate_ceiling=plan.ceiling,
+                        http_rate_observed=observed_http_rate,
+                        rate_limit_delta=recent_rate_limit_delta,
+                        db_connections_budget=resource_plan.db_connections_budget,
+                        db_connections_effective_max=resource_plan.db_connections_effective_max,
+                        db_pool_per_worker=resource_plan.db_pool_per_worker,
+                        archive_workers_budget=resource_plan.archive_workers_budget,
+                        archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+                        projection_workers_budget=resource_plan.projection_workers_budget,
+                        projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+                        redis_connections_budget=resource_plan.redis_connections_budget,
+                        redis_connections_effective_max=resource_plan.redis_connections_effective_max,
+                        redis_connections_per_client=resource_plan.redis_connections_per_client,
                         worker_metrics=campaign_metrics,
                         progress_source="redis_worker_heartbeat",
                         reconciled_at=reconciled_at,
@@ -1360,9 +1634,16 @@ def supervise_campaign(
                 workers_min=minimum,
                 workers_max=maximum,
                 worker_concurrency=worker_concurrency,
-                worker_rate=worker_rate,
+                worker_rate=plan.worker_rate,
                 rate_mode=rate_mode,
+                rate_independent=plan.independent,
+                fleet_rate_initial=plan.initial,
+                fleet_rate_max=plan.ceiling,
                 rate_ceiling=plan.ceiling,
+                db_pool_per_worker=resource_plan.db_pool_per_worker,
+                archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+                projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+                redis_connections_per_client=resource_plan.redis_connections_per_client,
             )
             try:
                 while any(worker.process.poll() is None for worker in children):
@@ -1449,10 +1730,23 @@ def supervise_campaign(
                     workers_max=maximum,
                     exhausted_capacity=exhausted_capacity,
                     worker_concurrency=worker_concurrency,
-                    worker_rate=worker_rate,
+                    worker_rate=plan.worker_rate,
                     rate_mode=rate_mode,
+                    rate_independent=plan.independent,
+                    fleet_rate_initial=plan.initial,
+                    fleet_rate_max=plan.ceiling,
                     rate_target=last_rate_target,
                     rate_ceiling=plan.ceiling,
+                    db_connections_budget=resource_plan.db_connections_budget,
+                    db_connections_effective_max=resource_plan.db_connections_effective_max,
+                    db_pool_per_worker=resource_plan.db_pool_per_worker,
+                    archive_workers_budget=resource_plan.archive_workers_budget,
+                    archive_workers_per_worker=resource_plan.archive_workers_per_worker,
+                    projection_workers_budget=resource_plan.projection_workers_budget,
+                    projection_workers_per_worker=resource_plan.projection_workers_per_worker,
+                    redis_connections_budget=resource_plan.redis_connections_budget,
+                    redis_connections_effective_max=resource_plan.redis_connections_effective_max,
+                    redis_connections_per_client=resource_plan.redis_connections_per_client,
                     worker_metrics=_with_retired_metrics(
                         _worker_metrics(registered_states), retired_metrics
                     ),
@@ -1508,7 +1802,7 @@ def campaign_status(run_id: int) -> dict:
 
     if settings.dbd_redis_url:
         try:
-            redis = _redis_client()
+            redis = _redis_client(settings.dbd_redis_max_connections)
             redis.ping()
             runtime = _read_runtime_state(redis, run_id)
             supervisor_active = bool(redis.exists(_supervisor_lease_key(run_id)))
@@ -1596,7 +1890,7 @@ def campaign_status(run_id: int) -> dict:
 def request_campaign_stop(run_id: int) -> None:
     if not settings.dbd_redis_url:
         raise ValueError("Campaign stop requires DBD_REDIS_URL")
-    redis = Redis.from_url(settings.dbd_redis_url, decode_responses=True)
+    redis = _redis_client(settings.dbd_redis_max_connections)
     try:
         redis.ping()
         _request_stop(redis, run_id, "operator_command")

@@ -63,10 +63,18 @@ class CampaignCoordinator:
     return payload['status']
     """
 
-    def __init__(self, url: str, run_id: int, *, namespace: str = "dbd:campaign") -> None:
+    def __init__(
+        self,
+        url: str,
+        run_id: int,
+        *,
+        namespace: str = "dbd:campaign",
+        max_connections: int | None = None,
+    ) -> None:
         self.url = url
         self.run_id = int(run_id)
         self.namespace = namespace.rstrip(":")
+        self.max_connections = max_connections
         self._redis: Redis | None = None
 
     @property
@@ -93,7 +101,10 @@ class CampaignCoordinator:
 
     async def open(self) -> None:
         if self._redis is None:
-            self._redis = Redis.from_url(self.url, decode_responses=True)
+            kwargs = {"decode_responses": True}
+            if self.max_connections is not None:
+                kwargs["max_connections"] = max(1, int(self.max_connections))
+            self._redis = Redis.from_url(self.url, **kwargs)
             await self._redis.ping()
 
     async def close(self) -> None:

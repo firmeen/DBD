@@ -12,7 +12,12 @@ Core controls:
 | `DBD_CONCURRENCY` | Maximum concurrent HTTP work; runtime guard 1..256 |
 | `DBD_RATE_PER_SECOND` | Global target admission ceiling |
 | `DBD_ENDPOINT_RATES` / CLI `--endpoint-rates` | Optional per-endpoint ceilings |
-| `DB_POOL_SIZE` | DB pool / upper bound for projection writers |
+| `DB_POOL_SIZE` | Per-process DB pool default; campaign supervisor may derive a lower worker cap |
+| `DBD_FLEET_DB_CONNECTIONS_MAX` / `--fleet-db-connections-max` | Hard MySQL connection budget for one campaign fleet; default `96` |
+| `DBD_FLEET_ARCHIVE_WORKERS_MAX` / `--fleet-archive-workers-max` | Archive-worker budget across `workers-max`; default `24` |
+| `DBD_FLEET_PROJECTION_WORKERS_MAX` / `--fleet-projection-workers-max` | Projection-worker budget across `workers-max`; default `48` |
+| `DBD_REDIS_MAX_CONNECTIONS` | Maximum connections in each Redis client pool |
+| `DBD_FLEET_REDIS_CONNECTIONS_MAX` / `--fleet-redis-connections-max` | Redis connection budget for the long-lived campaign fleet; default `128` |
 | `DBD_PIPELINE_QUEUE_SIZE` | Bounded fetch/archive/project backpressure |
 | `DBD_CLAIM_BATCH_SIZE` | Queue claims per transaction |
 | `DBD_ARCHIVE_BATCH_SIZE` | Archive responses handled per batch |
@@ -26,6 +31,21 @@ Core controls:
 
 Concurrency and admission rate are different controls. More concurrency helps only
 until enough in-flight work exists to sustain the accepted upstream rate.
+
+Campaign can explicitly decouple worker capacity from upstream admission with
+`--fleet-rate-initial` and `--fleet-rate-max`. When those flags are present,
+changing `workers` / `workers-max` does not change the shared HTTP ceiling.
+When they are omitted, the legacy `shared`, `multiply`, and `adaptive`
+worker-rate derivation remains compatible.
+
+Fleet resource limits are calculated before workers start. Defaults are global
+fleet caps rather than per-worker multipliers: 96 MySQL connections, 24 archive
+workers, 48 projection workers and 128 Redis connections. The supervisor reserves
+its own DB pool, then derives identical per-worker DB/archive/projection/Redis caps
+for the configured `workers-max`. A budget that cannot support at least one unit
+per maximum worker fails closed instead of allowing connection or writer growth to
+become unbounded. The sync MySQL pool uses zero overflow so the configured pool size
+is a real upper bound rather than a soft target.
 
 ## Rate control and distributed workers
 

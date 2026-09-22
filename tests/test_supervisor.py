@@ -6,17 +6,22 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 
 import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
+    AutoscaleController,
+    CampaignResourcePlan,
     WorkerProcess,
     _drain_registered_workers,
+    _fleet_rate_target,
     _force_kill_worker,
     _live_progress,
     _refresh_lease_with_grace,
     _runtime_progress_baseline,
     _seed_rate,
+    _spawn_worker,
     _terminate_workers,
     _with_retired_metrics,
     _worker_command,
     build_rate_plan,
+    build_resource_plan,
 )
 
 
@@ -266,7 +271,7 @@ def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) ->
             pass
 
     fake = FakeRedis()
-    monkeypatch.setattr(supervisor, "_redis_client", lambda: fake)
+    monkeypatch.setattr(supervisor, "_redis_client", lambda *args, **kwargs: fake)
     monkeypatch.setattr(
         supervisor,
         "settings",
@@ -274,6 +279,7 @@ def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) ->
             dbd_redis_url="redis://test",
             dbd_redis_rate_key="dbd:test:rate",
             dbd_rate_per_second=1.0,
+            dbd_redis_max_connections=4,
         ),
     )
     monkeypatch.setattr(
@@ -304,3 +310,111 @@ def test_retired_terminal_metrics_preserve_done_progress() -> None:
     assert merged["done"] == 10
     assert merged["not_available"] == 3
     assert merged["failed"] == 1
+
+
+
+def test_explicit_fleet_rate_is_independent_of_worker_count() -> None:
+    plan = build_rate_plan("adaptive", 2, 20, initial_workers=4, fleet_rate_initial=12, fleet_rate_max=20)
+    assert plan.independent is True
+    assert plan.initial == 12
+    assert plan.ceiling == 20
+    assert plan.worker_rate == 20
+    assert _fleet_rate_target(plan, 4) == 20
+    assert _fleet_rate_target(plan, 20) == 20
+
+
+def test_explicit_fleet_rate_rejects_initial_above_ceiling() -> None:
+    with pytest.raises(ValueError, match="0 < initial <= max"):
+        build_rate_plan("adaptive", 2, 20, fleet_rate_initial=21, fleet_rate_max=20)
+
+
+def test_resource_plan_bounds_maximum_fleet() -> None:
+    plan = build_resource_plan(
+        20, db_pool_size=8, archive_workers=2, projection_workers=8,
+        redis_max_connections=4, db_connections_max=96, archive_workers_max=20,
+        projection_workers_max=40, redis_connections_max=128,
+    )
+    assert plan.db_pool_per_worker == 2
+    assert plan.db_connections_effective_max <= 96
+    assert plan.archive_workers_per_worker == 1
+    assert plan.archive_workers_effective_max == 20
+    assert plan.projection_workers_per_worker == 2
+    assert plan.projection_workers_effective_max == 40
+    assert plan.redis_connections_per_client == 3
+    assert plan.redis_connections_effective_max <= 128
+
+
+def test_resource_plan_rejects_budget_that_cannot_support_workers_max() -> None:
+    with pytest.raises(ValueError, match="fleet DB connection budget"):
+        build_resource_plan(
+            20, db_pool_size=8, archive_workers=2, projection_workers=8,
+            redis_max_connections=4, db_connections_max=40,
+        )
+
+
+def test_spawn_worker_applies_derived_resource_caps(monkeypatch) -> None:
+    captured = {}
+
+    class FakeProcess:
+        pid = 1234
+
+        def poll(self):
+            return None
+
+    def fake_popen(command, **kwargs):
+        captured["command"] = command
+        captured["env"] = kwargs["env"]
+        return FakeProcess()
+
+    monkeypatch.setattr(supervisor.subprocess, "Popen", fake_popen)
+    plan = CampaignResourcePlan(
+        max_workers=20, supervisor_db_pool=8, db_connections_budget=96,
+        db_pool_per_worker=2, archive_workers_budget=20, archive_workers_per_worker=1,
+        projection_workers_budget=40, projection_workers_per_worker=2,
+        redis_connections_budget=128, redis_connections_per_client=3,
+    )
+    worker = _spawn_worker(
+        7, 1, concurrency=12, rate=20, fleet_rate_ceiling=20,
+        open_powershell=True, resource_plan=plan,
+    )
+    assert worker.process.pid == 1234
+    assert captured["env"]["DB_POOL_SIZE"] == "2"
+    assert captured["env"]["DBD_ARCHIVE_WORKERS"] == "1"
+    assert captured["env"]["DBD_PROJECTION_WORKERS"] == "2"
+    assert captured["env"]["DBD_REDIS_MAX_CONNECTIONS"] == "3"
+
+
+def test_autoscale_adds_worker_when_http_capacity_is_underutilized() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    assert controller.target(
+        pending=5000, running=24, current=4, effective_maximum=8, now=10.0,
+        fetch_queue=10, archive_queue=0, project_queue=0,
+        observed_http_rate=6.0, rate_target=12.0, rate_limit_delta=0,
+    ) == 5
+
+
+def test_autoscale_holds_when_rate_is_saturated_and_fetch_queue_is_deep() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    assert controller.target(
+        pending=5000, running=24, current=4, effective_maximum=8, now=10.0,
+        fetch_queue=500, archive_queue=0, project_queue=0,
+        observed_http_rate=11.5, rate_target=12.0, rate_limit_delta=0,
+    ) == 4
+
+
+def test_autoscale_freezes_on_rate_limit_pressure() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    assert controller.target(
+        pending=5000, running=24, current=4, effective_maximum=8, now=10.0,
+        fetch_queue=0, archive_queue=0, project_queue=0,
+        observed_http_rate=4.0, rate_target=12.0, rate_limit_delta=1,
+    ) == 4
+
+
+def test_autoscale_freezes_on_downstream_backlog() -> None:
+    controller = AutoscaleController(2, 8, 12)
+    assert controller.target(
+        pending=5000, running=24, current=4, effective_maximum=8, now=10.0,
+        fetch_queue=0, archive_queue=0, project_queue=500,
+        observed_http_rate=4.0, rate_target=12.0, rate_limit_delta=0,
+    ) == 4
