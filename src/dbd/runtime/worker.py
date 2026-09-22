@@ -206,9 +206,9 @@ async def process(
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed workers require DBD_REDIS_URL for one shared global rate cap")
 
+    _ = repo.archive_backend
     run = await repo.get_run(run_id)
     repo = repo.for_run(run)
-    _ = repo.archive_backend
 
     projection_workers = min(settings.dbd_projection_workers, settings.db_pool_size)
     archive_workers = settings.dbd_archive_workers
