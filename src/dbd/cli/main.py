@@ -16,6 +16,7 @@ from ..runtime.resources import PARTS, endpoints
 from ..runtime.worker import STATUS_OPERATING, prepare, process
 from ..storage.mysql.async_engine import create_engine
 from ..storage.mysql.repositories.worker_repository import WorkerRepository
+from ..version import package_version
 
 
 def positive(value):
@@ -386,7 +387,7 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
 
 def main():
     parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
-    parser.add_argument("--version", action="version", version="dbd-data 0.3.0")
+    parser.add_argument("--version", action="version", version=f"%(prog)s {package_version()}")
     sub = parser.add_subparsers(dest="command", required=True)
     _add_output_options(sub.add_parser("check-db", help="Check database connectivity"))
     _add_output_options(sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)"))
