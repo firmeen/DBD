@@ -477,11 +477,11 @@ export function SpatialMap({
       onHover={({ object }) => {
         if (!object) onHoverCompany(null)
       }}
-      style={{ position: "absolute", inset: 0 }}
+      style={{ position: "absolute", inset: "0" }}
     >
       <Map
         mapStyle={DEFAULT_MAP_STYLE}
-        attributionControl
+        attributionControl={{ compact: true }}
         reuseMaps
         style={{ width: "100%", height: "100%" }}
       />
