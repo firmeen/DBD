@@ -160,3 +160,37 @@ def test_all_satisfied_resources_finish_company_state() -> None:
     )
     assert second.status == "done"
     assert second.next_endpoint is None
+
+
+
+def test_failed_dirty_bit_is_retryable_and_success_clears_failure() -> None:
+    required = mask_for_endpoints(("committees", "transformations"))
+    committee = endpoint_bit("committees")
+    transform = endpoint_bit("transformations")
+
+    assert (
+        next_endpoint(
+            required,
+            done=transform,
+            not_available=0,
+            failed=committee,
+            dirty=committee,
+            fiscal_year=None,
+        )
+        == "committees"
+    )
+
+    transition = advance_state(
+        endpoint="committees",
+        outcome="done",
+        required_mask=required,
+        done_mask=transform,
+        not_available_mask=0,
+        failed_mask=committee,
+        dirty_mask=committee,
+    )
+    assert transition.done_mask == required
+    assert transition.failed_mask == 0
+    assert transition.dirty_mask == 0
+    assert transition.status == "done"
+    assert transition.next_endpoint is None

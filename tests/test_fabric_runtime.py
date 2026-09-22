@@ -9,6 +9,8 @@ from sqlalchemy import text
 
 from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
+from dbd.core.exceptions import ContractError
+import dbd.storage.mysql.repositories.projection_repository as projection_repository
 from dbd.runtime.collection_fabric import endpoint_bit
 from dbd.runtime.replay import replay_archive
 from dbd.runtime.resources import DEFAULT_PARTS, endpoints
@@ -388,16 +390,12 @@ async def test_expired_fabric_lease_is_fenced_and_reclaimed(repo):
     assert await fabric.finish(second, "done")
 
 
-async def test_fabric_retry_reopens_only_failed_resource_bits(repo):
-    class BrokenCommitteeApi(FullFabricApi):
-        calls = 0
-
+async def test_fabric_retry_reopens_only_failed_fetch_resource_bits(repo):
+    class BrokenCommitteeFetchApi(FullFabricApi):
         async def fetch(self, method, path, **kwargs):
-            type(self).calls += 1
-            result = await super().fetch(method, path, **kwargs)
             if "/committees/" in path:
-                result.data = [{"renamedSequence": 1}]
-            return result
+                raise ValueError("synthetic terminal fetch failure")
+            return await super().fetch(method, path, **kwargs)
 
     resources = ("profile", "committees", "transformations")
     fabric, run_id, _ = await new_fabric_run(repo, resources)
@@ -405,7 +403,7 @@ async def test_fabric_retry_reopens_only_failed_resource_bits(repo):
         repo,
         run_id,
         concurrency=2,
-        client_factory=BrokenCommitteeApi,
+        client_factory=BrokenCommitteeFetchApi,
     ) == {"failed": 1, "done": 2}
 
     assert await fabric.retry_failed(run_id) == 1
@@ -431,6 +429,94 @@ async def test_fabric_retry_reopens_only_failed_resource_bits(repo):
     assert state["done_count"] == 3
     assert state["failed_mask"] == 0
     assert state["status"] == "done"
+
+
+async def test_fabric_project_failure_retries_from_archive_without_http(repo, monkeypatch):
+    fabric, run_id, _ = await new_fabric_run(repo, ("committees",))
+    original_normalize = projection_repository.normalize_resource
+
+    def broken_normalize(endpoint, payload):
+        if endpoint == "committees":
+            raise ContractError("synthetic projection contract failure")
+        return original_normalize(endpoint, payload)
+
+    monkeypatch.setattr(
+        projection_repository,
+        "normalize_resource",
+        broken_normalize,
+    )
+    assert await process(
+        repo,
+        run_id,
+        concurrency=1,
+        client_factory=FullFabricApi,
+    ) == {"failed": 1}
+
+    async with repo.engine.connect() as conn:
+        archive = (
+            await conn.execute(
+                text(
+                    "SELECT id,processing_status FROM response_archive "
+                    "WHERE run_id=:run AND endpoint='committees'"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+    assert archive["processing_status"] == "invalid"
+
+    assert await fabric.retry_failed(run_id) == 1
+    async with repo.engine.connect() as conn:
+        retry_state = (
+            await conn.execute(
+                text(
+                    "SELECT stage,status,next_endpoint,raw_response_id,failed_mask,dirty_mask "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+    assert retry_state["stage"] == "project"
+    assert retry_state["status"] == "pending"
+    assert retry_state["next_endpoint"] == "committees"
+    assert retry_state["raw_response_id"] == archive["id"]
+    assert int(retry_state["failed_mask"]) & endpoint_bit("committees")
+    assert int(retry_state["dirty_mask"]) & endpoint_bit("committees")
+
+    monkeypatch.setattr(
+        projection_repository,
+        "normalize_resource",
+        original_normalize,
+    )
+    NoFetchApi.calls = 0
+    assert await process(
+        repo,
+        run_id,
+        concurrency=1,
+        client_factory=NoFetchApi,
+    ) == {"done": 1}
+    assert NoFetchApi.calls == 0
+
+    async with repo.engine.connect() as conn:
+        final_state = (
+            await conn.execute(
+                text(
+                    "SELECT status,failed_mask,dirty_mask,BIT_COUNT(done_mask) done_count "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+        archive_status = (
+            await conn.execute(
+                text("SELECT processing_status FROM response_archive WHERE id=:id"),
+                {"id": archive["id"]},
+            )
+        ).scalar_one()
+    assert final_state["status"] == "done"
+    assert final_state["failed_mask"] == 0
+    assert final_state["dirty_mask"] == 0
+    assert final_state["done_count"] == 1
+    assert archive_status == "processed"
 
 
 async def test_fabric_external_archive_resumes_without_refetch(repo):
