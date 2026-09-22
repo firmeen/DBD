@@ -823,6 +823,29 @@ class FabricWorkerRepository(WorkerRepository):
             ).mappings().all()
             return [dict(row) for row in rows]
 
+    async def failure_diagnostics(self, run_id, limit=8):
+        """Read-only durable failure summary for operator-facing status output."""
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text("""
+                    SELECT
+                      COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                      COALESCE(NULLIF(next_endpoint,''),'resolved') AS endpoint,
+                      stage,
+                      COUNT(*) AS n,
+                      COALESCE(SUM(BIT_COUNT(failed_mask & ~dirty_mask)),0) AS resources
+                    FROM company_collection_state
+                    WHERE run_id=:id AND (status='failed' OR (failed_mask & ~dirty_mask)<>0)
+                    GROUP BY error_code,endpoint,stage
+                    ORDER BY resources DESC,n DESC,error_code
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": max(1, int(limit))},
+                )
+            ).mappings().all()
+            return [dict(row) for row in rows]
+
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
             await conn.execute(
