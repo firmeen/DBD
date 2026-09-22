@@ -2049,8 +2049,8 @@ def supervise_campaign(
     return final_code
 
 
-def campaign_status(run_id: int) -> dict:
-    """Prefer the live Redis snapshot while supervised; fall back to exact MySQL."""
+def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
+    """Prefer live Redis state; only scan durable failure diagnostics on request."""
     state: dict | None = None
     redis = None
     workers: list[dict] = []
@@ -2094,7 +2094,8 @@ def campaign_status(run_id: int) -> dict:
 
     state["run_id"] = int(run_id)
     state["run_status"] = _run_status(run_id)
-    state["failure_diagnostics"] = _failure_diagnostics(run_id)
+    if diagnostics:
+        state["failure_diagnostics"] = _failure_diagnostics(run_id)
 
     if redis is not None:
         try:
