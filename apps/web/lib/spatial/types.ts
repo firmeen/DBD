@@ -16,6 +16,15 @@ export type SpatialLod = "national" | "regional" | "local" | "entity"
 
 export type SpatialAvailability = "ready" | "partial" | "unavailable"
 
+export type SpatialBounds = [
+  west: number,
+  south: number,
+  east: number,
+  north: number,
+]
+
+export const MAX_SPATIAL_COMPANY_POINTS = 25_000
+
 export interface SpatialViewState {
   longitude: number
   latitude: number
@@ -99,6 +108,7 @@ export interface SpatialSnapshot {
 
 export interface SpatialQuery {
   viewport: SpatialViewState
+  bounds: SpatialBounds | null
   lod: SpatialLod
   h3Resolution: number
   lens: LensState
