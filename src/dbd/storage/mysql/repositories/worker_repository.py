@@ -534,27 +534,40 @@ class WorkerRepository:
             return [dict(row) for row in rows]
 
     async def failure_diagnostics(self, run_id, limit=8):
-        """Read-only durable failure summary for legacy endpoint tasks."""
+        """Read-only durable failure diagnostics for legacy one-row-per-endpoint tasks."""
         async with self.engine.connect() as conn:
-            rows = (
+            by_endpoint = (
                 await conn.execute(
                     text("""
-                    SELECT
-                      COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
-                      endpoint,
-                      stage,
-                      COUNT(*) AS n,
-                      COUNT(*) AS resources
+                    SELECT endpoint,COUNT(*) AS states,COUNT(*) AS resources
                     FROM endpoint_tasks
                     WHERE run_id=:id AND status='failed'
-                    GROUP BY error_code,endpoint,stage
-                    ORDER BY n DESC,error_code
+                    GROUP BY endpoint
+                    ORDER BY resources DESC,endpoint
                     LIMIT :limit
                     """),
                     {"id": run_id, "limit": max(1, int(limit))},
                 )
             ).mappings().all()
-            return [dict(row) for row in rows]
+            by_error = (
+                await conn.execute(
+                    text("""
+                    SELECT COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
+                           stage,status,COUNT(*) AS states
+                    FROM endpoint_tasks
+                    WHERE run_id=:id AND status='failed'
+                    GROUP BY error_code,stage,status
+                    ORDER BY states DESC,error_code
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": max(1, int(limit))},
+                )
+            ).mappings().all()
+        return {
+            "by_endpoint": [dict(row) for row in by_endpoint],
+            "latest_errors": [dict(row) for row in by_error],
+            "error_scope": "task_error_exact",
+        }
 
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
