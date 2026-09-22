@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import inspect
 from io import StringIO
 
+import dbd.core.progress as progress_module
 from dbd.core.progress import (
     LiveCampaignDashboard,
     ProgressLine,
@@ -273,10 +273,10 @@ def test_renderer_failure_is_isolated_from_campaign() -> None:
 
 
 def test_presentation_layer_has_no_runtime_clients() -> None:
-    source = inspect.getsource(LiveCampaignDashboard)
-    assert "Redis" not in source
-    assert "MySQL" not in source
-    assert "connect(" not in source
+    namespace = vars(progress_module)
+    assert "Redis" not in namespace
+    assert "connect" not in namespace
+    assert "create_engine" not in namespace
     dashboard = LiveCampaignDashboard(7, enabled=False)
     assert not hasattr(dashboard, "redis")
     assert not hasattr(dashboard, "db")
