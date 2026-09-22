@@ -91,7 +91,11 @@ class TerminalPresenter:
             "error": "ERROR",
             "info": "INFO",
         }.get(kind, "INFO")
-        self.console.print(f"[{style}]{prefix}[/]  {message}")
+        line = Text()
+        line.append(prefix, style=style)
+        line.append("  ")
+        line.append(str(message))
+        self.console.print(line)
 
     def key_values(
         self,
