@@ -8,7 +8,7 @@ from typing import Mapping
 
 from redis.asyncio import Redis
 
-from ..core.redis import create_async_redis
+from ..core.redis import close_async_redis, create_async_redis
 from ..core.telemetry import REDIS_COMMANDS, REDIS_RTT
 
 
@@ -122,7 +122,7 @@ class CampaignCoordinator:
             client = self._redis
             self._redis = None
             try:
-                await client.aclose()
+                await close_async_redis(client)
             except Exception:
                 # Redis is control-plane state only. Closing a broken socket must
                 # never replace the durable worker/MySQL error being propagated.
