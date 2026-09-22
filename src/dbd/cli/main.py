@@ -311,15 +311,18 @@ def _add_campaign_worker_options(parser):
     parser.set_defaults(open_powershell=os.name == "nt")
 
 
-def _campaign_command(args) -> None:
+def _campaign_command(args, presenter: TerminalPresenter) -> None:
     from ..runtime.supervisor import campaign_status, request_campaign_stop, supervise_campaign
 
     if args.campaign_command == "status":
-        print(json.dumps(campaign_status(args.run_id), indent=2, default=str))
+        presenter.campaign_status(campaign_status(args.run_id))
         return
     if args.campaign_command == "stop":
         request_campaign_stop(args.run_id)
-        print(f"Graceful stop requested for campaign {args.run_id}")
+        presenter.command_result(
+            "DBD · CAMPAIGN CONTROL",
+            {"run_id": int(args.run_id), "action": "graceful_stop_requested"},
+        )
         return
     if not settings.dbd_redis_url:
         raise ValueError("campaign requires DBD_REDIS_URL")
@@ -335,7 +338,7 @@ def _campaign_command(args) -> None:
         with manager_lock() as conn:
             run_id = asyncio.run(_prepare_campaign(args))
             assert_manager_lock(conn)
-        print(f"Campaign run {run_id} prepared", flush=True)
+        presenter.message(f"Campaign run {run_id} prepared", kind="success")
     else:
         run_id = args.run_id
         asyncio.run(_validate_campaign_run(run_id))
