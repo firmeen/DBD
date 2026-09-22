@@ -1,5 +1,6 @@
 import { z } from "zod"
 
+import { MAX_SPATIAL_COMPANY_POINTS } from "./types"
 import type { SpatialSnapshot } from "./types"
 
 const coordinateSchema = z.tuple([z.number(), z.number()])
@@ -71,7 +72,12 @@ const snapshotSchema = z.object({
     expired: z.number().int().nonnegative().nullable(),
     prospect: z.number().int().nonnegative().nullable(),
   }),
-  companies: z.array(companySchema),
+  companies: z
+    .array(companySchema)
+    .max(
+      MAX_SPATIAL_COMPANY_POINTS,
+      "Spatial serving response exceeds the client company-point budget"
+    ),
   branches: z.array(branchSchema),
   h3Cells: z.array(h3Schema),
   areas: z.array(areaSchema),
