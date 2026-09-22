@@ -3,6 +3,8 @@ from uuid import uuid4
 
 import pytest
 
+from dbd.client.rate_control import EndpointRateController
+from dbd.core.redis import create_async_redis
 from dbd.runtime.coordination import CampaignCoordinator, WorkerIdentity
 
 REDIS_URL = os.getenv("DBD_REDIS_TEST_URL")
@@ -64,7 +66,12 @@ async def test_preexisting_targeted_drain_survives_register_and_active_heartbeat
         assert workers[0]["status"] == "draining"
         started_at = workers[0]["started_at"]
 
-        await coordinator.heartbeat_worker(worker, status="active", ttl_seconds=5)
+        heartbeat_status = await coordinator.heartbeat_worker(
+            worker,
+            status="active",
+            ttl_seconds=5,
+        )
+        assert heartbeat_status == "draining"
         workers = await coordinator.workers()
         assert workers[0]["status"] == "draining"
         assert workers[0]["started_at"] == started_at
@@ -132,3 +139,37 @@ async def test_campaign_coordinator_applies_connection_pool_cap():
         assert coordinator._client().connection_pool.max_connections == 2
     finally:
         await coordinator.close()
+
+
+
+async def test_coordinator_and_rate_controller_share_one_external_redis_client():
+    run_id = int(uuid4().hex[:8], 16)
+    namespace = "dbd:test-shared-client:" + uuid4().hex
+    rate_key = namespace + ":rate"
+    client = create_async_redis(REDIS_URL, max_connections=3)
+    coordinator = CampaignCoordinator(
+        REDIS_URL,
+        run_id,
+        namespace=namespace,
+        client=client,
+    )
+    controller = EndpointRateController(
+        1000,
+        redis_url=REDIS_URL,
+        redis_key=rate_key,
+        redis_client=client,
+    )
+    try:
+        await coordinator.open()
+        await controller.open()
+        assert coordinator._client() is client
+        assert controller._redis is client
+        assert coordinator._client().connection_pool is controller._redis.connection_pool
+
+        await coordinator.close()
+        await controller.close()
+
+        # Neither component owns the worker-wide shared client.
+        assert await client.ping() is True
+    finally:
+        await client.aclose()
