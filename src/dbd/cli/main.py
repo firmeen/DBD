@@ -48,6 +48,20 @@ def parts(value):
     return selected
 
 
+def _add_output_options(parser):
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Emit machine-readable JSON instead of the human terminal view",
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show extended diagnostic detail when available",
+    )
+    return parser
+
+
 def endpoint_rate_map(value):
     valid = {endpoint for group in PARTS.values() for endpoint in group}
     result = {}
@@ -367,14 +381,18 @@ def main():
     parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
     parser.add_argument("--version", action="version", version="dbd-data 0.3.0")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("check-db", help="Check database connectivity")
-    sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)")
-    sub.add_parser("master-status", help="Count discovered and verified company identities")
-    sub.add_parser("discover-status", help="Show discovery coverage")
-    sub.add_parser("discover-retry", help="Requeue failed discovery buckets")
-    reset = sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
+    _add_output_options(sub.add_parser("check-db", help="Check database connectivity"))
+    _add_output_options(sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)"))
+    _add_output_options(sub.add_parser("master-status", help="Count discovered and verified company identities"))
+    _add_output_options(sub.add_parser("discover-status", help="Show discovery coverage"))
+    _add_output_options(sub.add_parser("discover-retry", help="Requeue failed discovery buckets"))
+    reset = _add_output_options(
+        sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
+    )
     reset.add_argument("--bucket-id", type=positive)
-    replay = sub.add_parser("replay", help="Reprocess an archived endpoint payload without HTTP")
+    replay = _add_output_options(
+        sub.add_parser("replay", help="Reprocess an archived endpoint payload without HTTP")
+    )
     replay.add_argument("archive_id", type=positive)
 
     campaign = sub.add_parser("campaign", help="Supervise a coordinated local worker fleet")
@@ -401,9 +419,13 @@ def main():
     campaign_resume = campaign_sub.add_parser("resume", help="Resume one existing run with workers")
     campaign_resume.add_argument("run_id", type=positive)
     _add_campaign_worker_options(campaign_resume)
-    campaign_status_parser = campaign_sub.add_parser("status", help="Show fleet and durable queue status")
+    campaign_status_parser = _add_output_options(
+        campaign_sub.add_parser("status", help="Show fleet and durable queue status")
+    )
     campaign_status_parser.add_argument("run_id", type=positive)
-    campaign_stop = campaign_sub.add_parser("stop", help="Request graceful draining of all workers")
+    campaign_stop = _add_output_options(
+        campaign_sub.add_parser("stop", help="Request graceful draining of all workers")
+    )
     campaign_stop.add_argument("run_id", type=positive)
 
     for name in ("fetch-company", "bulk"):
@@ -449,12 +471,16 @@ def main():
                 help="Include struck-off, liquidated and dissolved companies (default: operating only)",
             )
     for name in ("bulk-status", "bulk-retry"):
-        p = sub.add_parser(name)
+        p = _add_output_options(sub.add_parser(name))
         p.add_argument("run_id", type=positive, nargs="?" if name.endswith("status") else None)
-    legacy = sub.add_parser("legacy-bulk", help="Resume pre-0.2 company-level runs")
+    legacy = _add_output_options(
+        sub.add_parser("legacy-bulk", help="Resume pre-0.2 company-level runs")
+    )
     legacy.add_argument("--run-id", type=positive)
     legacy.add_argument("--limit", type=positive)
-    disc = sub.add_parser("discover", help="Discover companies with durable per-page checkpoints")
+    disc = _add_output_options(
+        sub.add_parser("discover", help="Discover companies with durable per-page checkpoints")
+    )
     disc.add_argument("seeds", nargs="*")
     disc.add_argument("--seed-file")
     disc.add_argument("--type", default="")
@@ -468,16 +494,20 @@ def main():
     )
     disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
     args = parser.parse_args()
+    presenter = TerminalPresenter(
+        json_mode=bool(getattr(args, "json", False)),
+        verbose=bool(getattr(args, "verbose", False)),
+    )
     try:
         if args.command == "migrate":
             from ..storage.mysql.migrations import migrate
 
             migrate()
-            print("Schema is current")
+            presenter.command_result("DBD · MIGRATION", {"status": "current"})
         elif args.command == "check-db":
-            from .legacy import command_check_db
+            from .legacy import check_db_info
 
-            command_check_db()
+            presenter.check_db(check_db_info())
         elif args.command == "master-status":
             from ..storage.mysql.engine import connect
 
@@ -493,15 +523,15 @@ def main():
                     """
                 )
                 row = cur.fetchone()
-            print(json.dumps({key: int(value or 0) for key, value in row.items()}, indent=2))
+            presenter.master_status({key: int(value or 0) for key, value in row.items()})
         elif args.command == "campaign":
-            _campaign_command(args)
+            _campaign_command(args, presenter)
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
                 with manager_lock():
-                    asyncio.run(worker_command(args))
+                    asyncio.run(worker_command(args, presenter=presenter))
             else:
-                asyncio.run(worker_command(args))
+                asyncio.run(worker_command(args, presenter=presenter))
         elif args.command in ("bulk", "fetch-company"):
             configure(args.metrics_port)
             if args.command == "bulk" and args.distributed:
@@ -509,10 +539,16 @@ def main():
                     raise ValueError("--distributed requires an existing --run-id and cannot build a run")
                 if not settings.dbd_redis_url:
                     raise ValueError("--distributed requires DBD_REDIS_URL")
-                asyncio.run(worker_command(args))
+                asyncio.run(worker_command(args, presenter=presenter))
             else:
                 with manager_lock() as conn:
-                    asyncio.run(worker_command(args, health=lambda: assert_manager_lock(conn)))
+                    asyncio.run(
+                        worker_command(
+                            args,
+                            health=lambda: assert_manager_lock(conn),
+                            presenter=presenter,
+                        )
+                    )
         elif args.command == "replay":
             from ..runtime.replay import replay_archive
 
@@ -533,7 +569,7 @@ def main():
         elif args.command == "discover-status":
             from ..storage.mysql.repositories.discovery_repository import discovery_summary
 
-            print(json.dumps(discovery_summary(), indent=2, default=str))
+            presenter.discovery_status(discovery_summary())
         elif args.command == "discover":
             from ..pipelines import discovery
 
@@ -569,12 +605,18 @@ def main():
                             health=lambda: assert_manager_lock(conn),
                         )
                     )
-            print(
-                f"buckets {result.buckets_processed}, pages {result.pages_fetched}, "
-                f"companies {result.companies_written}, requests {result.requests_made}"
+            presenter.command_result(
+                "DBD · DISCOVERY RESULT",
+                {
+                    "buckets": result.buckets_processed,
+                    "pages": result.pages_fetched,
+                    "companies": result.companies_written,
+                    "requests": result.requests_made,
+                },
             )
     except KeyboardInterrupt:
-        print("Interrupted. Durable checkpoints remain recoverable.")
+        presenter.message("Interrupted. Durable checkpoints remain recoverable.", kind="warning")
         raise SystemExit(130) from None
     except Exception as exc:
-        parser.exit(1, f"dbd-data: {safe_error(exc)}\n")
+        presenter.message(safe_error(exc), kind="error")
+        raise SystemExit(1) from None
