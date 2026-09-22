@@ -156,6 +156,174 @@ class TerminalPresenter:
             ),
         )
 
+    def package_about(self, payload: Mapping[str, Any]) -> None:
+        if self.json_mode:
+            self.json(dict(payload))
+            return
+
+        health = str(payload.get("health") or "unknown")
+        identity = payload.get("identity") or {}
+        runtime = payload.get("runtime") or {}
+        installation = payload.get("installation") or {}
+        integrity = payload.get("integrity") or {}
+        actions = list(payload.get("actions") or [])
+
+        status_label = {
+            "healthy": "HEALTHY",
+            "mismatch": "VERSION MISMATCH",
+            "cleanup_needed": "CLEANUP NEEDED",
+        }.get(health, health.upper())
+        status_style = {
+            "healthy": "bold green",
+            "mismatch": "bold red",
+            "cleanup_needed": "bold yellow",
+        }.get(health, "bold cyan")
+
+        hero = Text()
+        hero.append("DBD DATA PLATFORM  ", style="bold")
+        hero.append(status_label, style=status_style)
+
+        version = Table.grid(padding=(0, 3))
+        version.add_column(style="dim", no_wrap=True)
+        version.add_column()
+        version.add_column(style="dim", no_wrap=True)
+        version.add_column()
+        version.add_row(
+            "SOURCE",
+            str(identity.get("source_version") or "--"),
+            "INSTALLED",
+            str(identity.get("installed_version") or "NOT INSTALLED"),
+        )
+        version.add_row(
+            "IDENTITY",
+            str(identity.get("name") or "dbd-data"),
+            "VERSION MATCH",
+            _bool(identity.get("version_match")),
+        )
+
+        runtime_table = Table.grid(padding=(0, 2))
+        runtime_table.add_column(style="dim", no_wrap=True)
+        runtime_table.add_column()
+        runtime_table.add_row(
+            "PYTHON",
+            f"{runtime.get('implementation') or '--'} {runtime.get('python') or '--'}",
+        )
+        runtime_table.add_row("EXECUTABLE", str(runtime.get("executable") or "--"))
+        runtime_table.add_row(
+            "ENVIRONMENT",
+            (
+                f"VIRTUALENV · {runtime.get('venv_path')}"
+                if runtime.get("virtualenv")
+                else "SYSTEM PYTHON"
+            ),
+        )
+        runtime_table.add_row("PLATFORM", str(runtime.get("platform") or "--"))
+
+        install_table = Table.grid(padding=(0, 2))
+        install_table.add_column(style="dim", no_wrap=True)
+        install_table.add_column()
+        install_table.add_row(
+            "MODE",
+            "EDITABLE" if installation.get("editable") else "STANDARD",
+        )
+        install_table.add_row(
+            "PROJECT",
+            str(installation.get("editable_project_location") or installation.get("project_root") or "--"),
+        )
+        install_table.add_row("PACKAGE", str(installation.get("package_path") or "--"))
+        install_table.add_row(
+            "DISTRIBUTION",
+            str(installation.get("distribution_location") or "--"),
+        )
+        install_table.add_row("METADATA", str(installation.get("metadata_location") or "--"))
+        install_table.add_row(
+            "DEPENDENCIES",
+            f"{_int(installation.get('dependency_count')):,} direct requirement(s)",
+        )
+        required_by = list(installation.get("required_by") or [])
+        install_table.add_row(
+            "REQUIRED BY",
+            ", ".join(required_by) if required_by else "—",
+        )
+
+        issues = list(integrity.get("issues") or [])
+        invalid = list(integrity.get("invalid_distribution_entries") or [])
+
+        sections: list[Any] = [
+            hero,
+            Text("Package identity, runtime and installation integrity", style="dim"),
+            Text(""),
+            version,
+            Text(""),
+            Text("RUNTIME", style="bold cyan"),
+            runtime_table,
+            Text(""),
+            Text("INSTALLATION", style="bold cyan"),
+            install_table,
+        ]
+
+        if issues:
+            issue_table = Table(box=box.SIMPLE_HEAVY, expand=False)
+            issue_table.add_column("LEVEL", no_wrap=True)
+            issue_table.add_column("ISSUE")
+            for item in issues:
+                severity = str(item.get("severity") or "info").upper()
+                issue_table.add_row(severity, str(item.get("message") or "--"))
+            sections.extend((Text(""), Text("INTEGRITY", style="bold yellow"), issue_table))
+        else:
+            sections.extend(
+                (
+                    Text(""),
+                    Text("INTEGRITY  No package metadata inconsistencies detected.", style="bold green"),
+                )
+            )
+
+        if invalid:
+            remnants = Table(box=box.SIMPLE_HEAVY, expand=False)
+            remnants.add_column("INVALID DISTRIBUTION REMNANT")
+            for path in invalid:
+                remnants.add_row(str(path))
+            sections.extend((Text(""), remnants))
+
+        if actions:
+            action_table = Table.grid(padding=(0, 2))
+            action_table.add_column(style="bold yellow", no_wrap=True)
+            action_table.add_column()
+            for index, action in enumerate(actions, 1):
+                action_table.add_row(f"{index}.", str(action))
+            sections.extend(
+                (
+                    Text(""),
+                    Text("RECOMMENDED ACTIONS", style="bold yellow"),
+                    action_table,
+                )
+            )
+
+        self.console.print(
+            Panel(
+                Group(*sections),
+                title="DBD · PACKAGE INTELLIGENCE",
+                border_style=(
+                    "green"
+                    if health == "healthy"
+                    else "red"
+                    if health == "mismatch"
+                    else "yellow"
+                ),
+                padding=(1, 2),
+            )
+        )
+
+        if self.verbose:
+            dependencies = list(installation.get("dependencies") or [])
+            if dependencies:
+                table = Table(title="DIRECT DEPENDENCIES", box=box.SIMPLE_HEAVY)
+                table.add_column("#", justify="right", style="dim")
+                table.add_column("PACKAGE")
+                for index, dependency in enumerate(dependencies, 1):
+                    table.add_row(str(index), str(dependency))
+                self.console.print(table)
+
     def master_status(self, data: Mapping[str, Any]) -> None:
         if self.json_mode:
             self.json(dict(data))
