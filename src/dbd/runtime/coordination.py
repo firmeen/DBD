@@ -115,6 +115,7 @@ class CampaignCoordinator:
         self._publish_worker_script = self._redis.register_script(
             self._PUBLISH_WORKER_SCRIPT
         )
+        await self._redis.script_load(self._PUBLISH_WORKER_SCRIPT)
 
     async def close(self) -> None:
         if self._redis is not None and self._owns_redis:
