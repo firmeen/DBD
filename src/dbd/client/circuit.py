@@ -145,6 +145,9 @@ return state
         self._local: dict[str, _LocalCircuit] = {}
         self._local_pressure: dict[str, float] = {}
         self._last_global_pressure_at = 0.0
+        self._before_script = None
+        self._failure_script = None
+        self._success_script = None
 
     def _keys(self, key: str) -> tuple[str, str, str, str, str]:
         prefix = f"{self.namespace}:{key}"
@@ -171,6 +174,16 @@ return state
     @property
     def _pressure_gate_seconds(self) -> float:
         return max(1.0, self.pressure_window_seconds / 2.0)
+
+    async def prepare_scripts(self) -> None:
+        if self.redis is None:
+            return
+        self._before_script = self.redis.register_script(self._BEFORE_SCRIPT)
+        self._failure_script = self.redis.register_script(self._FAILURE_SCRIPT)
+        self._success_script = self.redis.register_script(self._SUCCESS_SCRIPT)
+        await self.redis.script_load(self._BEFORE_SCRIPT)
+        await self.redis.script_load(self._FAILURE_SCRIPT)
+        await self.redis.script_load(self._SUCCESS_SCRIPT)
 
     async def before(self, key: str) -> str:
         """Block admission while OPEN and return the state that admitted the call."""
@@ -199,13 +212,15 @@ return state
                 return 0.25, "half_open"
             return 0.0, "closed"
 
-        wait_raw, state = await self.redis.eval(
-            self._BEFORE_SCRIPT,
-            5,
-            *self._keys(key),
-            uuid4().hex,
-            int(self.probe_seconds * 1000),
-            self._state_ttl_ms,
+        if self._before_script is None:
+            self._before_script = self.redis.register_script(self._BEFORE_SCRIPT)
+        wait_raw, state = await self._before_script(
+            keys=list(self._keys(key)),
+            args=[
+                uuid4().hex,
+                int(self.probe_seconds * 1000),
+                self._state_ttl_ms,
+            ],
         )
         return max(0.0, float(wait_raw) / 1000.0), str(state)
 
@@ -230,14 +245,16 @@ return state
                 state.probe_until = 0.0
             return state.state
 
-        result = await self.redis.eval(
-            self._FAILURE_SCRIPT,
-            5,
-            *self._keys(key),
-            self.failure_threshold,
-            int(self.window_seconds * 1000),
-            int(self.open_seconds * 1000),
-            self._state_ttl_ms,
+        if self._failure_script is None:
+            self._failure_script = self.redis.register_script(self._FAILURE_SCRIPT)
+        result = await self._failure_script(
+            keys=list(self._keys(key)),
+            args=[
+                self.failure_threshold,
+                int(self.window_seconds * 1000),
+                int(self.open_seconds * 1000),
+                self._state_ttl_ms,
+            ],
         )
         return str(result)
 
@@ -257,12 +274,14 @@ return state
                     state.window_started_at = 0.0
             return state.state
 
-        result = await self.redis.eval(
-            self._SUCCESS_SCRIPT,
-            5,
-            *self._keys(key),
-            int(self.window_seconds * 1000),
-            self._state_ttl_ms,
+        if self._success_script is None:
+            self._success_script = self.redis.register_script(self._SUCCESS_SCRIPT)
+        result = await self._success_script(
+            keys=list(self._keys(key)),
+            args=[
+                int(self.window_seconds * 1000),
+                self._state_ttl_ms,
+            ],
         )
         return str(result)
 
