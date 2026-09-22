@@ -270,13 +270,15 @@ class TerminalPresenter:
             alerts.append(f"Fleet lost {lost} worker-capacity slot after restart exhaustion.")
         if _int(metrics.get("http_retries")) > 0 and _int(metrics.get("rate_limit_hits")) == 0:
             alerts.append("HTTP retries exist without 429/503 hits; inspect transport/auth/5xx diagnostics.")
-        failures = list(state.get("failure_diagnostics") or [])
-        if failures:
-            top = failures[0]
+        diagnostics = state.get("failure_diagnostics") or {}
+        endpoint_failures = list(diagnostics.get("by_endpoint") or [])
+        if endpoint_failures:
+            top = endpoint_failures[0]
             alerts.append(
-                "Top durable failure: "
-                f"{top.get('error_code') or 'unknown'} · {top.get('endpoint') or 'unknown endpoint'} · "
-                f"{_int(top.get('resources', top.get('n'))):,} resource(s)."
+                "Largest durable failure concentration: "
+                f"{top.get('endpoint') or 'unknown endpoint'} · "
+                f"{_int(top.get('resources')):,} resource(s) across "
+                f"{_int(top.get('states')):,} state(s)."
             )
 
         body: list[Any] = [
@@ -324,23 +326,42 @@ class TerminalPresenter:
                     )
                 self.console.print(table)
 
-            self.failure_diagnostics(failures)
+            self.failure_diagnostics(diagnostics)
 
-    def failure_diagnostics(self, rows: Sequence[Mapping[str, Any]]) -> None:
-        if not rows:
-            return
-        table = Table(title="FAILURE DIAGNOSTICS", box=box.SIMPLE_HEAVY)
-        for name in ("ERROR", "ENDPOINT", "STAGE", "STATES", "RESOURCES"):
-            table.add_column(name)
-        for row in rows:
-            table.add_row(
-                str(row.get("error_code") or "unknown"),
-                str(row.get("endpoint") or "unknown"),
-                str(row.get("stage") or "unknown"),
-                f"{_int(row.get('n')):,}",
-                f"{_int(row.get('resources', row.get('n'))):,}",
+    def failure_diagnostics(self, diagnostics: Mapping[str, Any]) -> None:
+        by_endpoint = list(diagnostics.get("by_endpoint") or [])
+        latest_errors = list(diagnostics.get("latest_errors") or [])
+        if by_endpoint:
+            table = Table(title="FAILED RESOURCES BY ENDPOINT · EXACT", box=box.SIMPLE_HEAVY)
+            table.add_column("ENDPOINT")
+            table.add_column("STATES", justify="right")
+            table.add_column("RESOURCES", justify="right")
+            for row in by_endpoint:
+                table.add_row(
+                    str(row.get("endpoint") or "unknown"),
+                    f"{_int(row.get('states')):,}",
+                    f"{_int(row.get('resources')):,}",
+                )
+            self.console.print(table)
+
+        if latest_errors:
+            scope = str(diagnostics.get("error_scope") or "")
+            title = (
+                "LATEST STATE ERROR CONTEXT · NOT PER-ENDPOINT"
+                if scope == "state_latest_error_not_per_endpoint"
+                else "FAILED TASK ERRORS · EXACT"
             )
-        self.console.print(table)
+            table = Table(title=title, box=box.SIMPLE_HEAVY)
+            for name in ("ERROR", "STAGE", "STATUS", "STATES"):
+                table.add_column(name)
+            for row in latest_errors:
+                table.add_row(
+                    str(row.get("error_code") or "unknown"),
+                    str(row.get("stage") or "unknown"),
+                    str(row.get("status") or "unknown"),
+                    f"{_int(row.get('states')):,}",
+                )
+            self.console.print(table)
 
     def bulk_status(self, payload: Mapping[str, Any]) -> None:
         if self.json_mode:
@@ -413,7 +434,7 @@ class TerminalPresenter:
                 table.add_row(str(row.get("stage")), str(row.get("status")), f"{_int(row.get('n')):,}")
             self.console.print(table)
 
-        self.failure_diagnostics(list(payload.get("failures") or []))
+        self.failure_diagnostics(payload.get("failures") or {})
 
     def run_list(self, rows: Sequence[Mapping[str, Any]]) -> None:
         if self.json_mode:
