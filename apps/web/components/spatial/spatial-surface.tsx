@@ -108,7 +108,14 @@ export function SpatialSurface() {
 
   React.useEffect(
     () => () => {
-      saveSurfaceSnapshot("M", liveSnapshotRef.current)
+      const latest = liveSnapshotRef.current
+      saveSurfaceSnapshot("M", {
+        viewState: latest.viewState,
+        layers: latest.layers,
+        branchId: latest.branchId,
+        radiusKm: latest.radiusKm,
+        companyRailOpen: latest.companyRailOpen,
+      })
     },
     [saveSurfaceSnapshot]
   )
