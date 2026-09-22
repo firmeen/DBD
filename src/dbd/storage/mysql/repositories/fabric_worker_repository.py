@@ -830,15 +830,28 @@ class FabricWorkerRepository(WorkerRepository):
                 await conn.execute(
                     text("""
                     SELECT
-                      COALESCE(NULLIF(last_error,''),'unknown') AS error_code,
-                      COALESCE(NULLIF(next_endpoint,''),'resolved') AS endpoint,
-                      stage,
-                      COUNT(*) AS n,
-                      COALESCE(SUM(BIT_COUNT(failed_mask & ~dirty_mask)),0) AS resources
-                    FROM company_collection_state
-                    WHERE run_id=:id AND (status='failed' OR (failed_mask & ~dirty_mask)<>0)
-                    GROUP BY error_code,endpoint,stage
-                    ORDER BY resources DESC,n DESC,error_code
+                      COALESCE(NULLIF(s.last_error,''),'unknown') AS error_code,
+                      e.endpoint,
+                      s.stage,
+                      COUNT(DISTINCT s.id) AS n,
+                      COUNT(*) AS resources
+                    FROM company_collection_state s
+                    JOIN (
+                      SELECT 'profile' AS endpoint, 1 AS bit
+                      UNION ALL SELECT 'financial_submissions' AS endpoint, 2 AS bit
+                      UNION ALL SELECT 'financial_statements' AS endpoint, 4 AS bit
+                      UNION ALL SELECT 'industry_benchmark' AS endpoint, 8 AS bit
+                      UNION ALL SELECT 'committees' AS endpoint, 16 AS bit
+                      UNION ALL SELECT 'committee_signs' AS endpoint, 32 AS bit
+                      UNION ALL SELECT 'transformations' AS endpoint, 64 AS bit
+                      UNION ALL SELECT 'nations' AS endpoint, 128 AS bit
+                      UNION ALL SELECT 'nation_history' AS endpoint, 256 AS bit
+                      UNION ALL SELECT 'name_history' AS endpoint, 512 AS bit
+                      UNION ALL SELECT 'capital_history' AS endpoint, 1024 AS bit
+                    ) e ON (s.failed_mask & ~s.dirty_mask & e.bit)<>0
+                    WHERE s.run_id=:id
+                    GROUP BY error_code,e.endpoint,s.stage
+                    ORDER BY resources DESC,n DESC,error_code,e.endpoint
                     LIMIT :limit
                     """),
                     {"id": run_id, "limit": max(1, int(limit))},
