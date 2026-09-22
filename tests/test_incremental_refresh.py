@@ -5,6 +5,7 @@ from uuid import uuid4
 
 import pytest
 from sqlalchemy import text
+from test_fabric_runtime import FullFabricApi, NoFetchApi
 
 from dbd.client.endpoints.search import SearchFilters
 from dbd.contracts.company import CompanyProfile
@@ -18,8 +19,6 @@ from dbd.storage.mysql.repositories.discovery_repository import (
     save_page,
     upsert_bucket,
 )
-
-from test_fabric_runtime import FullFabricApi, NoFetchApi
 
 pytestmark = pytest.mark.integration
 
