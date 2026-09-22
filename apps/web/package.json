@@ -18,7 +18,12 @@
     "db:check": "drizzle-kit check",
     "prepare": "husky",
     "dev:turbo": "next dev",
-    "build:turbo": "next build"
+    "build:turbo": "next build",
+    "prepare:maplibre": "node scripts/copy-maplibre-worker.mjs",
+    "predev": "npm run prepare:maplibre",
+    "prebuild": "npm run prepare:maplibre",
+    "predev:turbo": "npm run prepare:maplibre",
+    "prebuild:turbo": "npm run prepare:maplibre"
   },
   "dependencies": {
     "@base-ui/react": "^1.8.0",
