@@ -1,9 +1,15 @@
 from types import SimpleNamespace
 
+import pytest
+from redis.exceptions import TimeoutError as RedisTimeoutError
+
 import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
     WorkerProcess,
     _force_kill_worker,
+    _live_progress,
+    _refresh_lease_with_grace,
+    _runtime_progress_baseline,
     _seed_rate,
     _terminate_workers,
     _worker_command,
@@ -117,3 +123,68 @@ def test_windows_terminate_workers_skips_wrapper_only_terminate(monkeypatch) -> 
     assert "kill" not in calls
     assert calls[0][0] == ["taskkill", "/PID", "9876", "/T", "/F"]
     assert calls[1] == ("wait", 5.0)
+
+
+
+def test_live_progress_uses_heartbeat_delta_from_durable_baseline() -> None:
+    baseline = {
+        "total": 1000,
+        "pending": 820,
+        "retry_wait": 0,
+        "running": 28,
+        "failed": 2,
+        "done": 100,
+        "not_available": 50,
+    }
+    live = _live_progress(
+        baseline,
+        {"completed": 20, "failed": 1, "inflight": 30},
+    )
+
+    assert live["terminal"] == 173
+    assert live["done"] == 170
+    assert live["failed"] == 3
+    assert live["inflight"] == 30
+    assert live["pending_estimate"] == 797
+
+
+def test_transient_redis_lease_timeout_is_tolerated_inside_safety_budget(monkeypatch) -> None:
+    def timeout(*args, **kwargs):
+        raise RedisTimeoutError("temporary")
+
+    monkeypatch.setattr(supervisor, "_refresh_supervisor_lease", timeout)
+
+    confirmed, error = _refresh_lease_with_grace(
+        object(),
+        7,
+        "token",
+        now=15.0,
+        last_confirmed=10.0,
+    )
+
+    assert confirmed == 10.0
+    assert isinstance(error, RedisTimeoutError)
+
+
+def test_redis_lease_timeout_fails_closed_before_lease_expiry(monkeypatch) -> None:
+    def timeout(*args, **kwargs):
+        raise RedisTimeoutError("temporary")
+
+    monkeypatch.setattr(supervisor, "_refresh_supervisor_lease", timeout)
+
+    with pytest.raises(RuntimeError, match="stopping before supervisor lease expiry"):
+        _refresh_lease_with_grace(
+            object(),
+            7,
+            "token",
+            now=31.0,
+            last_confirmed=10.0,
+        )
+
+
+def test_resume_progress_falls_back_when_redis_snapshot_times_out() -> None:
+    class TimeoutRedis:
+        def get(self, key):
+            raise RedisTimeoutError("temporary")
+
+    assert _runtime_progress_baseline(TimeoutRedis(), 7) is None
