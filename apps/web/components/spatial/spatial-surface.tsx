@@ -18,6 +18,7 @@ import {
   defaultSpatialSurfaceSnapshot,
   parseSpatialSurfaceSnapshot,
 } from "@/lib/spatial/surface-snapshot"
+import { spatialBoundsForView } from "@/lib/spatial/viewport"
 import {
   companyToEntityRef,
   branchToEntityRef,
@@ -58,6 +59,11 @@ const PENDING_SNAPSHOT: SpatialSnapshot = {
 }
 
 export function SpatialSurface() {
+  const surfaceRef = React.useRef<HTMLElement>(null)
+  const [surfaceSize, setSurfaceSize] = React.useState({
+    width: 0,
+    height: 0,
+  })
   const { lens } = useGlobalLens()
   const snapshotPayload = useWorkspaceStore(
     (state) => state.surfaceSnapshots.M?.payload
@@ -91,6 +97,26 @@ export function SpatialSurface() {
   const [railHoverId, setRailHoverId] = React.useState<string | null>(null)
 
   React.useEffect(() => {
+    const node = surfaceRef.current
+    if (!node) return
+
+    const updateSize = () => {
+      const rect = node.getBoundingClientRect()
+      setSurfaceSize((current) =>
+        current.width === rect.width && current.height === rect.height
+          ? current
+          : { width: rect.width, height: rect.height }
+      )
+    }
+
+    updateSize()
+    const observer = new ResizeObserver(updateSize)
+    observer.observe(node)
+
+    return () => observer.disconnect()
+  }, [])
+
+  React.useEffect(() => {
     const timeout = window.setTimeout(() => {
       setQueryViewState(viewState)
     }, 220)
@@ -117,10 +143,20 @@ export function SpatialSurface() {
 
   const lod = spatialLodForZoom(queryViewState.zoom)
   const h3Resolution = h3ResolutionForZoom(queryViewState.zoom)
+  const bounds = React.useMemo(
+    () =>
+      spatialBoundsForView(
+        queryViewState,
+        surfaceSize.width,
+        surfaceSize.height
+      ),
+    [queryViewState, surfaceSize.height, surfaceSize.width]
+  )
 
   const spatialQuery = React.useMemo(
     () => ({
       viewport: queryViewState,
+      bounds,
       lod,
       h3Resolution,
       lens,
@@ -129,6 +165,7 @@ export function SpatialSurface() {
       radiusKm,
     }),
     [
+      bounds,
       branchId,
       h3Resolution,
       layers,
@@ -180,7 +217,10 @@ export function SpatialSurface() {
   }
 
   return (
-    <main className="relative min-h-svh overflow-hidden bg-[#070a0d] text-white">
+    <main
+      ref={surfaceRef}
+      className="relative min-h-svh overflow-hidden bg-[#070a0d] text-white"
+    >
       <div className="absolute inset-0">
         <SpatialMap
           snapshot={snapshot}
