@@ -32,6 +32,21 @@ class FabricWorkerRepository(WorkerRepository):
 
     scheduler_mode = "fabric_v2"
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._run_policy_cache = {}
+        self._preparation_metrics = {
+            "companies": 0,
+            "changed": 0,
+            "stale": 0,
+            "forced": 0,
+            "skipped": 0,
+            "work_bearing": 0,
+        }
+
+    def preparation_metrics(self):
+        return dict(self._preparation_metrics)
+
     def for_run(self, run):
         mode = str(run.get("scheduler_mode") or "legacy")
         if mode != self.scheduler_mode:
@@ -39,6 +54,9 @@ class FabricWorkerRepository(WorkerRepository):
         return self
 
     async def _run_policy(self, conn, run_id: int) -> tuple[str | None, int]:
+        cached = self._run_policy_cache.get(int(run_id))
+        if cached is not None:
+            return cached
         row = (
             await conn.execute(
                 text(
@@ -48,7 +66,9 @@ class FabricWorkerRepository(WorkerRepository):
                 {"id": run_id},
             )
         ).mappings().one()
-        return row["fiscal_year"], int(row.get("force_refresh_mask") or 0)
+        policy = (row["fiscal_year"], int(row.get("force_refresh_mask") or 0))
+        self._run_policy_cache[int(run_id)] = policy
+        return policy
 
     async def _latest_endpoint_state(self, conn, company_ids, resources):
         if not company_ids or not resources:
@@ -186,6 +206,13 @@ class FabricWorkerRepository(WorkerRepository):
                 REFRESH_PLAN_RESOURCES.labels("forced").inc(forced_dirty.bit_count())
             if not dirty:
                 REFRESH_PLAN_COMPANIES.labels("skipped").inc()
+
+            self._preparation_metrics["companies"] += 1
+            self._preparation_metrics["changed"] += int(bool(change_dirty))
+            self._preparation_metrics["stale"] += int(bool(stale_dirty))
+            self._preparation_metrics["forced"] += int(bool(forced_dirty))
+            self._preparation_metrics["skipped"] += int(not dirty)
+            self._preparation_metrics["work_bearing"] += int(bool(dirty))
 
         await conn.execute(
             text("""
