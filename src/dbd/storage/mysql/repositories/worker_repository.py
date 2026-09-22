@@ -39,6 +39,8 @@ def now():
 
 
 class WorkerRepository:
+    scheduler_mode = "legacy"
+
     def __init__(self, engine, archive_backend=_AUTO_BACKEND):
         self.engine = engine
         self._archive_backend = archive_backend
@@ -48,6 +50,16 @@ class WorkerRepository:
         if self._archive_backend is _AUTO_BACKEND:
             self._archive_backend = build_archive_backend()
         return self._archive_backend
+
+    def for_run(self, run):
+        mode = str(run.get("scheduler_mode") or "legacy")
+        if mode == "legacy":
+            return self
+        if mode == "fabric_v2":
+            from .fabric_worker_repository import FabricWorkerRepository
+
+            return FabricWorkerRepository(self.engine, archive_backend=self.archive_backend)
+        raise ValueError(f"Unsupported scheduler mode {mode!r}")
 
     async def create_run(self, source, parts, fiscal_year=None, *, scheduler_mode="legacy"):
         if scheduler_mode not in ("legacy", "fabric_v2"):
@@ -520,14 +532,57 @@ class WorkerRepository:
                 )
             return result.rowcount
 
-    async def archive_batch(self, items):
-        """Archive responses and durably advance tasks to project stage.
+    def _archive_task_reference(self, task):
+        return task["id"]
 
-        Inline MySQL archives preserve the original V2 atomic transaction. With an
+    async def _lock_archive_work(self, conn, task) -> bool:
+        owned = (
+            await conn.execute(
+                text("""
+                SELECT id FROM endpoint_tasks
+                WHERE id=:id AND stage='fetch' AND status='running'
+                  AND lease_owner=:owner AND lease_version=:version
+                  AND lease_expires_at>UTC_TIMESTAMP(6)
+                FOR UPDATE
+                """),
+                {
+                    "id": task["id"],
+                    "owner": task["lease_owner"],
+                    "version": task["lease_version"],
+                },
+            )
+        ).first()
+        return owned is not None
+
+    async def _transition_archive_work(self, conn, task, archive_id: int) -> None:
+        transition = await conn.execute(
+            text("""
+            UPDATE endpoint_tasks
+            SET stage='project',raw_response_id=:archive,fetched_at=UTC_TIMESTAMP(6),
+              lease_expires_at=TIMESTAMPADD(SECOND,:lease,UTC_TIMESTAMP(6))
+            WHERE id=:id AND stage='fetch' AND status='running'
+              AND lease_owner=:owner AND lease_version=:version
+              AND lease_expires_at>UTC_TIMESTAMP(6)
+            """),
+            {
+                "archive": archive_id,
+                "lease": settings.dbd_lease_seconds,
+                "id": task["id"],
+                "owner": task["lease_owner"],
+                "version": task["lease_version"],
+            },
+        )
+        if transition.rowcount != 1:
+            raise RuntimeError("Lease changed while archiving task")
+
+    async def archive_batch(self, items):
+        """Archive responses and durably advance scheduler work to project stage.
+
+        Inline MySQL archives preserve the original atomic transaction. With an
         external backend, encrypted objects are uploaded first; MySQL then commits
-        the object reference and fetch->project transition together. This ordering
-        can create an unreferenced object after a DB failure, but never a committed
-        archive row that references an object which was never uploaded.
+        the object reference and fetch->project transition together. Scheduler-
+        specific lease checks and transitions are delegated through two narrow hooks
+        so legacy endpoint tasks and fabric state share the same durability boundary.
         """
         if not items:
             return []
@@ -578,23 +633,7 @@ class WorkerRepository:
         async with self.engine.begin() as conn:
             for item, encoded, external in prepared:
                 task = item["task"]
-                owned = (
-                    await conn.execute(
-                        text("""
-                        SELECT id FROM endpoint_tasks
-                        WHERE id=:id AND stage='fetch' AND status='running'
-                          AND lease_owner=:owner AND lease_version=:version
-                          AND lease_expires_at>UTC_TIMESTAMP(6)
-                        FOR UPDATE
-                    """),
-                        {
-                            "id": task["id"],
-                            "owner": task["lease_owner"],
-                            "version": task["lease_version"],
-                        },
-                    )
-                ).first()
-                if owned is None:
+                if not await self._lock_archive_work(conn, task):
                     continue
 
                 response = item["response"]
@@ -638,7 +677,7 @@ class WorkerRepository:
                     )
                 """),
                     {
-                        "task": task["id"],
+                        "task": self._archive_task_reference(task),
                         "run": task["run_id"],
                         "company": task["company_id"],
                         "endpoint": task["endpoint"],
@@ -653,25 +692,7 @@ class WorkerRepository:
                     },
                 )
                 archive_id = result.lastrowid
-                transition = await conn.execute(
-                    text("""
-                    UPDATE endpoint_tasks
-                    SET stage='project',raw_response_id=:archive,fetched_at=UTC_TIMESTAMP(6),
-                      lease_expires_at=TIMESTAMPADD(SECOND,:lease,UTC_TIMESTAMP(6))
-                    WHERE id=:id AND stage='fetch' AND status='running'
-                      AND lease_owner=:owner AND lease_version=:version
-                      AND lease_expires_at>UTC_TIMESTAMP(6)
-                """),
-                    {
-                        "archive": archive_id,
-                        "lease": settings.dbd_lease_seconds,
-                        "id": task["id"],
-                        "owner": task["lease_owner"],
-                        "version": task["lease_version"],
-                    },
-                )
-                if transition.rowcount != 1:
-                    raise RuntimeError("Lease changed while archiving task")
+                await self._transition_archive_work(conn, task, archive_id)
                 updated = dict(item)
                 updated["archive_id"] = archive_id
                 updated["encoded"] = encoded
