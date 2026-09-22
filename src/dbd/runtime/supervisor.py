@@ -50,6 +50,7 @@ class WorkerProcess:
     process: subprocess.Popen
     restarts: int = 0
     log_handle: object | None = None
+    log_path: str | None = None
     draining: bool = False
     drain_requested_at: float | None = None
     started_at: float = field(default_factory=time.time)
@@ -501,6 +502,7 @@ def _spawn_worker(
     creationflags = 0
     start_new_session = False
     log_handle = None
+    log_path = None
 
     if os.name == "nt":
         creationflags |= getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
@@ -537,7 +539,14 @@ def _spawn_worker(
         if log_handle is not None:
             log_handle.close()
         raise
-    return WorkerProcess(index, worker_id, process, restart_count, log_handle)
+    return WorkerProcess(
+        index,
+        worker_id,
+        process,
+        restart_count,
+        log_handle,
+        str(log_path) if log_path is not None else None,
+    )
 
 
 def _close_worker_handle(worker: WorkerProcess) -> None:
@@ -1253,6 +1262,7 @@ def supervise_campaign(
     http_sample_rate_limit_hits = 0
     observed_http_rate: float | None = None
     recent_rate_limit_delta = 0
+    last_worker_failure: dict | None = None
     dashboard_started_at = time.monotonic()
     progress = LiveCampaignDashboard(run_id, interval=0.5)
 
@@ -1292,7 +1302,16 @@ def supervise_campaign(
             retired_metrics[key] = int(retired_metrics.get(key, 0)) + int(row.get(key, 0) or 0)
 
     def replacement_for(worker: WorkerProcess, reason: str) -> WorkerProcess | None:
-        nonlocal exhausted_capacity, restart_events
+        nonlocal exhausted_capacity, restart_events, last_worker_failure
+        last_worker_failure = {
+            "worker_index": worker.index,
+            "worker_id": worker.worker_id,
+            "reason": reason,
+            "restart_count": worker.restarts,
+            "restart_budget": max_restarts,
+            "log_path": worker.log_path,
+            "observed_at": time.time(),
+        }
         if worker.restarts >= max_restarts:
             exhausted_capacity += 1
             progress.event(
@@ -1714,6 +1733,8 @@ def supervise_campaign(
                         workers_registered=registered,
                         workers_stale=stale_registered,
                         exhausted_capacity=exhausted_capacity,
+                        restarts=restart_events,
+                        last_worker_failure=last_worker_failure,
                         effective_worker_max=effective_maximum,
                         worker_concurrency=worker_concurrency,
                         worker_rate=plan.worker_rate,
@@ -1796,6 +1817,8 @@ def supervise_campaign(
                 fleet_rate_initial=plan.initial,
                 fleet_rate_max=plan.ceiling,
                 rate_ceiling=plan.ceiling,
+                restarts=restart_events,
+                last_worker_failure=last_worker_failure,
                 db_pool_per_worker=resource_plan.db_pool_per_worker,
                 archive_workers_per_worker=resource_plan.archive_workers_per_worker,
                 projection_workers_per_worker=resource_plan.projection_workers_per_worker,
