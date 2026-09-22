@@ -12,11 +12,12 @@ describe("intelligence surface registry", () => {
   it("resolves all registered surfaces", () => {
     for (const surface of SURFACES) {
       expect(SURFACE_BY_ID[surface.id]).toBe(surface)
-      expect(isSurfaceId(surface.id.toLowerCase())).toBe(true)
+      expect(isSurfaceId(surface.id)).toBe(true)
     }
   })
 
-  it("rejects unrelated keyboard keys", () => {
+  it("keeps the type guard exact", () => {
+    expect(isSurfaceId("m")).toBe(false)
     expect(isSurfaceId("X")).toBe(false)
     expect(isSurfaceId("1")).toBe(false)
   })

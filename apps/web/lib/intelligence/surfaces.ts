@@ -65,5 +65,5 @@ export const SURFACE_BY_ID = Object.fromEntries(
 ) as Record<SurfaceId, IntelligenceSurface>
 
 export function isSurfaceId(value: string): value is SurfaceId {
-  return Object.prototype.hasOwnProperty.call(SURFACE_BY_ID, value.toUpperCase())
+  return Object.prototype.hasOwnProperty.call(SURFACE_BY_ID, value)
 }

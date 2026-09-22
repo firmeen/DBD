@@ -25,8 +25,8 @@ interface WorkspaceState {
   commandOpen: boolean
   lensOpen: boolean
   surfaceSnapshots: Partial<Record<SurfaceId, SurfaceSnapshot>>
-  history: WorkspaceCheckpoint[]
-  historyCursor: number
+  historyPast: WorkspaceCheckpoint[]
+  historyFuture: WorkspaceCheckpoint[]
   setActiveSurface: (surface: SurfaceId) => void
   setFocus: (entity: EntityRef | null) => void
   setSelection: (entities: EntityRef[]) => void
@@ -49,6 +49,22 @@ function sameEntity(left: EntityRef, right: EntityRef) {
   return left.kind === right.kind && left.id === right.id
 }
 
+function snapshotOf(state: WorkspaceState): WorkspaceCheckpoint {
+  return {
+    surface: state.activeSurface,
+    focus: state.focus,
+    selection: state.selection,
+    compare: state.compare,
+  }
+}
+
+function recordBeforeMutation(state: WorkspaceState) {
+  return {
+    historyPast: [...state.historyPast, snapshotOf(state)].slice(-MAX_HISTORY),
+    historyFuture: [] as WorkspaceCheckpoint[],
+  }
+}
+
 export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   activeSurface: "M",
   focus: null,
@@ -57,20 +73,34 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   commandOpen: false,
   lensOpen: false,
   surfaceSnapshots: {},
-  history: [],
-  historyCursor: -1,
+  historyPast: [],
+  historyFuture: [],
 
-  setActiveSurface: (activeSurface) => {
-    get().checkpoint()
-    set({ activeSurface })
-  },
+  setActiveSurface: (activeSurface) =>
+    set((state) =>
+      state.activeSurface === activeSurface
+        ? state
+        : {
+            ...recordBeforeMutation(state),
+            activeSurface,
+          }
+    ),
 
-  setFocus: (focus) => set({ focus }),
+  setFocus: (focus) =>
+    set((state) => ({
+      ...recordBeforeMutation(state),
+      focus,
+    })),
 
-  setSelection: (selection) => set({ selection }),
+  setSelection: (selection) =>
+    set((state) => ({
+      ...recordBeforeMutation(state),
+      selection,
+    })),
 
   toggleSelection: (entity) =>
     set((state) => ({
+      ...recordBeforeMutation(state),
       selection: state.selection.some((candidate) =>
         sameEntity(candidate, entity)
       )
@@ -78,16 +108,33 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
         : [...state.selection, entity],
     })),
 
-  clearSelection: () => set({ selection: [] }),
+  clearSelection: () =>
+    set((state) =>
+      state.selection.length === 0
+        ? state
+        : {
+            ...recordBeforeMutation(state),
+            selection: [],
+          }
+    ),
 
   toggleCompare: (entity) =>
     set((state) => ({
+      ...recordBeforeMutation(state),
       compare: state.compare.some((candidate) => sameEntity(candidate, entity))
         ? state.compare.filter((candidate) => !sameEntity(candidate, entity))
         : [...state.compare, entity],
     })),
 
-  clearCompare: () => set({ compare: [] }),
+  clearCompare: () =>
+    set((state) =>
+      state.compare.length === 0
+        ? state
+        : {
+            ...recordBeforeMutation(state),
+            compare: [],
+          }
+    ),
 
   setCommandOpen: (commandOpen) => set({ commandOpen }),
 
@@ -104,49 +151,42 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       },
     })),
 
-  checkpoint: () => {
-    const state = get()
-    const snapshot: WorkspaceCheckpoint = {
-      surface: state.activeSurface,
-      focus: state.focus,
-      selection: state.selection,
-      compare: state.compare,
-    }
-    const kept = state.history.slice(0, state.historyCursor + 1)
-    const history = [...kept, snapshot].slice(-MAX_HISTORY)
-    set({
-      history,
-      historyCursor: history.length - 1,
-    })
-  },
+  checkpoint: () =>
+    set((state) => ({
+      ...recordBeforeMutation(state),
+    })),
 
   undoContext: () => {
     const state = get()
-    if (state.historyCursor < 0) return
-    const snapshot = state.history[state.historyCursor]
-    if (!snapshot) return
+    const previous = state.historyPast.at(-1)
+    if (!previous) return
+
+    const current = snapshotOf(state)
 
     set({
-      activeSurface: snapshot.surface,
-      focus: snapshot.focus,
-      selection: snapshot.selection,
-      compare: snapshot.compare,
-      historyCursor: state.historyCursor - 1,
+      activeSurface: previous.surface,
+      focus: previous.focus,
+      selection: previous.selection,
+      compare: previous.compare,
+      historyPast: state.historyPast.slice(0, -1),
+      historyFuture: [current, ...state.historyFuture].slice(0, MAX_HISTORY),
     })
   },
 
   redoContext: () => {
     const state = get()
-    const nextCursor = state.historyCursor + 1
-    const snapshot = state.history[nextCursor]
-    if (!snapshot) return
+    const next = state.historyFuture[0]
+    if (!next) return
+
+    const current = snapshotOf(state)
 
     set({
-      activeSurface: snapshot.surface,
-      focus: snapshot.focus,
-      selection: snapshot.selection,
-      compare: snapshot.compare,
-      historyCursor: nextCursor,
+      activeSurface: next.surface,
+      focus: next.focus,
+      selection: next.selection,
+      compare: next.compare,
+      historyPast: [...state.historyPast, current].slice(-MAX_HISTORY),
+      historyFuture: state.historyFuture.slice(1),
     })
   },
 }))
