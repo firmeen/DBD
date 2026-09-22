@@ -436,11 +436,13 @@ class FabricWorkerRepository(WorkerRepository):
                     """),
                     {"archive": archive_id, "error": error},
                 )
-            count = int(unresolved).bit_count()
+            before_terminal_failed = int(row["failed_mask"]) & ~int(row["dirty_mask"])
+            after_failed = int(row["failed_mask"]) | int(unresolved)
+            failed_delta = (after_failed & ~before_terminal_failed).bit_count()
             return FinishResult(
                 True,
-                completed_delta=count,
-                failed_delta=count,
+                completed_delta=failed_delta,
+                failed_delta=failed_delta,
             )
 
     @transaction_retry
@@ -493,8 +495,12 @@ class FabricWorkerRepository(WorkerRepository):
                 int(transition.not_available_mask)
                 & ~int(row["not_available_mask"])
             ).bit_count()
+            before_terminal_failed = int(row["failed_mask"]) & ~int(row["dirty_mask"])
+            after_terminal_failed = int(transition.failed_mask) & ~int(
+                transition.dirty_mask
+            )
             failed_delta = (
-                int(transition.failed_mask) & ~int(row["failed_mask"])
+                after_terminal_failed & ~before_terminal_failed
             ).bit_count()
             await self._apply_transition(conn, row, transition, error=error)
             return FinishResult(

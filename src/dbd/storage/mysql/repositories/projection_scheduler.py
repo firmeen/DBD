@@ -25,24 +25,6 @@ class LegacyProjectionScheduler:
             raise LeaseLost("Project-stage task lease is no longer owned")
         return None
 
-    def _retry_archive(self, cur, task, state, endpoint):
-        if not endpoint:
-            return None
-        bit = endpoint_bit(endpoint)
-        if not (int(state["failed_mask"]) & int(state["dirty_mask"]) & bit):
-            return None
-        cur.execute(
-            """
-            SELECT id FROM response_archive
-            WHERE run_id=%s AND company_id=%s AND endpoint=%s
-              AND processing_status IN ('pending','invalid','failed')
-            ORDER BY id DESC LIMIT 1
-            """,
-            (task["run_id"], task["company_id"], endpoint),
-        )
-        row = cur.fetchone()
-        return row["id"] if row else None
-
     def finish(self, cur, task, state, outcome, archive_id, normalized):
         task_status = "not_available" if outcome == "not_available" else "done"
         cur.execute(
@@ -98,6 +80,24 @@ class FabricProjectionScheduler:
         if row is None:
             raise LeaseLost("Project-stage fabric lease is no longer owned")
         return row
+
+    def _retry_archive(self, cur, task, state, endpoint):
+        if not endpoint:
+            return None
+        bit = endpoint_bit(endpoint)
+        if not (int(state["failed_mask"]) & int(state["dirty_mask"]) & bit):
+            return None
+        cur.execute(
+            """
+            SELECT id FROM response_archive
+            WHERE run_id=%s AND company_id=%s AND endpoint=%s
+              AND processing_status IN ('pending','invalid','failed')
+            ORDER BY id DESC LIMIT 1
+            """,
+            (task["run_id"], task["company_id"], endpoint),
+        )
+        row = cur.fetchone()
+        return row["id"] if row else None
 
     def _profile_fiscal_year(self, cur, task, state, outcome, normalized):
         if state.get("fiscal_year"):
