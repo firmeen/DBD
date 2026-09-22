@@ -207,7 +207,10 @@ def command_discover(
     rate: float | None,
     max_buckets: int | None,
     health=None,
+    *,
+    presenter: TerminalPresenter | None = None,
 ) -> None:
+    presenter = presenter or TerminalPresenter()
     import asyncio
 
     from ..pipelines import discovery
@@ -223,11 +226,16 @@ def command_discover(
         )
     )
 
-    print(
-        f"\nbuckets {result.buckets_processed}, pages {result.pages_fetched}, "
-        f"companies written {result.companies_written}, requests {result.requests_made}"
+    presenter.command_result(
+        "DBD · DISCOVERY RESULT",
+        {
+            "buckets": result.buckets_processed,
+            "pages": result.pages_fetched,
+            "companies": result.companies_written,
+            "requests": result.requests_made,
+        },
     )
-    command_discover_status()
+    command_discover_status(presenter=presenter)
 
 
 def command_discover_status(
