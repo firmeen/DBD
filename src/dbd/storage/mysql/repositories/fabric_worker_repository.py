@@ -623,64 +623,83 @@ class FabricWorkerRepository(WorkerRepository):
             )
 
     async def retry_failed(self, run_id):
-        async with self.engine.begin() as conn:
-            rows = (
-                await conn.execute(
-                    text("""
-                    SELECT s.* FROM company_collection_state s
-                    JOIN company_master m ON m.company_id=s.company_id
-                    WHERE s.run_id=:id AND s.status='failed' AND s.failed_mask<>0
-                      AND m.identity_status<>'conflict'
-                      AND COALESCE(s.last_error,'')<>'IdentityConflict'
-                    FOR UPDATE
-                    """),
-                    {"id": run_id},
-                )
-            ).mappings().all()
-            reopened = 0
-            for row in rows:
-                failed_mask = int(row["failed_mask"])
-                if not failed_mask:
-                    continue
-                retry_dirty = int(row["dirty_mask"]) | failed_mask
-                next_item = next_endpoint(
-                    int(row["required_mask"]),
-                    int(row["done_mask"]),
-                    int(row["not_available_mask"]),
-                    failed=failed_mask,
-                    dirty=retry_dirty,
-                    fiscal_year=row["fiscal_year"],
-                )
-                retry_row = dict(row)
-                retry_row["dirty_mask"] = retry_dirty
-                retry_archive = await self._retry_archive(conn, retry_row, next_item)
-                await conn.execute(
-                    text("""
-                    UPDATE company_collection_state
-                    SET dirty_mask=:dirty,next_endpoint=:next,stage=:stage,status='pending',
-                      attempts=0,project_attempts=0,available_at=UTC_TIMESTAMP(6),
-                      raw_response_id=:archive,
-                      lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,
-                      finished_at=NULL,updated_at=UTC_TIMESTAMP(6)
-                    WHERE id=:state
-                    """),
-                    {
-                        "dirty": retry_dirty,
-                        "next": next_item,
-                        "stage": "project" if retry_archive is not None else "fetch",
-                        "archive": retry_archive,
-                        "state": row["id"],
-                    },
-                )
-                reopened += 1
-            if reopened:
-                await conn.execute(
-                    text(
-                        "UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"
-                    ),
-                    {"id": run_id},
-                )
-            return reopened
+        """Reopen terminal fabric failures in bounded transactions.
+
+        Failed resources stay represented by failed_mask; dirty_mask marks the
+        subset reopened for retry. Project-stage failures reuse an existing durable
+        archive when available, while fetch-stage failures return to source HTTP.
+        """
+        reopened = 0
+        batch_size = max(1, int(settings.dbd_write_batch_size))
+        while True:
+            async with self.engine.begin() as conn:
+                rows = (
+                    await conn.execute(
+                        text("""
+                        SELECT s.* FROM company_collection_state s
+                        JOIN company_master m ON m.company_id=s.company_id
+                        WHERE s.run_id=:id AND s.status='failed' AND s.failed_mask<>0
+                          AND m.identity_status<>'conflict'
+                          AND COALESCE(s.last_error,'')<>'IdentityConflict'
+                        ORDER BY s.id
+                        LIMIT :limit FOR UPDATE SKIP LOCKED
+                        """),
+                        {"id": run_id, "limit": batch_size},
+                    )
+                ).mappings().all()
+                if not rows:
+                    break
+
+                batch_reopened = 0
+                for row in rows:
+                    failed_mask = int(row["failed_mask"])
+                    if not failed_mask:
+                        continue
+                    retry_dirty = int(row["dirty_mask"]) | failed_mask
+                    next_item = next_endpoint(
+                        int(row["required_mask"]),
+                        int(row["done_mask"]),
+                        int(row["not_available_mask"]),
+                        failed=failed_mask,
+                        dirty=retry_dirty,
+                        fiscal_year=row["fiscal_year"],
+                    )
+                    if next_item is None:
+                        raise RuntimeError(
+                            f"Fabric state {row['id']} has failed resources but no retryable endpoint"
+                        )
+                    retry_row = dict(row)
+                    retry_row["dirty_mask"] = retry_dirty
+                    retry_archive = await self._retry_archive(conn, retry_row, next_item)
+                    await conn.execute(
+                        text("""
+                        UPDATE company_collection_state
+                        SET dirty_mask=:dirty,next_endpoint=:next,stage=:stage,status='pending',
+                          attempts=0,project_attempts=0,available_at=UTC_TIMESTAMP(6),
+                          raw_response_id=:archive,
+                          lease_owner=NULL,lease_expires_at=NULL,last_error=NULL,
+                          finished_at=NULL,updated_at=UTC_TIMESTAMP(6)
+                        WHERE id=:state
+                        """),
+                        {
+                            "dirty": retry_dirty,
+                            "next": next_item,
+                            "stage": "project" if retry_archive is not None else "fetch",
+                            "archive": retry_archive,
+                            "state": row["id"],
+                        },
+                    )
+                    batch_reopened += 1
+
+                if batch_reopened:
+                    await conn.execute(
+                        text(
+                            "UPDATE worker_runs SET status='ready',finished_at=NULL WHERE id=:id"
+                        ),
+                        {"id": run_id},
+                    )
+                reopened += batch_reopened
+        return reopened
 
     def _archive_task_reference(self, task):
         return None

@@ -647,3 +647,57 @@ async def test_fabric_projection_parity_with_legacy_scheduler(repo):
     fabric_snapshot = await _semantic_snapshot(repo, fabric_identity)
 
     assert fabric_snapshot == legacy_snapshot
+
+
+
+async def test_fabric_retry_batches_large_failed_population(repo, monkeypatch):
+    monkeypatch.setattr("dbd.core.settings.settings.dbd_write_batch_size", 25)
+    resources = ("profile",)
+    fabric, run_id, _ = await new_fabric_run(repo, resources, count=61)
+    bit = endpoint_bit("profile")
+
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE company_collection_state "
+                "SET failed_mask=:bit,dirty_mask=0,done_mask=0,not_available_mask=0,"
+                "next_endpoint=NULL,status='failed',stage='fetch',finished_at=UTC_TIMESTAMP(6) "
+                "WHERE run_id=:run"
+            ),
+            {"bit": bit, "run": run_id},
+        )
+        await conn.execute(
+            text(
+                "UPDATE worker_runs SET status='failed',finished_at=UTC_TIMESTAMP(6) "
+                "WHERE id=:run"
+            ),
+            {"run": run_id},
+        )
+
+    assert await fabric.retry_failed(run_id) == 61
+
+    async with repo.engine.connect() as conn:
+        rows = (
+            await conn.execute(
+                text(
+                    "SELECT COUNT(*) total,"
+                    "SUM(status='pending') pending,"
+                    "SUM(next_endpoint='profile') profile_next,"
+                    "SUM((dirty_mask & :bit)<>0) retry_dirty "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"bit": bit, "run": run_id},
+            )
+        ).mappings().one()
+        run_status = (
+            await conn.execute(
+                text("SELECT status FROM worker_runs WHERE id=:run"),
+                {"run": run_id},
+            )
+        ).scalar_one()
+
+    assert rows["total"] == 61
+    assert rows["pending"] == 61
+    assert rows["profile_next"] == 61
+    assert rows["retry_dirty"] == 61
+    assert run_status == "ready"
