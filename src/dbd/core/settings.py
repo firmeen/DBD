@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     dbd_global_pressure_endpoint_threshold: int = Field(2, ge=2, le=32)
     dbd_count_timeout_seconds: int = Field(120, ge=1)
     dbd_write_batch_size: int = Field(100, ge=1, le=1000)
+    dbd_materialize_batch_size: int = Field(1000, ge=100, le=5000)
     dbd_queue_size: int = Field(64, ge=1, le=10000)
     dbd_pipeline_queue_size: int = Field(512, ge=8, le=100000)
     dbd_claim_batch_size: int = Field(64, ge=1, le=1000)
