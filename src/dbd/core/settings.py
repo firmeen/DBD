@@ -41,6 +41,7 @@ class Settings(BaseSettings):
     dbd_global_pressure_endpoint_threshold: int = Field(2, ge=2, le=32)
     dbd_count_timeout_seconds: int = Field(120, ge=1)
     dbd_write_batch_size: int = Field(100, ge=1, le=1000)
+    dbd_materialize_batch_size: int = Field(1000, ge=100, le=5000)
     dbd_queue_size: int = Field(64, ge=1, le=10000)
     dbd_pipeline_queue_size: int = Field(512, ge=8, le=100000)
     dbd_claim_batch_size: int = Field(64, ge=1, le=1000)
@@ -60,6 +61,21 @@ class Settings(BaseSettings):
     dbd_lease_seconds: int = Field(300, ge=30)
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
+    dbd_refresh_stale_hours: dict[str, float] = Field(
+        default_factory=lambda: {
+            "profile": 24.0,
+            "committees": 168.0,
+            "committee_signs": 168.0,
+            "transformations": 168.0,
+            "financial_submissions": 168.0,
+            "financial_statements": 168.0,
+            "industry_benchmark": 168.0,
+            "nations": 720.0,
+            "nation_history": 720.0,
+            "name_history": 720.0,
+            "capital_history": 720.0,
+        }
+    )
     dbd_metrics_port: int = Field(0, ge=0, le=65535)
     dbd_redis_url: str | None = None
     dbd_redis_rate_key: str = "dbd:global-rate"

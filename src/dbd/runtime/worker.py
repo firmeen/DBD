@@ -14,6 +14,7 @@ from ..core.exceptions import (
     DbdForbiddenError,
     IdentityConflict,
 )
+from ..core.prepare_dashboard import PreparationSnapshot
 from ..core.redis import close_async_redis, create_async_redis, redis_pool_snapshot
 from ..core.settings import settings
 from ..core.telemetry import (
@@ -25,6 +26,7 @@ from ..core.telemetry import (
 )
 from ..storage.mysql.repositories.projection_repository import project
 from ..storage.mysql.repositories.projection_scheduler import LeaseLost
+from .collection_fabric import mask_for_endpoints
 from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
@@ -63,29 +65,94 @@ async def prepare(
     fiscal_year=None,
     statuses=None,
     scheduler_mode="legacy",
+    force_refresh=False,
+    progress=None,
 ):
     resources = endpoints(list(parts or DEFAULT_PARTS))
+    force_refresh_mask = mask_for_endpoints(resources) if force_refresh else 0
+    started_at = time.monotonic()
     run_id = await repo.create_run(
         str(Path(file).resolve()) if file else "company_master",
         list(parts or DEFAULT_PARTS),
         fiscal_year,
         scheduler_mode=scheduler_mode,
+        force_refresh_mask=force_refresh_mask,
     )
     scheduler_repo = repo.for_run({"scheduler_mode": scheduler_mode})
-    if file:
-        for batch in code_batches(file, settings.dbd_write_batch_size):
-            await scheduler_repo.import_batch(run_id, batch, resources)
-    elif master:
-        after = 0
-        while (
-            after := await scheduler_repo.enqueue_master(
-                run_id, resources, after, settings.dbd_write_batch_size, statuses
+    batches = 0
+    processed = 0
+    total = 0
+    batch_size = (
+        settings.dbd_materialize_batch_size
+        if master
+        else settings.dbd_write_batch_size
+    )
+
+    def emit(phase: str) -> None:
+        if progress is None:
+            return
+        metrics = (
+            scheduler_repo.preparation_metrics()
+            if hasattr(scheduler_repo, "preparation_metrics")
+            else {}
+        )
+        progress(
+            PreparationSnapshot(
+                run_id=int(run_id),
+                scheduler_mode=scheduler_mode,
+                phase=phase,
+                processed=int(metrics.get("companies", processed)),
+                total=int(total),
+                batches=int(batches),
+                batch_size=int(batch_size),
+                changed=int(metrics.get("changed", 0)),
+                stale=int(metrics.get("stale", 0)),
+                forced=int(metrics.get("forced", 0)),
+                skipped=int(metrics.get("skipped", 0)),
+                work_bearing=int(metrics.get("work_bearing", 0)),
+                elapsed_seconds=max(0.0, time.monotonic() - started_at),
             )
-        ) is not None:
-            pass
+        )
+
+    if file:
+        emit("importing")
+        for batch in code_batches(file, batch_size):
+            await scheduler_repo.import_batch(run_id, batch, resources)
+            batches += 1
+            processed += len(batch)
+            emit("importing")
+    elif master:
+        emit("counting")
+        population = await repo.master_population()
+        total = int(
+            population["eligible_all_statuses"]
+            if not statuses
+            else population["eligible_operating"]
+        )
+        emit("materializing")
+        after = 0
+        while True:
+            next_after = await scheduler_repo.enqueue_master(
+                run_id,
+                resources,
+                after,
+                batch_size,
+                statuses,
+            )
+            if next_after is None:
+                break
+            after = next_after
+            batches += 1
+            if not hasattr(scheduler_repo, "preparation_metrics"):
+                processed = min(total, processed + batch_size)
+            emit("materializing")
     else:
         raise ValueError("Choose --file or --master")
+
     await scheduler_repo.ready(run_id)
+    if master and not hasattr(scheduler_repo, "preparation_metrics"):
+        processed = total
+    emit("ready")
     return run_id
 
 

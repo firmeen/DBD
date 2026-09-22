@@ -6,7 +6,15 @@ from hashlib import sha256
 
 from ....client.endpoints.search import SearchFilters
 from ....core.telemetry import DISCOVERY_PAGE_RESULTS, DISCOVERY_VALID_ROWS, observe_discovery
-from ....runtime.delta import MASTER_HASH_VERSION, master_fingerprint
+from ....runtime.delta import (
+    ALL_ENDPOINT_MASK,
+    CHANGE_ALL,
+    MASTER_HASH_VERSION,
+    change_mask,
+    dirty_mask_for_change,
+    master_components_json,
+    master_fingerprint,
+)
 from ..engine import connect, use_connection
 from .company_repository import company_upsert_sql, company_values
 
@@ -247,10 +255,22 @@ def child_total(bucket_id: int) -> int:
 
 
 def save_page(*, bucket_id: int, profiles: list, archive_id: int, requested_at: datetime) -> int:
-    """Project one archived Search page without storing the raw payload twice."""
+    """Project one archived Search page and preserve exact pending refresh intent.
+
+    change_mask describes the latest accepted Search observation. The separate
+    pending_dirty_mask is durable work intent and is ORed until a successful,
+    master-hash-fenced fabric projection clears the corresponding endpoint bit.
+    """
     if not profiles:
         return 0
-    hashes = [master_fingerprint(profile) for profile in profiles]
+    prepared = [
+        (
+            profile,
+            master_fingerprint(profile),
+            master_components_json(profile),
+        )
+        for profile in profiles
+    ]
     with connect() as conn:
         try:
             with conn.cursor() as cur:
@@ -263,48 +283,122 @@ def save_page(*, bucket_id: int, profiles: list, archive_id: int, requested_at: 
                     insert_company,
                     [company_values(profile, None, requested_at, archive_id) for profile in profiles],
                 )
-                cur.executemany(
-                    """
-                    INSERT INTO company_master(
-                      jp_no,jp_type_code,observed_jp_stat_code,observed_status_at,
-                      master_hash,master_hash_version,last_master_changed_at,
-                      latest_search_archive_id,first_seen_at,last_seen_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE
-                      last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),
-                      observed_jp_stat_code=IF(
-                        VALUES(observed_jp_stat_code) IS NULL,
-                        observed_jp_stat_code,VALUES(observed_jp_stat_code)
-                      ),
-                      observed_status_at=IF(
-                        VALUES(observed_jp_stat_code) IS NULL,
-                        observed_status_at,VALUES(observed_status_at)
-                      ),
-                      change_mask=IF(company_master.master_hash <=> VALUES(master_hash),0,127),
-                      last_master_changed_at=IF(
-                        company_master.master_hash <=> VALUES(master_hash),
-                        company_master.last_master_changed_at,VALUES(last_master_changed_at)
-                      ),
-                      master_hash=VALUES(master_hash),
-                      master_hash_version=VALUES(master_hash_version),
-                      latest_search_archive_id=VALUES(latest_search_archive_id)
-                    """,
-                    [
+
+                for profile, fingerprint, components_json in prepared:
+                    cur.execute(
+                        """
+                        SELECT master_hash,master_hash_version,master_components_json,
+                               master_observed_at,pending_dirty_mask
+                        FROM company_master
+                        WHERE jp_type_code=%s AND jp_no=%s
+                        FOR UPDATE
+                        """,
+                        (profile.jp_type_code, profile.jp_no),
+                    )
+                    current = cur.fetchone()
+
+                    if current is None:
+                        observed_change = CHANGE_ALL
+                        cur.execute(
+                            """
+                            INSERT INTO company_master(
+                              jp_no,jp_type_code,observed_jp_stat_code,observed_status_at,
+                              master_hash,master_hash_version,master_components_json,
+                              master_observed_at,change_mask,pending_dirty_mask,
+                              last_master_changed_at,latest_search_archive_id,
+                              first_seen_at,last_seen_at
+                            ) VALUES (
+                              %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                            )
+                            """,
+                            (
+                                profile.jp_no,
+                                profile.jp_type_code,
+                                profile.jp_stat_code,
+                                requested_at if profile.jp_stat_code is not None else None,
+                                fingerprint,
+                                MASTER_HASH_VERSION,
+                                components_json,
+                                requested_at,
+                                observed_change,
+                                ALL_ENDPOINT_MASK,
+                                requested_at,
+                                archive_id,
+                                requested_at,
+                                requested_at,
+                            ),
+                        )
+                        continue
+
+                    observed_at = current.get("master_observed_at")
+                    if observed_at is not None and observed_at > requested_at:
+                        cur.execute(
+                            """
+                            UPDATE company_master
+                            SET last_seen_at=GREATEST(last_seen_at,%s)
+                            WHERE jp_type_code=%s AND jp_no=%s
+                            """,
+                            (requested_at, profile.jp_type_code, profile.jp_no),
+                        )
+                        continue
+
+                    if (
+                        current.get("master_hash") == fingerprint
+                        and int(current.get("master_hash_version") or 0) == MASTER_HASH_VERSION
+                    ):
+                        observed_change = 0
+                    else:
+                        previous_components = current.get("master_components_json")
+                        observed_change = (
+                            change_mask(previous_components, profile)
+                            if previous_components is not None
+                            else CHANGE_ALL
+                        )
+
+                    pending_dirty = int(current.get("pending_dirty_mask") or 0)
+                    pending_dirty |= dirty_mask_for_change(observed_change)
+                    cur.execute(
+                        """
+                        UPDATE company_master
+                        SET last_seen_at=GREATEST(last_seen_at,%s),
+                            observed_jp_stat_code=IF(
+                              %s IS NULL,observed_jp_stat_code,%s
+                            ),
+                            observed_status_at=IF(
+                              %s IS NULL,observed_status_at,%s
+                            ),
+                            change_mask=%s,
+                            pending_dirty_mask=%s,
+                            last_master_changed_at=IF(
+                              %s=0,last_master_changed_at,%s
+                            ),
+                            master_hash=%s,
+                            master_hash_version=%s,
+                            master_components_json=%s,
+                            master_observed_at=%s,
+                            latest_search_archive_id=%s
+                        WHERE jp_type_code=%s AND jp_no=%s
+                        """,
                         (
-                            profile.jp_no,
-                            profile.jp_type_code,
+                            requested_at,
                             profile.jp_stat_code,
-                            requested_at if profile.jp_stat_code is not None else None,
+                            profile.jp_stat_code,
+                            profile.jp_stat_code,
+                            requested_at,
+                            observed_change,
+                            pending_dirty,
+                            observed_change,
+                            requested_at,
                             fingerprint,
                             MASTER_HASH_VERSION,
+                            components_json,
                             requested_at,
                             archive_id,
-                            requested_at,
-                            requested_at,
-                        )
-                        for profile, fingerprint in zip(profiles, hashes, strict=True)
-                    ],
-                )
+                            profile.jp_type_code,
+                            profile.jp_no,
+                        ),
+                    )
+
                 cur.executemany(
                     """
                     INSERT IGNORE INTO discovery_sightings(
@@ -321,7 +415,6 @@ def save_page(*, bucket_id: int, profiles: list, archive_id: int, requested_at: 
         except Exception:
             conn.rollback()
             raise
-
 
 def discovery_summary() -> dict:
     with connect() as conn, conn.cursor() as cur:

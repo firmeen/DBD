@@ -133,6 +133,19 @@ dbd-data campaign start `
 `--fleet-rate-max` เป็น hard shared ceiling ส่วน worker count ใช้เพิ่ม local pipeline capacity เท่านั้น
 resource budget จะถูกแบ่งเป็น per-worker caps ตั้งแต่เริ่ม supervisor และ configuration ที่เล็กจนรองรับ `workers-max` ไม่ได้จะถูก reject ก่อน spawn worker
 
+ระหว่าง `campaign start --master` ระบบต้อง materialize durable scheduler state ก่อนเปิด worker
+fleet. ช่วงนี้ CLI แสดง live `CAMPAIGN PREPARATION` dashboard แยกจาก runtime dashboard โดยมี
+จำนวนบริษัทที่ materialized, batch/rate/ETA และ fabric planner counters
+(`changed/stale/forced/skipped/work`) จึงไม่ควรมีช่วง terminal เงียบสำหรับ master ขนาดใหญ่
+
+ค่า batch ของขั้นนี้แยกจาก write batch อื่น:
+
+```env
+DBD_MATERIALIZE_BATCH_SIZE=1000
+```
+
+เพิ่มค่านี้เมื่อ MySQL รับ transaction ใหญ่ขึ้นได้; ไม่ได้เปลี่ยน archive/projection write batching
+
 เมื่อ command แสดง:
 
 ```text
