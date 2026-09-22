@@ -6,7 +6,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0009_fabric_scheduler"
+HEAD = "0010_incremental_refresh"
 
 
 def test_correctness_migration_adopts_existing_objects():
@@ -191,3 +191,53 @@ def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data()
         assert cur.fetchone()["n"] > 0
         cur.execute("SELECT bucket_key FROM discovery_buckets WHERE id=%s", (bucket_id,))
         assert cur.fetchone()["bucket_key"] == marker
+
+
+def test_incremental_refresh_migration_is_adoption_safe():
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE alembic_version SET version_num='0009_fabric_scheduler'")
+        conn.commit()
+
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='company_master'
+              AND column_name IN (
+                'master_components_json','master_observed_at','pending_dirty_mask'
+              )
+            ORDER BY column_name
+            """
+        )
+        assert [row["name"] for row in cur.fetchall()] == [
+            "master_components_json",
+            "master_observed_at",
+            "pending_dirty_mask",
+        ]
+        cur.execute(
+            """
+            SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='company_collection_state'
+              AND column_name IN (
+                'change_dirty_mask','stale_dirty_mask','forced_dirty_mask'
+              )
+            ORDER BY column_name
+            """
+        )
+        assert [row["name"] for row in cur.fetchall()] == [
+            "change_dirty_mask",
+            "forced_dirty_mask",
+            "stale_dirty_mask",
+        ]
+        cur.execute(
+            """
+            SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='worker_runs'
+              AND column_name='force_refresh_mask'
+            """
+        )
+        assert [row["name"] for row in cur.fetchall()] == ["force_refresh_mask"]
