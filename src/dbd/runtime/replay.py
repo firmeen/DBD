@@ -190,7 +190,13 @@ def replay_archive(archive_id):
             with connect() as conn, conn.cursor() as cur:
                 _refresh_run_status(cur, task["run_id"], scheduler_mode)
                 conn.commit()
-        print(f"archive {archive_id}: {status}")
+        return {
+            "archive_id": int(archive_id),
+            "status": str(status),
+            "scheduler_mode": scheduler_mode,
+            "run_id": raw.get("run_id"),
+            "endpoint": raw.get("endpoint"),
+        }
     except BaseException:
         if owns_scheduler:
             with connect() as conn, conn.cursor() as cur:
