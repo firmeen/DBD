@@ -87,10 +87,23 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
     ),
 
   setFocus: (focus) =>
-    set((state) => ({
-      ...recordBeforeMutation(state),
-      focus,
-    })),
+    set((state) => {
+      const unchanged =
+        state.focus === focus ||
+        (state.focus !== null &&
+          focus !== null &&
+          state.focus.kind === focus.kind &&
+          state.focus.id === focus.id &&
+          state.focus.label === focus.label &&
+          state.focus.secondary === focus.secondary)
+
+      return unchanged
+        ? state
+        : {
+            ...recordBeforeMutation(state),
+            focus,
+          }
+    }),
 
   setSelection: (selection) =>
     set((state) => ({
@@ -136,7 +149,14 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           }
     ),
 
-  setCommandOpen: (commandOpen) => set({ commandOpen }),
+  setCommandOpen: (commandOpen) =>
+    set((state) =>
+      commandOpen
+        ? { commandOpen: true, lensOpen: false }
+        : state.commandOpen
+          ? { commandOpen: false }
+          : state
+    ),
 
   setLensOpen: (lensOpen) => set({ lensOpen }),
 

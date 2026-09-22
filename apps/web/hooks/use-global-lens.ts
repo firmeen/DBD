@@ -21,7 +21,7 @@ const lensParsers = {
 
 export function useGlobalLens() {
   const [lens, setLens] = useQueryStates(lensParsers, {
-    history: "push",
+    history: "replace",
     shallow: true,
   })
 

@@ -25,6 +25,7 @@ export function useKeyboardRouter() {
 
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "k") {
         event.preventDefault()
+        setLensOpen(false)
         setCommandOpen(true)
         return
       }
@@ -42,6 +43,7 @@ export function useKeyboardRouter() {
 
       if (event.key === "?") {
         event.preventDefault()
+        setLensOpen(false)
         setCommandOpen(true)
         return
       }
