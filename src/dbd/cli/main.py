@@ -389,6 +389,9 @@ def main():
     parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
+    _add_output_options(
+        sub.add_parser("about", help="Inspect package, Python and installation integrity")
+    )
     _add_output_options(sub.add_parser("check-db", help="Check database connectivity"))
     _add_output_options(sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)"))
     _add_output_options(sub.add_parser("master-status", help="Count discovered and verified company identities"))
@@ -504,10 +507,14 @@ def main():
     args = parser.parse_args()
     presenter = TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
-        verbose=bool(getattr(args, "verbose", False)),
+        verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
     )
     try:
-        if args.command == "migrate":
+        if args.command == "about":
+            from ..core.package_info import package_environment_snapshot
+
+            presenter.package_about(package_environment_snapshot())
+        elif args.command == "migrate":
             from ..storage.mysql.migrations import migrate
 
             migrate()

@@ -200,3 +200,89 @@ def test_master_status_is_not_raw_json_by_default() -> None:
     assert "DBD · MASTER STATUS" in text
     assert "ELIGIBLE" in text
     assert not text.lstrip().startswith("{")
+
+
+def test_package_about_renders_version_mismatch_and_actions() -> None:
+    output, stream = presenter(verbose=True)
+    output.package_about(
+        {
+            "health": "mismatch",
+            "identity": {
+                "name": "dbd-data",
+                "source_version": "0.4.0",
+                "installed_version": "0.3.0",
+                "version_match": False,
+                "summary": "DBD DataWarehouse company data ingestion into MySQL",
+                "home_page": "https://github.com/firmeen/DBD",
+                "author": "Mr. Afimeen Usman",
+                "author_email": "Afirmeen13.us@gmail.com",
+                "license": "-",
+            },
+            "runtime": {
+                "python": "3.11.3",
+                "implementation": "CPython",
+                "executable": r"C:\project\DBD\.venv\Scripts\python.exe",
+                "virtualenv": True,
+                "venv_path": r"C:\project\DBD\.venv",
+                "platform": "Windows-11",
+            },
+            "installation": {
+                "package_path": r"C:\project\DBD\src\dbd",
+                "project_root": r"C:\project\DBD",
+                "distribution_location": r"C:\project\DBD\.venv\Lib\site-packages",
+                "metadata_location": r"C:\project\DBD\.venv\Lib\site-packages\dbd_data-0.3.0.dist-info",
+                "editable": True,
+                "editable_project_location": r"C:\project\DBD",
+                "dependencies": ["redis", "rich"],
+                "dependency_count": 2,
+                "required_by": [],
+            },
+            "integrity": {
+                "invalid_distribution_entries": [
+                    r"C:\project\DBD\.venv\Lib\site-packages\~bd-data"
+                ],
+                "invalid_distribution_count": 1,
+                "issues": [
+                    {
+                        "code": "version_mismatch",
+                        "severity": "error",
+                        "message": "Source version 0.4.0 differs from installed metadata 0.3.0.",
+                    },
+                    {
+                        "code": "invalid_distribution_remnants",
+                        "severity": "warning",
+                        "message": "Found 1 invalid '~*' distribution remnant(s) in site-packages.",
+                    },
+                ],
+            },
+            "actions": [
+                "python -m pip install -e .",
+                "Inspect the listed '~*' site-packages entries and remove only confirmed stale remnants.",
+            ],
+        }
+    )
+
+    text = stream.getvalue()
+    assert "DBD · PACKAGE INTELLIGENCE" in text
+    assert "VERSION MISMATCH" in text
+    assert "SOURCE" in text and "0.4.0" in text
+    assert "INSTALLED" in text and "0.3.0" in text
+    assert "PACKAGE PROFILE" in text
+    assert "VIRTUALENV" in text
+    assert "EDITABLE" in text
+    assert "~bd-data" in text
+    assert "RECOMMENDED ACTIONS" in text
+    assert "python -m pip install -e ." in text
+    assert "DIRECT DEPENDENCIES" in text
+
+
+def test_package_about_json_mode_preserves_snapshot() -> None:
+    output, stream = presenter(json_mode=True)
+    payload = {
+        "health": "healthy",
+        "identity": {"source_version": "0.4.0", "installed_version": "0.4.0"},
+    }
+
+    output.package_about(payload)
+
+    assert json.loads(stream.getvalue()) == payload
