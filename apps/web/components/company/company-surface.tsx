@@ -100,6 +100,22 @@ export function CompanySurface() {
   const [financialYear, setFinancialYear] = React.useState<string | null>(
     initialState.financialYear
   )
+  const previousFocusedCompanyIdRef = React.useRef(focusedCompanyId)
+
+  React.useEffect(() => {
+    if (previousFocusedCompanyIdRef.current === focusedCompanyId) return
+
+    const restored = resolveCompanySurfaceSnapshot(
+      snapshotPayload,
+      focusedCompanyId
+    )
+
+    previousFocusedCompanyIdRef.current = focusedCompanyId
+    setView(restored.view)
+    setSearchTerm(restored.searchTerm)
+    setDebouncedSearch(restored.searchTerm)
+    setFinancialYear(restored.financialYear)
+  }, [focusedCompanyId, snapshotPayload])
 
   React.useEffect(() => {
     const timeout = window.setTimeout(
