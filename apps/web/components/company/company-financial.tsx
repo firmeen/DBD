@@ -62,8 +62,8 @@ export function CompanyFinancial({
           />
         </div>
 
-        <div className="mt-5 h-[330px] min-h-[280px]">
-          <FinancialTrajectoryChart series={series} />
+        <div className="mt-5">
+          <FinancialTrajectoryCharts series={series} />
         </div>
       </section>
 
@@ -75,9 +75,53 @@ export function CompanyFinancial({
   )
 }
 
-function FinancialTrajectoryChart({
+function FinancialTrajectoryCharts({
   series,
 }: {
+  series: CompanyFinancialSeries[]
+}) {
+  const grouped = React.useMemo(() => {
+    const groups = new Map<
+      CompanyFinancialSeries["format"],
+      CompanyFinancialSeries[]
+    >()
+
+    for (const metric of series) {
+      const current = groups.get(metric.format) ?? []
+      current.push(metric)
+      groups.set(metric.format, current)
+    }
+
+    return [...groups.entries()]
+  }, [series])
+
+  if (grouped.length === 0) {
+    return (
+      <div className="grid h-[300px] place-items-center text-center">
+        <div>
+          <Activity className="mx-auto size-5 text-white/18" />
+          <p className="mt-3 text-xs text-white/42">
+            No trajectory series available
+          </p>
+        </div>
+      </div>
+    )
+  }
+
+  return (
+    <div className="grid gap-4 xl:grid-cols-2">
+      {grouped.map(([format, metrics]) => (
+        <TrajectoryField key={format} format={format} series={metrics} />
+      ))}
+    </div>
+  )
+}
+
+function TrajectoryField({
+  format,
+  series,
+}: {
+  format: CompanyFinancialSeries["format"]
   series: CompanyFinancialSeries[]
 }) {
   const option = React.useMemo<EChartsOption>(() => {
@@ -131,11 +175,8 @@ function FinancialTrajectoryChart({
         axisLabel: {
           color: "rgba(255,255,255,.26)",
           fontSize: 9,
-          formatter: (value: number) =>
-            new Intl.NumberFormat("en", {
-              notation: "compact",
-              maximumFractionDigits: 1,
-            }).format(value),
+          formatter: (value: number | string) =>
+            formatCompanyMetric(Number(value), format, true),
         },
       },
       series: series.map((metric, index) => ({
@@ -158,31 +199,44 @@ function FinancialTrajectoryChart({
         }),
       })),
     }
-  }, [series])
-
-  if (series.length === 0) {
-    return (
-      <div className="grid h-full place-items-center text-center">
-        <div>
-          <Activity className="mx-auto size-5 text-white/18" />
-          <p className="mt-3 text-xs text-white/42">
-            No trajectory series available
-          </p>
-        </div>
-      </div>
-    )
-  }
+  }, [format, series])
 
   return (
-    <div aria-label="Financial trajectory chart" className="h-full">
-      <ReactECharts
-        option={option}
-        notMerge
-        lazyUpdate
-        style={{ height: "100%", width: "100%" }}
-      />
+    <div className="rounded-2xl border border-white/7 bg-black/10 p-3">
+      <div className="mb-2 flex items-center justify-between px-1">
+        <p className="text-[8px] font-semibold uppercase tracking-[0.17em] text-white/24">
+          {trajectoryFormatLabel(format)}
+        </p>
+        <span className="font-mono text-[8px] text-white/17">
+          {series.length} series
+        </span>
+      </div>
+      <div
+        aria-label={`${trajectoryFormatLabel(format)} financial trajectory`}
+        className="h-[280px]"
+      >
+        <ReactECharts
+          option={option}
+          notMerge
+          lazyUpdate
+          style={{ height: "100%", width: "100%" }}
+        />
+      </div>
     </div>
   )
+}
+
+function trajectoryFormatLabel(format: CompanyFinancialSeries["format"]) {
+  switch (format) {
+    case "currency":
+      return "Currency field"
+    case "percent":
+      return "Percentage field"
+    case "ratio":
+      return "Ratio field"
+    default:
+      return "Numeric field"
+  }
 }
 
 function YearSelector({
