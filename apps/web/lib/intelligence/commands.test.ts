@@ -15,6 +15,18 @@ describe("intelligence command registry", () => {
     )
   })
 
+  it("exposes System, Light and Dark as explicit appearance commands", () => {
+    const appearance = INTELLIGENCE_COMMANDS.filter(
+      (command) => command.category === "Appearance"
+    )
+
+    expect(appearance.map((command) => command.id)).toEqual([
+      "theme.system",
+      "theme.light",
+      "theme.dark",
+    ])
+  })
+
   it("does not duplicate command ids", () => {
     const ids = INTELLIGENCE_COMMANDS.map((command) => command.id)
     expect(new Set(ids).size).toBe(ids.length)
