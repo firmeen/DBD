@@ -1,7 +1,7 @@
 "use client"
 
 import * as React from "react"
-import { useQuery } from "@tanstack/react-query"
+import { useQuery, type UseQueryResult } from "@tanstack/react-query"
 import {
   AlertTriangle,
   Building2,
@@ -32,8 +32,10 @@ import {
   companySearchResultToEntity,
   type CompanyDetailSnapshot,
   type CompanySearchResult,
+  type CompanySearchSnapshot,
   type CompanyViewId,
 } from "@/lib/company/types"
+import type { EntityRef, SurfaceId } from "@/lib/intelligence/types"
 import { cn } from "@/lib/utils"
 import { useWorkspaceStore } from "@/stores/workspace-store"
 
@@ -122,7 +124,6 @@ export function CompanySurface() {
     queryFn: ({ signal }) => searchCompanies(debouncedSearch, lens, signal),
     enabled: debouncedSearch.length >= 2,
     staleTime: 30_000,
-    placeholderData: (previous) => previous,
     retry: 1,
   })
 
@@ -132,7 +133,6 @@ export function CompanySurface() {
       fetchCompanyDetail(focusedCompany!.id, lens, signal),
     enabled: focusedCompany !== null,
     staleTime: 60_000,
-    placeholderData: (previous) => previous,
     retry: 1,
   })
 
@@ -257,10 +257,8 @@ function CompanyCommandBar({
 }: {
   searchTerm: string
   onSearchTermChange: (value: string) => void
-  focusedCompany: ReturnType<
-    typeof useWorkspaceStore.getState
-  >["focus"]
-  searchQuery: ReturnType<typeof useQuery>
+  focusedCompany: EntityRef | null
+  searchQuery: UseQueryResult<CompanySearchSnapshot, Error>
   onPickCompany: (company: CompanySearchResult) => void
   onClearFocus: () => void
 }) {
@@ -338,13 +336,11 @@ function CompanySearchPopover({
   results,
   onPickCompany,
 }: {
-  queryState: ReturnType<typeof useQuery>
+  queryState: UseQueryResult<CompanySearchSnapshot, Error>
   results: CompanySearchResult[]
   onPickCompany: (company: CompanySearchResult) => void
 }) {
-  const data = queryState.data as
-    | { availability?: string; message?: string }
-    | undefined
+  const data = queryState.data
 
   return (
     <div className="absolute left-0 right-0 top-[calc(100%+10px)] overflow-hidden rounded-2xl border border-white/10 bg-[#091117]/98 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl">
@@ -550,13 +546,11 @@ function CompanyView({
 }: {
   view: CompanyViewId
   detail: CompanyDetailSnapshot
-  fallbackEntity: NonNullable<
-    ReturnType<typeof useWorkspaceStore.getState>["focus"]
-  >
+  fallbackEntity: EntityRef
   selectedYear: string | null
   onYearChange: (year: string) => void
-  onFocusCompany: ReturnType<typeof useWorkspaceStore.getState>["setFocus"]
-  onHandoff: ReturnType<typeof useWorkspaceStore.getState>["setActiveSurface"]
+  onFocusCompany: (entity: EntityRef | null) => void
+  onHandoff: (surface: SurfaceId) => void
 }) {
   switch (view) {
     case "financial":
