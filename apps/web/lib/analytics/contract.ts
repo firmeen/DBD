@@ -29,18 +29,33 @@ const populationSchema = z.object({
   expiresAt: z.string().datetime({ offset: true }).nullable().optional(),
 })
 
-const filterSchema = z.object({
-  dimension: z.enum([
-    "tipStatus",
-    "province",
-    "businessType",
-    "incomeBand",
-    "product",
-    "subclass",
-  ]),
-  value: z.string().min(1).max(MAX_LABEL),
-  label: boundedLabel,
-})
+const filterSchema = z
+  .object({
+    dimension: z.enum([
+      "tipStatus",
+      "province",
+      "businessType",
+      "incomeBand",
+      "product",
+      "subclass",
+      "productSubclass",
+    ]),
+    value: z.string().min(1).max(MAX_LABEL),
+    label: boundedLabel,
+    product: boundedLabel.optional(),
+    subclass: boundedLabel.optional(),
+  })
+  .superRefine((filter, context) => {
+    if (
+      filter.dimension === "productSubclass" &&
+      (!filter.product || !filter.subclass)
+    ) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Product/subclass filters require both product and subclass",
+      })
+    }
+  })
 
 const summarySchema = z.object({
   companyCount: z.number().int().nonnegative().nullable(),
@@ -55,6 +70,27 @@ const summarySchema = z.object({
   lossRatio: z.number().finite().nullable(),
   averageOpportunityScore: z.number().finite().min(0).max(1).nullable(),
 })
+
+const productSubclassSchema = z.object({
+  product: boundedLabel,
+  subclass: boundedLabel,
+})
+
+const productSubclassListSchema = z
+  .array(productSubclassSchema)
+  .max(256)
+  .superRefine((pairs, context) => {
+    const keys = new Set(
+      pairs.map((pair) => JSON.stringify([pair.product, pair.subclass]))
+    )
+
+    if (keys.size !== pairs.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: "Analytics company contains duplicate product/subclass pairs",
+      })
+    }
+  })
 
 const companySchema = z.object({
   id: z.string().min(1).max(64),
@@ -74,6 +110,7 @@ const companySchema = z.object({
   productCount: z.number().int().nonnegative().nullable().optional(),
   products: z.array(z.string().min(1).max(MAX_LABEL)).max(64),
   subclasses: z.array(z.string().min(1).max(MAX_LABEL)).max(128),
+  productSubclasses: productSubclassListSchema,
 })
 
 const bucketSchema = z.object({
