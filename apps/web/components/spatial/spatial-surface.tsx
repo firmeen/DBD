@@ -266,7 +266,7 @@ export function SpatialSurface() {
   return (
     <main
       ref={surfaceRef}
-      className="relative min-h-svh overflow-hidden bg-[#070a0d] text-white"
+      className="relative min-h-svh overflow-hidden bg-tipx-canvas text-tipx-ink"
     >
       <div className="absolute inset-0">
         <SpatialMap
@@ -335,16 +335,16 @@ export function SpatialSurface() {
 
       {mapHover ? (
         <div
-          className="pointer-events-none absolute z-[42] w-60 rounded-xl border border-white/12 bg-[#071017]/94 px-3 py-2.5 shadow-2xl backdrop-blur-xl"
+          className="pointer-events-none absolute z-[42] w-60 rounded-xl border border-tipx-line/12 bg-tipx-floating/94 px-3 py-2.5 shadow-2xl backdrop-blur-xl"
           style={{
             left: Math.min(mapHover.x + 14, window.innerWidth - 260),
             top: Math.min(mapHover.y + 14, window.innerHeight - 150),
           }}
         >
-          <p className="truncate text-[11px] font-semibold text-white/82">
+          <p className="truncate text-[11px] font-semibold text-tipx-ink/82">
             {mapHover.company.name}
           </p>
-          <p className="mt-1 truncate text-[9px] text-white/35">
+          <p className="mt-1 truncate text-[9px] text-tipx-ink/35">
             {[
               mapHover.company.businessType,
               mapHover.company.district,
@@ -353,7 +353,7 @@ export function SpatialSurface() {
               .filter(Boolean)
               .join(" · ") || "Company entity"}
           </p>
-          <div className="mt-2 flex items-center gap-2 text-[9px] uppercase tracking-[0.12em] text-white/28">
+          <div className="mt-2 flex items-center gap-2 text-[9px] uppercase tracking-[0.12em] text-tipx-ink/28">
             <span>{mapHover.company.tipStatus ?? "TIP status unknown"}</span>
             {mapHover.company.boardCount !== null &&
             mapHover.company.boardCount !== undefined ? (
@@ -394,7 +394,7 @@ function SpatialStatePill({
   spinning?: boolean
 }) {
   return (
-    <div className="pointer-events-none fixed left-1/2 top-6 z-[39] -translate-x-1/2 rounded-full border border-white/9 bg-[#081016]/82 px-3 py-2 text-[9px] uppercase tracking-[0.14em] text-white/36 shadow-xl backdrop-blur-xl">
+    <div className="pointer-events-none fixed left-1/2 top-6 z-[39] -translate-x-1/2 rounded-full border border-tipx-line/9 bg-tipx-floating/82 px-3 py-2 text-[9px] uppercase tracking-[0.14em] text-tipx-ink/36 shadow-xl backdrop-blur-xl">
       <span className="flex items-center gap-2">
         <Icon className={`size-3 ${spinning ? "animate-spin" : ""}`} />
         {label}

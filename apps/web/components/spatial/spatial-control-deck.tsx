@@ -85,35 +85,35 @@ export function SpatialControlDeck({
 
   return (
     <aside className="pointer-events-auto fixed left-4 right-[4.75rem] top-4 z-[45] w-auto sm:left-7 sm:right-auto sm:top-7 sm:w-[360px]">
-      <div className="overflow-hidden rounded-2xl border border-white/10 bg-[#081016]/88 shadow-[0_24px_80px_rgba(0,0,0,.36)] backdrop-blur-2xl">
+      <div className="overflow-hidden rounded-2xl border border-tipx-line/10 bg-tipx-floating/88 shadow-[0_24px_80px_rgba(0,0,0,.36)] backdrop-blur-2xl">
         <button
           type="button"
           onClick={() => setOpen((value) => !value)}
           className="flex w-full items-center gap-3 px-4 py-3.5 text-left"
           aria-expanded={open}
         >
-          <span className="grid size-9 shrink-0 place-items-center rounded-xl border border-white/10 bg-white text-sm font-bold text-black">
+          <span className="grid size-9 shrink-0 place-items-center rounded-xl border border-tipx-line/10 bg-tipx-brand text-sm font-bold text-tipx-on-brand">
             M
           </span>
           <span className="min-w-0 flex-1">
-            <span className="flex items-center gap-2 text-xs font-semibold text-white">
+            <span className="flex items-center gap-2 text-xs font-semibold text-tipx-ink">
               Spatial Intelligence
               {isFetching ? (
                 <span className="size-1.5 animate-pulse rounded-full bg-cyan-300/80" />
               ) : null}
             </span>
-            <span className="mt-0.5 block truncate text-[10px] text-white/38">
+            <span className="mt-0.5 block truncate text-[10px] text-tipx-ink/38">
               {spatialLodLabel(lod)} · z{zoom.toFixed(1)}
             </span>
           </span>
           {open ? (
-            <ChevronUp className="size-4 text-white/35" />
+            <ChevronUp className="size-4 text-tipx-ink/35" />
           ) : (
-            <ChevronDown className="size-4 text-white/35" />
+            <ChevronDown className="size-4 text-tipx-ink/35" />
           )}
         </button>
 
-        <div className="grid grid-cols-4 border-t border-white/8 bg-black/20">
+        <div className="grid grid-cols-4 border-t border-tipx-line/8 bg-tipx-ink/5">
           <Metric label="Companies" value={formatMetric(totals.companies)} />
           <Metric label="Active" value={formatMetric(totals.active)} />
           <Metric label="Expired" value={formatMetric(totals.expired)} />
@@ -121,8 +121,8 @@ export function SpatialControlDeck({
         </div>
 
         {open ? (
-          <div className="border-t border-white/8 p-4">
-            <div className="flex items-start gap-2.5 rounded-xl border border-white/8 bg-white/[0.025] p-3">
+          <div className="border-t border-tipx-line/8 p-4">
+            <div className="flex items-start gap-2.5 rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.025] p-3">
               <CircleDot
                 className={cn(
                   "mt-0.5 size-3.5 shrink-0",
@@ -130,14 +130,14 @@ export function SpatialControlDeck({
                     ? "text-emerald-300"
                     : availability === "partial"
                       ? "text-amber-300"
-                      : "text-white/32"
+                      : "text-tipx-ink/32"
                 )}
               />
               <div>
-                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-white/50">
+                <p className="text-[10px] font-semibold uppercase tracking-[0.16em] text-tipx-ink/50">
                   Data boundary
                 </p>
-                <p className="mt-1 text-[10px] leading-4 text-white/36">
+                <p className="mt-1 text-[10px] leading-4 text-tipx-ink/36">
                   {configured
                     ? message || "Spatial serving contract connected."
                     : "No Center Database spatial endpoint configured. Basemap and workspace remain live; analytical geometry is never fabricated."}
@@ -163,8 +163,8 @@ export function SpatialControlDeck({
                     className={cn(
                       "rounded-xl border px-3 py-2 text-left text-[10px] transition",
                       active
-                        ? "border-white/20 bg-white text-black"
-                        : "border-white/8 bg-white/[0.02] text-white/46 hover:bg-white/[0.055] hover:text-white",
+                        ? "border-tipx-line/20 bg-tipx-brand text-tipx-on-brand"
+                        : "border-tipx-line/8 bg-tipx-ink/[0.02] text-tipx-ink/46 hover:bg-tipx-ink/[0.055] hover:text-tipx-ink",
                       !supported &&
                         item.id !== "selected" &&
                         "cursor-not-allowed opacity-25"
@@ -185,17 +185,17 @@ export function SpatialControlDeck({
                   onBranchChange(value === "__none__" ? null : value)
                 }
               >
-                <SelectTrigger className="h-10 w-full rounded-xl border border-white/8 bg-white/[0.035] px-3 text-xs text-white hover:bg-white/[0.055] disabled:opacity-30">
+                <SelectTrigger className="h-10 w-full rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.035] px-3 text-xs text-tipx-ink hover:bg-tipx-ink/[0.055] disabled:opacity-30">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent
                   align="start"
                   sideOffset={8}
-                  className="rounded-2xl border border-white/10 bg-[#0b1117]/98 text-white shadow-[0_24px_70px_rgba(0,0,0,.5)] backdrop-blur-2xl"
+                  className="rounded-2xl border border-tipx-line/10 bg-tipx-floating/98 text-tipx-ink shadow-[0_24px_70px_rgba(0,0,0,.5)] backdrop-blur-2xl"
                 >
                   <SelectItem
                     value="__none__"
-                    className="rounded-xl text-xs text-white/55 focus:bg-white/8 focus:text-white"
+                    className="rounded-xl text-xs text-tipx-ink/55 focus:bg-tipx-ink/8 focus:text-tipx-ink"
                   >
                     No branch selected
                   </SelectItem>
@@ -203,7 +203,7 @@ export function SpatialControlDeck({
                     <SelectItem
                       key={branch.id}
                       value={branch.id}
-                      className="rounded-xl text-xs text-white/70 focus:bg-white/8 focus:text-white"
+                      className="rounded-xl text-xs text-tipx-ink/70 focus:bg-tipx-ink/8 focus:text-tipx-ink"
                     >
                       {branch.name}
                     </SelectItem>
@@ -211,10 +211,10 @@ export function SpatialControlDeck({
                 </SelectContent>
               </Select>
 
-              <div className="rounded-xl border border-white/8 bg-white/[0.025] p-3">
-                <div className="mb-3 flex items-center justify-between text-[10px] text-white/45">
+              <div className="rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.025] p-3">
+                <div className="mb-3 flex items-center justify-between text-[10px] text-tipx-ink/45">
                   <span>Catchment radius</span>
-                  <span className="font-mono text-white/75">{radiusKm} km</span>
+                  <span className="font-mono text-tipx-ink/75">{radiusKm} km</span>
                 </div>
                 <Slider
                   min={1}
@@ -242,7 +242,7 @@ export function SpatialControlDeck({
                   key={surface}
                   type="button"
                   onClick={() => onHandoff(surface)}
-                  className="rounded-xl border border-white/8 bg-white/[0.025] px-2 py-2 text-[10px] font-semibold text-white/45 transition hover:border-white/16 hover:bg-white/[0.06] hover:text-white"
+                  className="rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.025] px-2 py-2 text-[10px] font-semibold text-tipx-ink/45 transition hover:border-tipx-line/16 hover:bg-tipx-ink/[0.06] hover:text-tipx-ink"
                 >
                   {surface}
                 </button>
@@ -252,7 +252,7 @@ export function SpatialControlDeck({
         ) : null}
       </div>
 
-      <div className="mt-2 flex items-center gap-2 px-1 text-[9px] uppercase tracking-[0.16em] text-white/24">
+      <div className="mt-2 flex items-center gap-2 px-1 text-[9px] uppercase tracking-[0.16em] text-tipx-ink/24">
         <LocateFixed className="size-3" />
         Semantic LOD · GPU surface
         <Building2 className="ml-auto size-3" />
@@ -269,7 +269,7 @@ function SectionLabel({
   label: string
 }) {
   return (
-    <div className="mb-2 mt-4 flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.18em] text-white/30">
+    <div className="mb-2 mt-4 flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.18em] text-tipx-ink/30">
       <Icon className="size-3" />
       {label}
     </div>
@@ -284,9 +284,9 @@ function Metric({
   value: string
 }) {
   return (
-    <div className="border-r border-white/6 px-2 py-2.5 text-center last:border-r-0">
-      <p className="font-mono text-[11px] text-white/78">{value}</p>
-      <p className="mt-0.5 truncate text-[8px] uppercase tracking-[0.12em] text-white/25">
+    <div className="border-r border-tipx-line/6 px-2 py-2.5 text-center last:border-r-0">
+      <p className="font-mono text-[11px] text-tipx-ink/78">{value}</p>
+      <p className="mt-0.5 truncate text-[8px] uppercase tracking-[0.12em] text-tipx-ink/25">
         {label}
       </p>
     </div>
