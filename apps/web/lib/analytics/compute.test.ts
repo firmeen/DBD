@@ -17,6 +17,7 @@ const rows: AnalyticsCompanyRow[] = [
     opportunityScore: 0.8,
     products: ["Motor"],
     subclasses: ["Fleet"],
+    productSubclasses: [{ product: "Motor", subclass: "Fleet" }],
   },
   {
     id: "c2",
@@ -31,6 +32,22 @@ const rows: AnalyticsCompanyRow[] = [
     opportunityScore: 0.6,
     products: [],
     subclasses: [],
+    productSubclasses: [],
+  },
+  {
+    id: "c3",
+    name: "C",
+    province: "Chiang Mai",
+    businessType: "Services",
+    incomeBand: "100M+",
+    tipStatus: "prospect",
+    totalIncome: 140,
+    premium: null,
+    loss: null,
+    opportunityScore: 0.5,
+    products: ["Motor", "Property"],
+    subclasses: ["Fleet"],
+    productSubclasses: [{ product: "Property", subclass: "Fleet" }],
   },
 ]
 
@@ -52,11 +69,24 @@ describe("analytics cross-filter compute", () => {
     expect(result.summary.lossRatio).toBe(20)
   })
 
-  it("supports product and subclass membership filters", () => {
+  it("supports independent product membership filters", () => {
     expect(
       computeAnalyticsSubset(rows, [
         { dimension: "product", value: "Motor", label: "Motor" },
-        { dimension: "subclass", value: "Fleet", label: "Fleet" },
+      ]).companyIds
+    ).toEqual(["c1", "c3"])
+  })
+
+  it("preserves the exact product/subclass relationship", () => {
+    expect(
+      computeAnalyticsSubset(rows, [
+        {
+          dimension: "productSubclass",
+          value: JSON.stringify(["Motor", "Fleet"]),
+          product: "Motor",
+          subclass: "Fleet",
+          label: "Motor · Fleet",
+        },
       ]).companyIds
     ).toEqual(["c1"])
   })
