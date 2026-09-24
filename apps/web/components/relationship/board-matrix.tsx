@@ -25,6 +25,8 @@ const MAX_REGION_ENTITIES = 240
 export function BoardMatrix({
   snapshot,
   synchronized,
+  loading,
+  errorMessage,
   companyQuery,
   personQuery,
   onCompanyQueryChange,
@@ -36,6 +38,8 @@ export function BoardMatrix({
 }: {
   snapshot: BoardMatrixSnapshot
   synchronized: boolean
+  loading: boolean
+  errorMessage: string | null
   companyQuery: string
   personQuery: string
   onCompanyQueryChange: (value: string) => void
@@ -201,6 +205,29 @@ export function BoardMatrix({
               </p>
               <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
                 Previous membership cells are intentionally hidden until both visible axis searches match the debounced serving query.
+              </p>
+            </div>
+          </div>
+        ) : loading ? (
+          <div className="grid h-full min-h-[420px] place-items-center px-8 text-center">
+            <div>
+              <LoaderMatrixState />
+              <p className="mt-3 text-sm font-medium text-white/48">
+                Loading Board Matrix
+              </p>
+              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+                The axis controls remain interactive while the synchronized Matrix population is requested.
+              </p>
+            </div>
+          </div>
+        ) : errorMessage ? (
+          <div className="grid h-full min-h-[420px] place-items-center px-8 text-center">
+            <div>
+              <p className="text-sm font-medium text-rose-100/55">
+                Board Matrix request failed
+              </p>
+              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+                {errorMessage}
               </p>
             </div>
           </div>

@@ -241,7 +241,7 @@ export function RelationshipSurface() {
       "relationship",
       "matrix",
       focus,
-      selection,
+      populationSelection,
       debouncedCompanyQuery,
       debouncedPersonQuery,
       lens,
@@ -441,38 +441,28 @@ export function RelationshipSurface() {
       ) : null}
 
       {view === "matrix" ? (
-        matrixQuery.isPending ? (
-          <RelationshipState
-            icon={LoaderCircle}
-            title="Loading virtual Board Matrix"
-            spinning
-          />
-        ) : matrixQuery.isError ? (
-          <RelationshipState
-            icon={AlertTriangle}
-            title="Board Matrix request failed"
-            detail={errorMessage(matrixQuery.error)}
-          />
-        ) : (
-          <BoardMatrix
-            snapshot={matrix}
-            synchronized={matrixSynchronized}
-            companyQuery={matrixCompanyQuery}
-            personQuery={matrixPersonQuery}
-            onCompanyQueryChange={setMatrixCompanyQuery}
-            onPersonQueryChange={setMatrixPersonQuery}
-            onFocusCompany={(entity) => {
-              setFocus(entity)
-              setActiveSurface("C")
-            }}
-            onFocusPerson={(entity) => {
-              setFocus(entity)
-              setActiveSurface("P")
-            }}
-            onSetSelection={setSelection}
-            onOpenNetwork={() => setView("explore")}
-          />
-        )
+        <BoardMatrix
+          snapshot={matrix}
+          synchronized={matrixSynchronized}
+          loading={matrixQuery.isPending || matrixQuery.isFetching}
+          errorMessage={
+            matrixQuery.isError ? errorMessage(matrixQuery.error) : null
+          }
+          companyQuery={matrixCompanyQuery}
+          personQuery={matrixPersonQuery}
+          onCompanyQueryChange={setMatrixCompanyQuery}
+          onPersonQueryChange={setMatrixPersonQuery}
+          onFocusCompany={(entity) => {
+            setFocus(entity)
+            setActiveSurface("C")
+          }}
+          onFocusPerson={(entity) => {
+            setFocus(entity)
+            setActiveSurface("P")
+          }}
+          onSetSelection={setSelection}
+          onOpenNetwork={() => setView("explore")}
+        />
       ) : null}
 
       {view === "genealogy" ? (
