@@ -1,6 +1,5 @@
 "use client"
 
-import * as React from "react"
 import { useTheme } from "next-themes"
 
 import {
@@ -20,27 +19,17 @@ function isAppearanceMode(value: string | undefined): value is TipxAppearanceMod
 
 export function useTipxTheme() {
   const { theme, resolvedTheme, setTheme } = useTheme()
-  const [mounted, setMounted] = React.useState(false)
-
-  React.useEffect(() => {
-    setMounted(true)
-  }, [])
-
+  const mounted = theme !== undefined
   const appearance: TipxAppearanceMode =
-    mounted && isAppearanceMode(theme) ? theme : "system"
+    isAppearanceMode(theme) ? theme : "system"
   const resolved: TipxResolvedTheme =
-    mounted && resolvedTheme === "light" ? "light" : "dark"
-
-  const setAppearance = React.useCallback(
-    (mode: TipxAppearanceMode) => setTheme(mode),
-    [setTheme]
-  )
+    resolvedTheme === "light" ? "light" : "dark"
 
   return {
     mounted,
     appearance,
     resolved,
     palette: TIPX_RENDER_PALETTES[resolved],
-    setAppearance,
+    setAppearance: (mode: TipxAppearanceMode) => setTheme(mode),
   }
 }
