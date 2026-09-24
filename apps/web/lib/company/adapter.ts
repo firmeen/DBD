@@ -1,5 +1,5 @@
 import {
-  parseCompanyDetailSnapshot,
+  parseCompanyDetailSnapshotForCompany,
   parseCompanySearchSnapshot,
 } from "./contract"
 import type {
@@ -118,7 +118,7 @@ export async function fetchCompanyDetail(
       companyId,
       lens,
     },
-    parseCompanyDetailSnapshot,
+    (input) => parseCompanyDetailSnapshotForCompany(input, companyId),
     signal
   )
 }

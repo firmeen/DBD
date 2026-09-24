@@ -7,9 +7,18 @@ import {
   type CompanySearchSnapshot,
 } from "./types"
 
+const MAX_NULLABLE_TEXT = 8_000
+const MAX_MESSAGE_TEXT = 2_000
+const MAX_RELATED_SECONDARY_TEXT = 1_000
+
 const nullableFiniteNumber = z.number().finite().nullable()
 const optionalNullableFiniteNumber = nullableFiniteNumber.optional()
-const nullableText = z.string().nullable().optional()
+const nullableText = z
+  .string()
+  .max(MAX_NULLABLE_TEXT)
+  .nullable()
+  .optional()
+const servingMessage = z.string().max(MAX_MESSAGE_TEXT).optional()
 const dateText = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/)
@@ -28,7 +37,7 @@ const searchResultSchema = z.object({
 
 const searchSnapshotSchema = z.object({
   availability: z.enum(["ready", "partial", "unavailable"]),
-  message: z.string().optional(),
+  message: servingMessage,
   generatedAt: nullableText,
   results: z.array(searchResultSchema).max(MAX_COMPANY_SEARCH_RESULTS),
 })
@@ -138,7 +147,7 @@ const relatedCompanySchema = z
     id: z.string().min(1).max(32),
     kind: z.literal("company"),
     label: z.string().min(1).max(500),
-    secondary: z.string().optional(),
+    secondary: z.string().max(MAX_RELATED_SECONDARY_TEXT).optional(),
   })
   .nullable()
   .optional()
@@ -175,7 +184,7 @@ const boardSummarySchema = z.object({
 
 const detailSnapshotSchema = z.object({
   availability: z.enum(["ready", "partial", "unavailable"]),
-  message: z.string().optional(),
+  message: servingMessage,
   generatedAt: nullableText,
   capabilities: z.object({
     financials: z.boolean(),
@@ -224,4 +233,19 @@ export function parseCompanyDetailSnapshot(
   input: unknown
 ): CompanyDetailSnapshot {
   return detailSnapshotSchema.parse(input) as CompanyDetailSnapshot
+}
+
+export function parseCompanyDetailSnapshotForCompany(
+  input: unknown,
+  expectedCompanyId: string
+): CompanyDetailSnapshot {
+  const snapshot = parseCompanyDetailSnapshot(input)
+
+  if (snapshot.profile && snapshot.profile.id !== expectedCompanyId) {
+    throw new Error(
+      `Company detail response identity mismatch: expected ${expectedCompanyId}, received ${snapshot.profile.id}`
+    )
+  }
+
+  return snapshot
 }

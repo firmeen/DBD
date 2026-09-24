@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   parseCompanyDetailSnapshot,
+  parseCompanyDetailSnapshotForCompany,
   parseCompanySearchSnapshot,
 } from "./contract"
 
@@ -42,6 +43,47 @@ describe("company serving contract", () => {
     expect(parseCompanyDetailSnapshot(baseDetail()).profile?.id).toBe(
       "0100000000000"
     )
+  })
+
+  it("rejects a valid detail payload bound to the wrong company identity", () => {
+    expect(() =>
+      parseCompanyDetailSnapshotForCompany(
+        baseDetail(),
+        "0100000000001"
+      )
+    ).toThrow(/identity mismatch/)
+  })
+
+  it("accepts a detail payload when the canonical company identity matches", () => {
+    expect(
+      parseCompanyDetailSnapshotForCompany(
+        baseDetail(),
+        "0100000000000"
+      ).profile?.id
+    ).toBe("0100000000000")
+  })
+
+  it("rejects oversized nullable text before it reaches query cache or DOM", () => {
+    const detail = baseDetail()
+    const invalid = {
+      ...detail,
+      profile: {
+        ...detail.profile,
+        setupObjective: "x".repeat(8_001),
+      },
+    }
+
+    expect(() => parseCompanyDetailSnapshot(invalid)).toThrow()
+  })
+
+  it("rejects oversized serving messages", () => {
+    expect(() =>
+      parseCompanySearchSnapshot({
+        availability: "unavailable",
+        message: "x".repeat(2_001),
+        results: [],
+      })
+    ).toThrow()
   })
 
   it("rejects non-finite financial values", () => {
