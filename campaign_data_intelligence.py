@@ -39,8 +39,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from dotenv import load_dotenv
 import pymysql
+from dotenv import load_dotenv
 from pymysql.cursors import DictCursor
 from rich import box
 from rich.console import Console, Group
