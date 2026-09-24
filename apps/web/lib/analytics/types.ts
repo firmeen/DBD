@@ -11,11 +11,14 @@ export type AnalyticsFilterDimension =
   | "incomeBand"
   | "product"
   | "subclass"
+  | "productSubclass"
 
 export interface AnalyticsFilter {
   dimension: AnalyticsFilterDimension
   value: string
   label: string
+  product?: string
+  subclass?: string
 }
 
 export const MAX_ANALYTICS_COMPANIES = 8_000
@@ -49,6 +52,11 @@ export interface AnalyticsSummary {
   averageOpportunityScore: number | null
 }
 
+export interface AnalyticsProductSubclassRef {
+  product: string
+  subclass: string
+}
+
 export interface AnalyticsCompanyRow {
   id: string
   name: string
@@ -67,6 +75,7 @@ export interface AnalyticsCompanyRow {
   productCount?: number | null
   products: string[]
   subclasses: string[]
+  productSubclasses: AnalyticsProductSubclassRef[]
 }
 
 export interface AnalyticsBucket {
