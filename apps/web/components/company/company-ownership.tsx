@@ -3,6 +3,7 @@
 import { Flag, Globe2 } from "lucide-react"
 
 import { formatCompanyMetric } from "@/lib/company/format"
+import { normalizeOwnershipComposition } from "@/lib/company/ownership"
 import type {
   CompanyNation,
   CompanyNationHistory,
@@ -60,10 +61,10 @@ export function CompanyOwnership({
         <div className="mt-7 space-y-4">
           {chronological.length ? (
             chronological.map((row) => {
-              const thai = clampPercent(row.thaiPct)
-              const other = clampPercent(row.otherPct)
-              const total = thai + other || 100
-              const thaiWidth = (thai / total) * 100
+              const composition = normalizeOwnershipComposition(
+                row.thaiPct,
+                row.otherPct
+              )
 
               return (
                 <div key={row.fiscalYear}>
@@ -76,13 +77,22 @@ export function CompanyOwnership({
                       {formatCompanyMetric(row.otherPct, "percent")}
                     </span>
                   </div>
-                  <div className="flex h-3 overflow-hidden rounded-full border border-white/7 bg-white/[0.025]">
-                    <span
-                      className="h-full bg-white/74"
-                      style={{ width: `${thaiWidth}%` }}
-                    />
-                    <span className="h-full flex-1 bg-cyan-200/24" />
-                  </div>
+                  {composition ? (
+                    <div className="flex h-3 overflow-hidden rounded-full border border-white/7 bg-white/[0.025]">
+                      <span
+                        className="h-full bg-white/74"
+                        style={{ width: `${composition.thaiWidth}%` }}
+                      />
+                      <span
+                        className="h-full bg-cyan-200/24"
+                        style={{ width: `${composition.otherWidth}%` }}
+                      />
+                    </div>
+                  ) : (
+                    <div className="flex h-8 items-center rounded-xl border border-dashed border-white/8 bg-white/[0.015] px-3 text-[9px] text-white/24">
+                      Composition incomplete · no normalized bar rendered
+                    </div>
+                  )}
                 </div>
               )
             })
