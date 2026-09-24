@@ -61,6 +61,20 @@ jobs:
         run: python -m pip install -e ".[dev]"
       - name: Compile
         run: python -m compileall -q src scripts tests
+      - name: PowerShell watchdog syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./Run-DBD.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Property Message,Extent
+            exit 1
+          }
       - name: Lint
         run: ruff check .
       - name: Tests

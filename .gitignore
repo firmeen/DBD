@@ -9,6 +9,7 @@ __pycache__/
 logs/
 data/raw/
 data/export/
+data/guardian/
 *.log
 .DS_Store
 Thumbs.db

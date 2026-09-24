@@ -331,6 +331,54 @@ def _add_campaign_worker_options(parser):
     parser.set_defaults(open_powershell=os.name == "nt")
 
 
+def _campaign_guard_overrides(args) -> dict:
+    names = (
+        "workers",
+        "workers_min",
+        "workers_max",
+        "worker_concurrency",
+        "worker_rate",
+        "rate_mode",
+        "fleet_rate_initial",
+        "fleet_rate_max",
+        "fleet_db_connections_max",
+        "fleet_archive_workers_max",
+        "fleet_projection_workers_max",
+        "fleet_redis_connections_max",
+        "max_restarts",
+        "open_powershell",
+        "redis_rate_key",
+        "recovery_interval",
+    )
+    return {name: getattr(args, name, None) for name in names}
+
+
+def _add_campaign_guard_options(parser):
+    parser.add_argument("--workers", type=positive)
+    parser.add_argument("--workers-min", type=positive)
+    parser.add_argument("--workers-max", type=positive)
+    parser.add_argument("--worker-concurrency", type=positive)
+    parser.add_argument("--worker-rate", type=positive_rate)
+    parser.add_argument("--rate-mode", choices=("shared", "multiply", "adaptive"))
+    parser.add_argument("--fleet-rate-initial", type=positive_rate)
+    parser.add_argument("--fleet-rate-max", type=positive_rate)
+    parser.add_argument("--fleet-db-connections-max", type=positive)
+    parser.add_argument("--fleet-archive-workers-max", type=positive)
+    parser.add_argument("--fleet-projection-workers-max", type=positive)
+    parser.add_argument("--fleet-redis-connections-max", type=positive)
+    parser.add_argument("--max-restarts", type=non_negative)
+    parser.add_argument("--redis-rate-key")
+    parser.add_argument(
+        "--recovery-interval",
+        type=positive_rate,
+        help="Seconds between Guardian recovery gate checks",
+    )
+    display = parser.add_mutually_exclusive_group()
+    display.add_argument("--open-powershell", dest="open_powershell", action="store_true")
+    display.add_argument("--headless", dest="open_powershell", action="store_false")
+    parser.set_defaults(open_powershell=None)
+
+
 def _campaign_command(args, presenter: TerminalPresenter) -> None:
     from ..runtime.supervisor import campaign_status, request_campaign_stop, supervise_campaign
 
@@ -345,6 +393,16 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
             "DBD · CAMPAIGN CONTROL",
             {"run_id": int(args.run_id), "action": "graceful_stop_requested"},
         )
+        return
+    if args.campaign_command == "guard":
+        from ..runtime.guardian import guard_campaign_run
+
+        code = guard_campaign_run(
+            args.run_id,
+            overrides=_campaign_guard_overrides(args),
+        )
+        if code:
+            raise SystemExit(code)
         return
     if not settings.dbd_redis_url:
         raise ValueError("campaign requires DBD_REDIS_URL")
@@ -430,6 +488,12 @@ def main():
     campaign_resume = campaign_sub.add_parser("resume", help="Resume one existing run with workers")
     campaign_resume.add_argument("run_id", type=positive)
     _add_campaign_worker_options(campaign_resume)
+    campaign_guard = campaign_sub.add_parser(
+        "guard",
+        help="Continuously protect and resume one durable campaign run",
+    )
+    campaign_guard.add_argument("run_id", type=positive)
+    _add_campaign_guard_options(campaign_guard)
     campaign_status_parser = _add_output_options(
         campaign_sub.add_parser("status", help="Show fleet and durable queue status")
     )
