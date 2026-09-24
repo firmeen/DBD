@@ -49,13 +49,16 @@ export function RelationshipNetwork({
     pathEdgeIds,
   })
 
-  stateRef.current = {
-    focusId,
-    hiddenNodeIds,
-    pinnedNodeIds,
-    pathNodeIds,
-    pathEdgeIds,
-  }
+  React.useEffect(() => {
+    stateRef.current = {
+      focusId,
+      hiddenNodeIds,
+      pinnedNodeIds,
+      pathNodeIds,
+      pathEdgeIds,
+    }
+    rendererRef.current?.refresh()
+  }, [focusId, hiddenNodeIds, pathEdgeIds, pathNodeIds, pinnedNodeIds])
 
   React.useEffect(() => {
     const container = containerRef.current
@@ -183,10 +186,6 @@ export function RelationshipNetwork({
     onToggleSelection,
     snapshot,
   ])
-
-  React.useEffect(() => {
-    rendererRef.current?.refresh()
-  }, [focusId, hiddenNodeIds, pathEdgeIds, pathNodeIds, pinnedNodeIds])
 
   return (
     <div className="absolute inset-0">
