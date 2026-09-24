@@ -2,6 +2,7 @@ import type { Metadata } from "next"
 import { Geist_Mono, Noto_Sans_Thai } from "next/font/google"
 
 import "./globals.css"
+import "maplibre-gl/dist/maplibre-gl.css"
 import { AppProviders } from "@/components/providers"
 import { cn } from "@/lib/utils"
 

@@ -1,5 +1,6 @@
 "use client"
 
+import dynamic from "next/dynamic"
 import {
   ArrowUpRight,
   CircleDot,
@@ -12,12 +13,27 @@ import { AnimatePresence, motion, useReducedMotion } from "motion/react"
 import { SURFACE_BY_ID } from "@/lib/intelligence/surfaces"
 import { useWorkspaceStore } from "@/stores/workspace-store"
 
+const SpatialSurface = dynamic(
+  () =>
+    import("@/components/spatial/spatial-surface").then(
+      (module) => module.SpatialSurface
+    ),
+  {
+    ssr: false,
+    loading: () => <SpatialSurfaceLoader />,
+  }
+)
+
 export function SurfaceStage() {
   const reduceMotion = useReducedMotion()
   const activeSurface = useWorkspaceStore((state) => state.activeSurface)
   const setCommandOpen = useWorkspaceStore((state) => state.setCommandOpen)
   const setLensOpen = useWorkspaceStore((state) => state.setLensOpen)
   const surface = SURFACE_BY_ID[activeSurface]
+
+  if (activeSurface === "M") {
+    return <SpatialSurface />
+  }
 
   return (
     <main className="relative min-h-svh overflow-hidden bg-[#070a0d] text-white">
@@ -108,5 +124,19 @@ function RuntimeCapability({
       <Icon className="size-3.5" aria-hidden />
       {label}
     </span>
+  )
+}
+
+
+function SpatialSurfaceLoader() {
+  return (
+    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-[#070a0d] text-white">
+      <div className="tipx-grid absolute inset-0 opacity-35" />
+      <div className="tipx-vignette absolute inset-0" />
+      <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/38 backdrop-blur-xl">
+        <span className="size-1.5 animate-pulse rounded-full bg-cyan-200/70" />
+        Loading spatial engine
+      </div>
+    </main>
   )
 }
