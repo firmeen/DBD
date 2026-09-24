@@ -39,17 +39,17 @@ export function CompanyFinancial({
 
   return (
     <div className="space-y-5">
-      <section className="rounded-[26px] border border-white/8 bg-[#0a1015]/72 p-5 backdrop-blur-2xl sm:p-6">
-        <div className="flex flex-col gap-5 border-b border-white/7 pb-5 lg:flex-row lg:items-end lg:justify-between">
+      <section className="rounded-[26px] border border-tipx-line/8 bg-tipx-surface/72 p-5 backdrop-blur-2xl sm:p-6">
+        <div className="flex flex-col gap-5 border-b border-tipx-line/7 pb-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-white/27">
+            <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/27">
               <Activity className="size-3.5" />
               Financial trajectory
             </p>
-            <h2 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-white">
+            <h2 className="mt-2 text-xl font-semibold tracking-[-0.03em] text-tipx-ink">
               Fiscal-year movement, not a KPI collage
             </h2>
-            <p className="mt-1 max-w-2xl text-[11px] leading-5 text-white/32">
+            <p className="mt-1 max-w-2xl text-[11px] leading-5 text-tipx-ink/32">
               Semantic series arrive from the Center Database serving model; the
               browser does not infer raw DBD item codes.
             </p>
@@ -99,8 +99,8 @@ function FinancialTrajectoryCharts({
     return (
       <div className="grid h-[300px] place-items-center text-center">
         <div>
-          <Activity className="mx-auto size-5 text-white/18" />
-          <p className="mt-3 text-xs text-white/42">
+          <Activity className="mx-auto size-5 text-tipx-ink/18" />
+          <p className="mt-3 text-xs text-tipx-ink/42">
             No trajectory series available
           </p>
         </div>
@@ -202,12 +202,12 @@ function TrajectoryField({
   }, [format, series])
 
   return (
-    <div className="rounded-2xl border border-white/7 bg-black/10 p-3">
+    <div className="rounded-2xl border border-tipx-line/7 bg-tipx-ink/[0.025] p-3">
       <div className="mb-2 flex items-center justify-between px-1">
-        <p className="text-[8px] font-semibold uppercase tracking-[0.17em] text-white/24">
+        <p className="text-[8px] font-semibold uppercase tracking-[0.17em] text-tipx-ink/24">
           {trajectoryFormatLabel(format)}
         </p>
-        <span className="font-mono text-[8px] text-white/17">
+        <span className="font-mono text-[8px] text-tipx-ink/17">
           {series.length} series
         </span>
       </div>
@@ -251,7 +251,7 @@ function YearSelector({
   if (years.length === 0) return null
 
   return (
-    <div className="flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-white/8 bg-black/20 p-1">
+    <div className="flex max-w-full items-center gap-1 overflow-x-auto rounded-xl border border-tipx-line/8 bg-tipx-ink/5 p-1">
       {years.map((year) => (
         <button
           key={year.year}
@@ -260,8 +260,8 @@ function YearSelector({
           className={cn(
             "shrink-0 rounded-lg px-3 py-2 font-mono text-[9px] transition",
             value === year.year
-              ? "bg-white text-black"
-              : "text-white/35 hover:bg-white/6 hover:text-white/65"
+              ? "bg-tipx-brand text-tipx-on-brand"
+              : "text-tipx-ink/35 hover:bg-tipx-ink/6 hover:text-tipx-ink/65"
           )}
         >
           {year.year}
@@ -273,17 +273,17 @@ function YearSelector({
 
 function RatioPanel({ year }: { year: CompanyFinancialYear | null }) {
   return (
-    <section className="rounded-[24px] border border-white/8 bg-white/[0.018] p-5 sm:p-6">
-      <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-white/27">
+    <section className="rounded-[24px] border border-tipx-line/8 bg-tipx-ink/[0.018] p-5 sm:p-6">
+      <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/27">
         <CalendarRange className="size-3.5" />
         Ratio field · {year?.year ?? "—"}
       </p>
-      <p className="mt-2 text-[11px] leading-5 text-white/31">
+      <p className="mt-2 text-[11px] leading-5 text-tipx-ink/31">
         Ratios stay separate for accurate reading instead of being compressed
         into a decorative radar chart.
       </p>
 
-      <div className="mt-5 divide-y divide-white/7">
+      <div className="mt-5 divide-y divide-tipx-line/7">
         {year?.ratios.length ? (
           year.ratios.map((ratio) => (
             <div
@@ -291,20 +291,20 @@ function RatioPanel({ year }: { year: CompanyFinancialYear | null }) {
               className="grid grid-cols-[1fr_auto] items-center gap-4 py-3 first:pt-0"
             >
               <span>
-                <span className="block text-[11px] text-white/57">
+                <span className="block text-[11px] text-tipx-ink/57">
                   {ratio.label}
                 </span>
-                <span className="mt-0.5 block font-mono text-[8px] uppercase tracking-[0.12em] text-white/18">
+                <span className="mt-0.5 block font-mono text-[8px] uppercase tracking-[0.12em] text-tipx-ink/18">
                   {ratio.code}
                 </span>
               </span>
-              <span className="font-mono text-[12px] text-white/76">
+              <span className="font-mono text-[12px] text-tipx-ink/76">
                 {formatCompanyMetric(ratio.value, ratio.format)}
               </span>
             </div>
           ))
         ) : (
-          <p className="py-8 text-center text-[11px] text-white/28">
+          <p className="py-8 text-center text-[11px] text-tipx-ink/28">
             No ratio series for this fiscal year.
           </p>
         )}
@@ -328,25 +328,25 @@ function FinancialStatement({
   })
 
   return (
-    <section className="overflow-hidden rounded-[24px] border border-white/8 bg-white/[0.018]">
-      <div className="flex items-end justify-between gap-4 border-b border-white/7 px-5 py-5 sm:px-6">
+    <section className="overflow-hidden rounded-[24px] border border-tipx-line/8 bg-tipx-ink/[0.018]">
+      <div className="flex items-end justify-between gap-4 border-b border-tipx-line/7 px-5 py-5 sm:px-6">
         <div>
-          <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-white/27">
+          <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/27">
             <TableProperties className="size-3.5" />
             Statement explorer
           </p>
-          <p className="mt-1.5 text-[11px] text-white/31">
+          <p className="mt-1.5 text-[11px] text-tipx-ink/31">
             {year?.fiscalYearEndDate
               ? `Year end ${formatCompanyDate(year.fiscalYearEndDate)}`
               : "Virtualized semantic line items"}
           </p>
         </div>
-        <span className="font-mono text-[9px] text-white/22">
+        <span className="font-mono text-[9px] text-tipx-ink/22">
           {items.length.toLocaleString()} lines
         </span>
       </div>
 
-      <div className="grid grid-cols-[minmax(160px,1fr)_110px_110px_74px] border-b border-white/7 bg-black/10 px-5 py-2 text-[8px] uppercase tracking-[0.12em] text-white/22 sm:px-6">
+      <div className="grid grid-cols-[minmax(160px,1fr)_110px_110px_74px] border-b border-tipx-line/7 bg-tipx-ink/[0.025] px-5 py-2 text-[8px] uppercase tracking-[0.12em] text-tipx-ink/22 sm:px-6">
         <span>Line item</span>
         <span className="text-right">Current</span>
         <span className="text-right">Previous</span>
@@ -355,7 +355,7 @@ function FinancialStatement({
 
       <div ref={scrollRef} className="h-[420px] overflow-auto">
         {items.length === 0 ? (
-          <div className="grid h-full place-items-center text-[11px] text-white/28">
+          <div className="grid h-full place-items-center text-[11px] text-tipx-ink/28">
             No statement lines available.
           </div>
         ) : (
@@ -370,23 +370,23 @@ function FinancialStatement({
                   key={item.code}
                   data-index={virtualRow.index}
                   ref={virtualizer.measureElement}
-                  className="absolute left-0 top-0 grid w-full grid-cols-[minmax(160px,1fr)_110px_110px_74px] items-center border-b border-white/[0.045] px-5 py-3 text-[10px] sm:px-6"
+                  className="absolute left-0 top-0 grid w-full grid-cols-[minmax(160px,1fr)_110px_110px_74px] items-center border-b border-tipx-line/[0.045] px-5 py-3 text-[10px] sm:px-6"
                   style={{
                     transform: `translateY(${virtualRow.start}px)`,
                   }}
                 >
                   <span className="min-w-0 pr-3">
-                    <span className="block truncate text-white/56">
+                    <span className="block truncate text-tipx-ink/56">
                       {item.label}
                     </span>
-                    <span className="mt-0.5 block truncate font-mono text-[8px] text-white/17">
+                    <span className="mt-0.5 block truncate font-mono text-[8px] text-tipx-ink/17">
                       {item.code}
                     </span>
                   </span>
-                  <span className="text-right font-mono text-white/64">
+                  <span className="text-right font-mono text-tipx-ink/64">
                     {formatCompanyMetric(item.amount, "currency", true)}
                   </span>
-                  <span className="text-right font-mono text-white/34">
+                  <span className="text-right font-mono text-tipx-ink/34">
                     {formatCompanyMetric(
                       item.previousAmount,
                       "currency",
@@ -400,7 +400,7 @@ function FinancialStatement({
                         ? "text-emerald-200/58"
                         : (item.pctChange ?? 0) < 0
                           ? "text-rose-200/58"
-                          : "text-white/30"
+                          : "text-tipx-ink/30"
                     )}
                   >
                     {formatSignedChange(item.pctChange)}
@@ -417,13 +417,13 @@ function FinancialStatement({
 
 function FinancialEmpty({ message }: { message: string }) {
   return (
-    <div className="grid min-h-[460px] place-items-center rounded-[26px] border border-white/8 bg-white/[0.018] px-6 text-center">
+    <div className="grid min-h-[460px] place-items-center rounded-[26px] border border-tipx-line/8 bg-tipx-ink/[0.018] px-6 text-center">
       <div>
-        <Activity className="mx-auto size-6 text-white/18" />
-        <p className="mt-3 text-sm font-medium text-white/52">
+        <Activity className="mx-auto size-6 text-tipx-ink/18" />
+        <p className="mt-3 text-sm font-medium text-tipx-ink/52">
           Financial intelligence unavailable
         </p>
-        <p className="mx-auto mt-2 max-w-md text-[11px] leading-5 text-white/28">
+        <p className="mx-auto mt-2 max-w-md text-[11px] leading-5 text-tipx-ink/28">
           {message}
         </p>
       </div>
