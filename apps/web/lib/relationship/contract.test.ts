@@ -48,6 +48,76 @@ describe("relationship serving contracts", () => {
     ).toThrow(/identity mismatch/)
   })
 
+  it("rejects unbound person relationships without a profile", () => {
+    expect(() =>
+      parsePersonDetailSnapshot(
+        {
+          availability: "ready",
+          profile: null,
+          companies: [
+            {
+              company: {
+                id: "company:1",
+                kind: "company",
+                label: "Company 1",
+              },
+            },
+          ],
+          sharedDirectors: [],
+        },
+        "person:1"
+      )
+    ).toThrow(/bound profile/)
+  })
+
+  it("accepts an empty unavailable person payload without a profile", () => {
+    expect(
+      parsePersonDetailSnapshot(
+        {
+          availability: "unavailable",
+          profile: null,
+          companies: [],
+          sharedDirectors: [],
+        },
+        "person:1"
+      ).availability
+    ).toBe("unavailable")
+  })
+
+  it("rejects unbound board members without a company", () => {
+    expect(() =>
+      parseCompanyBoardSnapshot(
+        {
+          availability: "ready",
+          company: null,
+          members: [
+            {
+              person: {
+                id: "person:1",
+                kind: "person",
+                label: "Person 1",
+              },
+            },
+          ],
+        },
+        "company:1"
+      )
+    ).toThrow(/bound company/)
+  })
+
+  it("accepts an empty unavailable board payload without a company", () => {
+    expect(
+      parseCompanyBoardSnapshot(
+        {
+          availability: "unavailable",
+          company: null,
+          members: [],
+        },
+        "company:1"
+      ).availability
+    ).toBe("unavailable")
+  })
+
   it("rejects graph edges that reference missing nodes", () => {
     expect(() =>
       parseRelationshipGraphSnapshot({

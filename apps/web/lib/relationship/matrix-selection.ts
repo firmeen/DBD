@@ -1,46 +1,40 @@
 import type { EntityRef } from "@/lib/intelligence/types"
 
-import {
-  matrixCompanyToEntity,
-  matrixPersonToEntity,
-  type MatrixCompany,
-  type MatrixPerson,
-} from "./types"
-
-export function matrixRegionSelection(
-  companies: MatrixCompany[],
-  people: MatrixPerson[],
-  limit: number
-): EntityRef[] {
-  if (limit <= 0 || companies.length === 0 || people.length === 0) return []
-
-  const safeLimit = Math.max(2, Math.floor(limit))
-  let companyTake = Math.min(
-    companies.length,
-    Math.max(1, Math.floor(safeLimit / 2))
-  )
-  let personTake = Math.min(
-    people.length,
-    Math.max(1, safeLimit - companyTake)
-  )
-
-  let remaining = safeLimit - companyTake - personTake
-
-  if (remaining > 0) {
-    const extraCompanies = Math.min(
-      remaining,
-      companies.length - companyTake
-    )
-    companyTake += extraCompanies
-    remaining -= extraCompanies
+export function capMatrixRegionSelection(
+  companies: EntityRef[],
+  people: EntityRef[],
+  maxEntities: number
+) {
+  if (maxEntities < 2) {
+    throw new Error("Matrix region selection budget must preserve both axes")
   }
 
-  if (remaining > 0) {
-    personTake += Math.min(remaining, people.length - personTake)
+  if (companies.length === 0 || people.length === 0) {
+    return [...companies, ...people].slice(0, maxEntities)
+  }
+
+  if (companies.length + people.length <= maxEntities) {
+    return [...companies, ...people]
+  }
+
+  const basePerAxis = Math.max(1, Math.floor(maxEntities / 2))
+  let companyBudget = Math.min(companies.length, basePerAxis)
+  let peopleBudget = Math.min(people.length, basePerAxis)
+
+  let remaining = maxEntities - companyBudget - peopleBudget
+
+  if (remaining > 0 && companies.length > companyBudget) {
+    const extra = Math.min(remaining, companies.length - companyBudget)
+    companyBudget += extra
+    remaining -= extra
+  }
+
+  if (remaining > 0 && people.length > peopleBudget) {
+    peopleBudget += Math.min(remaining, people.length - peopleBudget)
   }
 
   return [
-    ...companies.slice(0, companyTake).map(matrixCompanyToEntity),
-    ...people.slice(0, personTake).map(matrixPersonToEntity),
+    ...companies.slice(0, companyBudget),
+    ...people.slice(0, peopleBudget),
   ]
 }

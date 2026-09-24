@@ -345,6 +345,18 @@ export function parsePersonDetailSnapshot(
       `Person detail response identity mismatch: expected ${expectedPersonId}, received ${snapshot.profile.id}`
     )
   }
+
+  if (
+    snapshot.profile === null &&
+    (snapshot.availability !== "unavailable" ||
+      snapshot.companies.length > 0 ||
+      snapshot.sharedDirectors.length > 0)
+  ) {
+    throw new Error(
+      "Person detail response without a bound profile must be an empty unavailable payload"
+    )
+  }
+
   return snapshot
 }
 
@@ -362,6 +374,16 @@ export function parseCompanyBoardSnapshot(
       `Company board response identity mismatch: expected ${expectedCompanyId}, received ${snapshot.company.id}`
     )
   }
+
+  if (
+    snapshot.company === null &&
+    (snapshot.availability !== "unavailable" || snapshot.members.length > 0)
+  ) {
+    throw new Error(
+      "Company board response without a bound company must be an empty unavailable payload"
+    )
+  }
+
   return snapshot
 }
 
