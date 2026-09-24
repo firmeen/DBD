@@ -35,6 +35,7 @@ function baseSnapshot() {
         opportunityScore: 0.8,
         products: [],
         subclasses: [],
+        productSubclasses: [],
       },
     ],
     products: [],
@@ -56,6 +57,60 @@ describe("analytics serving contract", () => {
         companies: [...snapshot.companies, snapshot.companies[0]],
       })
     ).toThrow(/duplicate companies IDs/)
+  })
+
+  it("rejects duplicate product/subclass pairs on a company", () => {
+    const snapshot = baseSnapshot()
+
+    expect(() =>
+      parseAnalyticsSnapshot({
+        ...snapshot,
+        companies: [
+          {
+            ...snapshot.companies[0],
+            products: ["Motor"],
+            subclasses: ["Fleet"],
+            productSubclasses: [
+              { product: "Motor", subclass: "Fleet" },
+              { product: "Motor", subclass: "Fleet" },
+            ],
+          },
+        ],
+      })
+    ).toThrow(/duplicate product\/subclass pairs/)
+  })
+
+  it("accepts composite product/subclass bucket filters", () => {
+    const parsed = parseAnalyticsSnapshot({
+      ...baseSnapshot(),
+      distributions: [
+        {
+          id: "product-subclass",
+          label: "Product / Subclass",
+          format: "number",
+          buckets: [
+            {
+              id: "motor-fleet",
+              label: "Motor · Fleet",
+              count: 1,
+              filter: {
+                dimension: "productSubclass",
+                value: "[\"Motor\",\"Fleet\"]",
+                label: "Motor · Fleet",
+                product: "Motor",
+                subclass: "Fleet",
+              },
+            },
+          ],
+        },
+      ],
+    })
+
+    expect(parsed.distributions[0]?.buckets[0]?.filter).toMatchObject({
+      dimension: "productSubclass",
+      product: "Motor",
+      subclass: "Fleet",
+    })
   })
 
   it("rejects opportunity scores outside 0..1", () => {
