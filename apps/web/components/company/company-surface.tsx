@@ -157,6 +157,7 @@ export function CompanySurface() {
 
       <CompanyCommandBar
         searchTerm={searchTerm}
+        debouncedSearch={debouncedSearch}
         onSearchTermChange={setSearchTerm}
         focusedCompany={focusedCompany}
         searchQuery={searchQuery}
@@ -249,6 +250,7 @@ export function CompanySurface() {
 
 function CompanyCommandBar({
   searchTerm,
+  debouncedSearch,
   onSearchTermChange,
   focusedCompany,
   searchQuery,
@@ -256,19 +258,18 @@ function CompanyCommandBar({
   onClearFocus,
 }: {
   searchTerm: string
+  debouncedSearch: string
   onSearchTermChange: (value: string) => void
   focusedCompany: EntityRef | null
   searchQuery: UseQueryResult<CompanySearchSnapshot, Error>
   onPickCompany: (company: CompanySearchResult) => void
   onClearFocus: () => void
 }) {
-  const results =
-    searchQuery.data &&
-    "results" in searchQuery.data &&
-    Array.isArray(searchQuery.data.results)
-      ? (searchQuery.data.results as CompanySearchResult[])
-      : []
-  const showResults = searchTerm.trim().length >= 2
+  const results = searchQuery.data?.results ?? []
+  const normalizedSearch = searchTerm.trim()
+  const showResults = normalizedSearch.length >= 2
+  const searchSynchronized =
+    showResults && normalizedSearch === debouncedSearch
 
   return (
     <div className="pointer-events-none fixed left-4 right-[4.75rem] top-4 z-[32] flex items-start gap-2 sm:left-7 sm:right-24 sm:top-7">
@@ -300,7 +301,8 @@ function CompanyCommandBar({
           {showResults ? (
             <CompanySearchPopover
               queryState={searchQuery}
-              results={results}
+              results={searchSynchronized ? results : []}
+              synchronized={searchSynchronized}
               onPickCompany={onPickCompany}
             />
           ) : null}
@@ -334,24 +336,32 @@ function CompanyCommandBar({
 function CompanySearchPopover({
   queryState,
   results,
+  synchronized,
   onPickCompany,
 }: {
   queryState: UseQueryResult<CompanySearchSnapshot, Error>
   results: CompanySearchResult[]
+  synchronized: boolean
   onPickCompany: (company: CompanySearchResult) => void
 }) {
   const data = queryState.data
 
   return (
     <div className="absolute left-0 right-0 top-[calc(100%+10px)] overflow-hidden rounded-2xl border border-white/10 bg-[#091117]/98 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl">
-      {queryState.isFetching ? (
+      {!synchronized ? (
+        <SearchState
+          icon={LoaderCircle}
+          title="Preparing updated query"
+          description="Waiting for the visible search text to reach the debounced serving query. Previous results are intentionally hidden."
+        />
+      ) : queryState.isFetching ? (
         <div className="flex items-center gap-2 border-b border-white/7 px-4 py-2 text-[9px] uppercase tracking-[0.14em] text-white/25">
           <LoaderCircle className="size-3 animate-spin" />
           Searching serving model
         </div>
       ) : null}
 
-      {queryState.isError ? (
+      {!synchronized ? null : queryState.isError ? (
         <SearchState
           icon={AlertTriangle}
           title="Search request failed"
