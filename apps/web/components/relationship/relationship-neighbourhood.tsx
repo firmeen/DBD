@@ -218,10 +218,10 @@ export function RelationshipNeighbourhood({
     return (
       <div className="absolute inset-0 grid place-items-center px-8 text-center">
         <div>
-          <p className="text-sm font-medium text-white/50">
+          <p className="text-sm font-medium text-tipx-ink/50">
             Focus an entity to open Neighbourhood
           </p>
-          <p className="mx-auto mt-2 max-w-md text-[10px] leading-5 text-white/26">
+          <p className="mx-auto mt-2 max-w-md text-[10px] leading-5 text-tipx-ink/26">
             fCoSE is reserved for bounded structured investigation rather than
             the full exploratory population.
           </p>
@@ -237,7 +237,7 @@ export function RelationshipNeighbourhood({
         className="absolute inset-0"
         aria-label="Focused relationship neighbourhood"
       />
-      <div className="pointer-events-none absolute bottom-5 left-5 rounded-full border border-white/7 bg-[#071017]/76 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-white/24 backdrop-blur-xl">
+      <div className="pointer-events-none absolute bottom-5 left-5 rounded-full border border-tipx-line/7 bg-tipx-floating/76 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-tipx-ink/24 backdrop-blur-xl">
         fCoSE · bounded 2-hop neighbourhood
       </div>
     </div>

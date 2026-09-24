@@ -367,7 +367,7 @@ export function RelationshipSurface() {
   }
 
   return (
-    <main className="relative min-h-svh overflow-hidden bg-[#070a0d] text-white">
+    <main className="relative min-h-svh overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-18" />
       <div className="tipx-vignette absolute inset-0" />
 
@@ -563,16 +563,16 @@ function RelationshipControlDeck({
 
   return (
     <aside className="pointer-events-auto fixed left-4 right-[4.75rem] top-4 z-[45] sm:left-7 sm:right-auto sm:top-7 sm:w-[390px]">
-      <div className="rounded-2xl border border-white/10 bg-[#081016]/91 p-2 shadow-[0_24px_80px_rgba(0,0,0,.38)] backdrop-blur-2xl">
+      <div className="rounded-2xl border border-tipx-line/10 bg-tipx-floating/91 p-2 shadow-[0_24px_80px_rgba(0,0,0,.38)] backdrop-blur-2xl">
         <div className="flex items-center gap-2">
-          <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-white font-mono text-[11px] font-bold text-black">
+          <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-tipx-brand font-mono text-[11px] font-bold text-tipx-on-brand">
             R
           </span>
           <div className="min-w-0 flex-1">
-            <p className="truncate text-[10px] font-semibold text-white/58">
+            <p className="truncate text-[10px] font-semibold text-tipx-ink/58">
               Relationship Observatory
             </p>
-            <p className="mt-0.5 truncate text-[8px] uppercase tracking-[0.12em] text-white/21">
+            <p className="mt-0.5 truncate text-[8px] uppercase tracking-[0.12em] text-tipx-ink/21">
               {anchorEntity
                 ? "anchor · " + anchorEntity.label
                 : "Lens / Selection population"}
@@ -582,7 +582,7 @@ function RelationshipControlDeck({
             <button
               type="button"
               onClick={onClearFocus}
-              className="grid size-7 shrink-0 place-items-center rounded-lg border border-white/7 text-white/24 transition hover:bg-white/[0.055] hover:text-white"
+              className="grid size-7 shrink-0 place-items-center rounded-lg border border-tipx-line/7 text-tipx-ink/24 transition hover:bg-tipx-ink/[0.055] hover:text-tipx-ink"
               aria-label={"Clear focused " + currentFocus.kind + ": " + currentFocus.label}
               title="Clear current Focus"
             >
@@ -592,7 +592,7 @@ function RelationshipControlDeck({
           <span
             className={cn(
               "size-1.5 rounded-full",
-              endpointConfigured ? "bg-emerald-300/70" : "bg-white/16"
+              endpointConfigured ? "bg-emerald-300/70" : "bg-tipx-ink/16"
             )}
           />
         </div>
@@ -609,8 +609,8 @@ function RelationshipControlDeck({
                 className={cn(
                   "group rounded-xl border px-2 py-2 text-left transition",
                   active
-                    ? "border-white/20 bg-white text-black"
-                    : "border-white/7 bg-white/[0.018] text-white/34 hover:bg-white/[0.055] hover:text-white"
+                    ? "border-tipx-line/20 bg-tipx-brand text-tipx-on-brand"
+                    : "border-tipx-line/7 bg-tipx-ink/[0.018] text-tipx-ink/34 hover:bg-tipx-ink/[0.055] hover:text-tipx-ink"
                 )}
                 title={meta.label}
               >
@@ -631,32 +631,32 @@ function RelationshipControlDeck({
         {graphMode ? (
           <div className="mt-2 flex items-center gap-1.5">
             <div className="relative min-w-0 flex-1">
-              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-white/22" />
+              <Search className="pointer-events-none absolute left-2.5 top-1/2 size-3 -translate-y-1/2 text-tipx-ink/22" />
               <input
                 value={graphSearch}
                 onChange={(event) => onGraphSearchChange(event.target.value)}
                 placeholder="Search loaded graph…"
                 data-keyboard-input
-                className="h-9 w-full rounded-xl border border-white/7 bg-white/[0.02] pl-8 pr-3 text-[9px] text-white outline-none placeholder:text-white/18 focus:border-white/14"
+                className="h-9 w-full rounded-xl border border-tipx-line/7 bg-tipx-ink/[0.02] pl-8 pr-3 text-[9px] text-tipx-ink outline-none placeholder:text-tipx-ink/18 focus:border-tipx-line/14"
               />
               {graphSearch.trim() && searchResults.length > 0 ? (
-                <div className="absolute left-0 right-0 top-[calc(100%+7px)] z-50 max-h-64 overflow-auto rounded-xl border border-white/9 bg-[#091117]/98 p-1 shadow-2xl">
+                <div className="absolute left-0 right-0 top-[calc(100%+7px)] z-50 max-h-64 overflow-auto rounded-xl border border-tipx-line/9 bg-[#091117]/98 p-1 shadow-2xl">
                   {searchResults.map((node) => (
                     <button
                       key={node.id}
                       type="button"
                       onClick={() => onFocusSearchResult(node)}
-                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left hover:bg-white/[0.055]"
+                      className="flex w-full items-center gap-2 rounded-lg px-2.5 py-2 text-left hover:bg-tipx-ink/[0.055]"
                     >
                       {node.kind === "person" ? (
-                        <UserRound className="size-3 text-white/30" />
+                        <UserRound className="size-3 text-tipx-ink/30" />
                       ) : (
-                        <Network className="size-3 text-white/30" />
+                        <Network className="size-3 text-tipx-ink/30" />
                       )}
-                      <span className="min-w-0 flex-1 truncate text-[9px] text-white/55">
+                      <span className="min-w-0 flex-1 truncate text-[9px] text-tipx-ink/55">
                         {node.label}
                       </span>
-                      <span className="font-mono text-[7px] text-white/19">
+                      <span className="font-mono text-[7px] text-tipx-ink/19">
                         d{node.degree}
                       </span>
                     </button>
@@ -668,7 +668,7 @@ function RelationshipControlDeck({
             <button
               type="button"
               onClick={onRecenter}
-              className="grid size-9 place-items-center rounded-xl border border-white/7 bg-white/[0.02] text-white/34 hover:bg-white/[0.06] hover:text-white"
+              className="grid size-9 place-items-center rounded-xl border border-tipx-line/7 bg-tipx-ink/[0.02] text-tipx-ink/34 hover:bg-tipx-ink/[0.06] hover:text-tipx-ink"
               title="Recenter graph population on current Focus"
             >
               <Anchor className="size-3.5" />
@@ -676,8 +676,8 @@ function RelationshipControlDeck({
           </div>
         ) : null}
 
-        <div className="mt-2 flex items-center gap-2 border-t border-white/7 pt-2">
-          <span className="text-[8px] uppercase tracking-[0.12em] text-white/20">
+        <div className="mt-2 flex items-center gap-2 border-t border-tipx-line/7 pt-2">
+          <span className="text-[8px] uppercase tracking-[0.12em] text-tipx-ink/20">
             Depth
           </span>
           {[1, 2, 3, 4].map((value) => (
@@ -688,15 +688,15 @@ function RelationshipControlDeck({
               className={cn(
                 "grid size-7 place-items-center rounded-lg border font-mono text-[8px] transition",
                 depth === value
-                  ? "border-white/18 bg-white text-black"
-                  : "border-white/7 bg-white/[0.018] text-white/30 hover:bg-white/[0.05]"
+                  ? "border-tipx-line/18 bg-tipx-brand text-tipx-on-brand"
+                  : "border-tipx-line/7 bg-tipx-ink/[0.018] text-tipx-ink/30 hover:bg-tipx-ink/[0.05]"
               )}
             >
               {value}
             </button>
           ))}
           {layoutRunning ? (
-            <span className="ml-1 inline-flex items-center gap-1.5 text-[8px] uppercase tracking-[0.1em] text-white/25">
+            <span className="ml-1 inline-flex items-center gap-1.5 text-[8px] uppercase tracking-[0.1em] text-tipx-ink/25">
               <LoaderCircle className="size-3 animate-spin" />
               Layout
             </span>
@@ -709,7 +709,7 @@ function RelationshipControlDeck({
           <button
             type="button"
             onClick={() => onHandoff("M")}
-            className="ml-auto grid size-7 place-items-center rounded-lg border border-white/7 text-white/27 hover:bg-white/[0.05] hover:text-white"
+            className="ml-auto grid size-7 place-items-center rounded-lg border border-tipx-line/7 text-tipx-ink/27 hover:bg-tipx-ink/[0.05] hover:text-tipx-ink"
             title="Project selected companies to Map"
           >
             <MapIcon className="size-3" />
@@ -746,25 +746,25 @@ function RelationshipInspector({
   onOpenEntity: () => void
 }) {
   return (
-    <aside className="pointer-events-auto fixed bottom-20 right-5 z-[42] w-[min(340px,calc(100vw-40px))] rounded-2xl border border-white/10 bg-[#081016]/91 p-3 shadow-[0_24px_80px_rgba(0,0,0,.36)] backdrop-blur-2xl sm:right-7">
+    <aside className="pointer-events-auto fixed bottom-20 right-5 z-[42] w-[min(340px,calc(100vw-40px))] rounded-2xl border border-tipx-line/10 bg-tipx-floating/91 p-3 shadow-[0_24px_80px_rgba(0,0,0,.36)] backdrop-blur-2xl sm:right-7">
       <div className="flex items-start gap-3">
-        <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-white/8 bg-white/[0.03]">
+        <span className="grid size-10 shrink-0 place-items-center rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.03]">
           {entity.kind === "person" ? (
-            <UserRound className="size-4 text-white/40" />
+            <UserRound className="size-4 text-tipx-ink/40" />
           ) : (
-            <Network className="size-4 text-white/40" />
+            <Network className="size-4 text-tipx-ink/40" />
           )}
         </span>
         <div className="min-w-0 flex-1">
-          <p className="truncate text-[11px] font-semibold text-white/67">
+          <p className="truncate text-[11px] font-semibold text-tipx-ink/67">
             {entity.label}
           </p>
-          <p className="mt-1 truncate text-[8px] text-white/23">
+          <p className="mt-1 truncate text-[8px] text-tipx-ink/23">
             {entity.secondary || entity.kind}
           </p>
         </div>
         {node ? (
-          <span className="font-mono text-[8px] text-white/22">
+          <span className="font-mono text-[8px] text-tipx-ink/22">
             d{node.degree}
           </span>
         ) : null}
@@ -815,8 +815,8 @@ function InspectorAction({
       className={cn(
         "flex items-center justify-center gap-1.5 rounded-xl border px-2 py-2 text-[8px] transition",
         active
-          ? "border-white/18 bg-white text-black"
-          : "border-white/7 bg-white/[0.018] text-white/31 hover:bg-white/[0.06] hover:text-white"
+          ? "border-tipx-line/18 bg-tipx-brand text-tipx-on-brand"
+          : "border-tipx-line/7 bg-tipx-ink/[0.018] text-tipx-ink/31 hover:bg-tipx-ink/[0.06] hover:text-tipx-ink"
       )}
     >
       <Icon className="size-3" />
@@ -871,15 +871,15 @@ function RelationshipState({
 }) {
   return (
     <div className="pointer-events-none absolute inset-0 grid place-items-center px-8 text-center">
-      <div className="rounded-2xl border border-white/8 bg-[#081016]/76 px-6 py-5 backdrop-blur-xl">
+      <div className="rounded-2xl border border-tipx-line/8 bg-tipx-floating/76 px-6 py-5 backdrop-blur-xl">
         <Icon
           className={
-            "mx-auto size-5 text-white/24 " + (spinning ? "animate-spin" : "")
+            "mx-auto size-5 text-tipx-ink/24 " + (spinning ? "animate-spin" : "")
           }
         />
-        <p className="mt-3 text-[11px] font-medium text-white/48">{title}</p>
+        <p className="mt-3 text-[11px] font-medium text-tipx-ink/48">{title}</p>
         {detail ? (
-          <p className="mx-auto mt-1 max-w-md text-[9px] leading-4 text-white/25">
+          <p className="mx-auto mt-1 max-w-md text-[9px] leading-4 text-tipx-ink/25">
             {detail}
           </p>
         ) : null}
@@ -891,7 +891,7 @@ function RelationshipState({
 function EngineLoader({ label }: { label: string }) {
   return (
     <div className="absolute inset-0 grid place-items-center">
-      <div className="flex items-center gap-2 rounded-full border border-white/7 bg-[#081016]/72 px-3 py-2 text-[8px] uppercase tracking-[0.13em] text-white/25 backdrop-blur-xl">
+      <div className="flex items-center gap-2 rounded-full border border-tipx-line/7 bg-tipx-floating/72 px-3 py-2 text-[8px] uppercase tracking-[0.13em] text-tipx-ink/25 backdrop-blur-xl">
         <LoaderCircle className="size-3 animate-spin" />
         {label}
       </div>

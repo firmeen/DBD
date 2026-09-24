@@ -194,7 +194,7 @@ export function RelationshipNetwork({
         className="absolute inset-0"
         aria-label="Relationship network canvas"
       />
-      <div className="pointer-events-none absolute bottom-5 left-5 rounded-full border border-white/7 bg-[#071017]/76 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-white/24 backdrop-blur-xl">
+      <div className="pointer-events-none absolute bottom-5 left-5 rounded-full border border-tipx-line/7 bg-tipx-floating/76 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-tipx-ink/24 backdrop-blur-xl">
         Click focus · double click selection · wheel zoom · drag pan
       </div>
     </div>

@@ -23,11 +23,11 @@ export function RelationshipGenealogy({
     return (
       <div className="absolute inset-0 grid place-items-center px-8 text-center">
         <div>
-          <GitMerge className="mx-auto size-6 text-white/18" />
-          <p className="mt-4 text-sm font-medium text-white/49">
+          <GitMerge className="mx-auto size-6 text-tipx-ink/18" />
+          <p className="mt-4 text-sm font-medium text-tipx-ink/49">
             Genealogy unavailable
           </p>
-          <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+          <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-tipx-ink/25">
             {snapshot.message ||
               "Focus a company with transformation or merger history to open directed genealogy."}
           </p>
@@ -139,7 +139,7 @@ export function RelationshipGenealogy({
         </svg>
       </div>
 
-      <div className="pointer-events-none fixed bottom-20 left-7 rounded-full border border-white/7 bg-[#071017]/78 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-white/24 backdrop-blur-xl">
+      <div className="pointer-events-none fixed bottom-20 left-7 rounded-full border border-tipx-line/7 bg-tipx-floating/78 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-tipx-ink/24 backdrop-blur-xl">
         Dagre · directed transform / merger genealogy
       </div>
     </div>
