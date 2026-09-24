@@ -553,6 +553,17 @@ def _worker_command(run_id: int, *, concurrency: int, rate: float) -> list[str]:
     ]
 
 
+def _normalize_supervisor_generation(value: str | None) -> str:
+    generation = str(value or "").strip().lower()
+    if not generation:
+        return ""
+    if len(generation) != 16 or any(
+        char not in "0123456789abcdef" for char in generation
+    ):
+        raise ValueError("supervisor_generation must be a 16-character lowercase hex token")
+    return generation
+
+
 def _spawn_worker(
     run_id: int,
     index: int,
@@ -563,13 +574,22 @@ def _spawn_worker(
     open_powershell: bool,
     resource_plan: CampaignResourcePlan | None = None,
     restart_count: int = 0,
+    redis_rate_key: str | None = None,
+    supervisor_generation: str | None = None,
 ) -> WorkerProcess:
     """Spawn one worker atomically; no log handle survives a failed Popen."""
-    worker_id = f"local-{run_id}-{index}-{uuid4().hex[:8]}"
+    generation = _normalize_supervisor_generation(supervisor_generation)
+    worker_id = (
+        f"local-{run_id}-g{generation}-{index}-{uuid4().hex[:8]}"
+        if generation
+        else f"local-{run_id}-{index}-{uuid4().hex[:8]}"
+    )
     env = os.environ.copy()
     env["DBD_WORKER_ID"] = worker_id
     if fleet_rate_ceiling is not None:
         env["DBD_FLEET_RATE_CEILING"] = str(float(fleet_rate_ceiling))
+    if redis_rate_key:
+        env["DBD_REDIS_RATE_KEY"] = str(redis_rate_key)
     if resource_plan is not None:
         env["DB_POOL_SIZE"] = str(resource_plan.db_pool_per_worker)
         env["DBD_ARCHIVE_WORKERS"] = str(resource_plan.archive_workers_per_worker)
@@ -1109,11 +1129,27 @@ def _terminate_workers(workers: list[WorkerProcess]) -> None:
         _close_worker_handle(worker)
 
 
-def _release_dead_worker_leases(run_id: int, worker_id: str) -> int:
-    """Immediately reclaim leases from either scheduler after process death."""
+def _reclaim_running_leases(
+    run_id: int,
+    *,
+    worker_id: str | None = None,
+    worker_prefix: str | None = None,
+    reason: str,
+    raise_errors: bool = False,
+) -> int:
+    """Return confirmed-dead worker work to pending without charging a process-loss attempt."""
+    if (worker_id is None) == (worker_prefix is None):
+        raise ValueError("exactly one worker_id or worker_prefix is required")
     try:
         with connect() as conn, conn.cursor() as cur:
             reclaimed = 0
+            if worker_id is not None:
+                owner_clause = " AND lease_owner=%s"
+                owner_value = worker_id
+            else:
+                owner_clause = " AND lease_owner LIKE %s"
+                owner_value = f"{worker_prefix}%"
+            params = (reason, run_id, owner_value)
             for table in ("endpoint_tasks", "company_collection_state"):
                 cur.execute(
                     f"""
@@ -1127,18 +1163,41 @@ def _release_dead_worker_leases(run_id: int, worker_id: str) -> int:
                         WHEN stage='project' AND project_attempts>0
                         THEN project_attempts-1 ELSE project_attempts
                       END,
-                      available_at=UTC_TIMESTAMP(6),last_error='worker_process_lost'
-                    WHERE run_id=%s AND lease_owner=%s AND status='running'
+                      available_at=UTC_TIMESTAMP(6),last_error=%s
+                    WHERE run_id=%s{owner_clause} AND status='running'
                     """,
-                    (run_id, worker_id),
+                    params,
                 )
                 reclaimed += int(cur.rowcount or 0)
             conn.commit()
             return reclaimed
     except Exception:
-        # Lease expiry remains the durable fallback if immediate reclamation fails.
+        if raise_errors:
+            raise
+        # Lease expiry remains the durable fallback if immediate reconciliation fails.
         return 0
 
+
+def _release_dead_worker_leases(run_id: int, worker_id: str) -> int:
+    """Immediately reclaim leases owned by one confirmed-dead worker process."""
+    return _reclaim_running_leases(
+        run_id,
+        worker_id=worker_id,
+        reason="worker_process_lost",
+    )
+
+
+def reclaim_guardian_process_leases(run_id: int, supervisor_generation: str) -> int:
+    """Reclaim leases owned by one confirmed-dead Guardian generation only."""
+    generation = _normalize_supervisor_generation(supervisor_generation)
+    if not generation:
+        raise ValueError("supervisor_generation is required for Guardian lease recovery")
+    return _reclaim_running_leases(
+        run_id,
+        worker_prefix=f"local-{int(run_id)}-g{generation}-",
+        reason="guardian_process_recovery",
+        raise_errors=True,
+    )
 
 def _request_local_drain(
     redis: Redis,
@@ -1242,6 +1301,8 @@ def supervise_campaign(
     rate_mode: str = "adaptive",
     fleet_rate_initial: float | None = None,
     fleet_rate_max: float | None = None,
+    redis_rate_key: str | None = None,
+    supervisor_generation: str | None = None,
     fleet_db_connections_max: int | None = None,
     fleet_archive_workers_max: int | None = None,
     fleet_projection_workers_max: int | None = None,
@@ -1256,6 +1317,11 @@ def supervise_campaign(
         raise ValueError("Campaign supervisor requires DBD_REDIS_URL")
     if worker_concurrency < 1 or max_restarts < 0:
         raise ValueError("worker concurrency must be positive and max restarts non-negative")
+
+    rate_key = str(redis_rate_key or settings.dbd_redis_rate_key)
+    if not rate_key.strip():
+        raise ValueError("Redis rate key must not be empty")
+    generation = _normalize_supervisor_generation(supervisor_generation)
 
     requested_workers = int(workers)
     minimum = requested_workers if workers_min is None else int(workers_min)
@@ -1346,6 +1412,8 @@ def supervise_campaign(
             open_powershell=open_powershell,
             resource_plan=resource_plan,
             restart_count=restarts,
+            redis_rate_key=rate_key,
+            supervisor_generation=generation or None,
         )
         if restart_index is None:
             next_index += 1
@@ -1429,7 +1497,7 @@ def supervise_campaign(
         next_worker_refresh = now
         _clear_stop(redis, run_id)
         initial_rate_target = _fleet_rate_target(plan, initial_workers)
-        _seed_rate(redis, settings.dbd_redis_rate_key, plan.initial, initial_rate_target)
+        _seed_rate(redis, rate_key, plan.initial, initial_rate_target)
         last_rate_target = initial_rate_target
 
         if has_work:
@@ -1440,6 +1508,7 @@ def supervise_campaign(
             redis,
             run_id,
             supervisor_pid=os.getpid(),
+            supervisor_generation=generation or None,
             status="running",
             autoscale=autoscale,
             workers_initial=initial_workers,
@@ -1455,6 +1524,8 @@ def supervise_campaign(
             rate_independent=plan.independent,
             fleet_rate_initial=plan.initial,
             fleet_rate_max=plan.ceiling,
+            redis_rate_key=rate_key,
+            max_restarts=max_restarts,
             rate_target=initial_rate_target,
             rate_ceiling=plan.ceiling,
             db_connections_budget=resource_plan.db_connections_budget,
@@ -1638,7 +1709,7 @@ def supervise_campaign(
             if autoscale and not graceful_stop and not control_plane_degraded:
                 if plan.independent:
                     current_effective_rate = _effective_rate(
-                        redis, settings.dbd_redis_rate_key, plan.initial
+                        redis, rate_key, plan.initial
                     )
                 target = controller.target(
                     pending=pending,
@@ -1715,14 +1786,14 @@ def supervise_campaign(
                     if rate_target != last_rate_target or now >= next_state_write:
                         effective = _set_rate_target(
                             redis,
-                            settings.dbd_redis_rate_key,
+                            rate_key,
                             rate_target,
                         )
                         last_rate_target = rate_target
                     else:
                         effective = _effective_rate(
                             redis,
-                            settings.dbd_redis_rate_key,
+                            rate_key,
                             last_effective_rate,
                         )
                     last_effective_rate = effective
@@ -1781,6 +1852,7 @@ def supervise_campaign(
                         redis,
                         run_id,
                         supervisor_pid=os.getpid(),
+            supervisor_generation=generation or None,
                         status="draining" if graceful_stop else "running",
                         autoscale=autoscale,
                         workers_initial=initial_workers,
@@ -1799,6 +1871,8 @@ def supervise_campaign(
                         rate_independent=plan.independent,
                         fleet_rate_initial=plan.initial,
                         fleet_rate_max=plan.ceiling,
+                        redis_rate_key=rate_key,
+                        max_restarts=max_restarts,
                         rate_effective=effective,
                         rate_target=rate_target,
                         rate_ceiling=plan.ceiling,
@@ -1862,6 +1936,7 @@ def supervise_campaign(
                 redis,
                 run_id,
                 supervisor_pid=os.getpid(),
+            supervisor_generation=generation or None,
                 status="draining",
                 autoscale=autoscale,
                 workers_initial=initial_workers,
@@ -1873,6 +1948,8 @@ def supervise_campaign(
                 rate_independent=plan.independent,
                 fleet_rate_initial=plan.initial,
                 fleet_rate_max=plan.ceiling,
+                redis_rate_key=rate_key,
+                max_restarts=max_restarts,
                 rate_ceiling=plan.ceiling,
                 db_pool_per_worker=resource_plan.db_pool_per_worker,
                 archive_workers_per_worker=resource_plan.archive_workers_per_worker,
@@ -1980,6 +2057,7 @@ def supervise_campaign(
                     redis,
                     run_id,
                     supervisor_pid=os.getpid(),
+            supervisor_generation=generation or None,
                     status=runtime_status,
                     autoscale=autoscale,
                     workers_initial=initial_workers,
@@ -1992,6 +2070,8 @@ def supervise_campaign(
                     rate_independent=plan.independent,
                     fleet_rate_initial=plan.initial,
                     fleet_rate_max=plan.ceiling,
+                    redis_rate_key=rate_key,
+                    max_restarts=max_restarts,
                     rate_target=last_rate_target,
                     rate_ceiling=plan.ceiling,
                     db_connections_budget=resource_plan.db_connections_budget,
@@ -2129,10 +2209,13 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
             }
             state["worker_metrics"] = _worker_metrics(workers)
             state["worker_details"] = worker_details
-            state["effective_rate"] = _effective_rate(
-                redis, settings.dbd_redis_rate_key, settings.dbd_rate_per_second
+            status_rate_key = str(
+                (runtime or {}).get("redis_rate_key") or settings.dbd_redis_rate_key
             )
-            target_raw = redis.get(_rate_target_key(settings.dbd_redis_rate_key))
+            state["effective_rate"] = _effective_rate(
+                redis, status_rate_key, settings.dbd_rate_per_second
+            )
+            target_raw = redis.get(_rate_target_key(status_rate_key))
             try:
                 state["rate_target"] = float(target_raw) if target_raw is not None else None
             except (TypeError, ValueError):
