@@ -132,7 +132,7 @@ function BenchmarkStrip({
           ) : null}
           {companyPosition !== null ? (
             <span
-              className="absolute top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-black bg-tipx-brand shadow-[0_0_0_1px_rgba(255,255,255,.18),0_8px_24px_rgba(0,0,0,.4)]"
+              className="absolute top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-tipx-surface bg-tipx-brand ring-1 ring-tipx-line/16 shadow-[0_8px_24px_rgba(0,0,0,.22)]"
               style={{ left: `${companyPosition}%` }}
               title="Company"
             />
