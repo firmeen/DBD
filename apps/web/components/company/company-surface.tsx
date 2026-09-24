@@ -316,8 +316,8 @@ function CompanyCommandBar({
       </div>
 
       {focusedCompany ? (
-        <div className="pointer-events-auto hidden min-w-0 max-w-sm items-center gap-2 rounded-2xl border border-white/9 bg-[#081016]/86 p-1.5 backdrop-blur-xl lg:flex">
-          <div className="min-w-0 px-3">
+        <div className="pointer-events-auto flex min-w-0 items-center rounded-2xl border border-white/9 bg-[#081016]/86 p-1.5 backdrop-blur-xl lg:max-w-sm lg:gap-2">
+          <div className="hidden min-w-0 px-3 lg:block">
             <p className="truncate text-[10px] font-medium text-white/64">
               {focusedCompany.label}
             </p>
@@ -328,8 +328,9 @@ function CompanyCommandBar({
           <button
             type="button"
             onClick={onClearFocus}
-            className="grid size-9 shrink-0 place-items-center rounded-xl text-white/25 hover:bg-white/6 hover:text-white"
-            aria-label="Change focused company"
+            className="grid size-9 shrink-0 place-items-center rounded-xl text-white/36 transition hover:bg-white/6 hover:text-white"
+            aria-label={`Clear focused company: ${focusedCompany.label}`}
+            title="Return to company discovery"
           >
             <X className="size-3.5" />
           </button>

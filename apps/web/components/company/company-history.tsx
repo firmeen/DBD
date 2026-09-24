@@ -110,20 +110,25 @@ function HistoryEventRow({
           ) : null}
         </div>
 
-        {event.relatedCompany ? (
+        {event.relatedCompany ||
+        event.kind === "transform" ||
+        event.kind === "merger" ? (
           <div className="flex gap-1.5">
-            <button
-              type="button"
-              onClick={() => onFocusCompany(event.relatedCompany!)}
-              className="rounded-lg border border-white/8 bg-white/[0.025] px-2.5 py-2 text-[9px] text-white/40 hover:bg-white/[0.06] hover:text-white"
-            >
-              Focus company
-            </button>
-            {(event.kind === "transform" || event.kind === "merger") ? (
+            {event.relatedCompany ? (
+              <button
+                type="button"
+                onClick={() => onFocusCompany(event.relatedCompany!)}
+                className="rounded-lg border border-white/8 bg-white/[0.025] px-2.5 py-2 text-[9px] text-white/40 hover:bg-white/[0.06] hover:text-white"
+              >
+                Focus company
+              </button>
+            ) : null}
+            {event.kind === "transform" || event.kind === "merger" ? (
               <button
                 type="button"
                 onClick={() => onHandoff("R")}
                 className="rounded-lg border border-white/8 bg-white/[0.025] px-2.5 py-2 font-mono text-[9px] text-white/40 hover:bg-white/[0.06] hover:text-white"
+                aria-label="Open relationship intelligence for this corporate event"
               >
                 R
               </button>
