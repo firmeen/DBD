@@ -248,7 +248,7 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
       derivedQuery.isFetching)
 
   return (
-    <main className="relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid pointer-events-none fixed inset-0 opacity-20" />
       <div className="tipx-vignette pointer-events-none fixed inset-0" />
 
