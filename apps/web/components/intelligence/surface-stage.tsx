@@ -46,6 +46,17 @@ const PersonSurface = dynamic(
   }
 )
 
+const AnalyticsSurface = dynamic(
+  () =>
+    import("@/components/analytics/analytics-surface").then(
+      (module) => module.AnalyticsSurface
+    ),
+  {
+    ssr: false,
+    loading: () => <AnalyticsSurfaceLoader />,
+  }
+)
+
 const CompanySurface = dynamic(
   () =>
     import("@/components/company/company-surface").then(
@@ -89,6 +100,15 @@ export function SurfaceStage() {
 
   if (activeSurface === "R") {
     return <RelationshipSurface />
+  }
+
+  if (activeSurface === "A" || activeSurface === "O") {
+    return (
+      <AnalyticsSurface
+        key={`analytics:${activeSurface}`}
+        mode={activeSurface === "A" ? "population" : "opportunity"}
+      />
+    )
   }
 
   return (
@@ -234,6 +254,20 @@ function RelationshipSurfaceLoader() {
       <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/38 backdrop-blur-xl">
         <span className="size-1.5 animate-pulse rounded-full bg-cyan-200/70" />
         Loading relationship observatory
+      </div>
+    </main>
+  )
+}
+
+
+function AnalyticsSurfaceLoader() {
+  return (
+    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-[#070a0d] text-white">
+      <div className="tipx-grid absolute inset-0 opacity-24" />
+      <div className="tipx-vignette absolute inset-0" />
+      <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/38 backdrop-blur-xl">
+        <span className="size-1.5 animate-pulse rounded-full bg-emerald-200/70" />
+        Loading analytical field
       </div>
     </main>
   )

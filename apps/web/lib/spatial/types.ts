@@ -1,4 +1,8 @@
-import type { LensState, EntityRef } from "@/lib/intelligence/types"
+import type {
+  EntityRef,
+  LensState,
+  PopulationRef,
+} from "@/lib/intelligence/types"
 
 export const SPATIAL_LAYER_IDS = [
   "administrative",
@@ -24,6 +28,7 @@ export type SpatialBounds = [
 ]
 
 export const MAX_SPATIAL_COMPANY_POINTS = 25_000
+export const MAX_SPATIAL_EXACT_COMPANY_IDS = 500
 
 export interface SpatialViewState {
   longitude: number
@@ -112,6 +117,8 @@ export interface SpatialQuery {
   lod: SpatialLod
   h3Resolution: number
   lens: LensState
+  population: PopulationRef | null
+  exactCompanyIds: string[]
   layers: SpatialLayerId[]
   branchId: string | null
   radiusKm: number

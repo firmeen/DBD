@@ -9,6 +9,7 @@ import { SpatialControlDeck } from "./spatial-control-deck"
 import { SpatialMap } from "./spatial-map"
 import { useGlobalLens } from "@/hooks/use-global-lens"
 import { fetchSpatialSnapshot } from "@/lib/spatial/adapter"
+import { exactCompanyIdsForSpatial } from "@/lib/spatial/exact-selection"
 import { canAggregateH3InBrowser } from "@/lib/spatial/h3"
 import {
   h3ResolutionForZoom,
@@ -71,6 +72,7 @@ export function SpatialSurface() {
     (state) => state.saveSurfaceSnapshot
   )
   const selection = useWorkspaceStore((state) => state.selection)
+  const population = useWorkspaceStore((state) => state.population)
   const focus = useWorkspaceStore((state) => state.focus)
   const setFocus = useWorkspaceStore((state) => state.setFocus)
   const toggleSelection = useWorkspaceStore((state) => state.toggleSelection)
@@ -177,6 +179,11 @@ export function SpatialSurface() {
     saveSurfaceSnapshot,
   ])
 
+  const exactCompanyIds = React.useMemo(
+    () => exactCompanyIdsForSpatial(selection),
+    [selection]
+  )
+
   const lod = spatialLodForZoom(queryViewState.zoom)
   const h3Resolution = h3ResolutionForZoom(queryViewState.zoom)
   const bounds = React.useMemo(
@@ -196,6 +203,8 @@ export function SpatialSurface() {
       lod,
       h3Resolution,
       lens,
+      population,
+      exactCompanyIds,
       layers,
       branchId,
       radiusKm: queryRadiusKm,
@@ -204,9 +213,11 @@ export function SpatialSurface() {
       bounds,
       branchId,
       h3Resolution,
+      exactCompanyIds,
       layers,
       lens,
       lod,
+      population,
       queryViewState,
       queryRadiusKm,
     ]

@@ -133,6 +133,7 @@ export function RelationshipSurface() {
   const focus = useWorkspaceStore((state) => state.focus)
   const selection = useWorkspaceStore((state) => state.selection)
   const compare = useWorkspaceStore((state) => state.compare)
+  const population = useWorkspaceStore((state) => state.population)
   const setFocus = useWorkspaceStore((state) => state.setFocus)
   const setSelection = useWorkspaceStore((state) => state.setSelection)
   const toggleSelection = useWorkspaceStore((state) => state.toggleSelection)
@@ -219,6 +220,7 @@ export function RelationshipSurface() {
       "graph",
       anchorEntity,
       populationSelection,
+      population,
       depth,
       lens,
     ],
@@ -226,6 +228,7 @@ export function RelationshipSurface() {
       fetchRelationshipGraph(
         anchorEntity,
         populationSelection,
+        population,
         depth,
         lens,
         signal
@@ -242,6 +245,7 @@ export function RelationshipSurface() {
       "matrix",
       focus,
       populationSelection,
+      population,
       debouncedCompanyQuery,
       debouncedPersonQuery,
       lens,
@@ -250,6 +254,7 @@ export function RelationshipSurface() {
       fetchBoardMatrix(
         relationshipEntity(focus),
         populationSelection,
+        population,
         debouncedCompanyQuery,
         debouncedPersonQuery,
         lens,

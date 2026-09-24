@@ -1,6 +1,6 @@
 "use client"
 
-import { Command, CornerDownLeft, Layers3 } from "lucide-react"
+import { Command, CornerDownLeft, Layers3, X } from "lucide-react"
 
 import { useGlobalLens } from "@/hooks/use-global-lens"
 import { SURFACE_BY_ID } from "@/lib/intelligence/surfaces"
@@ -10,6 +10,8 @@ export function ContextBar() {
   const activeSurface = useWorkspaceStore((state) => state.activeSurface)
   const selection = useWorkspaceStore((state) => state.selection)
   const compare = useWorkspaceStore((state) => state.compare)
+  const population = useWorkspaceStore((state) => state.population)
+  const setPopulation = useWorkspaceStore((state) => state.setPopulation)
   const setCommandOpen = useWorkspaceStore((state) => state.setCommandOpen)
   const { activeCount } = useGlobalLens()
   const surface = SURFACE_BY_ID[activeSurface]
@@ -39,6 +41,18 @@ export function ContextBar() {
       />
       <ContextMetric label="Selected" value={selection.length.toString()} />
       <ContextMetric label="Compare" value={compare.length.toString()} />
+      {population ? (
+        <button
+          type="button"
+          onClick={() => setPopulation(null)}
+          title={`Clear analytical population: ${population.label}`}
+          className="flex max-w-44 items-center gap-1.5 rounded-lg border border-emerald-200/10 bg-emerald-200/[0.035] px-2 py-1.5 text-[8px] text-emerald-100/55 hover:bg-emerald-200/[0.07]"
+        >
+          <span className="truncate">{population.label}</span>
+          <span className="font-mono">{population.count.toLocaleString()}</span>
+          <X className="size-2.5 shrink-0" />
+        </button>
+      ) : null}
 
       <button
         type="button"
