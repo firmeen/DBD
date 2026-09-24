@@ -64,7 +64,6 @@ export const INTELLIGENCE_COMMANDS: readonly IntelligenceCommand[] = [
     id: "theme.dark",
     label: "Appearance · Dark",
     description: "Use the deep-navy TIPX intelligence theme.",
-    shortcut: "D",
     category: "Appearance",
   },
   {
