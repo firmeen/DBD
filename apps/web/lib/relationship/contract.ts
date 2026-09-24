@@ -162,6 +162,19 @@ const relationshipGraphSchema = z
       })
     }
 
+    if (snapshot.layout === "server") {
+      for (const [index, node] of snapshot.nodes.entries()) {
+        if (node.x == null || node.y == null) {
+          context.addIssue({
+            code: z.ZodIssueCode.custom,
+            path: ["nodes", index],
+            message:
+              "Server-layout relationship nodes require finite x/y coordinates",
+          })
+        }
+      }
+    }
+
     for (const [index, edge] of snapshot.edges.entries()) {
       if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) {
         context.addIssue({
@@ -219,6 +232,22 @@ const boardMatrixSchema = z
     const people = new Set(snapshot.people.map((person) => person.id))
     const membershipKeys = new Set<string>()
 
+    if (companies.size !== snapshot.companies.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["companies"],
+        message: "Board Matrix contains duplicate company axis IDs",
+      })
+    }
+
+    if (people.size !== snapshot.people.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["people"],
+        message: "Board Matrix contains duplicate person axis IDs",
+      })
+    }
+
     for (const [index, membership] of snapshot.memberships.entries()) {
       if (!companies.has(membership.companyId) || !people.has(membership.personId)) {
         context.addIssue({
@@ -268,6 +297,16 @@ const genealogySchema = z
   })
   .superRefine((snapshot, context) => {
     const nodeIds = new Set(snapshot.nodes.map((node) => node.id))
+    const edgeIds = new Set<string>()
+
+    if (nodeIds.size !== snapshot.nodes.length) {
+      context.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["nodes"],
+        message: "Genealogy contains duplicate node IDs",
+      })
+    }
+
     for (const [index, edge] of snapshot.edges.entries()) {
       if (!nodeIds.has(edge.source) || !nodeIds.has(edge.target)) {
         context.addIssue({
@@ -276,6 +315,15 @@ const genealogySchema = z
           message: "Genealogy edge references a missing company node",
         })
       }
+
+      if (edgeIds.has(edge.id)) {
+        context.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ["edges", index, "id"],
+          message: "Genealogy contains duplicate edge IDs",
+        })
+      }
+      edgeIds.add(edge.id)
     }
   })
 

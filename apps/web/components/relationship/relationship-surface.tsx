@@ -164,6 +164,9 @@ export function RelationshipSurface() {
         ) ?? null
       )
   )
+  const [populationSelection, setPopulationSelection] = React.useState<
+    EntityRef[]
+  >(() => relationshipPopulation(selection))
   const [hiddenNodeIds, setHiddenNodeIds] = React.useState<Set<string>>(
     () => new Set()
   )
@@ -215,14 +218,14 @@ export function RelationshipSurface() {
       "relationship",
       "graph",
       anchorEntity,
-      selection,
+      populationSelection,
       depth,
       lens,
     ],
     queryFn: ({ signal }) =>
       fetchRelationshipGraph(
         anchorEntity,
-        selection,
+        populationSelection,
         depth,
         lens,
         signal
@@ -246,7 +249,7 @@ export function RelationshipSurface() {
     queryFn: ({ signal }) =>
       fetchBoardMatrix(
         relationshipEntity(focus),
-        selection,
+        populationSelection,
         debouncedCompanyQuery,
         debouncedPersonQuery,
         lens,
@@ -272,6 +275,10 @@ export function RelationshipSurface() {
     staleTime: 60_000,
     retry: 1,
   })
+
+  const matrixSynchronized =
+    matrixCompanyQuery.trim() === debouncedCompanyQuery &&
+    matrixPersonQuery.trim() === debouncedPersonQuery
 
   const graph = graphQuery.data ?? EMPTY_GRAPH
   const matrix = matrixQuery.data ?? EMPTY_MATRIX
@@ -334,6 +341,7 @@ export function RelationshipSurface() {
     const entity = relationshipEntity(focus)
     if (!entity) return
     setAnchorEntity(entity)
+    setPopulationSelection(relationshipPopulation(selection))
     setHiddenNodeIds(new Set())
   }
 
@@ -448,6 +456,7 @@ export function RelationshipSurface() {
         ) : (
           <BoardMatrix
             snapshot={matrix}
+            synchronized={matrixSynchronized}
             companyQuery={matrixCompanyQuery}
             personQuery={matrixPersonQuery}
             onCompanyQueryChange={setMatrixCompanyQuery}
@@ -898,6 +907,12 @@ function EngineLoader({ label }: { label: string }) {
 function relationshipEntity(entity: EntityRef | null | undefined) {
   if (!entity) return null
   return entity.kind === "company" || entity.kind === "person" ? entity : null
+}
+
+function relationshipPopulation(entities: EntityRef[]) {
+  return entities.filter(
+    (entity) => entity.kind === "company" || entity.kind === "person"
+  )
 }
 
 function toggleSetValue(current: Set<string>, value: string) {

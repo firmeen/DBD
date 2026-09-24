@@ -19,12 +19,12 @@ import { cn } from "@/lib/utils"
 
 const ROW_HEADER_WIDTH = 250
 const COLUMN_WIDTH = 138
-const HEADER_HEIGHT = 76
 const ROW_HEIGHT = 52
 const MAX_REGION_ENTITIES = 240
 
 export function BoardMatrix({
   snapshot,
+  synchronized,
   companyQuery,
   personQuery,
   onCompanyQueryChange,
@@ -35,6 +35,7 @@ export function BoardMatrix({
   onOpenNetwork,
 }: {
   snapshot: BoardMatrixSnapshot
+  synchronized: boolean
   companyQuery: string
   personQuery: string
   onCompanyQueryChange: (value: string) => void
@@ -142,7 +143,7 @@ export function BoardMatrix({
   }
 
   return (
-    <div className="absolute inset-0 flex flex-col pt-[92px]">
+    <div className="absolute inset-0 flex flex-col pt-[152px] sm:pt-[148px]">
       <div className="pointer-events-auto mx-4 mb-2 flex flex-wrap items-center gap-2 sm:mx-7">
         <MatrixSearch
           icon={Building2}
@@ -191,7 +192,19 @@ export function BoardMatrix({
         ref={scrollRef}
         className="pointer-events-auto mx-4 mb-20 min-h-0 flex-1 overflow-auto rounded-2xl border border-white/8 bg-[#081016]/88 shadow-[0_24px_80px_rgba(0,0,0,.32)] backdrop-blur-xl sm:mx-7"
       >
-        {companies.length === 0 || people.length === 0 ? (
+        {!synchronized ? (
+          <div className="grid h-full min-h-[420px] place-items-center px-8 text-center">
+            <div>
+              <LoaderMatrixState />
+              <p className="mt-3 text-sm font-medium text-white/48">
+                Preparing updated Matrix query
+              </p>
+              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+                Previous membership cells are intentionally hidden until both visible axis searches match the debounced serving query.
+              </p>
+            </div>
+          </div>
+        ) : companies.length === 0 || people.length === 0 ? (
           <div className="grid h-full min-h-[420px] place-items-center px-8 text-center">
             <div>
               <p className="text-sm font-medium text-white/48">
@@ -377,5 +390,12 @@ function MatrixSearch({
         className="h-9 w-full rounded-xl border border-white/8 bg-[#081016]/82 pl-9 pr-3 text-[10px] text-white outline-none placeholder:text-white/20 focus:border-white/15 focus:bg-[#0b141b]"
       />
     </label>
+  )
+}
+
+
+function LoaderMatrixState() {
+  return (
+    <span className="mx-auto block size-5 animate-pulse rounded-full border border-white/15 bg-white/[0.04]" />
   )
 }

@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest"
 import {
   parseBoardMatrixSnapshot,
   parseCompanyBoardSnapshot,
+  parseGenealogySnapshot,
   parsePersonDetailSnapshot,
   parseRelationshipGraphSnapshot,
 } from "./contract"
@@ -58,6 +59,8 @@ describe("relationship serving contracts", () => {
             kind: "company",
             label: "Company 1",
             degree: 1,
+            x: 0,
+            y: 0,
           },
         ],
         edges: [
@@ -68,6 +71,41 @@ describe("relationship serving contracts", () => {
             kind: "board",
           },
         ],
+      })
+    ).toThrow()
+  })
+
+  it("requires coordinates when a graph claims server layout", () => {
+    expect(() =>
+      parseRelationshipGraphSnapshot({
+        availability: "ready",
+        layout: "server",
+        nodes: [
+          {
+            id: "company:1",
+            kind: "company",
+            label: "Company 1",
+            degree: 0,
+          },
+        ],
+        edges: [],
+      })
+    ).toThrow(/require finite x\/y/)
+  })
+
+  it("rejects duplicate Matrix axis identities", () => {
+    expect(() =>
+      parseBoardMatrixSnapshot({
+        availability: "ready",
+        companies: [
+          { id: "company:1", name: "Company 1", degree: 1 },
+          { id: "company:1", name: "Company 1 duplicate", degree: 1 },
+        ],
+        people: [
+          { id: "person:1", name: "Person 1", degree: 1 },
+          { id: "person:1", name: "Person 1 duplicate", degree: 1 },
+        ],
+        memberships: [],
       })
     ).toThrow()
   })
@@ -88,6 +126,46 @@ describe("relationship serving contracts", () => {
           {
             companyId: "company:1",
             personId: "person:missing",
+          },
+        ],
+      })
+    ).toThrow()
+  })
+
+  it("rejects duplicate genealogy node and edge identities", () => {
+    expect(() =>
+      parseGenealogySnapshot({
+        availability: "ready",
+        nodes: [
+          {
+            id: "g1",
+            company: {
+              id: "company:1",
+              kind: "company",
+              label: "Company 1",
+            },
+          },
+          {
+            id: "g1",
+            company: {
+              id: "company:2",
+              kind: "company",
+              label: "Company 2",
+            },
+          },
+        ],
+        edges: [
+          {
+            id: "e1",
+            source: "g1",
+            target: "g1",
+            kind: "transform",
+          },
+          {
+            id: "e1",
+            source: "g1",
+            target: "g1",
+            kind: "merger",
           },
         ],
       })

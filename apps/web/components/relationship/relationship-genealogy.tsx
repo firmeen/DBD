@@ -37,7 +37,7 @@ export function RelationshipGenealogy({
   }
 
   return (
-    <div className="absolute inset-0 overflow-auto px-6 pb-24 pt-28">
+    <div className="absolute inset-0 overflow-auto px-6 pb-24 pt-40">
       <div
         className="relative mx-auto min-h-full min-w-full"
         style={{
@@ -104,6 +104,12 @@ export function RelationshipGenealogy({
                 ")"
               }
               onClick={() => onFocusCompany(node.company)}
+              onKeyDown={(event) => {
+                if (event.key === "Enter" || event.key === " ") {
+                  event.preventDefault()
+                  onFocusCompany(node.company)
+                }
+              }}
               className="cursor-pointer"
               role="button"
               tabIndex={0}
