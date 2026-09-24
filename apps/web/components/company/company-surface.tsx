@@ -167,7 +167,7 @@ export function CompanySurface() {
   }
 
   return (
-    <main className="relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid fixed inset-0 opacity-25" />
       <div className="tipx-vignette fixed inset-0" />
       <div className="pointer-events-none fixed left-[8%] top-[8%] size-[42vw] max-h-[760px] max-w-[760px] rounded-full bg-cyan-300/[0.014] blur-3xl" />
