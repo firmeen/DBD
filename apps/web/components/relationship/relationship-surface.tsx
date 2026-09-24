@@ -156,7 +156,13 @@ export function RelationshipSurface() {
   const [view, setView] = React.useState<RelationshipViewId>(initialState.view)
   const [depth, setDepth] = React.useState(initialState.depth)
   const [anchorEntity, setAnchorEntity] = React.useState<EntityRef | null>(
-    () => relationshipEntity(focus) ?? relationshipEntity(selection[0] ?? null)
+    () =>
+      relationshipEntity(focus) ??
+      relationshipEntity(
+        selection.find(
+          (entity) => entity.kind === "company" || entity.kind === "person"
+        ) ?? null
+      )
   )
   const [hiddenNodeIds, setHiddenNodeIds] = React.useState<Set<string>>(
     () => new Set()
@@ -324,10 +330,6 @@ export function RelationshipSurface() {
   const preview = hoverEntity ?? relationshipEntity(focus)
   const previewNode = preview ? nodeById.get(preview.id) ?? null : null
 
-  function focusRelationshipEntity(entity: EntityRef) {
-    setFocus(entity)
-  }
-
   function recenterOnFocus() {
     const entity = relationshipEntity(focus)
     if (!entity) return
@@ -360,6 +362,7 @@ export function RelationshipSurface() {
         view={view}
         depth={depth}
         anchorEntity={anchorEntity}
+        currentFocus={relationshipEntity(focus)}
         layoutRunning={layoutRunning}
         endpointConfigured={relationshipEndpointConfigured()}
         graphSearch={graphSearch}
@@ -374,6 +377,7 @@ export function RelationshipSurface() {
           setGraphSearch("")
         }}
         onRecenter={recenterOnFocus}
+        onClearFocus={() => setFocus(null)}
         onHandoff={handoffEntity}
       />
 
@@ -393,7 +397,7 @@ export function RelationshipSurface() {
               pinnedNodeIds={pinnedNodeIds}
               pathNodeIds={pathNodes}
               pathEdgeIds={pathEdges}
-              onFocus={focusRelationshipEntity}
+              onFocus={setFocus}
               onToggleSelection={toggleSelection}
               onHover={setHoverEntity}
               onLayoutStateChange={setLayoutRunning}
@@ -418,7 +422,7 @@ export function RelationshipSurface() {
               hiddenNodeIds={hiddenNodeIds}
               pathNodeIds={pathNodes}
               pathEdgeIds={pathEdges}
-              onFocus={focusRelationshipEntity}
+              onFocus={setFocus}
               onToggleSelection={toggleSelection}
               onHover={setHoverEntity}
               onLayoutStateChange={setLayoutRunning}
@@ -429,7 +433,13 @@ export function RelationshipSurface() {
       ) : null}
 
       {view === "matrix" ? (
-        matrixQuery.isError ? (
+        matrixQuery.isPending ? (
+          <RelationshipState
+            icon={LoaderCircle}
+            title="Loading virtual Board Matrix"
+            spinning
+          />
+        ) : matrixQuery.isError ? (
           <RelationshipState
             icon={AlertTriangle}
             title="Board Matrix request failed"
@@ -462,6 +472,12 @@ export function RelationshipSurface() {
             icon={GitFork}
             title="Genealogy needs a company focus"
             detail="Focus a company from Map, Company, People, Matrix or the relationship graph before switching to directed genealogy."
+          />
+        ) : genealogyQuery.isPending ? (
+          <RelationshipState
+            icon={LoaderCircle}
+            title="Loading directed genealogy"
+            spinning
           />
         ) : genealogyQuery.isError ? (
           <RelationshipState
@@ -508,6 +524,7 @@ function RelationshipControlDeck({
   view,
   depth,
   anchorEntity,
+  currentFocus,
   layoutRunning,
   endpointConfigured,
   graphSearch,
@@ -518,11 +535,13 @@ function RelationshipControlDeck({
   onGraphSearchChange,
   onFocusSearchResult,
   onRecenter,
+  onClearFocus,
   onHandoff,
 }: {
   view: RelationshipViewId
   depth: number
   anchorEntity: EntityRef | null
+  currentFocus: EntityRef | null
   layoutRunning: boolean
   endpointConfigured: boolean
   graphSearch: string
@@ -533,6 +552,7 @@ function RelationshipControlDeck({
   onGraphSearchChange: (value: string) => void
   onFocusSearchResult: (node: RelationshipNode) => void
   onRecenter: () => void
+  onClearFocus: () => void
   onHandoff: (surface: SurfaceId) => void
 }) {
   const graphMode = view === "explore" || view === "neighbourhood"
@@ -554,6 +574,17 @@ function RelationshipControlDeck({
                 : "Lens / Selection population"}
             </p>
           </div>
+          {currentFocus ? (
+            <button
+              type="button"
+              onClick={onClearFocus}
+              className="grid size-7 shrink-0 place-items-center rounded-lg border border-white/7 text-white/24 transition hover:bg-white/[0.055] hover:text-white"
+              aria-label={"Clear focused " + currentFocus.kind + ": " + currentFocus.label}
+              title="Clear current Focus"
+            >
+              <X className="size-3" />
+            </button>
+          ) : null}
           <span
             className={cn(
               "size-1.5 rounded-full",
