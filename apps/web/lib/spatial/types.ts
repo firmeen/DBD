@@ -28,6 +28,7 @@ export type SpatialBounds = [
 ]
 
 export const MAX_SPATIAL_COMPANY_POINTS = 25_000
+export const MAX_SPATIAL_EXACT_COMPANY_IDS = 500
 
 export interface SpatialViewState {
   longitude: number
@@ -117,6 +118,7 @@ export interface SpatialQuery {
   h3Resolution: number
   lens: LensState
   population: PopulationRef | null
+  exactCompanyIds: string[]
   layers: SpatialLayerId[]
   branchId: string | null
   radiusKm: number
