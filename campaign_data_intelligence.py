@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 """
 DBD Campaign Data Intelligence
 ==============================
@@ -27,6 +25,8 @@ Examples:
 The script reads the existing project .env and never mutates application data.
 """
 
+from __future__ import annotations
+
 import argparse
 import json
 import math
@@ -39,8 +39,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-import pymysql
 from dotenv import load_dotenv
+import pymysql
 from pymysql.cursors import DictCursor
 from rich import box
 from rich.console import Console, Group
