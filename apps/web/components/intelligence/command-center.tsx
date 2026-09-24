@@ -9,6 +9,7 @@ import {
   DialogTitle,
 } from "@/components/ui/dialog"
 import { useGlobalLens } from "@/hooks/use-global-lens"
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import {
   INTELLIGENCE_COMMANDS,
   type IntelligenceCommand,
@@ -23,6 +24,7 @@ export function CommandCenter() {
   const setFocus = useWorkspaceStore((state) => state.setFocus)
   const clearSelection = useWorkspaceStore((state) => state.clearSelection)
   const { clearLens } = useGlobalLens()
+  const { setAppearance } = useTipxTheme()
 
   async function run(command: IntelligenceCommand) {
     if (command.surface) {
@@ -40,6 +42,15 @@ export function CommandCenter() {
           break
         case "workspace.clear-selection":
           clearSelection()
+          break
+        case "theme.system":
+          setAppearance("system")
+          break
+        case "theme.light":
+          setAppearance("light")
+          break
+        case "theme.dark":
+          setAppearance("dark")
           break
       }
     }
@@ -77,7 +88,7 @@ export function CommandCenter() {
               No matching intelligence command.
             </Command.Empty>
 
-            {(["Navigate", "Lens", "Workspace"] as const).map((category) => (
+            {(["Navigate", "Lens", "Workspace", "Appearance"] as const).map((category) => (
               <Command.Group key={category} heading={category}>
                 {INTELLIGENCE_COMMANDS.filter(
                   (command) =>

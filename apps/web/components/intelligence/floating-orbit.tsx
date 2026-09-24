@@ -3,6 +3,7 @@
 import { useMachine } from "@xstate/react"
 import { AnimatePresence, motion, useReducedMotion } from "motion/react"
 
+import { AppearanceControl } from "./appearance-control"
 import { orbitMachine } from "@/lib/intelligence/navigation-machine"
 import { SURFACES } from "@/lib/intelligence/surfaces"
 import type { SurfaceId } from "@/lib/intelligence/types"
@@ -91,6 +92,8 @@ export function FloatingOrbit() {
           </div>
         )
       })}
+
+      <AppearanceControl />
     </nav>
   )
 }

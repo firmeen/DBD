@@ -27,6 +27,18 @@
   --color-input: var(--input);
   --color-ring: var(--ring);
 
+  --color-tipx-canvas: var(--tipx-canvas);
+  --color-tipx-surface: var(--tipx-surface);
+  --color-tipx-elevated: var(--tipx-elevated);
+  --color-tipx-floating: var(--tipx-floating);
+  --color-tipx-ink: var(--tipx-ink);
+  --color-tipx-line: var(--tipx-line);
+  --color-tipx-brand: var(--tipx-brand);
+  --color-tipx-brand-strong: var(--tipx-brand-strong);
+  --color-tipx-brand-soft: var(--tipx-brand-soft);
+  --color-tipx-brand-accent: var(--tipx-brand-accent);
+  --color-tipx-on-brand: var(--tipx-on-brand);
+
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
   --radius-lg: var(--radius);
@@ -37,53 +49,100 @@
 }
 
 :root {
-  --background: oklch(0.985 0.002 240);
-  --foreground: oklch(0.16 0.012 250);
-  --card: oklch(1 0 0);
-  --card-foreground: var(--foreground);
-  --popover: oklch(1 0 0);
-  --popover-foreground: var(--foreground);
-  --primary: oklch(0.23 0.018 250);
-  --primary-foreground: oklch(0.985 0 0);
-  --secondary: oklch(0.95 0.004 245);
-  --secondary-foreground: var(--foreground);
-  --muted: oklch(0.95 0.004 245);
-  --muted-foreground: oklch(0.5 0.01 250);
-  --accent: oklch(0.94 0.006 245);
-  --accent-foreground: var(--foreground);
-  --destructive: oklch(0.58 0.22 28);
-  --border: oklch(0.89 0.005 245);
-  --input: oklch(0.89 0.005 245);
-  --ring: oklch(0.58 0.03 250);
+  color-scheme: light;
+
+  --tipx-canvas: oklch(0.978 0.008 270);
+  --tipx-surface: oklch(1 0 0);
+  --tipx-elevated: oklch(0.992 0.004 268);
+  --tipx-floating: oklch(0.995 0.004 268);
+  --tipx-ink: oklch(0.205 0.042 270);
+  --tipx-line: oklch(0.37 0.055 270);
+  --tipx-brand: oklch(0.42 0.225 270);
+  --tipx-brand-strong: oklch(0.34 0.235 270);
+  --tipx-brand-soft: oklch(0.945 0.036 277);
+  --tipx-brand-accent: oklch(0.61 0.225 29);
+  --tipx-on-brand: oklch(0.99 0.004 270);
+
+  --background: var(--tipx-canvas);
+  --foreground: var(--tipx-ink);
+  --card: var(--tipx-surface);
+  --card-foreground: var(--tipx-ink);
+  --popover: var(--tipx-floating);
+  --popover-foreground: var(--tipx-ink);
+  --primary: var(--tipx-brand);
+  --primary-foreground: var(--tipx-on-brand);
+  --secondary: var(--tipx-brand-soft);
+  --secondary-foreground: var(--tipx-ink);
+  --muted: oklch(0.95 0.012 270);
+  --muted-foreground: oklch(0.49 0.035 270);
+  --accent: oklch(0.94 0.032 275);
+  --accent-foreground: var(--tipx-brand-strong);
+  --destructive: var(--tipx-brand-accent);
+  --border: oklch(0.87 0.018 270);
+  --input: oklch(0.9 0.018 270);
+  --ring: var(--tipx-brand);
   --radius: 0.75rem;
 
-  --tipx-active: oklch(0.67 0.16 238);
+  --tipx-active: oklch(0.58 0.17 245);
   --tipx-expired: oklch(0.61 0.2 25);
-  --tipx-prospect: oklch(0.62 0.01 250);
-  --tipx-selected: oklch(0.76 0.12 175);
-  --tipx-related: oklch(0.73 0.11 285);
-  --tipx-opportunity: oklch(0.78 0.14 88);
+  --tipx-prospect: oklch(0.58 0.03 265);
+  --tipx-selected: var(--tipx-brand-accent);
+  --tipx-related: oklch(0.61 0.13 292);
+  --tipx-opportunity: oklch(0.75 0.15 78);
+
+  --tipx-grid-line: color-mix(in oklab, var(--tipx-brand) 9%, transparent);
+  --tipx-vignette-edge: color-mix(in oklab, var(--tipx-brand) 7%, transparent);
+  --tipx-vignette-wash: color-mix(in oklab, white 62%, transparent);
+  --tipx-selection-bg: color-mix(in oklab, var(--tipx-brand) 22%, transparent);
+  --tipx-selection-fg: var(--tipx-brand-strong);
 }
 
 .dark {
-  --background: oklch(0.105 0.007 245);
-  --foreground: oklch(0.96 0.004 245);
-  --card: oklch(0.14 0.008 245);
-  --card-foreground: var(--foreground);
-  --popover: oklch(0.13 0.008 245);
-  --popover-foreground: var(--foreground);
-  --primary: oklch(0.93 0.005 245);
-  --primary-foreground: oklch(0.12 0.008 245);
-  --secondary: oklch(0.18 0.008 245);
-  --secondary-foreground: var(--foreground);
-  --muted: oklch(0.18 0.008 245);
-  --muted-foreground: oklch(0.66 0.008 245);
-  --accent: oklch(0.2 0.01 245);
-  --accent-foreground: var(--foreground);
-  --destructive: oklch(0.69 0.18 25);
-  --border: oklch(1 0 0 / 10%);
-  --input: oklch(1 0 0 / 12%);
-  --ring: oklch(0.7 0.02 245);
+  color-scheme: dark;
+
+  --tipx-canvas: oklch(0.115 0.026 270);
+  --tipx-surface: oklch(0.145 0.03 270);
+  --tipx-elevated: oklch(0.175 0.035 270);
+  --tipx-floating: oklch(0.135 0.032 270);
+  --tipx-ink: oklch(0.965 0.012 265);
+  --tipx-line: oklch(0.83 0.04 270);
+  --tipx-brand: oklch(0.64 0.195 270);
+  --tipx-brand-strong: oklch(0.72 0.17 270);
+  --tipx-brand-soft: oklch(0.22 0.065 274);
+  --tipx-brand-accent: oklch(0.67 0.21 29);
+  --tipx-on-brand: oklch(0.99 0.004 270);
+
+  --background: var(--tipx-canvas);
+  --foreground: var(--tipx-ink);
+  --card: var(--tipx-surface);
+  --card-foreground: var(--tipx-ink);
+  --popover: var(--tipx-floating);
+  --popover-foreground: var(--tipx-ink);
+  --primary: var(--tipx-brand);
+  --primary-foreground: var(--tipx-on-brand);
+  --secondary: var(--tipx-elevated);
+  --secondary-foreground: var(--tipx-ink);
+  --muted: oklch(0.185 0.028 270);
+  --muted-foreground: oklch(0.68 0.025 270);
+  --accent: oklch(0.205 0.045 275);
+  --accent-foreground: var(--tipx-ink);
+  --destructive: var(--tipx-brand-accent);
+  --border: oklch(1 0 0 / 11%);
+  --input: oklch(1 0 0 / 13%);
+  --ring: var(--tipx-brand-strong);
+
+  --tipx-active: oklch(0.68 0.15 240);
+  --tipx-expired: oklch(0.69 0.18 25);
+  --tipx-prospect: oklch(0.7 0.025 265);
+  --tipx-selected: var(--tipx-brand-accent);
+  --tipx-related: oklch(0.75 0.12 292);
+  --tipx-opportunity: oklch(0.79 0.14 82);
+
+  --tipx-grid-line: color-mix(in oklab, var(--tipx-ink) 4%, transparent);
+  --tipx-vignette-edge: color-mix(in oklab, black 72%, transparent);
+  --tipx-vignette-wash: color-mix(in oklab, var(--tipx-brand) 4%, transparent);
+  --tipx-selection-bg: color-mix(in oklab, var(--tipx-brand) 30%, transparent);
+  --tipx-selection-fg: var(--tipx-on-brand);
 }
 
 @layer base {
@@ -107,15 +166,15 @@
   }
 
   ::selection {
-    background: color-mix(in oklab, white 20%, transparent);
-    color: white;
+    background: var(--tipx-selection-bg);
+    color: var(--tipx-selection-fg);
   }
 }
 
 .tipx-grid {
   background-image:
-    linear-gradient(to right, rgb(255 255 255 / 0.025) 1px, transparent 1px),
-    linear-gradient(to bottom, rgb(255 255 255 / 0.025) 1px, transparent 1px);
+    linear-gradient(to right, var(--tipx-grid-line) 1px, transparent 1px),
+    linear-gradient(to bottom, var(--tipx-grid-line) 1px, transparent 1px);
   background-size: 48px 48px;
   mask-image: linear-gradient(to bottom, black, transparent 88%);
 }
@@ -125,11 +184,29 @@
     radial-gradient(
       circle at 46% 42%,
       transparent 0%,
-      rgb(7 10 13 / 0.18) 52%,
-      rgb(7 10 13 / 0.84) 100%
+      transparent 49%,
+      var(--tipx-vignette-edge) 100%
     ),
-    linear-gradient(to bottom, rgb(255 255 255 / 0.018), transparent 20%);
+    linear-gradient(to bottom, var(--tipx-vignette-wash), transparent 24%);
   pointer-events: none;
+}
+
+.tipx-brand-field {
+  background:
+    radial-gradient(
+      circle at 24% 18%,
+      color-mix(in oklab, var(--tipx-brand) 11%, transparent),
+      transparent 34%
+    ),
+    radial-gradient(
+      circle at 82% 14%,
+      color-mix(in oklab, var(--tipx-brand-accent) 7%, transparent),
+      transparent 28%
+    );
+}
+
+.tipx-map-dark-fallback {
+  filter: brightness(0.62) saturate(0.78) contrast(1.08) hue-rotate(2deg);
 }
 
 @media (prefers-reduced-motion: reduce) {
