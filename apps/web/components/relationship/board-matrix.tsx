@@ -250,11 +250,11 @@ export function BoardMatrix({
             }}
           >
             <div
-              className="sticky top-0 z-30 h-[76px] border-b border-tipx-line/8 bg-[#0a1117]/98"
+              className="sticky top-0 z-30 h-[76px] border-b border-tipx-line/8 bg-tipx-floating/98"
               style={{ width: totalWidth }}
             >
               <div
-                className="sticky left-0 z-40 grid h-full place-items-center border-r border-tipx-line/8 bg-[#0b1218] px-4 text-left"
+                className="sticky left-0 z-40 grid h-full place-items-center border-r border-tipx-line/8 bg-tipx-surface px-4 text-left"
                 style={{ width: ROW_HEADER_WIDTH }}
               >
                 <div className="w-full">
@@ -315,7 +315,7 @@ export function BoardMatrix({
                         onFocusCompany(matrixCompanyToEntity(company))
                       }
                       title={company.name}
-                      className="sticky left-0 z-20 flex h-full items-center gap-2 border-r border-tipx-line/8 bg-[#0b1218]/98 px-3 text-left transition hover:bg-[#121b22]"
+                      className="sticky left-0 z-20 flex h-full items-center gap-2 border-r border-tipx-line/8 bg-tipx-surface/98 px-3 text-left transition hover:bg-tipx-elevated"
                       style={{ width: ROW_HEADER_WIDTH }}
                     >
                       <span className="grid size-7 shrink-0 place-items-center rounded-lg border border-tipx-line/7 bg-tipx-ink/[0.025] text-[9px] font-semibold text-tipx-ink/36">
@@ -412,7 +412,7 @@ function MatrixSearch({
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         data-keyboard-input
-        className="h-9 w-full rounded-xl border border-tipx-line/8 bg-tipx-floating/82 pl-9 pr-3 text-[10px] text-tipx-ink outline-none placeholder:text-tipx-ink/20 focus:border-tipx-line/15 focus:bg-[#0b141b]"
+        className="h-9 w-full rounded-xl border border-tipx-line/8 bg-tipx-floating/82 pl-9 pr-3 text-[10px] text-tipx-ink outline-none placeholder:text-tipx-ink/20 focus:border-tipx-line/15 focus:bg-tipx-elevated"
       />
     </label>
   )

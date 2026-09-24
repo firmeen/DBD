@@ -4,6 +4,7 @@ import * as React from "react"
 import cytoscape from "cytoscape"
 import fcose from "cytoscape-fcose"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import { relationshipNeighbourhood } from "@/lib/relationship/graph-algorithms"
 import type { RelationshipGraphSnapshot } from "@/lib/relationship/types"
 import { relationshipNodeToEntity } from "@/lib/relationship/types"
@@ -32,6 +33,7 @@ export function RelationshipNeighbourhood({
   onHover: (entity: EntityRef | null) => void
   onLayoutStateChange: (running: boolean) => void
 }) {
+  const { palette } = useTipxTheme()
   const containerRef = React.useRef<HTMLDivElement>(null)
 
   React.useEffect(() => {
@@ -93,16 +95,16 @@ export function RelationshipNeighbourhood({
           style: {
             label: "data(label)",
             "font-size": 9,
-            color: "#aeb9c1",
-            "text-background-color": "#071017",
+            color: palette.graph.label,
+            "text-background-color": palette.graph.canvas,
             "text-background-opacity": 0.86,
             "text-background-padding": "3px",
             "text-margin-y": -12,
             width: "mapData(degree, 0, 30, 24, 48)",
             height: "mapData(degree, 0, 30, 24, 48)",
-            "background-color": "#657987",
+            "background-color": palette.graph.node,
             "border-width": 1,
-            "border-color": "#aeb9c1",
+            "border-color": palette.graph.label,
             "border-opacity": 0.2,
           },
         },
@@ -110,38 +112,38 @@ export function RelationshipNeighbourhood({
           selector: 'node[kind = "person"]',
           style: {
             shape: "ellipse",
-            "background-color": "#c5d0d8",
-            color: "#d8e0e5",
+            "background-color": palette.graph.nodePerson,
+            color: palette.graph.label,
           },
         },
         {
           selector: 'node[kind = "company"]',
           style: {
             shape: "round-rectangle",
-            "background-color": "#557084",
+            "background-color": palette.graph.nodeCompany,
           },
         },
         {
           selector: 'node[focus = "true"]',
           style: {
             "border-width": 4,
-            "border-color": "#8fe8c9",
+            "border-color": palette.graph.selected,
             "border-opacity": 0.95,
           },
         },
         {
           selector: 'node[path = "true"]',
           style: {
-            "background-color": "#8fe8c9",
-            color: "#dffbf1",
+            "background-color": palette.graph.path,
+            color: palette.graph.label,
           },
         },
         {
           selector: "edge",
           style: {
             width: 1.1,
-            "line-color": "#40505b",
-            "target-arrow-color": "#657582",
+            "line-color": palette.graph.edge,
+            "target-arrow-color": palette.graph.edge,
             "curve-style": "bezier",
             opacity: 0.55,
           },
@@ -157,8 +159,8 @@ export function RelationshipNeighbourhood({
           selector: 'edge[path = "true"]',
           style: {
             width: 2.6,
-            "line-color": "#8fe8c9",
-            "target-arrow-color": "#8fe8c9",
+            "line-color": palette.graph.path,
+            "target-arrow-color": palette.graph.path,
             opacity: 1,
           },
         },
@@ -210,6 +212,7 @@ export function RelationshipNeighbourhood({
     onLayoutStateChange,
     onToggleSelection,
     pathEdgeIds,
+    palette,
     pathNodeIds,
     snapshot,
   ])

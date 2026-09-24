@@ -640,7 +640,7 @@ function RelationshipControlDeck({
                 className="h-9 w-full rounded-xl border border-tipx-line/7 bg-tipx-ink/[0.02] pl-8 pr-3 text-[9px] text-tipx-ink outline-none placeholder:text-tipx-ink/18 focus:border-tipx-line/14"
               />
               {graphSearch.trim() && searchResults.length > 0 ? (
-                <div className="absolute left-0 right-0 top-[calc(100%+7px)] z-50 max-h-64 overflow-auto rounded-xl border border-tipx-line/9 bg-[#091117]/98 p-1 shadow-2xl">
+                <div className="absolute left-0 right-0 top-[calc(100%+7px)] z-50 max-h-64 overflow-auto rounded-xl border border-tipx-line/9 bg-tipx-floating/98 p-1 shadow-2xl">
                   {searchResults.map((node) => (
                     <button
                       key={node.id}

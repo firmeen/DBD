@@ -290,7 +290,7 @@ function PersonSearchPopover({
   onPickPerson: (person: PersonSearchResult) => void
 }) {
   return (
-    <div className="absolute left-0 right-0 top-[calc(100%+10px)] overflow-hidden rounded-2xl border border-tipx-line/10 bg-[#091117]/98 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl">
+    <div className="absolute left-0 right-0 top-[calc(100%+10px)] overflow-hidden rounded-2xl border border-tipx-line/10 bg-tipx-floating/98 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl">
       {!synchronized ? (
         <SearchState
           icon={LoaderCircle}
