@@ -14,7 +14,7 @@ import {
   GitFork,
   LayoutGrid,
   LoaderCircle,
-  Map,
+  Map as MapIcon,
   Network,
   Pin,
   Search,
@@ -153,15 +153,10 @@ export function RelationshipSurface() {
     [snapshotPayload]
   )
 
-  const initialAnchor = React.useMemo(
-    () => relationshipEntity(focus) ?? relationshipEntity(selection[0] ?? null),
-    []
-  )
-
   const [view, setView] = React.useState<RelationshipViewId>(initialState.view)
   const [depth, setDepth] = React.useState(initialState.depth)
   const [anchorEntity, setAnchorEntity] = React.useState<EntityRef | null>(
-    initialAnchor
+    () => relationshipEntity(focus) ?? relationshipEntity(selection[0] ?? null)
   )
   const [hiddenNodeIds, setHiddenNodeIds] = React.useState<Set<string>>(
     () => new Set()
@@ -682,7 +677,7 @@ function RelationshipControlDeck({
             className="ml-auto grid size-7 place-items-center rounded-lg border border-white/7 text-white/27 hover:bg-white/[0.05] hover:text-white"
             title="Project selected companies to Map"
           >
-            <Map className="size-3" />
+            <MapIcon className="size-3" />
           </button>
         </div>
       </div>
