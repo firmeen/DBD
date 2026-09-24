@@ -205,8 +205,14 @@
     );
 }
 
-.tipx-map-dark-fallback {
-  filter: brightness(0.62) saturate(0.78) contrast(1.08) hue-rotate(2deg);
+.tipx-map-overlay {
+  background: linear-gradient(
+    to bottom,
+    color-mix(in oklab, var(--tipx-canvas) 18%, transparent),
+    transparent 18%,
+    transparent 76%,
+    color-mix(in oklab, var(--tipx-canvas) 44%, transparent)
+  );
 }
 
 @media (prefers-reduced-motion: reduce) {
