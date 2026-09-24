@@ -10,6 +10,10 @@ param(
     [ValidateRange(1, 300)]
     [int]$RestartDelaySeconds = 5,
 
+    [switch]$Headless,
+
+    [switch]$OpenPowerShell,
+
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$GuardianArgs
 )
@@ -24,13 +28,17 @@ $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $StatePath = Join-Path $Root "data\guardian\run-$RunId.state.json"
 $RecoveryPath = Join-Path $Root "data\guardian\run-$RunId.recovery.json"
 $VenvPython = Join-Path $Root ".venv\Scripts\python.exe"
+$SourceRoot = Join-Path $Root "src"
+
+# Keep this script ASCII-only. Windows PowerShell 5.1 can decode UTF-8
+# without a BOM through a legacy code page, which can corrupt source tokens.
 
 function Write-GuardianHeader {
     param([string]$State, [string]$Detail)
     Write-Host ""
-    Write-Host "╭──────────────────────── DBD CAMPAIGN GUARDIAN · OUTER WATCHDOG ────────────────────────╮"
-    Write-Host ("│ RUN {0,-8} {1,-20} {2,-48} │" -f $RunId, $State, $Detail)
-    Write-Host "╰────────────────────────────────────────────────────────────────────────────────────────╯"
+    Write-Host "+-------------------- DBD CAMPAIGN GUARDIAN / OUTER WATCHDOG --------------------+"
+    Write-Host ("| RUN {0,-8} {1,-20} {2,-48} |" -f $RunId, $State, $Detail)
+    Write-Host "+---------------------------------------------------------------------------------+"
 }
 
 function Resolve-Python {
@@ -39,6 +47,50 @@ function Resolve-Python {
     }
     $command = Get-Command python -ErrorAction Stop
     return $command.Source
+}
+
+function Initialize-ProjectPythonPath {
+    $moduleEntry = Join-Path $SourceRoot "dbd\__main__.py"
+    if (-not (Test-Path -LiteralPath $moduleEntry)) {
+        throw "Project source module not found at $moduleEntry"
+    }
+
+    $separator = [string][IO.Path]::PathSeparator
+    $current = [Environment]::GetEnvironmentVariable("PYTHONPATH", "Process")
+    $entries = @()
+    if (-not [string]::IsNullOrWhiteSpace($current)) {
+        $entries = @($current -split [regex]::Escape($separator))
+    }
+
+    if ($entries -notcontains $SourceRoot) {
+        if ([string]::IsNullOrWhiteSpace($current)) {
+            $env:PYTHONPATH = $SourceRoot
+        }
+        else {
+            $env:PYTHONPATH = "$SourceRoot$separator$current"
+        }
+    }
+}
+
+function Assert-DbdImport {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Python
+    )
+
+    $probe = @(
+        & $Python -c "import pathlib, dbd, dbd.cli.main; print(pathlib.Path(dbd.__file__).resolve())" 2>&1
+    )
+    if ($LASTEXITCODE -ne 0) {
+        $detail = ($probe | ForEach-Object { [string]$_ }) -join " "
+        throw (
+            "Python cannot import the project module 'dbd' after source bootstrap. " +
+            "Rebuild the environment with .\scripts\bootstrap.ps1 -Dev -InstallCommand. " +
+            "Details: $detail"
+        )
+    }
+
+    return [string]($probe | Select-Object -Last 1)
 }
 
 function Get-GuardianState {
@@ -211,18 +263,31 @@ function Stop-GuardianOwnedWorkers {
     return $workers.Count
 }
 
+if ($Headless -and $OpenPowerShell) {
+    throw "-Headless and -OpenPowerShell are mutually exclusive."
+}
+
+Initialize-ProjectPythonPath
 $Python = Resolve-Python
+$DbdModulePath = Assert-DbdImport -Python $Python
 $restartCount = 0
 
 Write-GuardianHeader "BOOT" ("Python: {0}" -f $Python)
+Write-Host ("DBD source: {0}" -f $DbdModulePath)
 
 while ($true) {
     $commandArgs = @("-m", "dbd", "campaign", "guard", [string]$RunId)
+    if ($Headless) {
+        $commandArgs += "--headless"
+    }
+    elseif ($OpenPowerShell) {
+        $commandArgs += "--open-powershell"
+    }
     if ($GuardianArgs) {
         $commandArgs += $GuardianArgs
     }
 
-    Write-GuardianHeader "STARTING" ("guardian process · restart {0}" -f $restartCount)
+    Write-GuardianHeader "STARTING" ("guardian process | restart {0}" -f $restartCount)
     $launchEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() / 1000.0
     & $Python @commandArgs
     $exitCode = $LASTEXITCODE
@@ -302,7 +367,7 @@ while ($true) {
 
         if ($ownershipVerified -and $ownedWorkers.Count -gt 0) {
             Write-GuardianHeader "DRAIN GRACE" (
-                "{0} owned worker(s) · Guardian PID {1} · {2}s" -f
+                "{0} owned worker(s) | Guardian PID {1} | {2}s" -f
                 $ownedWorkers.Count,
                 $lostGuardianPid,
                 $OrphanGraceSeconds
@@ -370,6 +435,6 @@ while ($true) {
         60,
         $RestartDelaySeconds * [Math]::Pow(2, [Math]::Min([Math]::Max($restartCount - 1, 0), 4))
     )
-    Write-GuardianHeader "RECOVERING" ("relaunch in {0}s · same Run ID" -f $effectiveDelay)
+    Write-GuardianHeader "RECOVERING" ("relaunch in {0}s | same Run ID" -f $effectiveDelay)
     Start-Sleep -Seconds ([int]$effectiveDelay)
 }

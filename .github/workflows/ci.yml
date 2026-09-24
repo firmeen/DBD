@@ -59,6 +59,26 @@ jobs:
           cache: pip
       - name: Install
         run: python -m pip install -e ".[dev]"
+      - name: Package and CLI smoke
+        run: |
+          python -c "import dbd; print(dbd.__version__)"
+          python -m dbd --version
+          dbd-data --version
+      - name: Watchdog source encoding contract
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("Run-DBD.ps1")
+          data = path.read_bytes()
+          try:
+              data.decode("ascii")
+          except UnicodeDecodeError as exc:
+              raise SystemExit(
+                  f"{path} must remain ASCII-only for Windows PowerShell 5.1 compatibility: {exc}"
+              )
+          print(f"{path}: ASCII-only ({len(data)} bytes)")
+          PY
       - name: Compile
         run: python -m compileall -q src scripts tests
       - name: PowerShell watchdog syntax
@@ -100,3 +120,40 @@ jobs:
           --iterations 2000
           --max-average-ms 2
           --max-p95-ms 5
+
+  windows-watchdog:
+    runs-on: windows-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - name: Windows PowerShell 5.1 watchdog syntax
+        shell: powershell
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Run-DBD.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Property Message,Extent
+            exit 1
+          }
+          Write-Host "Run-DBD.ps1 parses under Windows PowerShell $($PSVersionTable.PSVersion)"
+      - name: PowerShell 7 watchdog syntax
+        shell: pwsh
+        run: |
+          $tokens = $null
+          $errors = $null
+          [void][System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path .\Run-DBD.ps1),
+            [ref]$tokens,
+            [ref]$errors
+          )
+          if ($errors.Count -gt 0) {
+            $errors | Format-List -Property Message,Extent
+            exit 1
+          }
+          Write-Host "Run-DBD.ps1 parses under PowerShell $($PSVersionTable.PSVersion)"
+
