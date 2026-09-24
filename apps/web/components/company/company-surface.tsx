@@ -23,9 +23,8 @@ import {
   fetchCompanyDetail,
   searchCompanies,
 } from "@/lib/company/adapter"
-import {
-  resolveCompanySurfaceSnapshot,
-} from "@/lib/company/surface-snapshot"
+import { resolveCompanyFinancialYear } from "@/lib/company/financial-year"
+import { resolveCompanySurfaceSnapshot } from "@/lib/company/surface-snapshot"
 import {
   COMPANY_VIEW_IDS,
   companySearchResultToEntity,
@@ -142,8 +141,8 @@ export function CompanySurface() {
   })
 
   const detail = detailQuery.data ?? null
-  const effectiveYear = resolveFinancialYear(
-    detail,
+  const effectiveYear = resolveCompanyFinancialYear(
+    detail?.financial.years ?? [],
     financialYear,
     lens.fiscalYear
   )
@@ -611,25 +610,6 @@ function CompanyView({
         />
       )
   }
-}
-
-function resolveFinancialYear(
-  detail: CompanyDetailSnapshot | null,
-  explicit: string | null,
-  lensYear: number | null
-) {
-  const years = detail?.financial.years ?? []
-
-  if (explicit && years.some((year) => year.year === explicit)) {
-    return explicit
-  }
-
-  const requested = lensYear?.toString() ?? null
-  if (requested && years.some((year) => year.year === requested)) {
-    return requested
-  }
-
-  return years[0]?.year ?? null
 }
 
 function CompanyLoading({ entityLabel }: { entityLabel: string }) {
