@@ -40,6 +40,7 @@ export function RelationshipNetwork({
   onLayoutStateChange: (running: boolean) => void
 }) {
   const { palette } = useTipxTheme()
+  const paletteRef = React.useRef(palette)
   const containerRef = React.useRef<HTMLDivElement>(null)
   const rendererRef = React.useRef<Sigma | null>(null)
   const graphRef = React.useRef<Graph | null>(null)
@@ -51,6 +52,28 @@ export function RelationshipNetwork({
     pathNodeIds,
     pathEdgeIds,
   })
+
+  React.useEffect(() => {
+    paletteRef.current = palette
+
+    const graph = graphRef.current
+    if (graph) {
+      const nodeById = new Map(snapshot.nodes.map((node) => [node.id, node]))
+      const edgeById = new Map(snapshot.edges.map((edge) => [edge.id, edge]))
+
+      graph.forEachNode((node) => {
+        const source = nodeById.get(node)
+        if (source) graph.setNodeAttribute(node, "color", nodeColor(source, palette))
+      })
+
+      graph.forEachEdge((edge) => {
+        const source = edgeById.get(edge)
+        if (source) graph.setEdgeAttribute(edge, "color", edgeColor(source.kind, palette))
+      })
+    }
+
+    rendererRef.current?.refresh()
+  }, [palette, snapshot.edges, snapshot.nodes])
 
   React.useEffect(() => {
     stateRef.current = {
@@ -67,7 +90,8 @@ export function RelationshipNetwork({
     const container = containerRef.current
     if (!container || snapshot.nodes.length === 0) return
 
-    const graph = buildGraph(snapshot, onLayoutStateChange, palette)
+    const activePalette = paletteRef.current
+    const graph = buildGraph(snapshot, onLayoutStateChange, activePalette)
     graphRef.current = graph
 
     const nodeById = new Map(snapshot.nodes.map((node) => [node.id, node]))
@@ -78,9 +102,10 @@ export function RelationshipNetwork({
       labelDensity: 0.08,
       labelGridCellSize: 90,
       labelRenderedSizeThreshold: 7,
-      defaultNodeColor: palette.graph.node,
-      defaultEdgeColor: palette.graph.edge,
+      defaultNodeColor: activePalette.graph.node,
+      defaultEdgeColor: activePalette.graph.edge,
       nodeReducer(node, data) {
+        const currentPalette = paletteRef.current
         const current = stateRef.current
         const hidden = current.hiddenNodeIds.has(node)
         const hovered = hoveredRef.current
@@ -94,9 +119,9 @@ export function RelationshipNetwork({
           hidden,
           color:
             hovered && !adjacentToHover
-              ? palette.graph.nodeMuted
+              ? currentPalette.graph.nodeMuted
               : current.pathNodeIds.has(node)
-                ? palette.graph.path
+                ? currentPalette.graph.path
                 : data.color,
           size:
             data.size *
@@ -119,6 +144,7 @@ export function RelationshipNetwork({
         }
       },
       edgeReducer(edge, data) {
+        const currentPalette = paletteRef.current
         const current = stateRef.current
         const [source, target] = graph.extremities(edge)
         const hovered = hoveredRef.current
@@ -132,9 +158,9 @@ export function RelationshipNetwork({
           ...data,
           hidden,
           color: current.pathEdgeIds.has(edge)
-            ? palette.graph.path
+            ? currentPalette.graph.path
             : hovered && !incidentToHover
-              ? palette.graph.edgeMuted
+              ? currentPalette.graph.edgeMuted
               : data.color,
           size: current.pathEdgeIds.has(edge)
             ? Math.max(2.2, data.size)
@@ -187,7 +213,6 @@ export function RelationshipNetwork({
     onHover,
     onLayoutStateChange,
     onToggleSelection,
-    palette,
     snapshot,
   ])
 

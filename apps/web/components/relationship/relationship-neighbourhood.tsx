@@ -5,6 +5,7 @@ import cytoscape from "cytoscape"
 import fcose from "cytoscape-fcose"
 
 import { useTipxTheme } from "@/hooks/use-tipx-theme"
+import type { TipxRenderPalette } from "@/lib/theme/palette"
 import { relationshipNeighbourhood } from "@/lib/relationship/graph-algorithms"
 import type { RelationshipGraphSnapshot } from "@/lib/relationship/types"
 import { relationshipNodeToEntity } from "@/lib/relationship/types"
@@ -34,7 +35,14 @@ export function RelationshipNeighbourhood({
   onLayoutStateChange: (running: boolean) => void
 }) {
   const { palette } = useTipxTheme()
+  const paletteRef = React.useRef(palette)
   const containerRef = React.useRef<HTMLDivElement>(null)
+  const cyRef = React.useRef<ReturnType<typeof cytoscape> | null>(null)
+
+  React.useEffect(() => {
+    paletteRef.current = palette
+    cyRef.current?.style(neighbourhoodStyles(palette))
+  }, [palette])
 
   React.useEffect(() => {
     const container = containerRef.current
@@ -89,83 +97,10 @@ export function RelationshipNeighbourhood({
       minZoom: 0.15,
       maxZoom: 4,
       wheelSensitivity: 0.18,
-      style: [
-        {
-          selector: "node",
-          style: {
-            label: "data(label)",
-            "font-size": 9,
-            color: palette.graph.label,
-            "text-background-color": palette.graph.canvas,
-            "text-background-opacity": 0.86,
-            "text-background-padding": "3px",
-            "text-margin-y": -12,
-            width: "mapData(degree, 0, 30, 24, 48)",
-            height: "mapData(degree, 0, 30, 24, 48)",
-            "background-color": palette.graph.node,
-            "border-width": 1,
-            "border-color": palette.graph.label,
-            "border-opacity": 0.2,
-          },
-        },
-        {
-          selector: 'node[kind = "person"]',
-          style: {
-            shape: "ellipse",
-            "background-color": palette.graph.nodePerson,
-            color: palette.graph.label,
-          },
-        },
-        {
-          selector: 'node[kind = "company"]',
-          style: {
-            shape: "round-rectangle",
-            "background-color": palette.graph.nodeCompany,
-          },
-        },
-        {
-          selector: 'node[focus = "true"]',
-          style: {
-            "border-width": 4,
-            "border-color": palette.graph.selected,
-            "border-opacity": 0.95,
-          },
-        },
-        {
-          selector: 'node[path = "true"]',
-          style: {
-            "background-color": palette.graph.path,
-            color: palette.graph.label,
-          },
-        },
-        {
-          selector: "edge",
-          style: {
-            width: 1.1,
-            "line-color": palette.graph.edge,
-            "target-arrow-color": palette.graph.edge,
-            "curve-style": "bezier",
-            opacity: 0.55,
-          },
-        },
-        {
-          selector: 'edge[kind = "transform"], edge[kind = "merger"]',
-          style: {
-            "target-arrow-shape": "triangle",
-            "arrow-scale": 0.8,
-          },
-        },
-        {
-          selector: 'edge[path = "true"]',
-          style: {
-            width: 2.6,
-            "line-color": palette.graph.path,
-            "target-arrow-color": palette.graph.path,
-            opacity: 1,
-          },
-        },
-      ],
+      style: neighbourhoodStyles(paletteRef.current),
     })
+
+    cyRef.current = cy
 
     onLayoutStateChange(true)
     const layout = cy.layout({
@@ -200,6 +135,7 @@ export function RelationshipNeighbourhood({
     cy.on("mouseout", "node", () => onHover(null))
 
     return () => {
+      cyRef.current = null
       cy.destroy()
       onHover(null)
       onLayoutStateChange(false)
@@ -212,7 +148,6 @@ export function RelationshipNeighbourhood({
     onLayoutStateChange,
     onToggleSelection,
     pathEdgeIds,
-    palette,
     pathNodeIds,
     snapshot,
   ])
@@ -245,4 +180,84 @@ export function RelationshipNeighbourhood({
       </div>
     </div>
   )
+}
+
+
+function neighbourhoodStyles(palette: TipxRenderPalette) {
+  return [
+    {
+      selector: "node",
+      style: {
+        label: "data(label)",
+        "font-size": 9,
+        color: palette.graph.label,
+        "text-background-color": palette.graph.canvas,
+        "text-background-opacity": 0.86,
+        "text-background-padding": "3px",
+        "text-margin-y": -12,
+        width: "mapData(degree, 0, 30, 24, 48)",
+        height: "mapData(degree, 0, 30, 24, 48)",
+        "background-color": palette.graph.node,
+        "border-width": 1,
+        "border-color": palette.graph.label,
+        "border-opacity": 0.2,
+      },
+    },
+    {
+      selector: 'node[kind = "person"]',
+      style: {
+        shape: "ellipse",
+        "background-color": palette.graph.nodePerson,
+        color: palette.graph.label,
+      },
+    },
+    {
+      selector: 'node[kind = "company"]',
+      style: {
+        shape: "round-rectangle",
+        "background-color": palette.graph.nodeCompany,
+      },
+    },
+    {
+      selector: 'node[focus = "true"]',
+      style: {
+        "border-width": 4,
+        "border-color": palette.graph.selected,
+        "border-opacity": 0.95,
+      },
+    },
+    {
+      selector: 'node[path = "true"]',
+      style: {
+        "background-color": palette.graph.path,
+        color: palette.graph.label,
+      },
+    },
+    {
+      selector: "edge",
+      style: {
+        width: 1.1,
+        "line-color": palette.graph.edge,
+        "target-arrow-color": palette.graph.edge,
+        "curve-style": "bezier",
+        opacity: 0.55,
+      },
+    },
+    {
+      selector: 'edge[kind = "transform"], edge[kind = "merger"]',
+      style: {
+        "target-arrow-shape": "triangle",
+        "arrow-scale": 0.8,
+      },
+    },
+    {
+      selector: 'edge[path = "true"]',
+      style: {
+        width: 2.6,
+        "line-color": palette.graph.path,
+        "target-arrow-color": palette.graph.path,
+        opacity: 1,
+      },
+    },
+  ]
 }
