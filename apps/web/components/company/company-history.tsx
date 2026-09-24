@@ -76,7 +76,7 @@ function HistoryEventRow({
 }) {
   return (
     <article className="relative pb-7 last:pb-0">
-      <span className="absolute -left-8 top-0 grid size-[23px] place-items-center rounded-full border border-tipx-line/10 bg-[#0c1319] shadow-[0_0_0_5px_#0a1015]">
+      <span className="absolute -left-8 top-0 grid size-[23px] place-items-center rounded-full border border-tipx-line/10 bg-tipx-elevated shadow-[0_0_0_5px_var(--tipx-surface)]">
         <HistoryKindIcon kind={event.kind} />
       </span>
 
