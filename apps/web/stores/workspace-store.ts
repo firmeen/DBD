@@ -4,6 +4,7 @@ import { create } from "zustand"
 
 import type {
   EntityRef,
+  PopulationRef,
   SurfaceId,
   SurfaceSnapshot,
 } from "@/lib/intelligence/types"
@@ -15,6 +16,7 @@ export interface WorkspaceCheckpoint {
   focus: EntityRef | null
   selection: EntityRef[]
   compare: EntityRef[]
+  population: PopulationRef | null
 }
 
 interface WorkspaceState {
@@ -22,6 +24,7 @@ interface WorkspaceState {
   focus: EntityRef | null
   selection: EntityRef[]
   compare: EntityRef[]
+  population: PopulationRef | null
   commandOpen: boolean
   lensOpen: boolean
   surfaceSnapshots: Partial<Record<SurfaceId, SurfaceSnapshot>>
@@ -34,6 +37,7 @@ interface WorkspaceState {
   clearSelection: () => void
   toggleCompare: (entity: EntityRef) => void
   clearCompare: () => void
+  setPopulation: (population: PopulationRef | null) => void
   setCommandOpen: (open: boolean) => void
   setLensOpen: (open: boolean) => void
   saveSurfaceSnapshot: (
@@ -70,6 +74,7 @@ function snapshotOf(state: WorkspaceState): WorkspaceCheckpoint {
     focus: state.focus,
     selection: state.selection,
     compare: state.compare,
+    population: state.population,
   }
 }
 
@@ -85,6 +90,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
   focus: null,
   selection: [],
   compare: [],
+  population: null,
   commandOpen: false,
   lensOpen: false,
   surfaceSnapshots: {},
@@ -165,6 +171,27 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           }
     ),
 
+  setPopulation: (population) =>
+    set((state) => {
+      const unchanged =
+        state.population === population ||
+        (state.population !== null &&
+          population !== null &&
+          state.population.key === population.key &&
+          state.population.label === population.label &&
+          state.population.count === population.count &&
+          state.population.source === population.source &&
+          state.population.exact === population.exact &&
+          state.population.expiresAt === population.expiresAt)
+
+      return unchanged
+        ? state
+        : {
+            ...recordBeforeMutation(state),
+            population,
+          }
+    }),
+
   setCommandOpen: (commandOpen) =>
     set((state) =>
       commandOpen
@@ -211,6 +238,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       focus: previous.focus,
       selection: previous.selection,
       compare: previous.compare,
+      population: previous.population,
       historyPast: state.historyPast.slice(0, -1),
       historyFuture: [current, ...state.historyFuture].slice(0, MAX_HISTORY),
     })
@@ -228,6 +256,7 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
       focus: next.focus,
       selection: next.selection,
       compare: next.compare,
+      population: next.population,
       historyPast: [...state.historyPast, current].slice(-MAX_HISTORY),
       historyFuture: state.historyFuture.slice(1),
     })

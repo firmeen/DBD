@@ -71,6 +71,7 @@ export function SpatialSurface() {
     (state) => state.saveSurfaceSnapshot
   )
   const selection = useWorkspaceStore((state) => state.selection)
+  const population = useWorkspaceStore((state) => state.population)
   const focus = useWorkspaceStore((state) => state.focus)
   const setFocus = useWorkspaceStore((state) => state.setFocus)
   const toggleSelection = useWorkspaceStore((state) => state.toggleSelection)
@@ -196,6 +197,7 @@ export function SpatialSurface() {
       lod,
       h3Resolution,
       lens,
+      population,
       layers,
       branchId,
       radiusKm: queryRadiusKm,
@@ -207,6 +209,7 @@ export function SpatialSurface() {
       layers,
       lens,
       lod,
+      population,
       queryViewState,
       queryRadiusKm,
     ]

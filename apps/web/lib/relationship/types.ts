@@ -1,4 +1,8 @@
-import type { EntityRef, LensState } from "@/lib/intelligence/types"
+import type {
+  EntityRef,
+  LensState,
+  PopulationRef,
+} from "@/lib/intelligence/types"
 
 export const RELATIONSHIP_VIEW_IDS = [
   "explore",
@@ -198,6 +202,7 @@ export type RelationshipServingRequest =
       operation: "relationship-graph"
       focus: EntityRef | null
       selection: EntityRef[]
+      population: PopulationRef | null
       depth: number
       maxNodes: number
       lens: LensState
@@ -206,6 +211,7 @@ export type RelationshipServingRequest =
       operation: "board-matrix"
       focus: EntityRef | null
       selection: EntityRef[]
+      population: PopulationRef | null
       companyQuery: string
       personQuery: string
       maxCompanies: number

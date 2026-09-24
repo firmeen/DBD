@@ -11,6 +11,15 @@ export interface EntityRef {
   secondary?: string
 }
 
+export interface PopulationRef {
+  key: string
+  label: string
+  count: number
+  source: "analytics" | "spatial" | "relationship"
+  exact: boolean
+  expiresAt?: string | null
+}
+
 export interface SurfaceSnapshot {
   updatedAt: number
   payload: Record<string, unknown>

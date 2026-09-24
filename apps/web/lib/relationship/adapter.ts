@@ -19,7 +19,11 @@ import {
   type RelationshipGraphSnapshot,
   type RelationshipServingRequest,
 } from "./types"
-import type { EntityRef, LensState } from "@/lib/intelligence/types"
+import type {
+  EntityRef,
+  LensState,
+  PopulationRef,
+} from "@/lib/intelligence/types"
 
 export function getRelationshipEndpoint() {
   const value = process.env.NEXT_PUBLIC_TIPX_RELATIONSHIP_ENDPOINT?.trim()
@@ -141,6 +145,7 @@ export async function fetchCompanyBoard(
 export async function fetchRelationshipGraph(
   focus: EntityRef | null,
   selection: EntityRef[],
+  population: PopulationRef | null,
   depth: number,
   lens: LensState,
   signal?: AbortSignal
@@ -156,6 +161,7 @@ export async function fetchRelationshipGraph(
       operation: "relationship-graph",
       focus,
       selection,
+      population,
       depth,
       maxNodes: MAX_RELATIONSHIP_NODES,
       lens,
@@ -168,6 +174,7 @@ export async function fetchRelationshipGraph(
 export async function fetchBoardMatrix(
   focus: EntityRef | null,
   selection: EntityRef[],
+  population: PopulationRef | null,
   companyQuery: string,
   personQuery: string,
   lens: LensState,
@@ -190,6 +197,7 @@ export async function fetchBoardMatrix(
       operation: "board-matrix",
       focus,
       selection,
+      population,
       companyQuery,
       personQuery,
       maxCompanies: MAX_MATRIX_COMPANIES,
