@@ -174,13 +174,21 @@ function ProductPerformance({
               key={row.id}
               type="button"
               onClick={() =>
-                onFilter({
-                  dimension: row.subclass ? "subclass" : "product",
-                  value: row.subclass ?? row.product,
-                  label: row.subclass
-                    ? `${row.product} · ${row.subclass}`
-                    : row.product,
-                })
+                onFilter(
+                  row.subclass
+                    ? {
+                        dimension: "productSubclass",
+                        value: JSON.stringify([row.product, row.subclass]),
+                        product: row.product,
+                        subclass: row.subclass,
+                        label: `${row.product} · ${row.subclass}`,
+                      }
+                    : {
+                        dimension: "product",
+                        value: row.product,
+                        label: row.product,
+                      }
+                )
               }
               className="grid w-full grid-cols-[1fr_auto] gap-3 py-2.5 text-left hover:bg-white/[0.02]"
             >
