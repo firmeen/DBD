@@ -90,6 +90,9 @@ export function SpatialSurface() {
   const [layers, setLayers] = React.useState(initialState.layers)
   const [branchId, setBranchId] = React.useState(initialState.branchId)
   const [radiusKm, setRadiusKm] = React.useState(initialState.radiusKm)
+  const [queryRadiusKm, setQueryRadiusKm] = React.useState(
+    initialState.radiusKm
+  )
   const [companyRailOpen, setCompanyRailOpen] = React.useState(
     initialState.companyRailOpen
   )
@@ -150,6 +153,14 @@ export function SpatialSurface() {
   }, [viewState])
 
   React.useEffect(() => {
+    const timeout = window.setTimeout(() => {
+      setQueryRadiusKm(radiusKm)
+    }, 420)
+
+    return () => window.clearTimeout(timeout)
+  }, [radiusKm])
+
+  React.useEffect(() => {
     saveSurfaceSnapshot("M", {
       viewState: queryViewState,
       layers,
@@ -187,7 +198,7 @@ export function SpatialSurface() {
       lens,
       layers,
       branchId,
-      radiusKm,
+      radiusKm: queryRadiusKm,
     }),
     [
       bounds,
@@ -197,7 +208,7 @@ export function SpatialSurface() {
       lens,
       lod,
       queryViewState,
-      radiusKm,
+      queryRadiusKm,
     ]
   )
 

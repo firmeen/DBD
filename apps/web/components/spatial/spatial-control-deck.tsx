@@ -84,7 +84,7 @@ export function SpatialControlDeck({
   const configured = spatialEndpointConfigured()
 
   return (
-    <aside className="pointer-events-auto fixed left-5 top-5 z-[45] w-[min(360px,calc(100vw-40px))] sm:left-7 sm:top-7">
+    <aside className="pointer-events-auto fixed left-4 right-[4.75rem] top-4 z-[45] w-auto sm:left-7 sm:right-auto sm:top-7 sm:w-[360px]">
       <div className="overflow-hidden rounded-2xl border border-white/10 bg-[#081016]/88 shadow-[0_24px_80px_rgba(0,0,0,.36)] backdrop-blur-2xl">
         <button
           type="button"
