@@ -40,6 +40,16 @@ function rowMatchesFilter(row: AnalyticsCompanyRow, filter: AnalyticsFilter) {
       return row.products.includes(filter.value)
     case "subclass":
       return row.subclasses.includes(filter.value)
+    case "productSubclass":
+      return (
+        filter.product != null &&
+        filter.subclass != null &&
+        row.productSubclasses.some(
+          (pair) =>
+            pair.product === filter.product &&
+            pair.subclass === filter.subclass
+        )
+      )
   }
 }
 
