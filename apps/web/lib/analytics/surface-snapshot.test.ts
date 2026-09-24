@@ -28,6 +28,26 @@ describe("analytics surface snapshot", () => {
     ).toEqual(defaultAnalyticsSurfaceSnapshot("opportunity"))
   })
 
+  it("restores composite product/subclass filters without flattening pairs", () => {
+    const opportunity = {
+      mode: "opportunity" as const,
+      filters: [
+        {
+          dimension: "productSubclass" as const,
+          value: JSON.stringify(["Motor", "Fleet"]),
+          label: "Motor · Fleet",
+          product: "Motor",
+          subclass: "Fleet",
+        },
+      ],
+      candidateRailOpen: true,
+    }
+
+    expect(
+      parseAnalyticsSurfaceSnapshot(opportunity, "opportunity")
+    ).toEqual(opportunity)
+  })
+
   it("rejects oversized local filter stacks", () => {
     const filters = Array.from({ length: 13 }, (_, index) => ({
       dimension: "province" as const,
