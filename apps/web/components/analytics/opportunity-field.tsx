@@ -79,8 +79,8 @@ function OpportunityFrontier({
         axisLabel: {
           color: "rgba(255,255,255,.22)",
           fontSize: 8,
-          formatter: (value: number) =>
-            formatAnalyticsMetric(value, "currency", true),
+          formatter: (value: number | string) =>
+            formatAnalyticsMetric(Number(value), "currency", true),
         },
       },
       yAxis: {
@@ -93,7 +93,8 @@ function OpportunityFrontier({
         axisLabel: {
           color: "rgba(255,255,255,.22)",
           fontSize: 8,
-          formatter: (value: number) => formatOpportunityScore(value),
+          formatter: (value: number | string) =>
+            formatOpportunityScore(Number(value)),
         },
       },
       series: [
@@ -105,11 +106,10 @@ function OpportunityFrontier({
             itemStyle: { color: "rgba(255,255,255,.95)" },
             scale: 1.6,
           },
-          data: points.map((company) => ({
-            value: [company.totalIncome, company.opportunityScore],
-            companyId: company.id,
-            name: company.name,
-          })),
+          data: points.map((company) => [
+            company.totalIncome,
+            company.opportunityScore,
+          ]),
         },
       ],
     }),
@@ -118,10 +118,11 @@ function OpportunityFrontier({
 
   const onEvents = React.useMemo(
     () => ({
-      click: (params: { data?: { companyId?: string } }) => {
-        const company = points.find(
-          (candidate) => candidate.id === params.data?.companyId
-        )
+      click: (params: { dataIndex?: number }) => {
+        const company =
+          typeof params.dataIndex === "number"
+            ? points[params.dataIndex]
+            : undefined
         if (company) onFocusCompany(company)
       },
     }),
@@ -196,6 +197,8 @@ function ProductPerformance({
                   {row.opportunityCount.toLocaleString()} opp.
                 </span>
                 <span className="mt-0.5 block font-mono text-[8px] text-white/23">
+                  SI {formatAnalyticsMetric(row.sumInsured, "currency", true)} ·
+                  P {formatAnalyticsMetric(row.premium, "currency", true)} ·
                   LR {formatAnalyticsMetric(row.lossRatio, "percent")}
                 </span>
               </span>

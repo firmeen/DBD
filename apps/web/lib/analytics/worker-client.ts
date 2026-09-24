@@ -1,6 +1,6 @@
 "use client"
 
-import { wrap } from "comlink"
+import { wrap, type Remote } from "comlink"
 
 import { computeAnalyticsSubset } from "./compute"
 import type {
@@ -14,9 +14,7 @@ const WORKER_THRESHOLD = 750
 
 declare global {
   var __tipxAnalyticsWorker: Worker | undefined
-  var __tipxAnalyticsWorkerProxy:
-    | ReturnType<typeof wrap<AnalyticsWorkerApi>>
-    | undefined
+  var __tipxAnalyticsWorkerProxy: Remote<AnalyticsWorkerApi> | undefined
 }
 
 export async function computeAnalyticsSubsetOffMainThread(

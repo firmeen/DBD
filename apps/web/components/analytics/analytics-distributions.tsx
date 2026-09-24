@@ -114,7 +114,6 @@ function DistributionField({
           barMaxWidth: 14,
           data: buckets.map((bucket) => ({
             value: bucket.count,
-            bucket,
             itemStyle: {
               color: bucketIsActive(bucket, filters)
                 ? "rgba(255,255,255,.92)"
@@ -130,8 +129,11 @@ function DistributionField({
 
   const onEvents = React.useMemo(
     () => ({
-      click: (params: { data?: { bucket?: AnalyticsBucket } }) => {
-        const bucket = params.data?.bucket
+      click: (params: { dataIndex?: number }) => {
+        const bucket =
+          typeof params.dataIndex === "number"
+            ? buckets[params.dataIndex]
+            : undefined
         if (!bucket) return
 
         if (bucket.population) {
@@ -142,7 +144,7 @@ function DistributionField({
         if (bucket.filter) onFilter(bucket.filter)
       },
     }),
-    [onFilter, onPopulation]
+    [buckets, onFilter, onPopulation]
   )
 
   return (

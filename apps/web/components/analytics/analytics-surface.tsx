@@ -10,11 +10,12 @@ import {
   LoaderCircle,
   Map as MapIcon,
   Network,
-  Target,
 } from "lucide-react"
 
 import { AnalyticsCandidates } from "./analytics-candidates"
+import { AnalyticsCompare } from "./analytics-compare"
 import { AnalyticsDistributions } from "./analytics-distributions"
+import { AnalyticsTrajectory } from "./analytics-trajectory"
 import { OpportunityField } from "./opportunity-field"
 import { useGlobalLens } from "@/hooks/use-global-lens"
 import {
@@ -22,10 +23,7 @@ import {
   fetchAnalyticsSnapshot,
 } from "@/lib/analytics/adapter"
 import { formatAnalyticsMetric, formatOpportunityScore } from "@/lib/analytics/format"
-import {
-  defaultAnalyticsSurfaceSnapshot,
-  parseAnalyticsSurfaceSnapshot,
-} from "@/lib/analytics/surface-snapshot"
+import { parseAnalyticsSurfaceSnapshot } from "@/lib/analytics/surface-snapshot"
 import type {
   AnalyticsCompanyRow,
   AnalyticsDerivedSubset,
@@ -35,9 +33,7 @@ import type {
   AnalyticsSnapshot,
   AnalyticsSummary,
 } from "@/lib/analytics/types"
-import {
-  MAX_ANALYTICS_GLOBAL_SELECTION,
-} from "@/lib/analytics/types"
+import { MAX_ANALYTICS_GLOBAL_SELECTION } from "@/lib/analytics/types"
 import { computeAnalyticsSubsetOffMainThread } from "@/lib/analytics/worker-client"
 import type { EntityRef, PopulationRef, SurfaceId } from "@/lib/intelligence/types"
 import { cn } from "@/lib/utils"
@@ -242,9 +238,14 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
     }
   }
 
+  const canUseServedPopulation =
+    filters.length === 0 && snapshot.population !== null
+  const exactHandoffCount = filteredCompanies.length
   const handoffBlocked =
-    filters.length > 0 &&
-    filteredCompanies.length > MAX_ANALYTICS_GLOBAL_SELECTION
+    !canUseServedPopulation &&
+    (exactHandoffCount === 0 ||
+      exactHandoffCount > MAX_ANALYTICS_GLOBAL_SELECTION ||
+      derivedQuery.isFetching)
 
   return (
     <main className="relative min-h-svh overflow-x-hidden bg-[#070a0d] text-white">
@@ -334,12 +335,15 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
         ) : (
           <div className="space-y-4">
             {mode === "population" ? (
-              <AnalyticsDistributions
-                distributions={effectiveDistributions}
-                filters={filters}
-                onFilter={toggleFilter}
-                onPopulation={activatePopulation}
-              />
+              <>
+                <AnalyticsDistributions
+                  distributions={effectiveDistributions}
+                  filters={filters}
+                  onFilter={toggleFilter}
+                  onPopulation={activatePopulation}
+                />
+                <AnalyticsTrajectory series={snapshot.series} />
+              </>
             ) : (
               <OpportunityField
                 companies={filteredCompanies}
@@ -351,16 +355,24 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
               />
             )}
 
-            <AnalyticsCandidates
-              mode={mode}
-              companies={candidateRailOpen ? filteredCompanies : []}
-              selectedCompanyIds={selectedCompanyIds}
-              comparedCompanyIds={comparedCompanyIds}
-              onFocus={focusCompany}
-              onSelection={(company) => toggleSelection(companyEntity(company))}
-              onCompare={(company) => toggleCompare(companyEntity(company))}
+            <AnalyticsCompare
+              compare={compare}
+              companies={snapshot.companies}
               onOpenCompany={openCompany}
             />
+
+            {candidateRailOpen ? (
+              <AnalyticsCandidates
+                mode={mode}
+                companies={filteredCompanies}
+                selectedCompanyIds={selectedCompanyIds}
+                comparedCompanyIds={comparedCompanyIds}
+                onFocus={focusCompany}
+                onSelection={(company) => toggleSelection(companyEntity(company))}
+                onCompare={(company) => toggleCompare(companyEntity(company))}
+                onOpenCompany={openCompany}
+              />
+            ) : null}
 
             <button
               type="button"
