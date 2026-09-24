@@ -7,10 +7,13 @@ import { useWorkspaceStore } from "@/stores/workspace-store"
 
 export function EntityDock() {
   const reduceMotion = useReducedMotion()
+  const activeSurface = useWorkspaceStore((state) => state.activeSurface)
   const focus = useWorkspaceStore((state) => state.focus)
   const setFocus = useWorkspaceStore((state) => state.setFocus)
   const toggleCompare = useWorkspaceStore((state) => state.toggleCompare)
   const compare = useWorkspaceStore((state) => state.compare)
+
+  if (activeSurface === "C") return null
 
   const inCompare =
     focus &&
