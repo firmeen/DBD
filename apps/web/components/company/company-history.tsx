@@ -74,12 +74,10 @@ function HistoryEventRow({
   onFocusCompany: (company: EntityRef) => void
   onHandoff: (surface: SurfaceId) => void
 }) {
-  const Icon = historyIcon(event.kind)
-
   return (
     <article className="relative pb-7 last:pb-0">
       <span className="absolute -left-8 top-0 grid size-[23px] place-items-center rounded-full border border-white/10 bg-[#0c1319] shadow-[0_0_0_5px_#0a1015]">
-        <Icon className="size-3 text-white/42" />
+        <HistoryKindIcon kind={event.kind} />
       </span>
 
       <div className="grid gap-3 lg:grid-cols-[140px_1fr_auto] lg:items-start">
@@ -137,17 +135,23 @@ function HistoryEventRow({
   )
 }
 
-function historyIcon(kind: CompanyHistoryEvent["kind"]) {
+function HistoryKindIcon({
+  kind,
+}: {
+  kind: CompanyHistoryEvent["kind"]
+}) {
+  const className = "size-3 text-white/42"
+
   switch (kind) {
     case "capital":
-      return Landmark
+      return <Landmark className={className} />
     case "transform":
     case "merger":
-      return GitMerge
+      return <GitMerge className={className} />
     case "submission":
-      return RefreshCw
+      return <RefreshCw className={className} />
     default:
-      return Building2
+      return <Building2 className={className} />
   }
 }
 
