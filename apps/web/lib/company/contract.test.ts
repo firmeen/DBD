@@ -70,6 +70,39 @@ describe("company serving contract", () => {
     expect(() => parseCompanyDetailSnapshot(invalid)).toThrow()
   })
 
+  it("caps aggregate financial line items across fiscal years", () => {
+    const detail = baseDetail()
+    const lineItems = (year: string) =>
+      Array.from({ length: 1_251 }, (_, index) => ({
+        code: `${year}-${index}`,
+        label: `Line ${index}`,
+        amount: null,
+        previousAmount: null,
+        pctChange: null,
+      }))
+
+    const invalid = {
+      ...detail,
+      financial: {
+        years: [
+          {
+            year: "2024",
+            ratios: [],
+            lineItems: lineItems("2024"),
+          },
+          {
+            year: "2025",
+            ratios: [],
+            lineItems: lineItems("2025"),
+          },
+        ],
+        series: [],
+      },
+    }
+
+    expect(() => parseCompanyDetailSnapshot(invalid)).toThrow()
+  })
+
   it("caps search populations at the UI serving budget", () => {
     const results = Array.from({ length: 51 }, (_, index) => ({
       id: String(index),

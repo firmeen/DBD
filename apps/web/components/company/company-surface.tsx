@@ -373,7 +373,7 @@ function CompanySearchPopover({
         </div>
       ) : null}
 
-      {!synchronized ? null : queryState.isError ? (
+      {!synchronized || queryState.isPending ? null : queryState.isError ? (
         <SearchState
           icon={AlertTriangle}
           title="Search request failed"

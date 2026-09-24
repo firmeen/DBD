@@ -275,14 +275,7 @@ export function CompanyDossier({
 
 function StatusPill({ value }: { value?: string | null }) {
   return (
-    <span
-      className={cn(
-        "rounded-full border px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.14em]",
-        value
-          ? "border-emerald-300/16 bg-emerald-300/[0.055] text-emerald-100/72"
-          : "border-white/8 bg-white/[0.025] text-white/30"
-      )}
-    >
+    <span className="rounded-full border border-white/9 bg-white/[0.025] px-2.5 py-1 text-[9px] font-semibold uppercase tracking-[0.14em] text-white/46">
       {value || "Status unavailable"}
     </span>
   )

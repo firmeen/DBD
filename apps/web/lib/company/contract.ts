@@ -198,6 +198,20 @@ const detailSnapshotSchema = z.object({
   history: z.array(historySchema).max(512),
   tipContext: tipContextSchema.nullable(),
   boardSummary: boardSummarySchema.nullable(),
+}).superRefine((snapshot, context) => {
+  const totalLineItems = snapshot.financial.years.reduce(
+    (total, year) => total + year.lineItems.length,
+    0
+  )
+
+  if (totalLineItems > MAX_COMPANY_LINE_ITEMS) {
+    context.addIssue({
+      code: z.ZodIssueCode.custom,
+      path: ["financial", "years"],
+      message:
+        "Company detail response exceeds the aggregate financial line-item budget",
+    })
+  }
 })
 
 export function parseCompanySearchSnapshot(

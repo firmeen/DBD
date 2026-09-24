@@ -13,7 +13,7 @@ export function EntityDock() {
   const toggleCompare = useWorkspaceStore((state) => state.toggleCompare)
   const compare = useWorkspaceStore((state) => state.compare)
 
-  if (activeSurface === "C") return null
+  if (activeSurface === "C" && focus?.kind === "company") return null
 
   const inCompare =
     focus &&
