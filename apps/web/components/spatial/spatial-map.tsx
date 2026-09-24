@@ -2,19 +2,13 @@
 
 import * as React from "react"
 import type { Layer, MapViewState } from "@deck.gl/core"
-import { H3HexagonLayer } from "@deck.gl/geo-layers"
-import {
-  GeoJsonLayer,
-  IconLayer,
-  ScatterplotLayer,
-  TextLayer,
-} from "@deck.gl/layers"
-import { DeckGL } from "@deck.gl/react"
 import { circle } from "@turf/turf"
 import { setWorkerUrl } from "maplibre-gl"
 import { Map } from "react-map-gl/maplibre"
 import Supercluster from "supercluster"
 
+import { useDeckRuntime } from "@/lib/spatial/deck-runtime"
+import type { DeckRuntime } from "@/lib/spatial/deck-runtime"
 import { aggregateCompanyPointsToH3 } from "@/lib/spatial/h3"
 import { spatialLodForZoom } from "@/lib/spatial/lod"
 import type {
@@ -79,6 +73,7 @@ export function SpatialMap({
   onFocusCompany: (company: SpatialCompanyPoint) => void
   onFocusBranch: (branch: SpatialBranch) => void
 }) {
+  const deckRuntime = useDeckRuntime()
   const selectedIds = React.useMemo(
     () => new Set(selectedCompanyIds),
     [selectedCompanyIds]
@@ -173,6 +168,15 @@ export function SpatialMap({
   )
 
   const deckLayers = React.useMemo(() => {
+    if (!deckRuntime) return [] as Layer[]
+
+    const {
+      GeoJsonLayer,
+      H3HexagonLayer,
+      IconLayer,
+      ScatterplotLayer,
+      TextLayer,
+    } = deckRuntime
     const result: Layer[] = []
     const enabled = new Set(enabledLayers)
 
@@ -369,7 +373,8 @@ export function SpatialMap({
               selectedIds,
               hoveredCompanyId,
               onHoverCompany,
-              onFocusCompany
+              onFocusCompany,
+              IconLayer
             )
           )
         }
@@ -383,7 +388,8 @@ export function SpatialMap({
             selectedIds,
             hoveredCompanyId,
             onHoverCompany,
-            onFocusCompany
+            onFocusCompany,
+            IconLayer
           )
         )
       }
@@ -440,6 +446,7 @@ export function SpatialMap({
     return result
   }, [
     branch,
+    deckRuntime,
     branchId,
     catchment,
     clustered.clusters,
@@ -457,6 +464,19 @@ export function SpatialMap({
     snapshot,
     viewState,
   ])
+
+  if (!deckRuntime) {
+    return (
+      <Map
+        mapStyle={DEFAULT_MAP_STYLE}
+        attributionControl={{ compact: true }}
+        reuseMaps
+        style={{ width: "100%", height: "100%" }}
+      />
+    )
+  }
+
+  const { DeckGL } = deckRuntime
 
   return (
     <DeckGL
@@ -495,7 +515,8 @@ function createCompanyEntityLayer(
   selectedIds: Set<string>,
   hoveredCompanyId: string | null,
   onHoverCompany: (hover: HoveredCompany | null) => void,
-  onFocusCompany: (company: SpatialCompanyPoint) => void
+  onFocusCompany: (company: SpatialCompanyPoint) => void,
+  IconLayer: DeckRuntime["IconLayer"]
 ) {
   return new IconLayer({
     id,
