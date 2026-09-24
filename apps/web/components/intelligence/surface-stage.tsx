@@ -38,6 +38,7 @@ const CompanySurface = dynamic(
 export function SurfaceStage() {
   const reduceMotion = useReducedMotion()
   const activeSurface = useWorkspaceStore((state) => state.activeSurface)
+  const focus = useWorkspaceStore((state) => state.focus)
   const setCommandOpen = useWorkspaceStore((state) => state.setCommandOpen)
   const setLensOpen = useWorkspaceStore((state) => state.setLensOpen)
   const surface = SURFACE_BY_ID[activeSurface]
@@ -47,7 +48,10 @@ export function SurfaceStage() {
   }
 
   if (activeSurface === "C") {
-    return <CompanySurface />
+    const companySurfaceKey =
+      focus?.kind === "company" ? `company:${focus.id}` : "company:discovery"
+
+    return <CompanySurface key={companySurfaceKey} />
   }
 
   return (
