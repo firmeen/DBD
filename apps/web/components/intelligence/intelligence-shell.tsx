@@ -13,7 +13,7 @@ export function IntelligenceShell() {
   useKeyboardRouter()
 
   return (
-    <div className="relative min-h-svh bg-[#070a0d]">
+    <div className="relative min-h-svh bg-tipx-canvas">
       <SurfaceStage />
       <FloatingOrbit />
       <GlobalLens />

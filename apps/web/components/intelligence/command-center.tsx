@@ -62,29 +62,29 @@ export function CommandCenter() {
     <Dialog open={open} onOpenChange={setOpen}>
       <DialogContent
         showCloseButton={false}
-        className="top-[13vh] block w-[min(672px,calc(100vw-32px))] max-w-none translate-y-0 gap-0 overflow-hidden rounded-2xl border border-white/12 bg-[#0b0f13]/96 p-0 text-white shadow-[0_30px_90px_rgba(0,0,0,.55)] ring-0 backdrop-blur-xl"
+        className="top-[13vh] block w-[min(672px,calc(100vw-32px))] max-w-none translate-y-0 gap-0 overflow-hidden rounded-2xl border border-tipx-line/12 bg-tipx-floating/96 p-0 text-tipx-ink shadow-[0_30px_90px_rgba(0,0,0,.55)] ring-0 backdrop-blur-xl"
       >
         <DialogTitle className="sr-only">TIPX Command Center</DialogTitle>
 
         <Command
           label="TIPX Command Center"
           loop
-          className="[&_[cmdk-group-heading]]:px-4 [&_[cmdk-group-heading]]:pb-2 [&_[cmdk-group-heading]]:pt-4 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[0.2em] [&_[cmdk-group-heading]]:text-white/32"
+          className="[&_[cmdk-group-heading]]:px-4 [&_[cmdk-group-heading]]:pb-2 [&_[cmdk-group-heading]]:pt-4 [&_[cmdk-group-heading]]:text-[10px] [&_[cmdk-group-heading]]:font-semibold [&_[cmdk-group-heading]]:uppercase [&_[cmdk-group-heading]]:tracking-[0.2em] [&_[cmdk-group-heading]]:text-tipx-ink/32"
         >
-          <div className="flex items-center gap-3 border-b border-white/8 px-4">
-            <Search className="size-4 text-white/35" aria-hidden />
+          <div className="flex items-center gap-3 border-b border-tipx-line/8 px-4">
+            <Search className="size-4 text-tipx-ink/35" aria-hidden />
             <Command.Input
               autoFocus
               placeholder="Navigate, filter or control the workspace…"
-              className="h-14 w-full bg-transparent text-sm text-white outline-none placeholder:text-white/28"
+              className="h-14 w-full bg-transparent text-sm text-tipx-ink outline-none placeholder:text-tipx-ink/28"
             />
-            <kbd className="rounded-md border border-white/10 bg-white/5 px-2 py-1 font-mono text-[10px] text-white/36">
+            <kbd className="rounded-md border border-tipx-line/10 bg-tipx-ink/5 px-2 py-1 font-mono text-[10px] text-tipx-ink/36">
               ESC
             </kbd>
           </div>
 
           <Command.List className="max-h-[min(440px,58vh)] overflow-y-auto p-2">
-            <Command.Empty className="px-4 py-10 text-center text-xs text-white/42">
+            <Command.Empty className="px-4 py-10 text-center text-xs text-tipx-ink/42">
               No matching intelligence command.
             </Command.Empty>
 
@@ -99,16 +99,16 @@ export function CommandCenter() {
                     key={command.id}
                     value={`${command.label} ${command.description}`}
                     onSelect={() => void run(command)}
-                    className="group flex cursor-default items-center gap-3 rounded-xl px-3 py-3 text-sm text-white/72 outline-none data-[selected=true]:bg-white/8 data-[selected=true]:text-white"
+                    className="group flex cursor-default items-center gap-3 rounded-xl px-3 py-3 text-sm text-tipx-ink/72 outline-none data-[selected=true]:bg-tipx-ink/8 data-[selected=true]:text-tipx-ink"
                   >
                     <div className="min-w-0 flex-1">
                       <p className="font-medium">{command.label}</p>
-                      <p className="mt-0.5 truncate text-[11px] text-white/36">
+                      <p className="mt-0.5 truncate text-[11px] text-tipx-ink/36">
                         {command.description}
                       </p>
                     </div>
                     {command.shortcut ? (
-                      <kbd className="rounded-md border border-white/9 bg-black/25 px-2 py-1 font-mono text-[10px] text-white/35 group-data-[selected=true]:text-white/58">
+                      <kbd className="rounded-md border border-tipx-line/9 bg-tipx-ink/5 px-2 py-1 font-mono text-[10px] text-tipx-ink/35 group-data-[selected=true]:text-tipx-ink/58">
                         {command.shortcut}
                       </kbd>
                     ) : null}

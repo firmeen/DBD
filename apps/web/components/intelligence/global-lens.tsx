@@ -68,8 +68,8 @@ export function GlobalLens() {
           className={cn(
             "group flex h-11 items-center gap-3 rounded-2xl border px-3.5 shadow-2xl shadow-black/25 backdrop-blur-xl transition-colors",
             activeCount > 0
-              ? "border-white/20 bg-white text-black"
-              : "border-white/10 bg-[#0b0f13]/84 text-white hover:border-white/18 hover:bg-[#10161c]/92"
+              ? "border-tipx-line/20 bg-tipx-brand text-tipx-on-brand"
+              : "border-tipx-line/10 bg-tipx-floating/84 text-tipx-ink hover:border-tipx-line/18 hover:bg-tipx-elevated/92"
           )}
         >
           <span className="grid size-6 place-items-center rounded-lg border border-current/12">
@@ -110,17 +110,17 @@ export function GlobalLens() {
                   : { opacity: 0, y: 4, scale: 0.99 }
               }
               transition={{ duration: 0.16, ease: [0.2, 0.8, 0.2, 1] }}
-              className="z-[80] w-[min(430px,calc(100vw-24px))] overflow-hidden rounded-2xl border border-white/12 bg-[#0b0f13]/97 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl"
+              className="z-[80] w-[min(430px,calc(100vw-24px))] overflow-hidden rounded-2xl border border-tipx-line/12 bg-tipx-floating/97 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl"
             >
-              <div className="flex items-start justify-between border-b border-white/8 px-5 py-4">
+              <div className="flex items-start justify-between border-b border-tipx-line/8 px-5 py-4">
                 <div>
-                  <div className="flex items-center gap-2 text-white">
+                  <div className="flex items-center gap-2 text-tipx-ink">
                     <SlidersHorizontal className="size-4" aria-hidden />
                     <h2 className="text-sm font-semibold">
                       Global Intelligence Lens
                     </h2>
                   </div>
-                  <p className="mt-1 max-w-sm text-[11px] leading-5 text-white/40">
+                  <p className="mt-1 max-w-sm text-[11px] leading-5 text-tipx-ink/40">
                     Shareable analytical scope. These dimensions follow
                     compatible surfaces instead of resetting per page.
                   </p>
@@ -129,7 +129,7 @@ export function GlobalLens() {
                   type="button"
                   onClick={() => void clearLens()}
                   disabled={activeCount === 0}
-                  className="rounded-lg p-2 text-white/38 transition hover:bg-white/6 hover:text-white disabled:pointer-events-none disabled:opacity-20"
+                  className="rounded-lg p-2 text-tipx-ink/38 transition hover:bg-tipx-ink/6 hover:text-tipx-ink disabled:pointer-events-none disabled:opacity-20"
                   aria-label="Clear Global Lens"
                 >
                   <RotateCcw className="size-3.5" />
@@ -166,10 +166,10 @@ export function GlobalLens() {
                 </div>
 
                 <div>
-                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-white/35">
+                  <p className="mb-2 text-[10px] font-semibold uppercase tracking-[0.18em] text-tipx-ink/35">
                     TIP Status
                   </p>
-                  <div className="grid grid-cols-4 gap-1 rounded-xl border border-white/8 bg-black/20 p-1">
+                  <div className="grid grid-cols-4 gap-1 rounded-xl border border-tipx-line/8 bg-tipx-ink/5 p-1">
                     {tipOptions.map((option) => {
                       const selected = lens.tipStatus === option.value
 
@@ -183,8 +183,8 @@ export function GlobalLens() {
                           className={cn(
                             "rounded-lg px-2 py-2 text-[10px] font-medium transition",
                             selected
-                              ? "bg-white text-black shadow-sm"
-                              : "text-white/42 hover:bg-white/6 hover:text-white/72"
+                              ? "bg-tipx-brand text-tipx-on-brand shadow-sm"
+                              : "text-tipx-ink/42 hover:bg-tipx-ink/6 hover:text-tipx-ink/72"
                           )}
                         >
                           {option.label}
@@ -208,7 +208,7 @@ export function GlobalLens() {
                 />
               </div>
 
-              <div className="border-t border-white/8 bg-white/[0.018] px-5 py-3 text-[10px] leading-4 text-white/32">
+              <div className="border-t border-tipx-line/8 bg-tipx-ink/[0.018] px-5 py-3 text-[10px] leading-4 text-tipx-ink/32">
                 Population counts remain unavailable until a production serving
                 contract supplies them. The Lens never invents analytical totals.
               </div>
@@ -235,7 +235,7 @@ function LensTextField({
 }) {
   return (
     <label className="block">
-      <span className="mb-2 block text-[10px] font-semibold uppercase tracking-[0.18em] text-white/35">
+      <span className="mb-2 block text-[10px] font-semibold uppercase tracking-[0.18em] text-tipx-ink/35">
         {label}
       </span>
       <input
@@ -244,7 +244,7 @@ function LensTextField({
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         data-keyboard-input
-        className="h-10 w-full rounded-xl border border-white/8 bg-white/[0.035] px-3 text-xs text-white outline-none transition placeholder:text-white/22 focus:border-white/22 focus:bg-white/[0.055]"
+        className="h-10 w-full rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.035] px-3 text-xs text-tipx-ink outline-none transition placeholder:text-tipx-ink/22 focus:border-tipx-line/22 focus:bg-tipx-ink/[0.055]"
       />
     </label>
   )

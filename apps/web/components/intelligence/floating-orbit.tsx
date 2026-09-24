@@ -28,8 +28,8 @@ export function FloatingOrbit() {
       onMouseEnter={() => send({ type: "POINTER_ENTER" })}
       onMouseLeave={() => send({ type: "POINTER_LEAVE" })}
     >
-      <div className="mb-2 flex items-center gap-2 pr-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-white/35">
-        <span className="h-px w-5 bg-white/15" />
+      <div className="mb-2 flex items-center gap-2 pr-1 text-[10px] font-semibold uppercase tracking-[0.24em] text-tipx-ink/35">
+        <span className="h-px w-5 bg-tipx-ink/15" />
         Surfaces
       </div>
 
@@ -58,12 +58,12 @@ export function FloatingOrbit() {
                     duration: 0.16,
                     ease: [0.2, 0.8, 0.2, 1],
                   }}
-                  className="absolute right-12 mr-2 whitespace-nowrap rounded-xl border border-white/10 bg-[#0b0f13]/94 px-3 py-2 shadow-2xl shadow-black/35 backdrop-blur-xl"
+                  className="absolute right-12 mr-2 whitespace-nowrap rounded-xl border border-tipx-line/10 bg-tipx-floating/94 px-3 py-2 shadow-2xl shadow-black/35 backdrop-blur-xl"
                 >
-                  <p className="text-xs font-semibold text-white">
+                  <p className="text-xs font-semibold text-tipx-ink">
                     {surface.name}
                   </p>
-                  <p className="mt-0.5 max-w-72 text-[10px] leading-4 text-white/45">
+                  <p className="mt-0.5 max-w-72 text-[10px] leading-4 text-tipx-ink/45">
                     {surface.description}
                   </p>
                 </motion.div>
@@ -83,8 +83,8 @@ export function FloatingOrbit() {
               className={cn(
                 "group grid size-10 place-items-center rounded-xl border font-mono text-xs font-semibold transition-[transform,background-color,border-color,color,box-shadow] duration-200",
                 isActive
-                  ? "border-white/24 bg-white text-black shadow-[0_14px_35px_rgba(0,0,0,.28)]"
-                  : "border-white/10 bg-black/45 text-white/62 shadow-lg shadow-black/15 backdrop-blur-xl hover:-translate-x-0.5 hover:border-white/22 hover:bg-white/9 hover:text-white"
+                  ? "border-tipx-line/24 bg-tipx-brand text-tipx-on-brand shadow-[0_14px_35px_rgba(0,0,0,.28)]"
+                  : "border-tipx-line/10 bg-tipx-floating/88 text-tipx-ink/62 shadow-lg shadow-black/15 backdrop-blur-xl hover:-translate-x-0.5 hover:border-tipx-line/22 hover:bg-tipx-ink/9 hover:text-tipx-ink"
               )}
             >
               {surface.id}
