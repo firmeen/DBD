@@ -367,7 +367,7 @@ export function RelationshipSurface() {
   }
 
   return (
-    <main className="relative min-h-svh overflow-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative min-h-svh overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-18" />
       <div className="tipx-vignette absolute inset-0" />
 
