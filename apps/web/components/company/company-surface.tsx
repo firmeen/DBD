@@ -531,7 +531,7 @@ function CompanyViewRail({
             <span
               className={cn(
                 "grid size-5 place-items-center rounded-md border font-mono text-[8px] font-bold",
-                active ? "border-black/10" : "border-tipx-line/8"
+                active ? "border-tipx-brand/18" : "border-tipx-line/8"
               )}
             >
               {meta.short}
