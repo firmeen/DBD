@@ -96,8 +96,8 @@ function HistoryEventRow({
             </p>
           ) : null}
 
-          {event.previousAmount !== null ||
-          event.newAmount !== null ? (
+          {event.previousAmount != null ||
+          event.newAmount != null ? (
             <div className="mt-3 inline-flex items-center gap-2 rounded-lg border border-white/7 bg-white/[0.025] px-2.5 py-1.5 font-mono text-[9px] text-white/36">
               {formatCompanyMetric(
                 event.previousAmount,
