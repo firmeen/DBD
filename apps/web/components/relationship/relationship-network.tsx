@@ -5,6 +5,8 @@ import Graph from "graphology"
 import forceAtlas2 from "graphology-layout-forceatlas2"
 import Sigma from "sigma"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
+import type { TipxRenderPalette } from "@/lib/theme/palette"
 import type {
   RelationshipGraphSnapshot,
   RelationshipNode,
@@ -37,6 +39,7 @@ export function RelationshipNetwork({
   onHover: (entity: EntityRef | null) => void
   onLayoutStateChange: (running: boolean) => void
 }) {
+  const { palette } = useTipxTheme()
   const containerRef = React.useRef<HTMLDivElement>(null)
   const rendererRef = React.useRef<Sigma | null>(null)
   const graphRef = React.useRef<Graph | null>(null)
@@ -64,7 +67,7 @@ export function RelationshipNetwork({
     const container = containerRef.current
     if (!container || snapshot.nodes.length === 0) return
 
-    const graph = buildGraph(snapshot, onLayoutStateChange)
+    const graph = buildGraph(snapshot, onLayoutStateChange, palette)
     graphRef.current = graph
 
     const nodeById = new Map(snapshot.nodes.map((node) => [node.id, node]))
@@ -75,8 +78,8 @@ export function RelationshipNetwork({
       labelDensity: 0.08,
       labelGridCellSize: 90,
       labelRenderedSizeThreshold: 7,
-      defaultNodeColor: "#70808d",
-      defaultEdgeColor: "#34414b",
+      defaultNodeColor: palette.graph.node,
+      defaultEdgeColor: palette.graph.edge,
       nodeReducer(node, data) {
         const current = stateRef.current
         const hidden = current.hiddenNodeIds.has(node)
@@ -91,9 +94,9 @@ export function RelationshipNetwork({
           hidden,
           color:
             hovered && !adjacentToHover
-              ? "#273038"
+              ? palette.graph.nodeMuted
               : current.pathNodeIds.has(node)
-                ? "#a9f3d7"
+                ? palette.graph.path
                 : data.color,
           size:
             data.size *
@@ -129,9 +132,9 @@ export function RelationshipNetwork({
           ...data,
           hidden,
           color: current.pathEdgeIds.has(edge)
-            ? "#8fe8c9"
+            ? palette.graph.path
             : hovered && !incidentToHover
-              ? "#20282f"
+              ? palette.graph.edgeMuted
               : data.color,
           size: current.pathEdgeIds.has(edge)
             ? Math.max(2.2, data.size)
@@ -184,6 +187,7 @@ export function RelationshipNetwork({
     onHover,
     onLayoutStateChange,
     onToggleSelection,
+    palette,
     snapshot,
   ])
 
@@ -203,7 +207,8 @@ export function RelationshipNetwork({
 
 function buildGraph(
   snapshot: RelationshipGraphSnapshot,
-  onLayoutStateChange: (running: boolean) => void
+  onLayoutStateChange: (running: boolean) => void,
+  palette: TipxRenderPalette
 ) {
   const graph = new Graph({ type: "mixed", multi: true })
 
@@ -214,14 +219,14 @@ function buildGraph(
       x: finiteOr(node.x, fallbackX),
       y: finiteOr(node.y, fallbackY),
       size: nodeSize(node),
-      color: nodeColor(node),
+      color: nodeColor(node, palette),
     })
   })
 
   for (const edge of snapshot.edges) {
     const attributes = {
       size: Math.max(0.6, Math.min(3, edge.weight ?? 1)),
-      color: edgeColor(edge.kind),
+      color: edgeColor(edge.kind, palette),
     }
 
     if (edge.directed || edge.kind === "transform" || edge.kind === "merger") {
@@ -275,16 +280,16 @@ function nodeSize(node: RelationshipNode) {
   return Math.min(18, 5 + Math.log2(node.degree + 1) * 2.2)
 }
 
-function nodeColor(node: RelationshipNode) {
-  if (node.kind === "person") return "#c5d0d8"
-  if (node.tipStatus === "active") return "#367f9b"
-  if (node.tipStatus === "expired") return "#8a4f4b"
-  if (node.tipStatus === "prospect") return "#626d76"
-  return "#557084"
+function nodeColor(node: RelationshipNode, palette: TipxRenderPalette) {
+  if (node.kind === "person") return palette.graph.nodePerson
+  if (node.tipStatus === "active") return palette.entity.active
+  if (node.tipStatus === "expired") return palette.entity.expired
+  if (node.tipStatus === "prospect") return palette.entity.prospect
+  return palette.graph.nodeCompany
 }
 
-function edgeColor(kind: string) {
-  if (kind === "transform" || kind === "merger") return "#8b9ba8"
-  if (kind === "shared-director") return "#587080"
-  return "#3b4b56"
+function edgeColor(kind: string, palette: TipxRenderPalette) {
+  if (kind === "transform" || kind === "merger") return palette.graph.path
+  if (kind === "shared-director") return palette.graph.edge
+  return palette.graph.edgeMuted
 }
