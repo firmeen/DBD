@@ -287,7 +287,7 @@ export function SpatialSurface() {
         />
       </div>
 
-      <div className="pointer-events-none absolute inset-0 bg-[linear-gradient(to_bottom,rgba(7,10,13,.20),transparent_18%,transparent_76%,rgba(7,10,13,.42))]" />
+      <div className="tipx-map-overlay pointer-events-none absolute inset-0" />
 
       <SpatialControlDeck
         lod={lod}
