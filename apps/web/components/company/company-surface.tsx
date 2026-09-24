@@ -149,6 +149,19 @@ export function CompanySurface() {
         entity.kind === focusedCompany.kind && entity.id === focusedCompany.id
     )
 
+  function focusCompany(entity: EntityRef) {
+    setFocus(entity)
+    setSearchTerm("")
+    setView("dossier")
+    setFinancialYear(null)
+  }
+
+  function clearCompanyFocus() {
+    setFocus(null)
+    setView("dossier")
+    setFinancialYear(null)
+  }
+
   return (
     <main className="relative min-h-svh overflow-x-hidden bg-[#070a0d] text-white">
       <div className="tipx-grid fixed inset-0 opacity-25" />
@@ -161,17 +174,10 @@ export function CompanySurface() {
         onSearchTermChange={setSearchTerm}
         focusedCompany={focusedCompany}
         searchQuery={searchQuery}
-        onPickCompany={(company) => {
-          setFocus(companySearchResultToEntity(company))
-          setSearchTerm("")
-          setView("dossier")
-          setFinancialYear(null)
-        }}
-        onClearFocus={() => {
-          setFocus(null)
-          setView("dossier")
-          setFinancialYear(null)
-        }}
+        onPickCompany={(company) =>
+          focusCompany(companySearchResultToEntity(company))
+        }
+        onClearFocus={clearCompanyFocus}
       />
 
       <div className="relative z-10 mx-auto w-full max-w-[1680px] px-4 pb-36 pt-32 sm:px-7 lg:px-10 lg:pt-36">
@@ -236,7 +242,7 @@ export function CompanySurface() {
                   fallbackEntity={focusedCompany}
                   selectedYear={effectiveYear}
                   onYearChange={setFinancialYear}
-                  onFocusCompany={setFocus}
+                  onFocusCompany={focusCompany}
                   onHandoff={setActiveSurface}
                 />
               </motion.div>
@@ -559,7 +565,7 @@ function CompanyView({
   fallbackEntity: EntityRef
   selectedYear: string | null
   onYearChange: (year: string) => void
-  onFocusCompany: (entity: EntityRef | null) => void
+  onFocusCompany: (entity: EntityRef) => void
   onHandoff: (surface: SurfaceId) => void
 }) {
   switch (view) {
