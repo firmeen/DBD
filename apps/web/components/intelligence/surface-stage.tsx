@@ -24,6 +24,28 @@ const SpatialSurface = dynamic(
   }
 )
 
+const RelationshipSurface = dynamic(
+  () =>
+    import("@/components/relationship/relationship-surface").then(
+      (module) => module.RelationshipSurface
+    ),
+  {
+    ssr: false,
+    loading: () => <RelationshipSurfaceLoader />,
+  }
+)
+
+const PersonSurface = dynamic(
+  () =>
+    import("@/components/people/person-surface").then(
+      (module) => module.PersonSurface
+    ),
+  {
+    ssr: false,
+    loading: () => <PeopleSurfaceLoader />,
+  }
+)
+
 const CompanySurface = dynamic(
   () =>
     import("@/components/company/company-surface").then(
@@ -52,6 +74,21 @@ export function SurfaceStage() {
       focus?.kind === "company" ? `company:${focus.id}` : "company:discovery"
 
     return <CompanySurface key={companySurfaceKey} />
+  }
+
+  if (activeSurface === "P") {
+    const peopleSurfaceKey =
+      focus?.kind === "person"
+        ? `person:${focus.id}`
+        : focus?.kind === "company"
+          ? `company-board:${focus.id}`
+          : "people:discovery"
+
+    return <PersonSurface key={peopleSurfaceKey} />
+  }
+
+  if (activeSurface === "R") {
+    return <RelationshipSurface />
   }
 
   return (
@@ -169,6 +206,34 @@ function CompanySurfaceLoader() {
       <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/38 backdrop-blur-xl">
         <span className="size-1.5 animate-pulse rounded-full bg-cyan-200/70" />
         Loading company intelligence
+      </div>
+    </main>
+  )
+}
+
+
+function PeopleSurfaceLoader() {
+  return (
+    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-[#070a0d] text-white">
+      <div className="tipx-grid absolute inset-0 opacity-24" />
+      <div className="tipx-vignette absolute inset-0" />
+      <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/38 backdrop-blur-xl">
+        <span className="size-1.5 animate-pulse rounded-full bg-cyan-200/70" />
+        Loading people intelligence
+      </div>
+    </main>
+  )
+}
+
+
+function RelationshipSurfaceLoader() {
+  return (
+    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-[#070a0d] text-white">
+      <div className="tipx-grid absolute inset-0 opacity-18" />
+      <div className="tipx-vignette absolute inset-0" />
+      <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-white/8 bg-white/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-white/38 backdrop-blur-xl">
+        <span className="size-1.5 animate-pulse rounded-full bg-cyan-200/70" />
+        Loading relationship observatory
       </div>
     </main>
   )

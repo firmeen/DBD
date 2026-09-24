@@ -14,6 +14,18 @@ export function EntityDock() {
   const compare = useWorkspaceStore((state) => state.compare)
 
   if (activeSurface === "C" && focus?.kind === "company") return null
+  if (
+    activeSurface === "P" &&
+    (focus?.kind === "person" || focus?.kind === "company")
+  ) {
+    return null
+  }
+  if (
+    activeSurface === "R" &&
+    (focus?.kind === "person" || focus?.kind === "company")
+  ) {
+    return null
+  }
 
   const inCompare =
     focus &&
