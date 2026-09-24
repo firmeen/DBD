@@ -24,8 +24,7 @@ import {
   searchCompanies,
 } from "@/lib/company/adapter"
 import {
-  defaultCompanySurfaceSnapshot,
-  parseCompanySurfaceSnapshot,
+  resolveCompanySurfaceSnapshot,
 } from "@/lib/company/surface-snapshot"
 import {
   COMPANY_VIEW_IDS,
@@ -85,11 +84,12 @@ export function CompanySurface() {
     (state) => state.saveSurfaceSnapshot
   )
 
+  const focusedCompany = focus?.kind === "company" ? focus : null
+  const focusedCompanyId = focusedCompany?.id ?? null
+
   const initialState = React.useMemo(
-    () =>
-      parseCompanySurfaceSnapshot(snapshotPayload) ??
-      defaultCompanySurfaceSnapshot(),
-    [snapshotPayload]
+    () => resolveCompanySurfaceSnapshot(snapshotPayload, focusedCompanyId),
+    [focusedCompanyId, snapshotPayload]
   )
 
   const [view, setView] = React.useState<CompanyViewId>(initialState.view)
@@ -111,13 +111,18 @@ export function CompanySurface() {
 
   React.useEffect(() => {
     saveSurfaceSnapshot("C", {
+      focusedCompanyId,
       view,
       searchTerm,
       financialYear,
     })
-  }, [financialYear, saveSurfaceSnapshot, searchTerm, view])
-
-  const focusedCompany = focus?.kind === "company" ? focus : null
+  }, [
+    financialYear,
+    focusedCompanyId,
+    saveSurfaceSnapshot,
+    searchTerm,
+    view,
+  ])
 
   const searchQuery = useQuery({
     queryKey: ["tipx", "company", "search", debouncedSearch, lens],

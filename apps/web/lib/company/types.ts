@@ -204,6 +204,7 @@ export interface CompanyDetailRequest {
 export type CompanyServingRequest = CompanySearchRequest | CompanyDetailRequest
 
 export interface CompanySurfaceSnapshot {
+  focusedCompanyId: string | null
   view: CompanyViewId
   searchTerm: string
   financialYear: string | null
