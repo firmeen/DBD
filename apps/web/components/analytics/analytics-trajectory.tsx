@@ -5,6 +5,7 @@ import type { EChartsOption } from "echarts"
 import ReactECharts from "echarts-for-react"
 import { Activity } from "lucide-react"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import { formatAnalyticsMetric } from "@/lib/analytics/format"
 import type {
   AnalyticsMetricFormat,
@@ -59,39 +60,46 @@ function TrajectoryGroup({
   format: AnalyticsMetricFormat
   series: AnalyticsSeries[]
 }) {
+  const { palette } = useTipxTheme()
+
   const option = React.useMemo<EChartsOption>(() => {
     const periods = Array.from(
       new Set(series.flatMap((item) => item.points.map((point) => point.period)))
     ).sort()
 
     return {
+      color: [
+        palette.chart.primary,
+        palette.chart.secondary,
+        palette.chart.accent,
+      ],
       animationDuration: 360,
       grid: { left: 8, right: 14, top: 42, bottom: 16, containLabel: true },
       legend: {
         top: 0,
         left: 0,
         type: "scroll",
-        textStyle: { color: "rgba(255,255,255,.38)", fontSize: 8 },
+        textStyle: { color: palette.chart.label, fontSize: 8 },
       },
       tooltip: {
         trigger: "axis",
-        backgroundColor: "rgba(8,16,22,.97)",
-        borderColor: "rgba(255,255,255,.1)",
-        textStyle: { color: "rgba(255,255,255,.76)", fontSize: 10 },
+        backgroundColor: palette.chart.tooltipBackground,
+        borderColor: palette.chart.tooltipBorder,
+        textStyle: { color: palette.chart.tooltipText, fontSize: 10 },
       },
       xAxis: {
         type: "category",
         data: periods,
         boundaryGap: false,
         axisTick: { show: false },
-        axisLine: { lineStyle: { color: "rgba(255,255,255,.07)" } },
-        axisLabel: { color: "rgba(255,255,255,.22)", fontSize: 8 },
+        axisLine: { lineStyle: { color: palette.chart.axis } },
+        axisLabel: { color: palette.chart.muted, fontSize: 8 },
       },
       yAxis: {
         type: "value",
-        splitLine: { lineStyle: { color: "rgba(255,255,255,.045)" } },
+        splitLine: { lineStyle: { color: palette.chart.grid } },
         axisLabel: {
-          color: "rgba(255,255,255,.22)",
+          color: palette.chart.muted,
           fontSize: 8,
           formatter: (value: number | string) =>
             formatAnalyticsMetric(Number(value), format, true),
@@ -112,7 +120,7 @@ function TrajectoryGroup({
         ),
       })),
     }
-  }, [format, series])
+  }, [format, palette, series])
 
   return (
     <div className="rounded-2xl border border-tipx-line/7 bg-tipx-ink/[0.025] p-3">

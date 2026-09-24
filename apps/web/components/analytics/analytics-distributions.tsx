@@ -4,6 +4,7 @@ import * as React from "react"
 import type { EChartsOption } from "echarts"
 import ReactECharts from "echarts-for-react"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import type {
   AnalyticsBucket,
   AnalyticsDistribution,
@@ -64,6 +65,7 @@ function DistributionField({
   onFilter: (filter: AnalyticsFilter) => void
   onPopulation: (population: PopulationRef) => void
 }) {
+  const { palette } = useTipxTheme()
   const buckets = React.useMemo(
     () =>
       [...distribution.buckets]
@@ -86,14 +88,14 @@ function DistributionField({
       },
       tooltip: {
         trigger: "item",
-        backgroundColor: "rgba(8,16,22,.97)",
-        borderColor: "rgba(255,255,255,.1)",
-        textStyle: { color: "rgba(255,255,255,.76)", fontSize: 10 },
+        backgroundColor: palette.chart.tooltipBackground,
+        borderColor: palette.chart.tooltipBorder,
+        textStyle: { color: palette.chart.tooltipText, fontSize: 10 },
       },
       xAxis: {
         type: "value",
-        splitLine: { lineStyle: { color: "rgba(255,255,255,.045)" } },
-        axisLabel: { color: "rgba(255,255,255,.22)", fontSize: 8 },
+        splitLine: { lineStyle: { color: palette.chart.grid } },
+        axisLabel: { color: palette.chart.muted, fontSize: 8 },
       },
       yAxis: {
         type: "category",
@@ -102,7 +104,7 @@ function DistributionField({
         axisTick: { show: false },
         axisLine: { show: false },
         axisLabel: {
-          color: "rgba(255,255,255,.38)",
+          color: palette.chart.label,
           fontSize: 9,
           width: 116,
           overflow: "truncate",
@@ -116,15 +118,15 @@ function DistributionField({
             value: bucket.count,
             itemStyle: {
               color: bucketIsActive(bucket, filters)
-                ? "rgba(255,255,255,.92)"
-                : "rgba(139,202,220,.48)",
+                ? palette.chart.selected
+                : palette.chart.secondary,
               borderRadius: [0, 6, 6, 0],
             },
           })),
         },
       ],
     }),
-    [buckets, filters]
+    [buckets, filters, palette]
   )
 
   const onEvents = React.useMemo(

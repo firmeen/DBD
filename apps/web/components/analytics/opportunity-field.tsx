@@ -5,6 +5,7 @@ import type { EChartsOption } from "echarts"
 import ReactECharts from "echarts-for-react"
 import { ArrowUpRight, MapPinned, PackageSearch } from "lucide-react"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import { formatAnalyticsMetric, formatOpportunityScore } from "@/lib/analytics/format"
 import type {
   AnalyticsCompanyRow,
@@ -50,6 +51,7 @@ function OpportunityFrontier({
   companies: AnalyticsCompanyRow[]
   onFocusCompany: (company: AnalyticsCompanyRow) => void
 }) {
+  const { palette } = useTipxTheme()
   const points = React.useMemo(
     () =>
       companies
@@ -67,17 +69,17 @@ function OpportunityFrontier({
       grid: { left: 14, right: 18, top: 18, bottom: 20, containLabel: true },
       tooltip: {
         trigger: "item",
-        backgroundColor: "rgba(8,16,22,.97)",
-        borderColor: "rgba(255,255,255,.1)",
-        textStyle: { color: "rgba(255,255,255,.76)", fontSize: 10 },
+        backgroundColor: palette.chart.tooltipBackground,
+        borderColor: palette.chart.tooltipBorder,
+        textStyle: { color: palette.chart.tooltipText, fontSize: 10 },
       },
       xAxis: {
         type: "value",
         name: "Income",
-        nameTextStyle: { color: "rgba(255,255,255,.24)", fontSize: 8 },
-        splitLine: { lineStyle: { color: "rgba(255,255,255,.045)" } },
+        nameTextStyle: { color: palette.chart.muted, fontSize: 8 },
+        splitLine: { lineStyle: { color: palette.chart.grid } },
         axisLabel: {
-          color: "rgba(255,255,255,.22)",
+          color: palette.chart.muted,
           fontSize: 8,
           formatter: (value: number | string) =>
             formatAnalyticsMetric(Number(value), "currency", true),
@@ -88,10 +90,10 @@ function OpportunityFrontier({
         min: 0,
         max: 1,
         name: "Opportunity",
-        nameTextStyle: { color: "rgba(255,255,255,.24)", fontSize: 8 },
-        splitLine: { lineStyle: { color: "rgba(255,255,255,.045)" } },
+        nameTextStyle: { color: palette.chart.muted, fontSize: 8 },
+        splitLine: { lineStyle: { color: palette.chart.grid } },
         axisLabel: {
-          color: "rgba(255,255,255,.22)",
+          color: palette.chart.muted,
           fontSize: 8,
           formatter: (value: number | string) =>
             formatOpportunityScore(Number(value)),
@@ -101,9 +103,9 @@ function OpportunityFrontier({
         {
           type: "scatter",
           symbolSize: 9,
-          itemStyle: { color: "rgba(119,219,194,.62)" },
+          itemStyle: { color: palette.chart.primary },
           emphasis: {
-            itemStyle: { color: "rgba(255,255,255,.95)" },
+            itemStyle: { color: palette.chart.accent },
             scale: 1.6,
           },
           data: points.map((company) => [
@@ -113,7 +115,7 @@ function OpportunityFrontier({
         },
       ],
     }),
-    [points]
+    [palette, points]
   )
 
   const onEvents = React.useMemo(

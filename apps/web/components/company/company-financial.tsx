@@ -6,6 +6,7 @@ import type { EChartsOption } from "echarts"
 import ReactECharts from "echarts-for-react"
 import { Activity, CalendarRange, TableProperties } from "lucide-react"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import {
   formatCompanyDate,
   formatCompanyMetric,
@@ -124,12 +125,19 @@ function TrajectoryField({
   format: CompanyFinancialSeries["format"]
   series: CompanyFinancialSeries[]
 }) {
+  const { palette } = useTipxTheme()
+
   const option = React.useMemo<EChartsOption>(() => {
     const categories = Array.from(
       new Set(series.flatMap((metric) => metric.points.map((point) => point.year)))
     ).sort()
 
     return {
+      color: [
+        palette.chart.primary,
+        palette.chart.secondary,
+        palette.chart.accent,
+      ],
       animationDuration: 420,
       animationEasing: "cubicOut",
       backgroundColor: "transparent",
@@ -145,19 +153,19 @@ function TrajectoryField({
         top: 0,
         left: 0,
         textStyle: {
-          color: "rgba(255,255,255,.48)",
+          color: palette.chart.label,
           fontSize: 9,
         },
         pageTextStyle: {
-          color: "rgba(255,255,255,.34)",
+          color: palette.chart.muted,
         },
       },
       tooltip: {
         trigger: "axis",
-        backgroundColor: "rgba(8,16,22,.96)",
-        borderColor: "rgba(255,255,255,.12)",
+        backgroundColor: palette.chart.tooltipBackground,
+        borderColor: palette.chart.tooltipBorder,
         textStyle: {
-          color: "rgba(255,255,255,.78)",
+          color: palette.chart.tooltipText,
           fontSize: 10,
         },
       },
@@ -165,15 +173,15 @@ function TrajectoryField({
         type: "category",
         data: categories,
         boundaryGap: false,
-        axisLine: { lineStyle: { color: "rgba(255,255,255,.09)" } },
+        axisLine: { lineStyle: { color: palette.chart.axis } },
         axisTick: { show: false },
-        axisLabel: { color: "rgba(255,255,255,.28)", fontSize: 9 },
+        axisLabel: { color: palette.chart.muted, fontSize: 9 },
       },
       yAxis: {
         type: "value",
-        splitLine: { lineStyle: { color: "rgba(255,255,255,.055)" } },
+        splitLine: { lineStyle: { color: palette.chart.grid } },
         axisLabel: {
-          color: "rgba(255,255,255,.26)",
+          color: palette.chart.muted,
           fontSize: 9,
           formatter: (value: number | string) =>
             formatCompanyMetric(Number(value), format, true),
@@ -199,7 +207,7 @@ function TrajectoryField({
         }),
       })),
     }
-  }, [format, series])
+  }, [format, palette, series])
 
   return (
     <div className="rounded-2xl border border-tipx-line/7 bg-tipx-ink/[0.025] p-3">
