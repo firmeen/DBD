@@ -25,12 +25,12 @@ export function AnalyticsDistributions({
 }) {
   if (distributions.length === 0) {
     return (
-      <div className="grid min-h-[360px] place-items-center rounded-[26px] border border-white/8 bg-white/[0.018] text-center">
+      <div className="grid min-h-[360px] place-items-center rounded-[26px] border border-tipx-line/8 bg-tipx-ink/[0.018] text-center">
         <div>
-          <p className="text-sm font-medium text-white/43">
+          <p className="text-sm font-medium text-tipx-ink/43">
             No coordinated distributions
           </p>
-          <p className="mt-2 text-[10px] text-white/24">
+          <p className="mt-2 text-[10px] text-tipx-ink/24">
             The serving contract has not supplied analytical buckets for this population.
           </p>
         </div>
@@ -148,17 +148,17 @@ function DistributionField({
   )
 
   return (
-    <section className="overflow-hidden rounded-[24px] border border-white/8 bg-[#0a1015]/70 p-4 backdrop-blur-xl">
+    <section className="overflow-hidden rounded-[24px] border border-tipx-line/8 bg-tipx-surface/70 p-4 backdrop-blur-xl">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div>
-          <p className="text-[9px] font-semibold uppercase tracking-[0.18em] text-white/28">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.18em] text-tipx-ink/28">
             {distribution.label}
           </p>
-          <p className="mt-1 text-[9px] text-white/18">
+          <p className="mt-1 text-[9px] text-tipx-ink/18">
             Click a semantic bucket to coordinate the analytical population
           </p>
         </div>
-        <span className="font-mono text-[8px] text-white/18">
+        <span className="font-mono text-[8px] text-tipx-ink/18">
           {distribution.buckets.length} buckets
         </span>
       </div>

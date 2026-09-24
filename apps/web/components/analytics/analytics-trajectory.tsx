@@ -29,13 +29,13 @@ export function AnalyticsTrajectory({
   if (groups.length === 0) return null
 
   return (
-    <section className="rounded-[26px] border border-white/8 bg-[#0a1015]/70 p-4 backdrop-blur-xl sm:p-5">
+    <section className="rounded-[26px] border border-tipx-line/8 bg-tipx-surface/70 p-4 backdrop-blur-xl sm:p-5">
       <div className="mb-4">
-        <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.19em] text-white/28">
+        <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.19em] text-tipx-ink/28">
           <Activity className="size-3.5" />
           Population trajectory
         </p>
-        <p className="mt-1 text-[9px] text-white/20">
+        <p className="mt-1 text-[9px] text-tipx-ink/20">
           Metric families stay on separate units; no mixed currency/percentage axis.
         </p>
       </div>
@@ -115,8 +115,8 @@ function TrajectoryGroup({
   }, [format, series])
 
   return (
-    <div className="rounded-2xl border border-white/7 bg-black/10 p-3">
-      <p className="mb-2 font-mono text-[8px] uppercase tracking-[0.14em] text-white/18">
+    <div className="rounded-2xl border border-tipx-line/7 bg-tipx-ink/[0.025] p-3">
+      <p className="mb-2 font-mono text-[8px] uppercase tracking-[0.14em] text-tipx-ink/18">
         {format}
       </p>
       <ReactECharts
