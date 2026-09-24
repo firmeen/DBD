@@ -112,7 +112,7 @@ export function SurfaceStage() {
   }
 
   return (
-    <main className="relative min-h-svh overflow-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative min-h-svh overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-45" />
       <div className="tipx-vignette absolute inset-0" />
       <div className="absolute left-[11%] top-[18%] size-[38vw] max-h-[640px] max-w-[640px] rounded-full bg-tipx-ink/[0.018] blur-3xl" />
@@ -206,7 +206,7 @@ function RuntimeCapability({
 
 function SpatialSurfaceLoader() {
   return (
-    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-35" />
       <div className="tipx-vignette absolute inset-0" />
       <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-tipx-line/8 bg-tipx-ink/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/38 backdrop-blur-xl">
@@ -220,7 +220,7 @@ function SpatialSurfaceLoader() {
 
 function CompanySurfaceLoader() {
   return (
-    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-25" />
       <div className="tipx-vignette absolute inset-0" />
       <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-tipx-line/8 bg-tipx-ink/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/38 backdrop-blur-xl">
@@ -234,7 +234,7 @@ function CompanySurfaceLoader() {
 
 function PeopleSurfaceLoader() {
   return (
-    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-24" />
       <div className="tipx-vignette absolute inset-0" />
       <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-tipx-line/8 bg-tipx-ink/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/38 backdrop-blur-xl">
@@ -248,7 +248,7 @@ function PeopleSurfaceLoader() {
 
 function RelationshipSurfaceLoader() {
   return (
-    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-18" />
       <div className="tipx-vignette absolute inset-0" />
       <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-tipx-line/8 bg-tipx-ink/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/38 backdrop-blur-xl">
@@ -262,7 +262,7 @@ function RelationshipSurfaceLoader() {
 
 function AnalyticsSurfaceLoader() {
   return (
-    <main className="relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative grid min-h-svh place-items-center overflow-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid absolute inset-0 opacity-24" />
       <div className="tipx-vignette absolute inset-0" />
       <div className="relative z-10 flex items-center gap-3 rounded-2xl border border-tipx-line/8 bg-tipx-ink/[0.025] px-4 py-3 text-[10px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/38 backdrop-blur-xl">
