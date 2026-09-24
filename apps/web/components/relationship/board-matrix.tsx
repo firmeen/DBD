@@ -9,7 +9,6 @@ import {
   UserRound,
 } from "lucide-react"
 
-import { capMatrixRegionSelection } from "@/lib/relationship/matrix-selection"
 import type { BoardMatrixSnapshot } from "@/lib/relationship/types"
 import {
   matrixCompanyToEntity,
@@ -135,15 +134,14 @@ export function BoardMatrix({
     const columnStart = Math.min(anchorPersonIndex, personIndex)
     const columnEnd = Math.max(anchorPersonIndex, personIndex)
 
-    const regionEntities = capMatrixRegionSelection(
-      companies
+    const regionEntities = [
+      ...companies
         .slice(rowStart, rowEnd + 1)
         .map(matrixCompanyToEntity),
-      people
+      ...people
         .slice(columnStart, columnEnd + 1)
         .map(matrixPersonToEntity),
-      MAX_REGION_ENTITIES
-    )
+    ].slice(0, MAX_REGION_ENTITIES)
 
     onSetSelection(regionEntities)
   }
