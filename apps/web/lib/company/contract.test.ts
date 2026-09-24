@@ -53,15 +53,21 @@ describe("company serving contract", () => {
 
   it("rejects nationality percentages outside 0..100", () => {
     const detail = baseDetail()
-    detail.nationality.current = [
-      {
-        code: "TH",
-        country: "Thailand",
-        sharePct: 101,
+    const invalid = {
+      ...detail,
+      nationality: {
+        ...detail.nationality,
+        current: [
+          {
+            code: "TH",
+            country: "Thailand",
+            sharePct: 101,
+          },
+        ],
       },
-    ]
+    }
 
-    expect(() => parseCompanyDetailSnapshot(detail)).toThrow()
+    expect(() => parseCompanyDetailSnapshot(invalid)).toThrow()
   })
 
   it("caps search populations at the UI serving budget", () => {
