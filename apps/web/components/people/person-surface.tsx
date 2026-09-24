@@ -114,7 +114,7 @@ export function PersonSurface() {
   }
 
   return (
-    <main className="relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
+    <main className="tipx-brand-field relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid fixed inset-0 opacity-24" />
       <div className="tipx-vignette fixed inset-0" />
       <div className="pointer-events-none fixed left-[14%] top-[10%] size-[40vw] max-h-[720px] max-w-[720px] rounded-full bg-cyan-200/[0.012] blur-3xl" />
