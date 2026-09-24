@@ -471,7 +471,18 @@ def test_local_guardian_lock_prevents_duplicate_controller(monkeypatch, tmp_path
 def test_powershell_watchdog_contract() -> None:
     script = (guardian.PROJECT_ROOT / "Run-DBD.ps1").read_text(encoding="utf-8")
 
+    # Windows PowerShell 5.1 can misdecode UTF-8 without BOM using a legacy
+    # code page. Keeping the watchdog source ASCII-only makes parsing invariant.
+    assert script.isascii()
     assert '"-m", "dbd", "campaign", "guard"' in script
+    assert '[switch]$Headless' in script
+    assert '[switch]$OpenPowerShell' in script
+    assert '$commandArgs += "--headless"' in script
+    assert '$commandArgs += "--open-powershell"' in script
+    assert '$SourceRoot = Join-Path $Root "src"' in script
+    assert 'Initialize-ProjectPythonPath' in script
+    assert 'PYTHONPATH' in script
+    assert 'Assert-DbdImport' in script
     assert "bulk-retry" not in script.lower()
     assert "flushdb" not in script.lower()
     assert "flushall" not in script.lower()
