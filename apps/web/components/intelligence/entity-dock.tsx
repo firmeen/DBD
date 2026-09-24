@@ -20,6 +20,12 @@ export function EntityDock() {
   ) {
     return null
   }
+  if (
+    activeSurface === "R" &&
+    (focus?.kind === "person" || focus?.kind === "company")
+  ) {
+    return null
+  }
 
   const inCompare =
     focus &&
