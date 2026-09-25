@@ -1,5 +1,6 @@
 "use client"
 
+import { AiAssistantEntry } from "./assistant/ai-assistant-entry"
 import { CommandCenter } from "./command-center"
 import { CompareTray } from "./compare-tray"
 import { ContextBar } from "./context-bar"
@@ -21,6 +22,7 @@ export function IntelligenceShell() {
       <EntityDock />
       <CompareTray />
       <CommandCenter />
+      <AiAssistantEntry />
     </div>
   )
 }
