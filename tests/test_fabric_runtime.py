@@ -911,7 +911,7 @@ async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_re
         recovery_run,
         concurrency=1,
         client_factory=FullFabricApi,
-    ) == {"done": 3}
+    ) == {"done": 2, "not_available": 1}
     assert FullFabricApi.calls == 1
 
     async with repo.engine.connect() as conn:

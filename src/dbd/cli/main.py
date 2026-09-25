@@ -421,7 +421,11 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
         return
     if args.campaign_command == "recover":
         source_state = campaign_status(args.source_run_id)
-        if source_state.get("supervisor_active") or int(source_state.get("workers", 0) or 0):
+        if (
+            source_state.get("supervisor_active")
+            or int(source_state.get("workers", 0) or 0)
+            or int(source_state.get("running", 0) or 0)
+        ):
             raise ValueError(
                 "Source campaign is still active; pause/stop it before creating a recovery run"
             )

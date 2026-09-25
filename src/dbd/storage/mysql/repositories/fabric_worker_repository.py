@@ -943,12 +943,21 @@ class FabricWorkerRepository(WorkerRepository):
                         s.not_available_mask & s.required_mask & ~s.done_mask
                       )),0) AS preserved_not_available,
                       COALESCE(SUM(BIT_COUNT(
-                        s.required_mask & ~(s.done_mask | s.not_available_mask)
+                        CASE WHEN m.identity_status<>'conflict'
+                          THEN s.required_mask & ~(s.done_mask | s.not_available_mask)
+                          ELSE 0 END
                       )),0) AS retry_resources,
                       COALESCE(SUM(BIT_COUNT(
-                        s.failed_mask & s.required_mask
-                        & ~s.done_mask & ~s.not_available_mask
+                        CASE WHEN m.identity_status<>'conflict'
+                          THEN s.failed_mask & s.required_mask
+                            & ~s.done_mask & ~s.not_available_mask
+                          ELSE 0 END
                       )),0) AS failed_resources_to_reopen,
+                      COALESCE(SUM(BIT_COUNT(
+                        CASE WHEN m.identity_status='conflict'
+                          THEN s.required_mask & ~(s.done_mask | s.not_available_mask)
+                          ELSE 0 END
+                      )),0) AS quarantined_resources,
                       COALESCE(SUM(m.identity_status='conflict'),0) AS identity_conflicts
                     FROM company_collection_state s
                     JOIN company_master m ON m.company_id=s.company_id
@@ -1056,7 +1065,7 @@ class FabricWorkerRepository(WorkerRepository):
                     if conflict:
                         failed = retry_mask
                         next_item = None
-                        status = "failed"
+                        status = "failed" if retry_mask else "done"
                     else:
                         next_item = next_endpoint(
                             required,
