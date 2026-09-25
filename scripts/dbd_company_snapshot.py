@@ -601,6 +601,20 @@ def db_name(conn) -> str:
     return value.decode() if isinstance(value, bytes) else str(value)
 
 
+def dict_value_ci(row: dict[str, Any], key: str) -> Any:
+    """Return a mapping value using a case-insensitive key lookup.
+
+    INFORMATION_SCHEMA column labels are not consistently cased across
+    MySQL/PyMySQL combinations. For example, selecting COLUMN_NAME can yield
+    either "column_name" or "COLUMN_NAME" in DictCursor rows.
+    """
+    wanted = key.casefold()
+    for existing_key, value in row.items():
+        if str(existing_key).casefold() == wanted:
+            return value
+    raise KeyError(key)
+
+
 def table_exists(conn, table_name: str) -> bool:
     sql = """
     SELECT COUNT(*) AS n
@@ -609,18 +623,21 @@ def table_exists(conn, table_name: str) -> bool:
     """
     with conn.cursor() as cur:
         cur.execute(sql, (db_name(conn), table_name))
-        return int(cur.fetchone()["n"]) > 0
+        return int(dict_value_ci(cur.fetchone(), "n") or 0) > 0
 
 
 def get_table_columns(conn, table_name: str) -> set[str]:
     sql = """
-    SELECT column_name
+    SELECT COLUMN_NAME AS column_name
     FROM information_schema.columns
     WHERE table_schema=%s AND table_name=%s
     """
     with conn.cursor() as cur:
         cur.execute(sql, (db_name(conn), table_name))
-        return {row["column_name"] for row in cur.fetchall()}
+        return {
+            str(dict_value_ci(row, "column_name")).casefold()
+            for row in cur.fetchall()
+        }
 
 
 def preflight_source_schema(conn):
