@@ -82,6 +82,8 @@ class WorkerRepository:
         *,
         scheduler_mode="legacy",
         force_refresh_mask=0,
+        parent_run_id=None,
+        recovery_kind=None,
     ):
         if scheduler_mode not in ("legacy", "fabric_v2"):
             raise ValueError("scheduler_mode must be legacy or fabric_v2")
@@ -92,9 +94,11 @@ class WorkerRepository:
             result = await conn.execute(
                 text("""
                 INSERT INTO worker_runs(
-                  source_label,parts,fiscal_year,scheduler_mode,force_refresh_mask
+                  source_label,parts,fiscal_year,scheduler_mode,force_refresh_mask,
+                  parent_run_id,recovery_kind
                 ) VALUES (
-                  :source,:parts,:year,:scheduler_mode,:force_refresh_mask
+                  :source,:parts,:year,:scheduler_mode,:force_refresh_mask,
+                  :parent_run_id,:recovery_kind
                 )
                 """),
                 {
@@ -103,6 +107,8 @@ class WorkerRepository:
                     "year": fiscal_year,
                     "scheduler_mode": scheduler_mode,
                     "force_refresh_mask": force_refresh_mask,
+                    "parent_run_id": parent_run_id,
+                    "recovery_kind": recovery_kind,
                 },
             )
             return result.lastrowid
@@ -460,6 +466,69 @@ class WorkerRepository:
             if status == "not_available":
                 return FinishResult(True, completed_delta=1, not_available_delta=1)
             return FinishResult(True, completed_delta=1, done_delta=1)
+
+    @transaction_retry
+    async def defer(self, task, error, *, delay_seconds: int):
+        """Defer owned work without charging a transient infrastructure failure."""
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                UPDATE endpoint_tasks
+                SET status='retry_wait',last_error=:error,
+                  lease_owner=NULL,lease_expires_at=NULL,
+                  attempts=CASE
+                    WHEN stage='fetch' AND attempts>0 THEN attempts-1 ELSE attempts END,
+                  project_attempts=CASE
+                    WHEN stage='project' AND project_attempts>0
+                    THEN project_attempts-1 ELSE project_attempts END,
+                  available_at=TIMESTAMPADD(SECOND,:delay,UTC_TIMESTAMP(6))
+                WHERE id=:id AND status='running'
+                  AND lease_owner=:owner AND lease_version=:version
+                  AND lease_expires_at>UTC_TIMESTAMP(6)
+                """),
+                {
+                    "error": error,
+                    "delay": max(1, int(delay_seconds)),
+                    "id": task["id"],
+                    "owner": task["lease_owner"],
+                    "version": task["lease_version"],
+                },
+            )
+            return FinishResult(result.rowcount == 1)
+
+    async def record_failure_event(
+        self,
+        task,
+        *,
+        outcome: str,
+        error_code: str,
+        http_status: int | None,
+        attempt: int,
+        archive_id=None,
+    ) -> None:
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text("""
+                INSERT INTO collection_failure_events(
+                  run_id,company_id,endpoint,stage,outcome,error_code,http_status,
+                  attempt,archive_id,occurred_at
+                ) VALUES (
+                  :run,:company,:endpoint,:stage,:outcome,:error,:http_status,
+                  :attempt,:archive,UTC_TIMESTAMP(6)
+                )
+                """),
+                {
+                    "run": task["run_id"],
+                    "company": task["company_id"],
+                    "endpoint": task["endpoint"],
+                    "stage": task.get("stage", "fetch"),
+                    "outcome": outcome,
+                    "error": error_code,
+                    "http_status": http_status,
+                    "attempt": max(0, int(attempt)),
+                    "archive": archive_id,
+                },
+            )
 
     @transaction_retry
     async def release(self, owner):

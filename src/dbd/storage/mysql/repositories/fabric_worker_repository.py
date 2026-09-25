@@ -567,6 +567,38 @@ class FabricWorkerRepository(WorkerRepository):
             )
 
     @transaction_retry
+    async def defer(self, task, error, *, delay_seconds: int):
+        async with self.engine.begin() as conn:
+            row = await self._owned_state(conn, task)
+            if row is None:
+                return FinishResult(False)
+            result = await conn.execute(
+                text("""
+                UPDATE company_collection_state
+                SET status='retry_wait',last_error=:error,
+                  lease_owner=NULL,lease_expires_at=NULL,
+                  attempts=CASE
+                    WHEN stage='fetch' AND attempts>0 THEN attempts-1 ELSE attempts END,
+                  project_attempts=CASE
+                    WHEN stage='project' AND project_attempts>0
+                    THEN project_attempts-1 ELSE project_attempts END,
+                  available_at=TIMESTAMPADD(SECOND,:delay,UTC_TIMESTAMP(6)),
+                  updated_at=UTC_TIMESTAMP(6)
+                WHERE id=:id AND status='running'
+                  AND lease_owner=:owner AND lease_version=:version
+                  AND lease_expires_at>UTC_TIMESTAMP(6)
+                """),
+                {
+                    "error": error,
+                    "delay": max(1, int(delay_seconds)),
+                    "id": row["id"],
+                    "owner": row["lease_owner"],
+                    "version": row["lease_version"],
+                },
+            )
+            return FinishResult(result.rowcount == 1)
+
+    @transaction_retry
     async def finish_identity_conflict(
         self,
         task,
@@ -894,6 +926,240 @@ class FabricWorkerRepository(WorkerRepository):
                 {"id": run_id},
             )
 
+    async def recovery_plan(self, source_run_id: int) -> dict:
+        source = await self.get_run(source_run_id)
+        if str(source.get("scheduler_mode") or "legacy") != self.scheduler_mode:
+            raise ValueError("Campaign recovery requires a fabric_v2 source run")
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                    SELECT
+                      COUNT(*) AS companies,
+                      COALESCE(SUM(BIT_COUNT(s.required_mask)),0) AS selected_resources,
+                      COALESCE(SUM(BIT_COUNT(s.done_mask & s.required_mask)),0)
+                        AS preserved_done,
+                      COALESCE(SUM(BIT_COUNT(
+                        s.not_available_mask & s.required_mask & ~s.done_mask
+                      )),0) AS preserved_not_available,
+                      COALESCE(SUM(BIT_COUNT(
+                        s.required_mask & ~(s.done_mask | s.not_available_mask)
+                      )),0) AS retry_resources,
+                      COALESCE(SUM(BIT_COUNT(
+                        s.failed_mask & s.required_mask
+                        & ~s.done_mask & ~s.not_available_mask
+                      )),0) AS failed_resources_to_reopen,
+                      COALESCE(SUM(m.identity_status='conflict'),0) AS identity_conflicts
+                    FROM company_collection_state s
+                    JOIN company_master m ON m.company_id=s.company_id
+                    WHERE s.run_id=:run
+                    """),
+                    {"run": int(source_run_id)},
+                )
+            ).mappings().one()
+        return {
+            "source_run_id": int(source_run_id),
+            **{key: int(value or 0) for key, value in row.items()},
+        }
+
+    async def create_recovery_run(
+        self,
+        source_run_id: int,
+        *,
+        recovery_run_id: int | None = None,
+    ) -> dict:
+        source = await self.get_run(source_run_id)
+        if str(source.get("scheduler_mode") or "legacy") != self.scheduler_mode:
+            raise ValueError("Campaign recovery requires a fabric_v2 source run")
+
+        if recovery_run_id is None:
+            recovery_run_id = int(
+                await self.create_run(
+                    f"recovery:{int(source_run_id)}:{str(source.get('source_label') or '')}"[:255],
+                    str(source.get("parts") or "").split(","),
+                    source.get("fiscal_year"),
+                    scheduler_mode=self.scheduler_mode,
+                    force_refresh_mask=0,
+                    parent_run_id=int(source_run_id),
+                    recovery_kind="failed_unresolved",
+                )
+            )
+        else:
+            recovery_run_id = int(recovery_run_id)
+            async with self.engine.connect() as conn:
+                target = (
+                    await conn.execute(
+                        text("SELECT * FROM worker_runs WHERE id=:id"),
+                        {"id": recovery_run_id},
+                    )
+                ).mappings().first()
+            if target is None:
+                raise ValueError(f"Recovery run {recovery_run_id} not found")
+            if str(target.get("scheduler_mode") or "") != self.scheduler_mode:
+                raise ValueError("Recovery target must use fabric_v2")
+            if int(target.get("parent_run_id") or 0) != int(source_run_id):
+                raise ValueError("Recovery target belongs to a different source run")
+            if str(target.get("recovery_kind") or "") != "failed_unresolved":
+                raise ValueError("Recovery target has an incompatible recovery kind")
+            if str(target.get("status") or "") != "building":
+                raise ValueError("Only an interrupted building recovery run can be resumed")
+
+        batch_size = max(100, int(settings.dbd_materialize_batch_size))
+        async with self.engine.connect() as conn:
+            after_company = int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT COALESCE(MAX(company_id),0) "
+                            "FROM company_collection_state WHERE run_id=:run"
+                        ),
+                        {"run": recovery_run_id},
+                    )
+                ).scalar_one()
+                or 0
+            )
+
+        while True:
+            async with self.engine.begin() as conn:
+                rows = (
+                    await conn.execute(
+                        text("""
+                        SELECT s.*,m.identity_status
+                        FROM company_collection_state s
+                        JOIN company_master m ON m.company_id=s.company_id
+                        WHERE s.run_id=:source AND s.company_id>:after
+                        ORDER BY s.company_id
+                        LIMIT :limit
+                        """),
+                        {
+                            "source": int(source_run_id),
+                            "after": after_company,
+                            "limit": batch_size,
+                        },
+                    )
+                ).mappings().all()
+                if not rows:
+                    break
+
+                values = []
+                for row in rows:
+                    required = int(row["required_mask"])
+                    done = int(row["done_mask"]) & required
+                    not_available = int(row["not_available_mask"]) & required & ~done
+                    retry_mask = required & ~(done | not_available)
+                    conflict = (
+                        str(row.get("identity_status") or "") == "conflict"
+                        or str(row.get("last_error") or "") == "IdentityConflict"
+                    )
+                    failed = int(row["failed_mask"]) & retry_mask
+                    dirty = 0 if conflict else retry_mask
+                    if conflict:
+                        failed = retry_mask
+                        next_item = None
+                        status = "failed"
+                    else:
+                        next_item = next_endpoint(
+                            required,
+                            done,
+                            not_available,
+                            failed=failed,
+                            dirty=dirty,
+                            fiscal_year=row.get("fiscal_year"),
+                        )
+                        if retry_mask and next_item is None:
+                            raise RuntimeError(
+                                f"Recovery state for company {row['company_id']} "
+                                "contains unreachable work"
+                            )
+                        status = "pending" if retry_mask else "done"
+
+                    values.append(
+                        {
+                            "run": recovery_run_id,
+                            "company": int(row["company_id"]),
+                            "required": required,
+                            "done": done,
+                            "na": not_available,
+                            "failed": failed,
+                            "dirty": dirty,
+                            "forced": dirty,
+                            "next": next_item,
+                            "year": row.get("fiscal_year"),
+                            "master_hash": row.get("master_hash"),
+                            "status": status,
+                            "finished": now() if status in ("done", "failed") else None,
+                        }
+                    )
+
+                await conn.execute(
+                    text("""
+                    INSERT INTO company_collection_state(
+                      run_id,company_id,required_mask,done_mask,not_available_mask,
+                      failed_mask,dirty_mask,change_dirty_mask,stale_dirty_mask,
+                      forced_dirty_mask,next_endpoint,fiscal_year,master_hash,
+                      stage,status,attempts,project_attempts,available_at,
+                      lease_owner,lease_version,lease_expires_at,raw_response_id,
+                      last_error,updated_at,finished_at
+                    ) VALUES (
+                      :run,:company,:required,:done,:na,
+                      :failed,:dirty,0,0,
+                      :forced,:next,:year,:master_hash,
+                      'fetch',:status,0,0,UTC_TIMESTAMP(6),
+                      NULL,0,NULL,NULL,
+                      NULL,UTC_TIMESTAMP(6),:finished
+                    )
+                    ON DUPLICATE KEY UPDATE id=id
+                    """),
+                    values,
+                )
+                after_company = int(rows[-1]["company_id"])
+
+        async with self.engine.begin() as conn:
+            source_count = int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM company_collection_state "
+                            "WHERE run_id=:run"
+                        ),
+                        {"run": int(source_run_id)},
+                    )
+                ).scalar_one()
+                or 0
+            )
+            target_count = int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM company_collection_state "
+                            "WHERE run_id=:run"
+                        ),
+                        {"run": recovery_run_id},
+                    )
+                ).scalar_one()
+                or 0
+            )
+            if source_count != target_count:
+                raise RuntimeError(
+                    f"Recovery materialization incomplete: source={source_count} "
+                    f"target={target_count}"
+                )
+            await conn.execute(
+                text(
+                    "UPDATE worker_runs SET status='ready',finished_at=NULL "
+                    "WHERE id=:run AND status='building'"
+                ),
+                {"run": recovery_run_id},
+            )
+
+        plan = await self.recovery_plan(source_run_id)
+        return {
+            **plan,
+            "recovery_run_id": recovery_run_id,
+            "materialized_companies": target_count,
+            "status": "ready",
+        }
+
     async def retry_failed(self, run_id):
         """Reopen terminal fabric failures in bounded transactions.
 
@@ -910,7 +1176,11 @@ class FabricWorkerRepository(WorkerRepository):
                         text("""
                         SELECT s.* FROM company_collection_state s
                         JOIN company_master m ON m.company_id=s.company_id
-                        WHERE s.run_id=:id AND s.status='failed' AND s.failed_mask<>0
+                        WHERE s.run_id=:id AND s.status IN ('pending','failed')
+                          AND (
+                            s.failed_mask & ~s.dirty_mask
+                            & ~s.done_mask & ~s.not_available_mask
+                          )<>0
                           AND m.identity_status<>'conflict'
                           AND COALESCE(s.last_error,'')<>'IdentityConflict'
                         ORDER BY s.id
@@ -925,9 +1195,16 @@ class FabricWorkerRepository(WorkerRepository):
                 batch_reopened = 0
                 for row in rows:
                     failed_mask = int(row["failed_mask"])
-                    if not failed_mask:
+                    retryable_failed = (
+                        failed_mask
+                        & ~int(row["dirty_mask"])
+                        & ~int(row["done_mask"])
+                        & ~int(row["not_available_mask"])
+                        & int(row["required_mask"])
+                    )
+                    if not retryable_failed:
                         continue
-                    retry_dirty = int(row["dirty_mask"]) | failed_mask
+                    retry_dirty = int(row["dirty_mask"]) | retryable_failed
                     next_item = next_endpoint(
                         int(row["required_mask"]),
                         int(row["done_mask"]),

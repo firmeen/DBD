@@ -248,6 +248,31 @@ async def _prepare_campaign(args) -> int:
         await engine.dispose()
 
 
+async def _recover_campaign(args) -> dict:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        source = await repo.get_run(args.source_run_id)
+        scheduler_repo = repo.for_run(source)
+        if scheduler_repo.scheduler_mode != "fabric_v2":
+            raise ValueError("campaign recover requires a fabric_v2 source run")
+        if not args.execute:
+            plan = await scheduler_repo.recovery_plan(args.source_run_id)
+            return {
+                **plan,
+                "action": "plan_only",
+                "next_command": (
+                    f"dbd-data campaign recover {int(args.source_run_id)} --execute"
+                ),
+            }
+        return await scheduler_repo.create_recovery_run(
+            args.source_run_id,
+            recovery_run_id=args.recovery_run_id,
+        )
+    finally:
+        await engine.dispose()
+
+
 async def _validate_campaign_run(run_id: int) -> None:
     engine = create_engine()
     repo = WorkerRepository(engine)
@@ -394,6 +419,26 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
             {"run_id": int(args.run_id), "action": "graceful_stop_requested"},
         )
         return
+    if args.campaign_command == "recover":
+        source_state = campaign_status(args.source_run_id)
+        if source_state.get("supervisor_active") or int(source_state.get("workers", 0) or 0):
+            raise ValueError(
+                "Source campaign is still active; pause/stop it before creating a recovery run"
+            )
+        if args.recovery_run_id is not None and not args.execute:
+            raise ValueError("--recovery-run-id requires --execute")
+        if args.execute:
+            with manager_lock() as conn:
+                payload = asyncio.run(_recover_campaign(args))
+                assert_manager_lock(conn)
+        else:
+            payload = asyncio.run(_recover_campaign(args))
+        if args.execute:
+            payload["next_command"] = (
+                f".\\Run-DBD.ps1 {int(payload['recovery_run_id'])} -Headless"
+            )
+        presenter.command_result("DBD · FABRIC RECOVERY", payload)
+        return
     if args.campaign_command == "guard":
         from ..runtime.guardian import guard_campaign_run
 
@@ -494,6 +539,23 @@ def main():
     )
     campaign_guard.add_argument("run_id", type=positive)
     _add_campaign_guard_options(campaign_guard)
+    campaign_recover = _add_output_options(
+        campaign_sub.add_parser(
+            "recover",
+            help="Plan or materialize a clean fabric_v2 recovery run from an existing run",
+        )
+    )
+    campaign_recover.add_argument("source_run_id", type=positive)
+    campaign_recover.add_argument(
+        "--execute",
+        action="store_true",
+        help="Create the recovery run; without this flag the command is read-only",
+    )
+    campaign_recover.add_argument(
+        "--recovery-run-id",
+        type=positive,
+        help="Resume one interrupted building recovery run",
+    )
     campaign_status_parser = _add_output_options(
         campaign_sub.add_parser("status", help="Show fleet and durable queue status")
     )
