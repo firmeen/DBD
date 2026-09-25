@@ -5,10 +5,11 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import dbd.client.async_client as async_client_module
 from dbd.client import rate_limit
 from dbd.client.async_client import AsyncDbdClient
 from dbd.client.rate_limit import TokenBucket, protective_cooldown
-from dbd.core.exceptions import DbdTokenExpiredError
+from dbd.core.exceptions import DbdAuthError, DbdForbiddenError, DbdTokenExpiredError
 
 
 def response(status=200, headers=None):
@@ -129,9 +130,52 @@ def test_rate_recovers_gradually_and_never_exceeds_target(monkeypatch):
     assert bucket.recover() is None
 
 
-async def test_403_is_not_retried():
+async def test_403_refreshes_auth_and_retries():
+    c = client()
+    c._session.request.side_effect = [response(403), response()]
+    c._ensure_token = AsyncMock(side_effect=["old", "new", "new"])
+
+    result = await c.fetch("GET", "/test")
+
+    assert result.status == 200
+    assert c.requests_made == 2
+    assert c.retries_made == 1
+    assert c._ensure_token.await_count == 3
+
+
+async def test_repeated_403_is_bounded_by_http_retry_budget():
     c = client()
     c._session.request.return_value = response(403)
-    with pytest.raises(Exception, match="403"):
+    c._ensure_token = AsyncMock(return_value="token")
+
+    with pytest.raises(DbdForbiddenError, match="403"):
         await c.fetch("GET", "/test")
-    assert c.requests_made == 1
+
+    assert c.requests_made == 2
+    assert c.retries_made == 1
+
+
+async def test_context_entry_does_not_require_upstream_auth(monkeypatch):
+    c = AsyncDbdClient(concurrency=1, rate_per_second=1, max_retries=0)
+    c.endpoint_rate.open = AsyncMock()
+    c.endpoint_rate.close = AsyncMock()
+    fake_async_session = SimpleNamespace(close=AsyncMock(), cookies={})
+    fake_auth_session = SimpleNamespace(close=lambda: None)
+
+    monkeypatch.setattr(
+        async_client_module,
+        "AsyncSession",
+        lambda **kwargs: fake_async_session,
+    )
+    monkeypatch.setattr(
+        async_client_module,
+        "create_session",
+        lambda: fake_auth_session,
+    )
+    c._ensure_token = AsyncMock(side_effect=DbdAuthError("offline"))
+
+    entered = await c.__aenter__()
+    assert entered is c
+    c._ensure_token.assert_not_awaited()
+
+    await c.__aexit__()

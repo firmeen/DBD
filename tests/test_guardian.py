@@ -7,15 +7,18 @@ from dbd.presentation.guardian import GuardianDashboard
 class QuietDashboard:
     def __init__(self) -> None:
         self.phases = []
+        self.payloads = []
 
     def render(self, payload):
         self.phases.append(payload["phase"])
+        self.payloads.append(payload)
 
     def suspend(self):
         pass
 
     def close(self, payload):
         self.phases.append(payload["phase"])
+        self.payloads.append(payload)
 
 
 def state(*, remaining: int, failed: int = 0):
@@ -348,14 +351,59 @@ def test_operator_pause_is_not_auto_resumed(monkeypatch, tmp_path) -> None:
         "supervise_campaign",
         lambda run_id, **kwargs: calls.append(run_id) or 130,
     )
+    monkeypatch.setattr(
+        guardian,
+        "campaign_status",
+        lambda run_id: state(remaining=7, failed=3),
+    )
+    dashboard = QuietDashboard()
 
     code = guardian._guard_loop(
         guardian.GuardianConfig(run_id=8),
-        QuietDashboard(),
+        dashboard,
     )
 
     assert code == 130
     assert calls == [8]
+    assert dashboard.phases[-1] == "PAUSED"
+    assert dashboard.payloads[-1]["counts"]["total"] == 10
+    assert dashboard.payloads[-1]["counts"]["failed"] == 3
+    assert dashboard.payloads[-1]["counts"]["remaining"] == 7
+
+
+def test_capacity_exhaustion_stops_guardian_recovery_churn(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(guardian, "package_environment_snapshot", lambda: {"health": "healthy"})
+    monkeypatch.setattr(
+        guardian,
+        "_wait_for_recovery_gate",
+        lambda *a, **k: (state(remaining=10), probe()),
+    )
+    calls = []
+    monkeypatch.setattr(
+        guardian,
+        "supervise_campaign",
+        lambda run_id, **kwargs: calls.append(run_id) or 2,
+    )
+    monkeypatch.setattr(
+        guardian,
+        "campaign_status",
+        lambda run_id: state(remaining=10),
+    )
+    dashboard = QuietDashboard()
+
+    code = guardian._guard_loop(
+        guardian.GuardianConfig(run_id=8),
+        dashboard,
+    )
+
+    assert code == 2
+    assert calls == [8]
+    assert dashboard.phases[-1] == "CAPACITY_EXHAUSTED"
+    saved = guardian._read_json(guardian.guardian_state_path(8))
+    assert saved["terminal"] is True
+    assert saved["phase"] == "CAPACITY_EXHAUSTED"
+    assert saved["exit_code"] == 2
 
 
 def test_duplicate_guardian_cannot_persist_rejected_overrides(monkeypatch, tmp_path) -> None:
