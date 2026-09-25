@@ -10,7 +10,7 @@ from sqlalchemy import text
 import dbd.storage.mysql.repositories.projection_repository as projection_repository
 from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
-from dbd.core.exceptions import ContractError
+from dbd.core.exceptions import ContractError, DbdForbiddenError
 from dbd.core.settings import settings
 from dbd.runtime.collection_fabric import endpoint_bit
 from dbd.runtime.replay import replay_archive
@@ -702,3 +702,232 @@ async def test_fabric_retry_batches_large_failed_population(repo):
     assert rows["profile_next"] == population
     assert rows["retry_dirty"] == population
     assert run_status == "ready"
+
+
+class AlwaysForbiddenApi:
+    calls = 0
+
+    def __init__(self, **kwargs):
+        self.requests_made = 0
+        self.retries_made = 0
+        self.rate_limit_hits = 0
+        self.endpoint_rate = None
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return None
+
+    async def fetch(self, method, path, **kwargs):
+        type(self).calls += 1
+        self.requests_made += 1
+        raise DbdForbiddenError("HTTP 403")
+
+
+async def test_transient_forbidden_defers_without_failed_bit_or_attempt_charge(repo):
+    AlwaysForbiddenApi.calls = 0
+    fabric, run_id, _ = await new_fabric_run(repo, ("profile",))
+
+    result = await process(
+        repo,
+        run_id,
+        concurrency=1,
+        limit=1,
+        client_factory=AlwaysForbiddenApi,
+    )
+
+    assert result == {"retry_wait": 1}
+    assert AlwaysForbiddenApi.calls == 1
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT status,attempts,failed_mask,last_error "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+        event = (
+            await conn.execute(
+                text(
+                    "SELECT outcome,error_code,http_status,attempt "
+                    "FROM collection_failure_events WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert state["status"] == "retry_wait"
+    assert state["attempts"] == 0
+    assert state["failed_mask"] == 0
+    assert state["last_error"] == "DbdForbiddenError"
+    assert event["outcome"] == "deferred"
+    assert event["error_code"] == "DbdForbiddenError"
+    assert event["http_status"] == 403
+    assert event["attempt"] == 1
+
+
+async def test_fabric_retry_reopens_failed_bits_embedded_in_pending_state(repo):
+    resources = ("profile", "committees", "transformations")
+    fabric, run_id, _ = await new_fabric_run(repo, resources)
+    profile = endpoint_bit("profile")
+    committee = endpoint_bit("committees")
+    transform = endpoint_bit("transformations")
+
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE company_collection_state "
+                "SET done_mask=:profile,failed_mask=:committee,dirty_mask=:transform,"
+                "next_endpoint='transformations',status='pending',last_error='ContractError' "
+                "WHERE run_id=:run"
+            ),
+            {
+                "profile": profile,
+                "committee": committee,
+                "transform": transform,
+                "run": run_id,
+            },
+        )
+
+    assert await fabric.retry_failed(run_id) == 1
+
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT status,next_endpoint,failed_mask,dirty_mask,attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert state["status"] == "pending"
+    assert state["next_endpoint"] == "committees"
+    assert int(state["failed_mask"]) & committee
+    assert int(state["dirty_mask"]) & committee
+    assert int(state["dirty_mask"]) & transform
+    assert state["attempts"] == 0
+
+
+async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_rest(repo):
+    resources = ("profile", "committees", "transformations")
+    fabric, source_run, _ = await new_fabric_run(repo, resources)
+    profile = endpoint_bit("profile")
+    committee = endpoint_bit("committees")
+    transform = endpoint_bit("transformations")
+
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE company_collection_state "
+                "SET done_mask=:profile,not_available_mask=:transform,"
+                "failed_mask=:committee,dirty_mask=0,next_endpoint=NULL,"
+                "status='failed',attempts=3,last_error='DbdForbiddenError',"
+                "finished_at=UTC_TIMESTAMP(6) WHERE run_id=:run"
+            ),
+            {
+                "profile": profile,
+                "transform": transform,
+                "committee": committee,
+                "run": source_run,
+            },
+        )
+
+    source_before = None
+    async with repo.engine.connect() as conn:
+        source_before = dict(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT done_mask,not_available_mask,failed_mask,status,attempts "
+                        "FROM company_collection_state WHERE run_id=:run"
+                    ),
+                    {"run": source_run},
+                )
+            ).mappings().one()
+        )
+
+    plan = await fabric.recovery_plan(source_run)
+    assert plan["preserved_done"] == 1
+    assert plan["preserved_not_available"] == 1
+    assert plan["retry_resources"] == 1
+    assert plan["failed_resources_to_reopen"] == 1
+
+    created = await fabric.create_recovery_run(source_run)
+    recovery_run = created["recovery_run_id"]
+
+    async with repo.engine.connect() as conn:
+        target_run = (
+            await conn.execute(
+                text(
+                    "SELECT parent_run_id,recovery_kind,status "
+                    "FROM worker_runs WHERE id=:run"
+                ),
+                {"run": recovery_run},
+            )
+        ).mappings().one()
+        target = (
+            await conn.execute(
+                text(
+                    "SELECT done_mask,not_available_mask,failed_mask,dirty_mask,"
+                    "next_endpoint,status,attempts,project_attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": recovery_run},
+            )
+        ).mappings().one()
+        source_after = dict(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT done_mask,not_available_mask,failed_mask,status,attempts "
+                        "FROM company_collection_state WHERE run_id=:run"
+                    ),
+                    {"run": source_run},
+                )
+            ).mappings().one()
+        )
+
+    assert target_run["parent_run_id"] == source_run
+    assert target_run["recovery_kind"] == "failed_unresolved"
+    assert target_run["status"] == "ready"
+    assert int(target["done_mask"]) == profile
+    assert int(target["not_available_mask"]) == transform
+    assert int(target["failed_mask"]) == committee
+    assert int(target["dirty_mask"]) == committee
+    assert target["next_endpoint"] == "committees"
+    assert target["status"] == "pending"
+    assert target["attempts"] == 0
+    assert target["project_attempts"] == 0
+    assert source_after == source_before
+
+    FullFabricApi.calls = 0
+    assert await process(
+        repo,
+        recovery_run,
+        concurrency=1,
+        client_factory=FullFabricApi,
+    ) == {"done": 3}
+    assert FullFabricApi.calls == 1
+
+    async with repo.engine.connect() as conn:
+        final = (
+            await conn.execute(
+                text(
+                    "SELECT BIT_COUNT(done_mask) done_count,"
+                    "BIT_COUNT(not_available_mask) na_count,failed_mask,dirty_mask,status "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": recovery_run},
+            )
+        ).mappings().one()
+
+    assert final["done_count"] == 2
+    assert final["na_count"] == 1
+    assert final["failed_mask"] == 0
+    assert final["dirty_mask"] == 0
+    assert final["status"] == "done"
