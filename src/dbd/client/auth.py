@@ -27,9 +27,11 @@ class DbdAuth:
             return self._token
         return self._refresh(session)
 
-    def invalidate(self) -> None:
+    def invalidate(self, *, reset_warmup: bool = False) -> None:
         self._token = None
         self._expires_at = 0.0
+        if reset_warmup:
+            self._warmed_up = False
 
     def _refresh(self, session: requests.Session) -> str:
         if not self._warmed_up:

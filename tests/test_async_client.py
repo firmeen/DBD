@@ -141,6 +141,7 @@ async def test_403_refreshes_auth_and_retries():
     assert c.requests_made == 2
     assert c.retries_made == 1
     assert c._ensure_token.await_count == 3
+    c._ensure_token.assert_any_await(rejected="old", reset_warmup=True)
 
 
 async def test_repeated_403_is_bounded_by_http_retry_budget():

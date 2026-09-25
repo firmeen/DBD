@@ -148,10 +148,10 @@ class AsyncDbdClient:
             self._auth_session = None
         await self.endpoint_rate.close()
 
-    async def _ensure_token(self, *, rejected=None, force=False):
+    async def _ensure_token(self, *, rejected=None, force=False, reset_warmup=False):
         async with self._auth_lock:
             if force or (rejected is not None and rejected == self._token):
-                self._auth.invalidate()
+                self._auth.invalidate(reset_warmup=reset_warmup)
                 self._token = None
             if self._token is None or time.time() >= self._auth._expires_at - 15:
                 self._token = await asyncio.to_thread(self._blocking_token)
@@ -318,7 +318,7 @@ class AsyncDbdClient:
                         raise TransientHttpError("HTTP 401", status_code=401)
                     if status == 403:
                         await self._penalize_access(rate_key)
-                        await self._ensure_token(rejected=token)
+                        await self._ensure_token(rejected=token, reset_warmup=True)
                         raise DbdForbiddenError("HTTP 403")
                     if status in (429, 500, 502, 503, 504):
                         raise TransientHttpError(f"HTTP {status}", status_code=status)
