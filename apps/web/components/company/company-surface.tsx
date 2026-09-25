@@ -167,10 +167,10 @@ export function CompanySurface() {
   }
 
   return (
-    <main className="relative min-h-svh overflow-x-hidden bg-[#070a0d] text-white">
+    <main className="tipx-brand-field relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid fixed inset-0 opacity-25" />
       <div className="tipx-vignette fixed inset-0" />
-      <div className="pointer-events-none fixed left-[8%] top-[8%] size-[42vw] max-h-[760px] max-w-[760px] rounded-full bg-cyan-300/[0.014] blur-3xl" />
+      <div className="pointer-events-none fixed left-[8%] top-[8%] size-[42vw] max-h-[760px] max-w-[760px] rounded-full bg-tipx-brand/[0.025] blur-3xl" />
 
       <CompanyCommandBar
         searchTerm={searchTerm}
@@ -213,7 +213,7 @@ export function CompanySurface() {
 
               <div className="flex items-center gap-2 self-start lg:self-auto">
                 {detail.availability === "partial" ? (
-                  <span className="rounded-full border border-amber-200/10 bg-amber-200/[0.025] px-2.5 py-1.5 text-[9px] uppercase tracking-[0.13em] text-amber-100/48">
+                  <span className="rounded-full border border-tipx-warning/18 bg-tipx-warning/7 px-2.5 py-1.5 text-[9px] uppercase tracking-[0.13em] text-tipx-warning">
                     Partial serving data
                   </span>
                 ) : null}
@@ -223,8 +223,8 @@ export function CompanySurface() {
                   className={cn(
                     "rounded-xl border px-3 py-2 text-[10px] font-medium transition",
                     inCompare
-                      ? "border-white/22 bg-white text-black"
-                      : "border-white/8 bg-white/[0.025] text-white/45 hover:bg-white/[0.06] hover:text-white"
+                      ? "border-tipx-line/22 bg-tipx-brand text-tipx-on-brand"
+                      : "border-tipx-line/8 bg-tipx-ink/[0.025] text-tipx-ink/45 hover:bg-tipx-ink/[0.06] hover:text-tipx-ink"
                   )}
                 >
                   {inCompare ? "In compare" : "Add to compare"}
@@ -283,25 +283,25 @@ function CompanyCommandBar({
 
   return (
     <div className="pointer-events-none fixed left-4 right-[4.75rem] top-4 z-[32] flex items-start gap-2 sm:left-7 sm:right-24 sm:top-7">
-      <div className="pointer-events-auto flex min-w-0 flex-1 items-center gap-2 rounded-2xl border border-white/10 bg-[#081016]/91 p-1.5 shadow-[0_24px_80px_rgba(0,0,0,.35)] backdrop-blur-2xl sm:max-w-2xl">
-        <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-white font-mono text-xs font-bold text-black">
+      <div className="pointer-events-auto flex min-w-0 flex-1 items-center gap-2 rounded-2xl border border-tipx-line/10 bg-tipx-floating/91 p-1.5 shadow-[0_24px_80px_rgba(0,0,0,.35)] backdrop-blur-2xl sm:max-w-2xl">
+        <span className="grid size-10 shrink-0 place-items-center rounded-xl bg-tipx-brand font-mono text-xs font-bold text-tipx-on-brand">
           C
         </span>
 
         <div className="relative min-w-0 flex-1">
-          <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-white/25" />
+          <Search className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-tipx-ink/25" />
           <input
             value={searchTerm}
             onChange={(event) => onSearchTermChange(event.target.value)}
             placeholder="Search company or juristic-person number…"
             data-keyboard-input
-            className="h-10 w-full rounded-xl border border-transparent bg-white/[0.025] pl-9 pr-9 text-xs text-white outline-none transition placeholder:text-white/21 focus:border-white/10 focus:bg-white/[0.045]"
+            className="h-10 w-full rounded-xl border border-transparent bg-tipx-ink/[0.025] pl-9 pr-9 text-xs text-tipx-ink outline-none transition placeholder:text-tipx-ink/21 focus:border-tipx-line/10 focus:bg-tipx-ink/[0.045]"
           />
           {searchTerm ? (
             <button
               type="button"
               onClick={() => onSearchTermChange("")}
-              className="absolute right-2 top-1/2 grid size-7 -translate-y-1/2 place-items-center rounded-lg text-white/24 hover:bg-white/6 hover:text-white"
+              className="absolute right-2 top-1/2 grid size-7 -translate-y-1/2 place-items-center rounded-lg text-tipx-ink/24 hover:bg-tipx-ink/6 hover:text-tipx-ink"
               aria-label="Clear company search"
             >
               <X className="size-3.5" />
@@ -320,19 +320,19 @@ function CompanyCommandBar({
       </div>
 
       {focusedCompany ? (
-        <div className="pointer-events-auto flex min-w-0 items-center rounded-2xl border border-white/9 bg-[#081016]/86 p-1.5 backdrop-blur-xl lg:max-w-sm lg:gap-2">
+        <div className="pointer-events-auto flex min-w-0 items-center rounded-2xl border border-tipx-line/9 bg-tipx-floating/86 p-1.5 backdrop-blur-xl lg:max-w-sm lg:gap-2">
           <div className="hidden min-w-0 px-3 lg:block">
-            <p className="truncate text-[10px] font-medium text-white/64">
+            <p className="truncate text-[10px] font-medium text-tipx-ink/64">
               {focusedCompany.label}
             </p>
-            <p className="mt-0.5 truncate font-mono text-[8px] text-white/24">
+            <p className="mt-0.5 truncate font-mono text-[8px] text-tipx-ink/24">
               {focusedCompany.id}
             </p>
           </div>
           <button
             type="button"
             onClick={onClearFocus}
-            className="grid size-9 shrink-0 place-items-center rounded-xl text-white/36 transition hover:bg-white/6 hover:text-white"
+            className="grid size-9 shrink-0 place-items-center rounded-xl text-tipx-ink/36 transition hover:bg-tipx-ink/6 hover:text-tipx-ink"
             aria-label={`Clear focused company: ${focusedCompany.label}`}
             title="Return to company discovery"
           >
@@ -358,7 +358,7 @@ function CompanySearchPopover({
   const data = queryState.data
 
   return (
-    <div className="absolute left-0 right-0 top-[calc(100%+10px)] overflow-hidden rounded-2xl border border-white/10 bg-[#091117]/98 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl">
+    <div className="absolute left-0 right-0 top-[calc(100%+10px)] overflow-hidden rounded-2xl border border-tipx-line/10 bg-tipx-floating/98 shadow-[0_28px_90px_rgba(0,0,0,.55)] backdrop-blur-2xl">
       {!synchronized ? (
         <SearchState
           icon={LoaderCircle}
@@ -366,7 +366,7 @@ function CompanySearchPopover({
           description="Waiting for the visible search text to reach the debounced serving query. Previous results are intentionally hidden."
         />
       ) : queryState.isFetching ? (
-        <div className="flex items-center gap-2 border-b border-white/7 px-4 py-2 text-[9px] uppercase tracking-[0.14em] text-white/25">
+        <div className="flex items-center gap-2 border-b border-tipx-line/7 px-4 py-2 text-[9px] uppercase tracking-[0.14em] text-tipx-ink/25">
           <LoaderCircle className="size-3 animate-spin" />
           Searching serving model
         </div>
@@ -395,23 +395,23 @@ function CompanySearchPopover({
               key={company.id}
               type="button"
               onClick={() => onPickCompany(company)}
-              className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition hover:bg-white/[0.055]"
+              className="flex w-full items-center gap-3 rounded-xl px-3 py-3 text-left transition hover:bg-tipx-ink/[0.055]"
             >
-              <span className="grid size-9 shrink-0 place-items-center rounded-xl border border-white/8 bg-white/[0.035] text-xs font-semibold text-white/55">
+              <span className="grid size-9 shrink-0 place-items-center rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.035] text-xs font-semibold text-tipx-ink/55">
                 {company.nameTh.trim().charAt(0).toUpperCase() || "?"}
               </span>
               <span className="min-w-0 flex-1">
-                <span className="block truncate text-[11px] font-medium text-white/68">
+                <span className="block truncate text-[11px] font-medium text-tipx-ink/68">
                   {company.nameTh}
                 </span>
-                <span className="mt-0.5 block truncate text-[9px] text-white/27">
+                <span className="mt-0.5 block truncate text-[9px] text-tipx-ink/27">
                   {[company.id, company.businessType, company.province]
                     .filter(Boolean)
                     .join(" · ")}
                 </span>
               </span>
               {company.latestFiscalYear ? (
-                <span className="shrink-0 font-mono text-[8px] text-white/20">
+                <span className="shrink-0 font-mono text-[8px] text-tipx-ink/20">
                   FY {company.latestFiscalYear}
                 </span>
               ) : null}
@@ -447,38 +447,38 @@ function CompanyDiscovery({
   return (
     <section className="grid min-h-[calc(100svh-12rem)] place-items-center">
       <div className="max-w-2xl text-center">
-        <span className="mx-auto grid size-12 place-items-center rounded-2xl border border-white/9 bg-white/[0.025]">
-          <Building2 className="size-5 text-white/38" />
+        <span className="mx-auto grid size-12 place-items-center rounded-2xl border border-tipx-line/9 bg-tipx-ink/[0.025]">
+          <Building2 className="size-5 text-tipx-ink/38" />
         </span>
-        <p className="mt-6 font-mono text-[10px] uppercase tracking-[0.28em] text-white/24">
+        <p className="mt-6 font-mono text-[10px] uppercase tracking-[0.28em] text-tipx-ink/24">
           C / Company Intelligence
         </p>
-        <h1 className="mt-3 text-balance text-4xl font-semibold tracking-[-0.045em] text-white sm:text-6xl">
+        <h1 className="mt-3 text-balance text-4xl font-semibold tracking-[-0.045em] text-tipx-ink sm:text-6xl">
           Start with an entity,
           <br />
           not a dashboard.
         </h1>
-        <p className="mx-auto mt-5 max-w-xl text-pretty text-[12px] leading-6 text-white/34">
+        <p className="mx-auto mt-5 max-w-xl text-pretty text-[12px] leading-6 text-tipx-ink/34">
           Search a canonical company identity or arrive from Map. Financial,
           benchmark, ownership and corporate-history representations remain
           attached to the same entity context.
         </p>
 
-        <div className="mx-auto mt-7 flex w-fit items-center gap-4 rounded-2xl border border-white/8 bg-white/[0.02] px-4 py-3 text-[9px] uppercase tracking-[0.13em] text-white/27">
+        <div className="mx-auto mt-7 flex w-fit items-center gap-4 rounded-2xl border border-tipx-line/8 bg-tipx-ink/[0.02] px-4 py-3 text-[9px] uppercase tracking-[0.13em] text-tipx-ink/27">
           <span className="inline-flex items-center gap-2">
             <span
               className={cn(
                 "size-1.5 rounded-full",
-                endpointConfigured ? "bg-emerald-300/70" : "bg-white/16"
+                endpointConfigured ? "bg-tipx-success/70" : "bg-tipx-ink/16"
               )}
             />
             {endpointConfigured ? "Serving configured" : "Serving unavailable"}
           </span>
-          <span className="h-3 w-px bg-white/8" />
+          <span className="h-3 w-px bg-tipx-ink/8" />
           <span>Lens {activeLensCount}</span>
           {searchTerm ? (
             <>
-              <span className="h-3 w-px bg-white/8" />
+              <span className="h-3 w-px bg-tipx-ink/8" />
               <span className="max-w-36 truncate normal-case tracking-normal">
                 “{searchTerm}”
               </span>
@@ -510,7 +510,7 @@ function CompanyViewRail({
   return (
     <nav
       aria-label="Company intelligence representations"
-      className="flex max-w-full items-center gap-1 overflow-x-auto rounded-2xl border border-white/8 bg-[#0a1015]/72 p-1 backdrop-blur-xl"
+      className="flex max-w-full items-center gap-1 overflow-x-auto rounded-2xl border border-tipx-line/8 bg-tipx-surface/72 p-1 backdrop-blur-xl"
     >
       {COMPANY_VIEW_IDS.map((id) => {
         const meta = VIEW_META[id]
@@ -524,14 +524,14 @@ function CompanyViewRail({
             className={cn(
               "group flex shrink-0 items-center gap-2 rounded-xl px-3 py-2 transition",
               active
-                ? "bg-white text-black"
-                : "text-white/35 hover:bg-white/[0.055] hover:text-white/70"
+                ? "bg-tipx-brand text-tipx-on-brand"
+                : "text-tipx-ink/35 hover:bg-tipx-ink/[0.055] hover:text-tipx-ink/70"
             )}
           >
             <span
               className={cn(
                 "grid size-5 place-items-center rounded-md border font-mono text-[8px] font-bold",
-                active ? "border-black/10" : "border-white/8"
+                active ? "border-tipx-brand/18" : "border-tipx-line/8"
               )}
             >
               {meta.short}
@@ -543,7 +543,7 @@ function CompanyViewRail({
               <span
                 className={cn(
                   "hidden text-[8px] xl:block",
-                  active ? "text-black/42" : "text-white/19"
+                  active ? "text-tipx-on-brand/42" : "text-tipx-ink/19"
                 )}
               >
                 {capability[id] ? meta.description : "Capability unavailable"}
@@ -616,11 +616,11 @@ function CompanyLoading({ entityLabel }: { entityLabel: string }) {
   return (
     <div className="grid min-h-[calc(100svh-13rem)] place-items-center text-center">
       <div>
-        <LoaderCircle className="mx-auto size-6 animate-spin text-white/28" />
-        <p className="mt-4 text-sm font-medium text-white/52">
+        <LoaderCircle className="mx-auto size-6 animate-spin text-tipx-ink/28" />
+        <p className="mt-4 text-sm font-medium text-tipx-ink/52">
           Resolving {entityLabel}
         </p>
-        <p className="mt-1 text-[10px] text-white/25">
+        <p className="mt-1 text-[10px] text-tipx-ink/25">
           Loading company intelligence contract
         </p>
       </div>
@@ -638,17 +638,17 @@ function CompanyError({
   return (
     <div className="grid min-h-[calc(100svh-13rem)] place-items-center text-center">
       <div>
-        <AlertTriangle className="mx-auto size-6 text-amber-100/35" />
-        <p className="mt-4 text-sm font-medium text-white/52">
+        <AlertTriangle className="mx-auto size-6 text-tipx-warning/80" />
+        <p className="mt-4 text-sm font-medium text-tipx-ink/52">
           Company serving request failed
         </p>
-        <p className="mx-auto mt-2 max-w-lg text-[11px] leading-5 text-white/28">
+        <p className="mx-auto mt-2 max-w-lg text-[11px] leading-5 text-tipx-ink/28">
           {message}
         </p>
         <button
           type="button"
           onClick={onRetry}
-          className="mt-5 rounded-xl border border-white/9 bg-white/[0.035] px-4 py-2 text-[10px] text-white/50 hover:bg-white/[0.07] hover:text-white"
+          className="mt-5 rounded-xl border border-tipx-line/9 bg-tipx-ink/[0.035] px-4 py-2 text-[10px] text-tipx-ink/50 hover:bg-tipx-ink/[0.07] hover:text-tipx-ink"
         >
           Retry
         </button>
@@ -668,14 +668,14 @@ function SearchState({
 }) {
   return (
     <div className="flex items-start gap-3 p-4">
-      <span className="grid size-8 shrink-0 place-items-center rounded-xl border border-white/8 bg-white/[0.025]">
-        <Icon className="size-3.5 text-white/30" />
+      <span className="grid size-8 shrink-0 place-items-center rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.025]">
+        <Icon className="size-3.5 text-tipx-ink/30" />
       </span>
       <span>
-        <span className="block text-[11px] font-medium text-white/55">
+        <span className="block text-[11px] font-medium text-tipx-ink/55">
           {title}
         </span>
-        <span className="mt-1 block text-[9px] leading-4 text-white/27">
+        <span className="mt-1 block text-[9px] leading-4 text-tipx-ink/27">
           {description}
         </span>
       </span>

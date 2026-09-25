@@ -20,9 +20,9 @@ export function CompareTray() {
           }
           animate={{ opacity: 1, y: 0, scale: 1 }}
           exit={reduceMotion ? { opacity: 0 } : { opacity: 0, y: 10 }}
-          className="pointer-events-auto fixed bottom-20 left-1/2 z-[35] flex max-w-[min(720px,calc(100vw-40px))] -translate-x-1/2 items-center gap-2 rounded-2xl border border-white/10 bg-[#0b0f13]/94 p-2 shadow-2xl shadow-black/30 backdrop-blur-xl"
+          className="pointer-events-auto fixed bottom-20 left-1/2 z-[35] flex max-w-[min(720px,calc(100vw-40px))] -translate-x-1/2 items-center gap-2 rounded-2xl border border-tipx-line/10 bg-tipx-floating/94 p-2 shadow-2xl shadow-black/30 backdrop-blur-xl"
         >
-          <div className="px-2 text-[9px] font-semibold uppercase tracking-[0.18em] text-white/34">
+          <div className="px-2 text-[9px] font-semibold uppercase tracking-[0.18em] text-tipx-ink/34">
             Compare
           </div>
           <div className="flex min-w-0 gap-1 overflow-x-auto">
@@ -31,17 +31,17 @@ export function CompareTray() {
                 key={`${entity.kind}:${entity.id}`}
                 type="button"
                 onClick={() => toggleCompare(entity)}
-                className="flex shrink-0 items-center gap-1.5 rounded-lg border border-white/8 bg-white/[0.035] px-2.5 py-2 text-[10px] text-white/62 hover:bg-white/[0.07] hover:text-white"
+                className="flex shrink-0 items-center gap-1.5 rounded-lg border border-tipx-line/8 bg-tipx-ink/[0.035] px-2.5 py-2 text-[10px] text-tipx-ink/62 hover:bg-tipx-ink/[0.07] hover:text-tipx-ink"
               >
                 <span className="max-w-32 truncate">{entity.label}</span>
-                <X className="size-3 text-white/30" />
+                <X className="size-3 text-tipx-ink/30" />
               </button>
             ))}
           </div>
           <button
             type="button"
             onClick={clearCompare}
-            className="shrink-0 rounded-lg px-2 py-2 text-[9px] uppercase tracking-[0.12em] text-white/28 hover:bg-white/5 hover:text-white/60"
+            className="shrink-0 rounded-lg px-2 py-2 text-[9px] uppercase tracking-[0.12em] text-tipx-ink/28 hover:bg-tipx-ink/5 hover:text-tipx-ink/60"
           >
             Clear
           </button>

@@ -248,7 +248,7 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
       derivedQuery.isFetching)
 
   return (
-    <main className="relative min-h-svh overflow-x-hidden bg-[#070a0d] text-white">
+    <main className="tipx-brand-field relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid pointer-events-none fixed inset-0 opacity-20" />
       <div className="tipx-vignette pointer-events-none fixed inset-0" />
 
@@ -270,23 +270,23 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
       />
 
       <div className="relative z-10 mx-auto max-w-[1800px] px-4 pb-24 pt-32 sm:px-7 sm:pt-36">
-        <header className="mb-5 flex flex-col gap-3 border-b border-white/7 pb-5 lg:flex-row lg:items-end lg:justify-between">
+        <header className="mb-5 flex flex-col gap-3 border-b border-tipx-line/7 pb-5 lg:flex-row lg:items-end lg:justify-between">
           <div>
-            <p className="font-mono text-[9px] uppercase tracking-[0.22em] text-white/22">
+            <p className="font-mono text-[9px] uppercase tracking-[0.22em] text-tipx-ink/22">
               {mode === "population" ? "A / Analytical Field" : "O / Opportunity Intelligence"}
             </p>
-            <h1 className="mt-2 text-2xl font-semibold tracking-[-0.035em] text-white/82 sm:text-3xl">
+            <h1 className="mt-2 text-2xl font-semibold tracking-[-0.035em] text-tipx-ink/82 sm:text-3xl">
               {mode === "population"
                 ? "One population. Coordinated representations."
                 : "Opportunity as evidence, not a single score."}
             </h1>
-            <p className="mt-2 max-w-3xl text-[11px] leading-5 text-white/29">
+            <p className="mt-2 max-w-3xl text-[11px] leading-5 text-tipx-ink/29">
               Lens, Population, Focus, Selection and Compare remain shared with Map,
               Company and Relationship. Local analytical filters run only on the
               bounded loaded subset; canonical business rules remain server-side.
             </p>
           </div>
-          <span className="font-mono text-[9px] text-white/22">
+          <span className="font-mono text-[9px] text-tipx-ink/22">
             {snapshot.generatedAt ? `served ${snapshot.generatedAt}` : "serving time unavailable"}
           </span>
         </header>
@@ -304,13 +304,13 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
                 key={`${filter.dimension}:${filter.value}`}
                 type="button"
                 onClick={() => toggleFilter(filter)}
-                className="rounded-full border border-white/9 bg-white/[0.035] px-2.5 py-1.5 text-[8px] text-white/42 hover:bg-white/[0.07] hover:text-white"
+                className="rounded-full border border-tipx-line/9 bg-tipx-ink/[0.035] px-2.5 py-1.5 text-[8px] text-tipx-ink/42 hover:bg-tipx-ink/[0.07] hover:text-tipx-ink"
               >
                 {filter.label} ×
               </button>
             ))}
             {derivedQuery.isFetching ? (
-              <span className="ml-1 inline-flex items-center gap-1.5 text-[8px] uppercase tracking-[0.12em] text-white/20">
+              <span className="ml-1 inline-flex items-center gap-1.5 text-[8px] uppercase tracking-[0.12em] text-tipx-ink/20">
                 <LoaderCircle className="size-3 animate-spin" />
                 recomputing loaded subset
               </span>
@@ -377,7 +377,7 @@ export function AnalyticsSurface({ mode }: { mode: AnalyticsMode }) {
             <button
               type="button"
               onClick={() => setCandidateRailOpen((open) => !open)}
-              className="text-[8px] uppercase tracking-[0.14em] text-white/18 hover:text-white/45"
+              className="text-[8px] uppercase tracking-[0.14em] text-tipx-ink/18 hover:text-tipx-ink/45"
             >
               {candidateRailOpen ? "Collapse exact company field" : "Expand exact company field"}
             </button>
@@ -417,16 +417,16 @@ function AnalyticsControlDeck({
 }) {
   return (
     <aside className="pointer-events-auto fixed left-4 right-[4.75rem] top-4 z-[45] sm:left-7 sm:right-auto sm:top-7 sm:w-[430px]">
-      <div className="rounded-2xl border border-white/10 bg-[#081016]/92 p-2 shadow-[0_24px_80px_rgba(0,0,0,.4)] backdrop-blur-2xl">
+      <div className="rounded-2xl border border-tipx-line/10 bg-tipx-floating/92 p-2 shadow-[0_24px_80px_rgba(0,0,0,.4)] backdrop-blur-2xl">
         <div className="flex items-center gap-2">
-          <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-white font-mono text-[11px] font-bold text-black">
+          <span className="grid size-9 shrink-0 place-items-center rounded-xl bg-tipx-brand font-mono text-[11px] font-bold text-tipx-on-brand">
             {mode === "population" ? "A" : "O"}
           </span>
           <div className="min-w-0 flex-1">
-            <p className="truncate text-[10px] font-semibold text-white/60">
+            <p className="truncate text-[10px] font-semibold text-tipx-ink/60">
               {mode === "population" ? "Population Analytical Field" : "Opportunity Intelligence"}
             </p>
-            <p className="mt-0.5 truncate text-[8px] uppercase tracking-[0.12em] text-white/21">
+            <p className="mt-0.5 truncate text-[8px] uppercase tracking-[0.12em] text-tipx-ink/21">
               {population
                 ? `${population.label} · ${population.count.toLocaleString()}`
                 : `${loadedCount.toLocaleString()} exact rows loaded`}
@@ -435,7 +435,7 @@ function AnalyticsControlDeck({
           <span
             className={cn(
               "size-1.5 rounded-full",
-              endpointConfigured ? "bg-emerald-300/70" : "bg-white/16"
+              endpointConfigured ? "bg-tipx-success/70" : "bg-tipx-ink/16"
             )}
           />
         </div>
@@ -449,8 +449,8 @@ function AnalyticsControlDeck({
               className={cn(
                 "rounded-xl border px-3 py-2 text-left text-[9px] transition",
                 candidate === mode
-                  ? "border-white/18 bg-white text-black"
-                  : "border-white/7 bg-white/[0.018] text-white/32 hover:bg-white/[0.05] hover:text-white"
+                  ? "border-tipx-line/18 bg-tipx-brand text-tipx-on-brand"
+                  : "border-tipx-line/7 bg-tipx-ink/[0.018] text-tipx-ink/32 hover:bg-tipx-ink/[0.05] hover:text-tipx-ink"
               )}
             >
               {candidate === "population" ? "A · Population" : "O · Opportunity"}
@@ -458,12 +458,12 @@ function AnalyticsControlDeck({
           ))}
         </div>
 
-        <div className="mt-2 flex items-center gap-1.5 border-t border-white/7 pt-2">
+        <div className="mt-2 flex items-center gap-1.5 border-t border-tipx-line/7 pt-2">
           {filters.length > 0 ? (
             <button
               type="button"
               onClick={onClearFilters}
-              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-white/7 px-2 text-[8px] text-white/28 hover:bg-white/[0.05] hover:text-white"
+              className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-tipx-line/7 px-2 text-[8px] text-tipx-ink/28 hover:bg-tipx-ink/[0.05] hover:text-tipx-ink"
             >
               <FilterX className="size-3" />
               Clear {filters.length}
@@ -475,14 +475,14 @@ function AnalyticsControlDeck({
             <button
               type="button"
               onClick={() => onPopulation(servedPopulation)}
-              className="h-8 rounded-lg border border-emerald-200/10 bg-emerald-200/[0.035] px-2 text-[8px] text-emerald-100/52 hover:bg-emerald-200/[0.07]"
+              className="h-8 rounded-lg border border-tipx-success/18 bg-tipx-success/8 px-2 text-[8px] text-tipx-success hover:bg-tipx-success/12"
             >
               Activate served population
             </button>
           ) : null}
 
           {computing ? (
-            <LoaderCircle className="ml-1 size-3 animate-spin text-white/22" />
+            <LoaderCircle className="ml-1 size-3 animate-spin text-tipx-ink/22" />
           ) : null}
 
           <div className="ml-auto flex gap-1">
@@ -495,7 +495,7 @@ function AnalyticsControlDeck({
                   ? `Refine to ≤${MAX_ANALYTICS_GLOBAL_SELECTION} exact companies or activate a served population`
                   : "Project current analytical population to Map"
               }
-              className="grid size-8 place-items-center rounded-lg border border-white/7 text-white/28 hover:bg-white/[0.05] hover:text-white disabled:cursor-not-allowed disabled:opacity-20"
+              className="grid size-8 place-items-center rounded-lg border border-tipx-line/7 text-tipx-ink/28 hover:bg-tipx-ink/[0.05] hover:text-tipx-ink disabled:cursor-not-allowed disabled:opacity-20"
             >
               <MapIcon className="size-3.5" />
             </button>
@@ -508,7 +508,7 @@ function AnalyticsControlDeck({
                   ? `Refine to ≤${MAX_ANALYTICS_GLOBAL_SELECTION} exact companies or activate a served population`
                   : "Project current analytical population to Relationship"
               }
-              className="grid size-8 place-items-center rounded-lg border border-white/7 text-white/28 hover:bg-white/[0.05] hover:text-white disabled:cursor-not-allowed disabled:opacity-20"
+              className="grid size-8 place-items-center rounded-lg border border-tipx-line/7 text-tipx-ink/28 hover:bg-tipx-ink/[0.05] hover:text-tipx-ink disabled:cursor-not-allowed disabled:opacity-20"
             >
               <Network className="size-3.5" />
             </button>
@@ -548,22 +548,22 @@ function SummaryRail({
         ]
 
   return (
-    <section className="mb-4 overflow-hidden rounded-[22px] border border-white/8 bg-[#0a1015]/64 backdrop-blur-xl">
+    <section className="mb-4 overflow-hidden rounded-[22px] border border-tipx-line/8 bg-tipx-surface/64 backdrop-blur-xl">
       <div className="grid grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
         {metrics.map(([label, value]) => (
           <div
             key={label}
-            className="border-b border-r border-white/6 px-4 py-3 last:border-r-0 xl:border-b-0"
+            className="border-b border-r border-tipx-line/6 px-4 py-3 last:border-r-0 xl:border-b-0"
           >
-            <p className="font-mono text-[13px] text-white/68">{value}</p>
-            <p className="mt-1 text-[8px] uppercase tracking-[0.12em] text-white/21">
+            <p className="font-mono text-[13px] text-tipx-ink/68">{value}</p>
+            <p className="mt-1 text-[8px] uppercase tracking-[0.12em] text-tipx-ink/21">
               {label}
             </p>
           </div>
         ))}
       </div>
       {localFiltered ? (
-        <div className="border-t border-white/6 px-4 py-2 text-[8px] uppercase tracking-[0.12em] text-amber-100/32">
+        <div className="border-t border-tipx-line/6 px-4 py-2 text-[8px] uppercase tracking-[0.12em] text-tipx-warning/72">
           Local cross-filter summary · loaded exact subset only
         </div>
       ) : null}
@@ -583,12 +583,12 @@ function AnalyticsState({
   spinning?: boolean
 }) {
   return (
-    <div className="grid min-h-[520px] place-items-center rounded-[28px] border border-white/8 bg-[#0a1015]/52 px-8 text-center">
+    <div className="grid min-h-[520px] place-items-center rounded-[28px] border border-tipx-line/8 bg-tipx-surface/52 px-8 text-center">
       <div>
-        <Icon className={cn("mx-auto size-6 text-white/20", spinning && "animate-spin")} />
-        <p className="mt-3 text-sm font-medium text-white/48">{title}</p>
+        <Icon className={cn("mx-auto size-6 text-tipx-ink/20", spinning && "animate-spin")} />
+        <p className="mt-3 text-sm font-medium text-tipx-ink/48">{title}</p>
         {detail ? (
-          <p className="mx-auto mt-2 max-w-xl text-[10px] leading-5 text-white/26">
+          <p className="mx-auto mt-2 max-w-xl text-[10px] leading-5 text-tipx-ink/26">
             {detail}
           </p>
         ) : null}

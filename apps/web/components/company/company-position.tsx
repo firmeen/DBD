@@ -23,17 +23,17 @@ export function CompanyPosition({
 
   return (
     <div className="space-y-5">
-      <section className="rounded-[26px] border border-white/8 bg-[#0a1015]/72 p-6 backdrop-blur-2xl">
+      <section className="rounded-[26px] border border-tipx-line/8 bg-tipx-surface/72 p-6 backdrop-blur-2xl">
         <div className="grid gap-5 lg:grid-cols-[1fr_auto] lg:items-end">
           <div>
-            <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-white/27">
+            <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/27">
               <BarChart3 className="size-3.5" />
               Industry position · FY {industry.fiscalYear}
             </p>
-            <h2 className="mt-2 text-2xl font-semibold tracking-[-0.035em] text-white">
+            <h2 className="mt-2 text-2xl font-semibold tracking-[-0.035em] text-tipx-ink">
               Company versus its operating field
             </h2>
-            <p className="mt-2 max-w-2xl text-[11px] leading-5 text-white/31">
+            <p className="mt-2 max-w-2xl text-[11px] leading-5 text-tipx-ink/31">
               Precision comparison strips preserve magnitude and direction
               without compressing unrelated metrics into gauges or radar shapes.
             </p>
@@ -50,9 +50,9 @@ export function CompanyPosition({
         </div>
       </section>
 
-      <section className="rounded-[26px] border border-white/8 bg-white/[0.018] p-5 sm:p-6">
+      <section className="rounded-[26px] border border-tipx-line/8 bg-tipx-ink/[0.018] p-5 sm:p-6">
         {usable.length ? (
-          <div className="divide-y divide-white/7">
+          <div className="divide-y divide-tipx-line/7">
             {usable.map((metric) => (
               <BenchmarkStrip key={metric.code} metric={metric} />
             ))}
@@ -60,8 +60,8 @@ export function CompanyPosition({
         ) : (
           <div className="grid min-h-[360px] place-items-center text-center">
             <div>
-              <Building className="mx-auto size-5 text-white/18" />
-              <p className="mt-3 text-xs text-white/40">
+              <Building className="mx-auto size-5 text-tipx-ink/18" />
+              <p className="mt-3 text-xs text-tipx-ink/40">
                 No comparable benchmark metrics available.
               </p>
             </div>
@@ -100,14 +100,14 @@ function BenchmarkStrip({
     <div className="py-5 first:pt-0 last:pb-0">
       <div className="flex items-start justify-between gap-4">
         <div>
-          <p className="text-[11px] font-medium text-white/61">
+          <p className="text-[11px] font-medium text-tipx-ink/61">
             {metric.label}
           </p>
-          <p className="mt-0.5 font-mono text-[8px] uppercase tracking-[0.12em] text-white/18">
+          <p className="mt-0.5 font-mono text-[8px] uppercase tracking-[0.12em] text-tipx-ink/18">
             {metric.code}
           </p>
         </div>
-        <span className="inline-flex items-center gap-1.5 font-mono text-[9px] text-white/30">
+        <span className="inline-flex items-center gap-1.5 font-mono text-[9px] text-tipx-ink/30">
           <TrendingUp className="size-3" />
           Industry Δ {formatSignedChange(metric.pctChange)}
         </span>
@@ -115,10 +115,10 @@ function BenchmarkStrip({
 
       <div className="mt-5">
         <div className="relative h-8">
-          <div className="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-white/9" />
+          <div className="absolute left-0 right-0 top-1/2 h-px -translate-y-1/2 bg-tipx-ink/9" />
           {previousPosition !== null ? (
             <span
-              className="absolute top-1/2 size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-white/16 bg-[#26313a]"
+              className="absolute top-1/2 size-2 -translate-x-1/2 -translate-y-1/2 rounded-full border border-tipx-line/16 bg-[#26313a]"
               style={{ left: `${previousPosition}%` }}
               title="Previous industry average"
             />
@@ -132,7 +132,7 @@ function BenchmarkStrip({
           ) : null}
           {companyPosition !== null ? (
             <span
-              className="absolute top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-black bg-white shadow-[0_0_0_1px_rgba(255,255,255,.18),0_8px_24px_rgba(0,0,0,.4)]"
+              className="absolute top-1/2 size-4 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-tipx-surface bg-tipx-brand ring-1 ring-tipx-line/16 shadow-[0_8px_24px_rgba(0,0,0,.22)]"
               style={{ left: `${companyPosition}%` }}
               title="Company"
             />
@@ -170,12 +170,12 @@ function MetricLegend({
 }) {
   return (
     <div>
-      <p className="uppercase tracking-[0.12em] text-white/21">{label}</p>
+      <p className="uppercase tracking-[0.12em] text-tipx-ink/21">{label}</p>
       <p
         className={
           emphasized
-            ? "mt-1 font-mono text-[11px] text-white/78"
-            : "mt-1 font-mono text-[10px] text-white/42"
+            ? "mt-1 font-mono text-[11px] text-tipx-ink/78"
+            : "mt-1 font-mono text-[10px] text-tipx-ink/42"
         }
       >
         {value}
@@ -192,11 +192,11 @@ function PopulationMetric({
   value: number | null
 }) {
   return (
-    <div className="min-w-20 rounded-xl border border-white/8 bg-white/[0.025] px-3 py-2 text-right">
-      <p className="font-mono text-[12px] text-white/67">
+    <div className="min-w-20 rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.025] px-3 py-2 text-right">
+      <p className="font-mono text-[12px] text-tipx-ink/67">
         {value === null ? "—" : value.toLocaleString()}
       </p>
-      <p className="mt-0.5 text-[8px] uppercase tracking-[0.12em] text-white/22">
+      <p className="mt-0.5 text-[8px] uppercase tracking-[0.12em] text-tipx-ink/22">
         {label}
       </p>
     </div>
@@ -205,13 +205,13 @@ function PopulationMetric({
 
 function PositionEmpty({ message }: { message: string }) {
   return (
-    <div className="grid min-h-[460px] place-items-center rounded-[26px] border border-white/8 bg-white/[0.018] px-6 text-center">
+    <div className="grid min-h-[460px] place-items-center rounded-[26px] border border-tipx-line/8 bg-tipx-ink/[0.018] px-6 text-center">
       <div>
-        <Building className="mx-auto size-6 text-white/18" />
-        <p className="mt-3 text-sm font-medium text-white/52">
+        <Building className="mx-auto size-6 text-tipx-ink/18" />
+        <p className="mt-3 text-sm font-medium text-tipx-ink/52">
           Industry position unavailable
         </p>
-        <p className="mx-auto mt-2 max-w-md text-[11px] leading-5 text-white/28">
+        <p className="mx-auto mt-2 max-w-md text-[11px] leading-5 text-tipx-ink/28">
           {message}
         </p>
       </div>

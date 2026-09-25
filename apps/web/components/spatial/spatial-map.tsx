@@ -7,6 +7,8 @@ import { setWorkerUrl } from "maplibre-gl"
 import { Map } from "react-map-gl/maplibre"
 import Supercluster from "supercluster"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
+import type { TipxRenderPalette } from "@/lib/theme/palette"
 import { useDeckRuntime } from "@/lib/spatial/deck-runtime"
 import type { DeckRuntime } from "@/lib/spatial/deck-runtime"
 import { aggregateCompanyPointsToH3 } from "@/lib/spatial/h3"
@@ -21,9 +23,18 @@ import type {
 
 setWorkerUrl("/maplibre/maplibre-gl-worker.mjs")
 
-const DEFAULT_MAP_STYLE =
-  process.env.NEXT_PUBLIC_TIPX_MAP_STYLE_URL?.trim() ||
+const GENERAL_MAP_STYLE = process.env.NEXT_PUBLIC_TIPX_MAP_STYLE_URL?.trim()
+const LIGHT_MAP_STYLE =
+  process.env.NEXT_PUBLIC_TIPX_MAP_STYLE_LIGHT_URL?.trim() ||
+  GENERAL_MAP_STYLE ||
   "https://tiles.openfreemap.org/styles/liberty"
+const DARK_MAP_STYLE =
+  process.env.NEXT_PUBLIC_TIPX_MAP_STYLE_DARK_URL?.trim() ||
+  GENERAL_MAP_STYLE ||
+  LIGHT_MAP_STYLE
+const HAS_DEDICATED_DARK_MAP_STYLE = Boolean(
+  process.env.NEXT_PUBLIC_TIPX_MAP_STYLE_DARK_URL?.trim()
+)
 
 type HoveredCompany = {
   company: SpatialCompanyPoint
@@ -73,7 +84,13 @@ export function SpatialMap({
   onFocusCompany: (company: SpatialCompanyPoint) => void
   onFocusBranch: (branch: SpatialBranch) => void
 }) {
+  const { resolved, palette } = useTipxTheme()
   const deckRuntime = useDeckRuntime()
+  const mapStyle = resolved === "dark" ? DARK_MAP_STYLE : LIGHT_MAP_STYLE
+  const mapFallbackFilter =
+    resolved === "dark" && !HAS_DEDICATED_DARK_MAP_STYLE
+      ? "brightness(0.62) saturate(0.78) contrast(1.08)"
+      : undefined
   const selectedIds = React.useMemo(
     () => new Set(selectedCompanyIds),
     [selectedCompanyIds]
@@ -204,8 +221,8 @@ export function SpatialMap({
           },
           filled: true,
           stroked: true,
-          getFillColor: [72, 96, 118, 34],
-          getLineColor: [210, 226, 238, 62],
+          getFillColor: palette.deck.administrativeFill,
+          getLineColor: palette.deck.administrativeLine,
           getLineWidth: 1,
           lineWidthUnits: "pixels",
           pickable: false,
@@ -225,9 +242,12 @@ export function SpatialMap({
           getHexagon: (cell) => cell.index,
           getFillColor: (cell) => {
             const intensity = Math.min(188, 54 + Math.log2(cell.count + 1) * 24)
-            return [33, 175, 210, Math.round(intensity)]
+            return [
+              ...palette.deck.density,
+              Math.round(intensity),
+            ]
           },
-          getLineColor: [12, 20, 28, 120],
+          getLineColor: palette.deck.densityLine,
           getLineWidth: 1,
           lineWidthUnits: "pixels",
           extruded: false,
@@ -252,14 +272,14 @@ export function SpatialMap({
           getHexagon: (cell) => cell.index,
           getFillColor: (cell) => {
             const score = Math.max(0, Math.min(1, cell.opportunityScore ?? 0))
-            return [
-              Math.round(120 + 100 * score),
-              Math.round(130 + 70 * score),
-              54,
-              Math.round(44 + 146 * score),
-            ]
+            return mixOpportunityColor(
+              palette.deck.opportunityLow,
+              palette.deck.opportunityHigh,
+              score,
+              Math.round(44 + 146 * score)
+            )
           },
-          getLineColor: [20, 20, 14, 120],
+          getLineColor: palette.deck.densityLine,
           getLineWidth: 1,
           lineWidthUnits: "pixels",
           pickable: true,
@@ -279,8 +299,8 @@ export function SpatialMap({
           data: catchment,
           filled: true,
           stroked: true,
-          getFillColor: [105, 211, 176, 28],
-          getLineColor: [139, 232, 199, 180],
+          getFillColor: palette.deck.catchmentFill,
+          getLineColor: palette.deck.catchmentLine,
           getLineWidth: 2,
           lineWidthUnits: "pixels",
           pickable: false,
@@ -306,7 +326,7 @@ export function SpatialMap({
           radiusUnits: "pixels",
           stroked: true,
           filled: false,
-          getLineColor: [142, 238, 205, 230],
+          getLineColor: palette.deck.selected,
           getLineWidth: 3,
           lineWidthUnits: "pixels",
           pickable: false,
@@ -328,8 +348,8 @@ export function SpatialMap({
               getRadius: (cluster) =>
                 Math.min(28, 12 + Math.log2(cluster.count + 1) * 3),
               radiusUnits: "pixels",
-              getFillColor: [18, 24, 30, 218],
-              getLineColor: [210, 227, 238, 150],
+              getFillColor: palette.deck.clusterFill,
+              getLineColor: palette.deck.clusterLine,
               stroked: true,
               getLineWidth: 1,
               lineWidthUnits: "pixels",
@@ -357,7 +377,7 @@ export function SpatialMap({
               getText: (cluster) => compactNumber(cluster.count),
               getSize: 10,
               sizeUnits: "pixels",
-              getColor: [245, 248, 250, 220],
+              getColor: palette.deck.clusterText,
               getTextAnchor: "middle",
               getAlignmentBaseline: "center",
               pickable: false,
@@ -374,7 +394,8 @@ export function SpatialMap({
               hoveredCompanyId,
               onHoverCompany,
               onFocusCompany,
-              IconLayer
+              IconLayer,
+              palette
             )
           )
         }
@@ -389,7 +410,8 @@ export function SpatialMap({
             hoveredCompanyId,
             onHoverCompany,
             onFocusCompany,
-            IconLayer
+            IconLayer,
+            palette
           )
         )
       }
@@ -409,9 +431,9 @@ export function SpatialMap({
           radiusUnits: "pixels",
           getFillColor: (item) =>
             item.id === branchId
-              ? [240, 246, 250, 245]
-              : [169, 185, 197, 210],
-          getLineColor: [7, 10, 13, 220],
+              ? palette.deck.branchPrimary
+              : palette.deck.branchSecondary,
+          getLineColor: palette.deck.branchLine,
           stroked: true,
           getLineWidth: 2,
           lineWidthUnits: "pixels",
@@ -432,11 +454,11 @@ export function SpatialMap({
           getPixelOffset: [0, -18],
           getSize: 10,
           sizeUnits: "pixels",
-          getColor: [245, 248, 250, 190],
+          getColor: palette.deck.label,
           getTextAnchor: "middle",
           getAlignmentBaseline: "bottom",
           background: true,
-          getBackgroundColor: [7, 10, 13, 185],
+          getBackgroundColor: palette.deck.labelBackground,
           backgroundPadding: [5, 3],
           pickable: false,
         })
@@ -460,6 +482,7 @@ export function SpatialMap({
     onFocusCompany,
     onHoverCompany,
     onViewStateChange,
+    palette,
     selectedIds,
     snapshot,
     viewState,
@@ -468,10 +491,14 @@ export function SpatialMap({
   if (!deckRuntime) {
     return (
       <Map
-        mapStyle={DEFAULT_MAP_STYLE}
+        mapStyle={mapStyle}
         attributionControl={{ compact: true }}
         reuseMaps
-        style={{ width: "100%", height: "100%" }}
+        style={{
+          width: "100%",
+          height: "100%",
+          filter: mapFallbackFilter,
+        }}
       />
     )
   }
@@ -500,10 +527,14 @@ export function SpatialMap({
       style={{ position: "absolute", inset: "0" }}
     >
       <Map
-        mapStyle={DEFAULT_MAP_STYLE}
+        mapStyle={mapStyle}
         attributionControl={{ compact: true }}
         reuseMaps
-        style={{ width: "100%", height: "100%" }}
+        style={{
+          width: "100%",
+          height: "100%",
+          filter: mapFallbackFilter,
+        }}
       />
     </DeckGL>
   )
@@ -516,7 +547,8 @@ function createCompanyEntityLayer(
   hoveredCompanyId: string | null,
   onHoverCompany: (hover: HoveredCompany | null) => void,
   onFocusCompany: (company: SpatialCompanyPoint) => void,
-  IconLayer: DeckRuntime["IconLayer"]
+  IconLayer: DeckRuntime["IconLayer"],
+  palette: TipxRenderPalette
 ) {
   return new IconLayer({
     id,
@@ -526,7 +558,8 @@ function createCompanyEntityLayer(
       url: companyIconDataUrl(
         company,
         selectedIds.has(company.id),
-        company.id === hoveredCompanyId
+        company.id === hoveredCompanyId,
+        palette.entity
       ),
       width: 64,
       height: 64,
@@ -552,23 +585,42 @@ function createCompanyEntityLayer(
 function companyIconDataUrl(
   company: SpatialCompanyPoint,
   selected: boolean,
-  hovered: boolean
+  hovered: boolean,
+  palette: TipxRenderPalette["entity"]
 ) {
   const fill =
     company.tipStatus === "active"
-      ? "#256d8a"
+      ? palette.active
       : company.tipStatus === "expired"
-        ? "#8a403f"
-        : "#515b64"
-  const border = selected ? "#8fe8c9" : hovered ? "#ffffff" : "#b9c4cc"
+        ? palette.expired
+        : palette.prospect
+  const border = selected
+    ? palette.selected
+    : hovered
+      ? palette.hover
+      : palette.border
   const initial = escapeSvg(company.name.trim().charAt(0).toUpperCase() || "?")
   const svg =
     `<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">` +
     `<rect x="5" y="5" width="54" height="54" rx="15" fill="${fill}" stroke="${border}" stroke-width="${selected ? 4 : 2}"/>` +
-    `<text x="32" y="38" text-anchor="middle" font-family="Arial,sans-serif" font-size="23" font-weight="700" fill="#fff">${initial}</text>` +
+    `<text x="32" y="38" text-anchor="middle" font-family="Arial,sans-serif" font-size="23" font-weight="700" fill="${palette.text}">${initial}</text>` +
     `</svg>`
 
   return `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`
+}
+
+function mixOpportunityColor(
+  low: [number, number, number],
+  high: [number, number, number],
+  score: number,
+  alpha: number
+): [number, number, number, number] {
+  return [
+    Math.round(low[0] + (high[0] - low[0]) * score),
+    Math.round(low[1] + (high[1] - low[1]) * score),
+    Math.round(low[2] + (high[2] - low[2]) * score),
+    alpha,
+  ]
 }
 
 function escapeSvg(value: string) {

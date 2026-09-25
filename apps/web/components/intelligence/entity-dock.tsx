@@ -41,18 +41,18 @@ export function EntityDock() {
           animate={{ opacity: 1, x: 0 }}
           exit={reduceMotion ? { opacity: 0 } : { opacity: 0, x: 18 }}
           transition={{ duration: 0.2, ease: [0.2, 0.8, 0.2, 1] }}
-          className="pointer-events-auto fixed bottom-20 right-5 top-44 z-30 flex w-[min(360px,calc(100vw-40px))] flex-col rounded-2xl border border-white/10 bg-[#0b0f13]/92 shadow-[0_30px_90px_rgba(0,0,0,.4)] backdrop-blur-2xl sm:right-7"
+          className="pointer-events-auto fixed bottom-20 right-5 top-44 z-30 flex w-[min(360px,calc(100vw-40px))] flex-col rounded-2xl border border-tipx-line/10 bg-tipx-floating/92 shadow-[0_30px_90px_rgba(0,0,0,.4)] backdrop-blur-2xl sm:right-7"
         >
-          <div className="flex items-start justify-between border-b border-white/8 p-4">
+          <div className="flex items-start justify-between border-b border-tipx-line/8 p-4">
             <div>
-              <p className="text-[9px] font-semibold uppercase tracking-[0.2em] text-white/30">
+              <p className="text-[9px] font-semibold uppercase tracking-[0.2em] text-tipx-ink/30">
                 Focus · {focus.kind}
               </p>
-              <h2 className="mt-1 text-sm font-semibold text-white">
+              <h2 className="mt-1 text-sm font-semibold text-tipx-ink">
                 {focus.label}
               </h2>
               {focus.secondary ? (
-                <p className="mt-1 text-[11px] text-white/38">
+                <p className="mt-1 text-[11px] text-tipx-ink/38">
                   {focus.secondary}
                 </p>
               ) : null}
@@ -60,7 +60,7 @@ export function EntityDock() {
             <button
               type="button"
               onClick={() => setFocus(null)}
-              className="rounded-lg p-2 text-white/35 transition hover:bg-white/6 hover:text-white"
+              className="rounded-lg p-2 text-tipx-ink/35 transition hover:bg-tipx-ink/6 hover:text-tipx-ink"
               aria-label="Close entity context"
             >
               <X className="size-3.5" />
@@ -69,21 +69,21 @@ export function EntityDock() {
 
           <div className="flex flex-1 items-center justify-center p-6 text-center">
             <div>
-              <p className="text-xs font-medium text-white/58">
+              <p className="text-xs font-medium text-tipx-ink/58">
                 Entity context contract ready
               </p>
-              <p className="mx-auto mt-2 max-w-60 text-[11px] leading-5 text-white/30">
+              <p className="mx-auto mt-2 max-w-60 text-[11px] leading-5 text-tipx-ink/30">
                 Domain-specific dossier content is intentionally owned by the
                 Company and People implementation tracks.
               </p>
             </div>
           </div>
 
-          <div className="border-t border-white/8 p-3">
+          <div className="border-t border-tipx-line/8 p-3">
             <button
               type="button"
               onClick={() => toggleCompare(focus)}
-              className="w-full rounded-xl border border-white/9 bg-white/[0.035] px-3 py-2.5 text-xs font-medium text-white/66 transition hover:bg-white/[0.07] hover:text-white"
+              className="w-full rounded-xl border border-tipx-line/9 bg-tipx-ink/[0.035] px-3 py-2.5 text-xs font-medium text-tipx-ink/66 transition hover:bg-tipx-ink/[0.07] hover:text-tipx-ink"
             >
               {inCompare ? "Remove from compare" : "Add to compare"}
             </button>

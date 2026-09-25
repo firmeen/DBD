@@ -40,3 +40,6 @@ export type IntelligenceCommandId =
   | "command.open"
   | "workspace.clear-focus"
   | "workspace.clear-selection"
+  | "theme.system"
+  | "theme.light"
+  | "theme.dark"

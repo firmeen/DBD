@@ -17,22 +17,22 @@ export function ContextBar() {
   const surface = SURFACE_BY_ID[activeSurface]
 
   return (
-    <div className="pointer-events-auto fixed bottom-5 left-1/2 z-[35] hidden -translate-x-1/2 items-center gap-1 rounded-2xl border border-white/9 bg-[#0b0f13]/78 p-1 shadow-2xl shadow-black/20 backdrop-blur-xl md:flex">
+    <div className="pointer-events-auto fixed bottom-5 left-1/2 z-[35] hidden -translate-x-1/2 items-center gap-1 rounded-2xl border border-tipx-line/9 bg-tipx-floating/78 p-1 shadow-2xl shadow-black/20 backdrop-blur-xl md:flex">
       <div className="flex items-center gap-2 px-3 py-2">
-        <span className="grid size-5 place-items-center rounded-md bg-white text-[9px] font-bold text-black">
+        <span className="grid size-5 place-items-center rounded-md bg-tipx-brand text-[9px] font-bold text-tipx-on-brand">
           {activeSurface}
         </span>
         <div className="min-w-0">
-          <p className="max-w-48 truncate text-[10px] font-medium text-white/74">
+          <p className="max-w-48 truncate text-[10px] font-medium text-tipx-ink/74">
             {surface.name}
           </p>
-          <p className="text-[9px] text-white/30">
+          <p className="text-[9px] text-tipx-ink/30">
             Issue #{surface.ownerIssue}
           </p>
         </div>
       </div>
 
-      <span className="h-6 w-px bg-white/8" />
+      <span className="h-6 w-px bg-tipx-ink/8" />
 
       <ContextMetric
         icon={Layers3}
@@ -57,11 +57,11 @@ export function ContextBar() {
       <button
         type="button"
         onClick={() => setCommandOpen(true)}
-        className="ml-1 flex items-center gap-2 rounded-xl border border-white/8 bg-white/[0.035] px-3 py-2 text-[10px] text-white/48 transition hover:bg-white/[0.065] hover:text-white"
+        className="ml-1 flex items-center gap-2 rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.035] px-3 py-2 text-[10px] text-tipx-ink/48 transition hover:bg-tipx-ink/[0.065] hover:text-tipx-ink"
       >
         <Command className="size-3.5" aria-hidden />
         Command
-        <span className="flex items-center gap-0.5 font-mono text-[9px] text-white/28">
+        <span className="flex items-center gap-0.5 font-mono text-[9px] text-tipx-ink/28">
           <CornerDownLeft className="size-2.5" />
           K
         </span>
@@ -80,10 +80,10 @@ function ContextMetric({
   value: string
 }) {
   return (
-    <div className="flex items-center gap-1.5 px-2 py-2 text-[9px] uppercase tracking-[0.12em] text-white/30">
+    <div className="flex items-center gap-1.5 px-2 py-2 text-[9px] uppercase tracking-[0.12em] text-tipx-ink/30">
       {Icon ? <Icon className="size-3" aria-hidden /> : null}
       {label}
-      <span className="font-mono text-white/66">{value}</span>
+      <span className="font-mono text-tipx-ink/66">{value}</span>
     </div>
   )
 }
