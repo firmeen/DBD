@@ -19,6 +19,7 @@ import {
   createAiAmbientTarget,
 } from "@/lib/assistant/motion"
 import { cn } from "@/lib/utils"
+import { useWorkspaceStore } from "@/stores/workspace-store"
 
 export function AiAssistantEntry() {
   if (!aiAssistantEntryEnabled()) return null
@@ -30,12 +31,17 @@ function EnabledAiAssistantEntry() {
   const reduceMotion = useReducedMotion()
   const controls = useAnimationControls()
   const ambientMotionEnabled = aiAssistantAmbientMotionEnabled()
+  const activeSurface = useWorkspaceStore((state) => state.activeSurface)
+  const focus = useWorkspaceStore((state) => state.focus)
+  const compare = useWorkspaceStore((state) => state.compare)
   const [desktopRoaming, setDesktopRoaming] = React.useState(false)
   const [tooltipOpen, setTooltipOpen] = React.useState(false)
   const clickTimer = React.useRef<number | null>(null)
 
   React.useEffect(() => {
-    const media = window.matchMedia("(min-width: 768px)")
+    const media = window.matchMedia(
+      "(min-width: 1024px) and (hover: hover) and (pointer: fine)"
+    )
 
     function sync() {
       setDesktopRoaming(media.matches)
@@ -48,6 +54,16 @@ function EnabledAiAssistantEntry() {
 
   const canRoam =
     ambientMotionEnabled && !reduceMotion && desktopRoaming
+  const entityDockVisible = Boolean(
+    focus &&
+      !(
+        (activeSurface === "C" && focus.kind === "company") ||
+        (activeSurface === "P" &&
+          (focus.kind === "person" || focus.kind === "company")) ||
+        (activeSurface === "R" &&
+          (focus.kind === "person" || focus.kind === "company"))
+      )
+  )
 
   React.useEffect(() => {
     if (!canRoam) {
@@ -116,7 +132,11 @@ function EnabledAiAssistantEntry() {
 
   return (
     <motion.div
-      className="pointer-events-none fixed bottom-24 right-4 z-40 md:bottom-auto md:left-7 md:right-auto md:top-[54%]"
+      className={cn(
+        "pointer-events-none fixed right-4 z-40 transition-[bottom,opacity] duration-200 md:bottom-auto md:left-7 md:right-auto md:top-[54%]",
+        compare.length > 0 ? "bottom-36" : "bottom-24",
+        entityDockVisible ? "max-md:hidden" : null
+      )}
       initial={false}
       animate={controls}
     >
