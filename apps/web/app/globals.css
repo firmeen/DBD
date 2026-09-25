@@ -38,6 +38,15 @@
   --color-tipx-brand-soft: var(--tipx-brand-soft);
   --color-tipx-brand-accent: var(--tipx-brand-accent);
   --color-tipx-on-brand: var(--tipx-on-brand);
+  --color-tipx-active: var(--tipx-active);
+  --color-tipx-expired: var(--tipx-expired);
+  --color-tipx-prospect: var(--tipx-prospect);
+  --color-tipx-selected: var(--tipx-selected);
+  --color-tipx-related: var(--tipx-related);
+  --color-tipx-opportunity: var(--tipx-opportunity);
+  --color-tipx-success: var(--tipx-success);
+  --color-tipx-warning: var(--tipx-warning);
+  --color-tipx-danger: var(--tipx-danger);
 
   --radius-sm: calc(var(--radius) - 4px);
   --radius-md: calc(var(--radius) - 2px);
@@ -89,6 +98,9 @@
   --tipx-selected: var(--tipx-brand-accent);
   --tipx-related: oklch(0.61 0.13 292);
   --tipx-opportunity: oklch(0.75 0.15 78);
+  --tipx-success: oklch(0.48 0.14 150);
+  --tipx-warning: oklch(0.55 0.14 75);
+  --tipx-danger: oklch(0.56 0.19 25);
 
   --tipx-grid-line: color-mix(in oklab, var(--tipx-brand) 9%, transparent);
   --tipx-vignette-edge: color-mix(in oklab, var(--tipx-brand) 7%, transparent);
@@ -137,6 +149,9 @@
   --tipx-selected: var(--tipx-brand-accent);
   --tipx-related: oklch(0.75 0.12 292);
   --tipx-opportunity: oklch(0.79 0.14 82);
+  --tipx-success: oklch(0.76 0.15 150);
+  --tipx-warning: oklch(0.82 0.14 80);
+  --tipx-danger: oklch(0.72 0.18 25);
 
   --tipx-grid-line: color-mix(in oklab, var(--tipx-ink) 4%, transparent);
   --tipx-vignette-edge: color-mix(in oklab, black 72%, transparent);

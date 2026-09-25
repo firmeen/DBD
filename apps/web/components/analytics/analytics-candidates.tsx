@@ -124,7 +124,7 @@ export function AnalyticsCandidates({
                       className={cn(
                         "grid size-7 shrink-0 place-items-center rounded-lg border transition",
                         selected
-                          ? "border-emerald-100/25 bg-emerald-200/10 text-emerald-100/70"
+                          ? "border-tipx-selected/28 bg-tipx-selected/10 text-tipx-selected"
                           : "border-tipx-line/7 text-tipx-ink/20 hover:bg-tipx-ink/[0.05] hover:text-tipx-ink"
                       )}
                       title={selected ? "Remove from Selection" : "Add to Selection"}
@@ -137,7 +137,7 @@ export function AnalyticsCandidates({
                       className={cn(
                         "grid size-7 shrink-0 place-items-center rounded-lg border transition",
                         compared
-                          ? "border-cyan-100/25 bg-cyan-200/10 text-cyan-100/70"
+                          ? "border-tipx-related/28 bg-tipx-related/10 text-tipx-related"
                           : "border-tipx-line/7 text-tipx-ink/20 hover:bg-tipx-ink/[0.05] hover:text-tipx-ink"
                       )}
                       title={compared ? "Remove from Compare" : "Add to Compare"}

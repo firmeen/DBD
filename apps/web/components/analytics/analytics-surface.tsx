@@ -435,7 +435,7 @@ function AnalyticsControlDeck({
           <span
             className={cn(
               "size-1.5 rounded-full",
-              endpointConfigured ? "bg-emerald-300/70" : "bg-tipx-ink/16"
+              endpointConfigured ? "bg-tipx-success/70" : "bg-tipx-ink/16"
             )}
           />
         </div>
@@ -475,7 +475,7 @@ function AnalyticsControlDeck({
             <button
               type="button"
               onClick={() => onPopulation(servedPopulation)}
-              className="h-8 rounded-lg border border-emerald-200/10 bg-emerald-200/[0.035] px-2 text-[8px] text-emerald-100/52 hover:bg-emerald-200/[0.07]"
+              className="h-8 rounded-lg border border-tipx-success/18 bg-tipx-success/8 px-2 text-[8px] text-tipx-success hover:bg-tipx-success/12"
             >
               Activate served population
             </button>
@@ -563,7 +563,7 @@ function SummaryRail({
         ))}
       </div>
       {localFiltered ? (
-        <div className="border-t border-tipx-line/6 px-4 py-2 text-[8px] uppercase tracking-[0.12em] text-amber-100/32">
+        <div className="border-t border-tipx-line/6 px-4 py-2 text-[8px] uppercase tracking-[0.12em] text-tipx-warning/72">
           Local cross-filter summary · loaded exact subset only
         </div>
       ) : null}

@@ -592,7 +592,7 @@ function RelationshipControlDeck({
           <span
             className={cn(
               "size-1.5 rounded-full",
-              endpointConfigured ? "bg-emerald-300/70" : "bg-tipx-ink/16"
+              endpointConfigured ? "bg-tipx-success/70" : "bg-tipx-ink/16"
             )}
           />
         </div>
@@ -702,7 +702,7 @@ function RelationshipControlDeck({
             </span>
           ) : null}
           {pathLength > 1 ? (
-            <span className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-emerald-200/10 bg-emerald-200/[0.035] px-2 py-1 font-mono text-[7px] text-emerald-100/55">
+            <span className="ml-auto inline-flex items-center gap-1.5 rounded-full border border-tipx-related/18 bg-tipx-related/8 px-2 py-1 font-mono text-[7px] text-tipx-related">
               path {pathLength - 1}
             </span>
           ) : null}

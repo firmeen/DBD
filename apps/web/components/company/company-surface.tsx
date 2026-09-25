@@ -170,7 +170,7 @@ export function CompanySurface() {
     <main className="tipx-brand-field relative min-h-svh overflow-x-hidden bg-tipx-canvas text-tipx-ink">
       <div className="tipx-grid fixed inset-0 opacity-25" />
       <div className="tipx-vignette fixed inset-0" />
-      <div className="pointer-events-none fixed left-[8%] top-[8%] size-[42vw] max-h-[760px] max-w-[760px] rounded-full bg-cyan-300/[0.014] blur-3xl" />
+      <div className="pointer-events-none fixed left-[8%] top-[8%] size-[42vw] max-h-[760px] max-w-[760px] rounded-full bg-tipx-brand/[0.025] blur-3xl" />
 
       <CompanyCommandBar
         searchTerm={searchTerm}
@@ -213,7 +213,7 @@ export function CompanySurface() {
 
               <div className="flex items-center gap-2 self-start lg:self-auto">
                 {detail.availability === "partial" ? (
-                  <span className="rounded-full border border-amber-200/10 bg-amber-200/[0.025] px-2.5 py-1.5 text-[9px] uppercase tracking-[0.13em] text-amber-100/48">
+                  <span className="rounded-full border border-tipx-warning/18 bg-tipx-warning/7 px-2.5 py-1.5 text-[9px] uppercase tracking-[0.13em] text-tipx-warning">
                     Partial serving data
                   </span>
                 ) : null}
@@ -469,7 +469,7 @@ function CompanyDiscovery({
             <span
               className={cn(
                 "size-1.5 rounded-full",
-                endpointConfigured ? "bg-emerald-300/70" : "bg-tipx-ink/16"
+                endpointConfigured ? "bg-tipx-success/70" : "bg-tipx-ink/16"
               )}
             />
             {endpointConfigured ? "Serving configured" : "Serving unavailable"}
@@ -638,7 +638,7 @@ function CompanyError({
   return (
     <div className="grid min-h-[calc(100svh-13rem)] place-items-center text-center">
       <div>
-        <AlertTriangle className="mx-auto size-6 text-amber-100/35" />
+        <AlertTriangle className="mx-auto size-6 text-tipx-warning/80" />
         <p className="mt-4 text-sm font-medium text-tipx-ink/52">
           Company serving request failed
         </p>

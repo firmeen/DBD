@@ -342,7 +342,7 @@ function ContextRow({
       <span
         className={cn(
           "size-1.5 rounded-full",
-          active ? "bg-emerald-300/70" : "bg-tipx-ink/16"
+          active ? "bg-tipx-success/70" : "bg-tipx-ink/16"
         )}
       />
     </div>
@@ -370,8 +370,8 @@ function UnavailableCompanyDetail({
         <p className="mt-2 text-sm text-tipx-ink/36">{entity.secondary}</p>
       ) : null}
 
-      <div className="mt-8 max-w-2xl rounded-2xl border border-amber-200/10 bg-amber-200/[0.025] p-5">
-        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-amber-100/55">
+      <div className="mt-8 max-w-2xl rounded-2xl border border-tipx-warning/18 bg-tipx-warning/7 p-5">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.18em] text-tipx-warning">
           Company serving detail unavailable
         </p>
         <p className="mt-2 text-[12px] leading-6 text-tipx-ink/38">

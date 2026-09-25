@@ -405,9 +405,9 @@ function FinancialStatement({
                     className={cn(
                       "text-right font-mono",
                       (item.pctChange ?? 0) > 0
-                        ? "text-emerald-200/58"
+                        ? "text-tipx-success"
                         : (item.pctChange ?? 0) < 0
-                          ? "text-rose-200/58"
+                          ? "text-tipx-danger"
                           : "text-tipx-ink/30"
                     )}
                   >
