@@ -1028,7 +1028,9 @@ class FabricWorkerRepository(WorkerRepository):
             if str(target.get("status") or "") != "building":
                 raise ValueError("Only an interrupted building recovery run can be resumed")
 
-        batch_size = max(100, int(settings.dbd_materialize_batch_size))
+        # Recovery is a one-time durable copy, not upstream I/O. Use the largest
+        # supported materialization batch to keep million-company recovery bounded.
+        batch_size = max(5000, int(settings.dbd_materialize_batch_size))
         async with self.engine.connect() as conn:
             after_company = int(
                 (

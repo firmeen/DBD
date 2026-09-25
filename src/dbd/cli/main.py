@@ -673,6 +673,17 @@ def main():
             _campaign_command(args, presenter)
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
+                from ..runtime.supervisor import campaign_status
+
+                state = campaign_status(args.run_id)
+                if (
+                    state.get("supervisor_active")
+                    or int(state.get("workers", 0) or 0)
+                    or int(state.get("running", 0) or 0)
+                ):
+                    raise ValueError(
+                        "Pause/stop the campaign before reopening failed resources"
+                    )
                 with manager_lock():
                     asyncio.run(worker_command(args, presenter=presenter))
             else:

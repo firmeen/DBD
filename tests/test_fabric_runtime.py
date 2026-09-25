@@ -752,7 +752,7 @@ async def test_transient_forbidden_defers_without_failed_bit_or_attempt_charge(r
         event = (
             await conn.execute(
                 text(
-                    "SELECT outcome,error_code,http_status,attempt "
+                    "SELECT outcome,error_code,error_message,http_status,attempt "
                     "FROM collection_failure_events WHERE run_id=:run"
                 ),
                 {"run": run_id},
@@ -765,6 +765,7 @@ async def test_transient_forbidden_defers_without_failed_bit_or_attempt_charge(r
     assert state["last_error"] == "DbdForbiddenError"
     assert event["outcome"] == "deferred"
     assert event["error_code"] == "DbdForbiddenError"
+    assert event["error_message"] == "HTTP 403"
     assert event["http_status"] == 403
     assert event["attempt"] == 1
 

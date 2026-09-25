@@ -183,6 +183,14 @@ def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data()
         assert cur.fetchone()["n"] == 1
         cur.execute(
             """
+            SELECT COUNT(*) AS n FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='collection_failure_events'
+              AND column_name='error_message'
+            """
+        )
+        assert cur.fetchone()["n"] == 1
+        cur.execute(
+            """
             SELECT COUNT(*) AS n FROM information_schema.statistics
             WHERE table_schema=DATABASE() AND table_name='company_collection_state'
               AND index_name='idx_collection_active'
