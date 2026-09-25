@@ -61,6 +61,7 @@ For browser-to-browser integration, bind each source application to approved ori
 
 ```text
 TIPX_INTEGRATION_SOURCE_ORIGINS={"central":["https://central.example.com"],"sales":["https://sales.example.com"]}
+TIPX_INTEGRATION_RETURN_ORIGINS={"central":"https://central.example.com","sales":"https://sales.example.com"}
 ```
 
 Cross-origin browser requests are denied unless the request origin is configured for the declared source application. Same-origin and server-to-server requests do not require CORS configuration.
@@ -112,6 +113,10 @@ v1 accepts only an application-relative `returnContext.path`, for example:
 ```
 
 Absolute and protocol-relative return URLs are rejected. This avoids turning TIPX into an open redirect. The source application origin remains deployment configuration rather than caller-controlled data.
+
+When return context is present, TIPX exposes a compact return action in the shared Context Bar. The browser navigates first to the local `/api/tipx/integration/v1/return` endpoint; that server route resolves the relative path against the configured source origin and issues the redirect. The external origin is never accepted from query parameters.
+
+If `TIPX_INTEGRATION_RETURN_ORIGINS` is not configured for a source and exactly one source origin exists in `TIPX_INTEGRATION_SOURCE_ORIGINS`, that single origin is used as a safe fallback.
 
 ## Error contract
 
