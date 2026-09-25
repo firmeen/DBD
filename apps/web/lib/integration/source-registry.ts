@@ -51,6 +51,38 @@ export function integrationCorsHeaders(origin: string | null) {
   }
 }
 
+export function resolveIntegrationReturnUrl(
+  sourceApp: string,
+  path: string,
+  env: Environment = process.env
+) {
+  if (
+    !isIntegrationSourceEnabled(sourceApp, env) ||
+    !path.startsWith("/") ||
+    path.startsWith("//") ||
+    path.includes("\\")
+  ) {
+    return null
+  }
+
+  const explicitOrigin = configuredReturnOrigins(env)[sourceApp]
+  const sourceOrigins = configuredSourceOrigins(env)[sourceApp]
+  const fallbackOrigin =
+    sourceOrigins?.size === 1 ? [...sourceOrigins][0] : undefined
+  const origin = explicitOrigin ?? fallbackOrigin
+
+  if (!origin) return null
+
+  try {
+    const destination = new URL(path, origin)
+    return destination.origin === origin
+      ? destination.toString()
+      : null
+  } catch {
+    return null
+  }
+}
+
 function configuredSourceApps(env: Environment) {
   const configured = env.TIPX_INTEGRATION_SOURCES?.split(",")
     .map((value) => value.trim())
@@ -61,6 +93,29 @@ function configuredSourceApps(env: Environment) {
       ? configured
       : DEFAULT_SOURCE_APPS
   )
+}
+
+function configuredReturnOrigins(env: Environment) {
+  const raw = env.TIPX_INTEGRATION_RETURN_ORIGINS?.trim()
+  if (!raw) return {} as Record<string, string>
+
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return {}
+    }
+
+    const result: Record<string, string> = {}
+    for (const [source, value] of Object.entries(parsed)) {
+      if (typeof value !== "string") continue
+      const origin = normalizeOrigin(value)
+      if (origin) result[source] = origin
+    }
+
+    return result
+  } catch {
+    return {}
+  }
 }
 
 function configuredSourceOrigins(env: Environment) {
