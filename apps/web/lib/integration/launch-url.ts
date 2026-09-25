@@ -85,6 +85,19 @@ export function buildTipxLaunchHref(
   return url.toString()
 }
 
+export function buildTipxReturnEndpointHref(
+  context: IntegrationLaunchContext
+) {
+  if (!context.returnContext) return null
+
+  const params = new URLSearchParams({
+    source: context.sourceApp,
+    path: context.returnContext.path,
+  })
+
+  return `/api/tipx/integration/v1/return?${params.toString()}`
+}
+
 export function parseTipxIntegrationSearchParams(
   params: SearchParamsRecord
 ): IntegrationLaunchContext | null {
