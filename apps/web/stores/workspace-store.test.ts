@@ -88,6 +88,31 @@ describe("workspace history invariants", () => {
     expect(useWorkspaceStore.getState().historyFuture).toHaveLength(1)
   })
 
+  it("hydrates external launch context without inheriting workspace state", () => {
+    useWorkspaceStore.getState().setFocus(COMPANY)
+    useWorkspaceStore.getState().setPopulation(POPULATION)
+
+    const EXTERNAL: EntityRef = {
+      id: "0200000000000",
+      kind: "company",
+      label: "External Company",
+    }
+
+    useWorkspaceStore.getState().hydrateExternalContext({
+      activeSurface: "C",
+      focus: EXTERNAL,
+    })
+
+    const state = useWorkspaceStore.getState()
+    expect(state.activeSurface).toBe("C")
+    expect(state.focus).toEqual(EXTERNAL)
+    expect(state.selection).toEqual([])
+    expect(state.compare).toEqual([])
+    expect(state.population).toBeNull()
+    expect(state.historyPast).toEqual([])
+    expect(state.historyFuture).toEqual([])
+  })
+
   it("keeps command center and Global Lens mutually exclusive", () => {
     useWorkspaceStore.getState().setLensOpen(true)
     useWorkspaceStore.getState().setCommandOpen(true)
