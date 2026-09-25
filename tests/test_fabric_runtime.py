@@ -15,7 +15,7 @@ from dbd.core.settings import settings
 from dbd.runtime.collection_fabric import endpoint_bit
 from dbd.runtime.replay import replay_archive
 from dbd.runtime.resources import DEFAULT_PARTS, endpoints
-from dbd.runtime.supervisor import _has_active_work, _task_progress
+from dbd.runtime.supervisor import _failure_diagnostics, _has_active_work, _task_progress
 from dbd.runtime.worker import process
 
 pytestmark = pytest.mark.integration
@@ -768,6 +768,18 @@ async def test_transient_forbidden_defers_without_failed_bit_or_attempt_charge(r
     assert event["error_message"] == "HTTP 403"
     assert event["http_status"] == 403
     assert event["attempt"] == 1
+
+    diagnostics = _failure_diagnostics(run_id)
+    assert diagnostics["failure_events"] == [
+        {
+            "error_code": "DbdForbiddenError",
+            "http_status": 403,
+            "stage": "fetch",
+            "outcome": "deferred",
+            "events": 1,
+            "sample_message": "HTTP 403",
+        }
+    ]
 
 
 async def test_fabric_retry_reopens_failed_bits_embedded_in_pending_state(repo):

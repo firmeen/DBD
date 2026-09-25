@@ -492,9 +492,25 @@ def _failure_diagnostics(run_id: int, limit: int = 8) -> dict:
             )
             latest_errors = [dict(row) for row in cur.fetchall()]
             scope = "task_error_exact"
+
+        cur.execute(
+            """
+            SELECT error_code,http_status,stage,outcome,COUNT(*) AS events,
+                   MAX(error_message) AS sample_message
+            FROM collection_failure_events
+            WHERE run_id=%s
+            GROUP BY error_code,http_status,stage,outcome
+            ORDER BY events DESC,error_code
+            LIMIT %s
+            """,
+            (run_id, max(1, int(limit))),
+        )
+        failure_events = [dict(row) for row in cur.fetchall()]
+
     return {
         "by_endpoint": by_endpoint,
         "latest_errors": latest_errors,
+        "failure_events": failure_events,
         "error_scope": scope,
     }
 
