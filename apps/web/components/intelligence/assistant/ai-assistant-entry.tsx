@@ -115,7 +115,7 @@ function EnabledAiAssistantEntry() {
                 duration: Math.max(target.duration, 0.2),
                 ease: [0.22, 0.75, 0.25, 1],
               }
-            : { duration: 0.18, ease: "easeOut" }
+            : { duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }
       }
     >
       <TooltipProvider delay={120}>
@@ -140,7 +140,7 @@ function EnabledAiAssistantEntry() {
             />
             <span
               aria-hidden
-              className="absolute -right-1 -top-1 size-3 rounded-full border border-tipx-canvas bg-tipx-brand shadow-[0_0_18px_color-mix(in_oklab,var(--tipx-brand)_55%,transparent)]"
+              className="absolute -right-1 -top-1 size-3 rounded-full border border-tipx-canvas bg-tipx-brand shadow-[0_0_18px_rgba(0,0,0,.18)]"
             />
             <Sparkles
               aria-hidden
