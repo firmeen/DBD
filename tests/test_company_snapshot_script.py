@@ -184,3 +184,34 @@ def test_snapshot_off_mode_is_supported_without_changing_auto_logic():
     assert module.determine_mode("off", 1_315_245) == "OFF"
     assert module.determine_mode("auto", 0) == "FULL"
     assert module.determine_mode("auto", 1) == "INCREMENTAL"
+
+
+def test_classify_rows_accepts_string_and_datetime_timestamps():
+    module = load_module()
+    newer = datetime(2026, 9, 25, 6, 12, 44, 904657)
+    older = datetime(2026, 9, 25, 6, 0, 0)
+
+    source_rows = [
+        {
+            "company_id": 99,
+            "source_hash": "same",
+            "source_updated_at": "2026-09-25 06:12:44.904657",
+        }
+    ]
+    existing = {
+        99: {
+            "source_hash": "same",
+            "source_updated_at": older,
+        }
+    }
+
+    _, _, source_only_rows, unchanged_rows = module.classify_rows(
+        source_rows,
+        existing,
+    )
+
+    assert source_only_rows == source_rows
+    assert unchanged_rows == []
+    assert module.normalize_datetime(
+        "2026-09-25 06:12:44.904657"
+    ) == newer
