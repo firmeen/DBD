@@ -303,6 +303,35 @@ def canonical_value(value: Any) -> str:
     return str(value)
 
 
+def normalize_datetime(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, str):
+        text_value = value.strip()
+        if not text_value:
+            return None
+        if text_value.endswith("Z"):
+            text_value = text_value[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(text_value)
+        except ValueError:
+            for fmt in ("%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S"):
+                try:
+                    return datetime.strptime(text_value, fmt)
+                except ValueError:
+                    continue
+    raise TypeError(
+        "Unsupported datetime value "
+        f"{value!r} ({type(value).__name__})"
+    )
+
+
 def calculate_source_hash(row: dict[str, Any]) -> str:
     canonical = "|".join(
         f"{field_name}={canonical_value(row.get(field_name))}"
@@ -334,8 +363,8 @@ def classify_rows(
         if current["source_hash"] != row["source_hash"]:
             changed_rows.append(row)
             continue
-        old_time = current.get("source_updated_at")
-        new_time = row.get("source_updated_at")
+        old_time = normalize_datetime(current.get("source_updated_at"))
+        new_time = normalize_datetime(row.get("source_updated_at"))
         if old_time is not None and new_time is not None and new_time > old_time:
             source_only_rows.append(row)
         else:
@@ -910,24 +939,26 @@ def fetch_snapshot_source(
         ) AS has_history,
         NULLIF(TRIM(c.phone_no),'') AS phone,
         NULLIF(TRIM(c.email),'') AS email,
-        GREATEST(
-            COALESCE(
-                c.last_seen_at,
-                '1000-01-01 00:00:00.000000'
-            ),
-            COALESCE(
-                cm.master_observed_at,
-                cm.last_seen_at,
-                '1000-01-01 00:00:00.000000'
-            ),
-            COALESCE(
-                (
-                    SELECT MAX(ces.requested_at)
-                    FROM company_endpoint_state ces
-                    WHERE ces.company_id=cm.company_id
+        CAST(
+            GREATEST(
+                COALESCE(
+                    c.last_seen_at,
+                    '1000-01-01 00:00:00.000000'
                 ),
-                '1000-01-01 00:00:00.000000'
-            )
+                COALESCE(
+                    cm.master_observed_at,
+                    cm.last_seen_at,
+                    '1000-01-01 00:00:00.000000'
+                ),
+                COALESCE(
+                    (
+                        SELECT MAX(ces.requested_at)
+                        FROM company_endpoint_state ces
+                        WHERE ces.company_id=cm.company_id
+                    ),
+                    '1000-01-01 00:00:00.000000'
+                )
+            ) AS DATETIME(6)
         ) AS source_updated_at
     FROM company_master cm
     INNER JOIN companies c
@@ -951,6 +982,9 @@ def fetch_snapshot_source(
     for row in rows:
         for field_name in integer_fields:
             row[field_name] = int(row[field_name] or 0)
+        row["source_updated_at"] = normalize_datetime(
+            row.get("source_updated_at")
+        )
         row["source_hash"] = calculate_source_hash(row)
     return rows
 
