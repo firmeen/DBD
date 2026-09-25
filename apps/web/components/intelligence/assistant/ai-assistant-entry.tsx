@@ -93,7 +93,15 @@ function EnabledAiAssistantEntry() {
     []
   )
 
+  function handleTooltipOpenChange(open: boolean) {
+    if (open) {
+      controls.stop()
+    }
+    setTooltipOpen(open)
+  }
+
   function showComingSoon() {
+    controls.stop()
     setTooltipOpen(true)
 
     if (clickTimer.current !== null) {
@@ -115,7 +123,7 @@ function EnabledAiAssistantEntry() {
       <TooltipProvider delay={120}>
         <Tooltip
           open={tooltipOpen}
-          onOpenChange={setTooltipOpen}
+          onOpenChange={handleTooltipOpenChange}
         >
           <TooltipTrigger
             type="button"
