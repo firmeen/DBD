@@ -8,6 +8,7 @@ import pytest
 import dbd.client.async_client as async_client_module
 from dbd.client import rate_limit
 from dbd.client.async_client import AsyncDbdClient
+from dbd.client.auth import DbdAuth
 from dbd.client.rate_limit import TokenBucket, protective_cooldown
 from dbd.core.exceptions import DbdAuthError, DbdForbiddenError, DbdTokenExpiredError
 
@@ -180,3 +181,16 @@ async def test_context_entry_does_not_require_upstream_auth(monkeypatch):
     c._ensure_token.assert_not_awaited()
 
     await c.__aexit__()
+
+
+def test_auth_invalidate_can_force_session_rewarm():
+    auth = DbdAuth()
+    auth._token = "old"
+    auth._expires_at = time.time() + 60
+    auth._warmed_up = True
+
+    auth.invalidate(reset_warmup=True)
+
+    assert auth._token is None
+    assert auth._expires_at == 0.0
+    assert auth._warmed_up is False
