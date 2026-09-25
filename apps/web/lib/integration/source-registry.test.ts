@@ -4,6 +4,7 @@ import {
   isIntegrationPreflightOriginAllowed,
   isIntegrationRequestOriginAllowed,
   isIntegrationSourceEnabled,
+  resolveIntegrationReturnUrl,
 } from "./source-registry"
 
 const ENV = {
@@ -11,6 +12,10 @@ const ENV = {
   TIPX_INTEGRATION_SOURCE_ORIGINS: JSON.stringify({
     central: ["https://central.example.com"],
     sales: ["https://sales.example.com"],
+  }),
+  TIPX_INTEGRATION_RETURN_ORIGINS: JSON.stringify({
+    central: "https://central.example.com",
+    sales: "https://sales.example.com",
   }),
 }
 
@@ -41,6 +46,32 @@ describe("TIPX integration source registry", () => {
         ENV
       )
     ).toBe(false)
+  })
+
+  it("resolves return navigation only against trusted source origins", () => {
+    expect(
+      resolveIntegrationReturnUrl(
+        "central",
+        "/companies/1?tab=detail",
+        ENV
+      )
+    ).toBe("https://central.example.com/companies/1?tab=detail")
+
+    expect(
+      resolveIntegrationReturnUrl(
+        "central",
+        "//evil.example/path",
+        ENV
+      )
+    ).toBeNull()
+
+    expect(
+      resolveIntegrationReturnUrl(
+        "unknown",
+        "/companies/1",
+        ENV
+      )
+    ).toBeNull()
   })
 
   it("allows preflight only from a configured integration origin", () => {
