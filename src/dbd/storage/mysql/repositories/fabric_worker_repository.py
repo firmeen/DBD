@@ -997,6 +997,39 @@ class FabricWorkerRepository(WorkerRepository):
             raise ValueError("Campaign recovery requires a fabric_v2 source run")
 
         if recovery_run_id is None:
+            async with self.engine.connect() as conn:
+                existing = (
+                    await conn.execute(
+                        text("""
+                        SELECT id,status
+                        FROM worker_runs
+                        WHERE parent_run_id=:source
+                          AND recovery_kind='failed_unresolved'
+                        ORDER BY id DESC
+                        LIMIT 1
+                        """),
+                        {"source": int(source_run_id)},
+                    )
+                ).mappings().first()
+            if existing is not None:
+                existing_id = int(existing["id"])
+                existing_status = str(existing.get("status") or "unknown")
+                if existing_status == "building":
+                    raise ValueError(
+                        f"Recovery run {existing_id} is already building; resume with "
+                        f"--recovery-run-id {existing_id}"
+                    )
+                if existing_status == "ready":
+                    raise ValueError(
+                        f"Recovery run {existing_id} already exists and is ready; "
+                        f"start that run instead of creating a duplicate"
+                    )
+                raise ValueError(
+                    f"Recovery lineage already contains run {existing_id} "
+                    f"with status {existing_status!r}; use that run as the next "
+                    "recovery source if additional recovery is required"
+                )
+
             recovery_run_id = int(
                 await self.create_run(
                     f"recovery:{int(source_run_id)}:{str(source.get('source_label') or '')}"[:255],

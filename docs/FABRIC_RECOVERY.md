@@ -55,6 +55,10 @@ Create the recovery run explicitly:
 dbd-data campaign recover 8 --execute
 ```
 
+Creation is lineage-fenced: if a recovery child already exists for the source run,
+the command refuses to create a duplicate. A `building` child must be resumed with
+`--recovery-run-id`; a `ready` child must be started instead of materialized again.
+
 The command creates a new `fabric_v2` run with durable lineage:
 
 ```text

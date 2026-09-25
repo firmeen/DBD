@@ -918,6 +918,9 @@ async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_re
     assert target["project_attempts"] == 0
     assert source_after == source_before
 
+    with pytest.raises(ValueError, match=f"Recovery run {recovery_run} already exists"):
+        await fabric.create_recovery_run(source_run)
+
     FullFabricApi.calls = 0
     assert await process(
         repo,
