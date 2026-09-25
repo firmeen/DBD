@@ -898,9 +898,24 @@ class FabricWorkerRepository(WorkerRepository):
                     {"id": run_id, "limit": max(1, int(limit))},
                 )
             ).mappings().all()
+            event_errors = (
+                await conn.execute(
+                    text("""
+                    SELECT error_code,http_status,stage,outcome,COUNT(*) AS events,
+                           MAX(error_message) AS sample_message
+                    FROM collection_failure_events
+                    WHERE run_id=:id
+                    GROUP BY error_code,http_status,stage,outcome
+                    ORDER BY events DESC,error_code
+                    LIMIT :limit
+                    """),
+                    {"id": run_id, "limit": max(1, int(limit))},
+                )
+            ).mappings().all()
         return {
             "by_endpoint": [dict(row) for row in by_endpoint],
             "latest_errors": [dict(row) for row in by_error],
+            "failure_events": [dict(row) for row in event_errors],
             "error_scope": "state_latest_error_not_per_endpoint",
         }
 

@@ -232,6 +232,7 @@ async def _record_failure_event(repo, task, exc, *, outcome: str, archive_id=Non
             task,
             outcome=outcome,
             error_code=type(exc).__name__,
+            error_message=str(exc) or type(exc).__name__,
             http_status=_http_status(exc),
             attempt=_attempt_count(task),
             archive_id=archive_id,

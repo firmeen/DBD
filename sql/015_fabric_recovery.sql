@@ -16,6 +16,7 @@ CREATE TABLE collection_failure_events (
   stage VARCHAR(16) NOT NULL,
   outcome VARCHAR(32) NOT NULL,
   error_code VARCHAR(100) NOT NULL,
+  error_message VARCHAR(500) NOT NULL,
   http_status SMALLINT UNSIGNED NULL,
   attempt INT UNSIGNED NOT NULL DEFAULT 0,
   archive_id BIGINT UNSIGNED NULL,

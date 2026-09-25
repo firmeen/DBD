@@ -502,6 +502,7 @@ class WorkerRepository:
         *,
         outcome: str,
         error_code: str,
+        error_message: str,
         http_status: int | None,
         attempt: int,
         archive_id=None,
@@ -510,11 +511,11 @@ class WorkerRepository:
             await conn.execute(
                 text("""
                 INSERT INTO collection_failure_events(
-                  run_id,company_id,endpoint,stage,outcome,error_code,http_status,
-                  attempt,archive_id,occurred_at
+                  run_id,company_id,endpoint,stage,outcome,error_code,error_message,
+                  http_status,attempt,archive_id,occurred_at
                 ) VALUES (
-                  :run,:company,:endpoint,:stage,:outcome,:error,:http_status,
-                  :attempt,:archive,UTC_TIMESTAMP(6)
+                  :run,:company,:endpoint,:stage,:outcome,:error,:error_message,
+                  :http_status,:attempt,:archive,UTC_TIMESTAMP(6)
                 )
                 """),
                 {
@@ -524,6 +525,7 @@ class WorkerRepository:
                     "stage": task.get("stage", "fetch"),
                     "outcome": outcome,
                     "error": error_code,
+                    "error_message": error_message[:500],
                     "http_status": http_status,
                     "attempt": max(0, int(attempt)),
                     "archive": archive_id,

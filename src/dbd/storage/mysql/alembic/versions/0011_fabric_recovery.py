@@ -77,6 +77,7 @@ def upgrade():
               stage VARCHAR(16) NOT NULL,
               outcome VARCHAR(32) NOT NULL,
               error_code VARCHAR(100) NOT NULL,
+              error_message VARCHAR(500) NOT NULL,
               http_status SMALLINT UNSIGNED NULL,
               attempt INT UNSIGNED NOT NULL DEFAULT 0,
               archive_id BIGINT UNSIGNED NULL,
@@ -87,6 +88,21 @@ def upgrade():
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
             """
         )
+
+    if not _column_exists(connection, "collection_failure_events", "error_message"):
+        connection.exec_driver_sql(
+            "ALTER TABLE collection_failure_events ADD COLUMN error_message "
+            "VARCHAR(500) NOT NULL DEFAULT '' AFTER error_code"
+        )
+    for index, columns in (
+        ("idx_failure_event_run", "run_id,outcome,id"),
+        ("idx_failure_event_company", "company_id,endpoint,id"),
+        ("idx_failure_event_error", "run_id,error_code,http_status,id"),
+    ):
+        if not _index_exists(connection, "collection_failure_events", index):
+            connection.exec_driver_sql(
+                f"CREATE INDEX {index} ON collection_failure_events({columns})"
+            )
 
 
 def downgrade():
