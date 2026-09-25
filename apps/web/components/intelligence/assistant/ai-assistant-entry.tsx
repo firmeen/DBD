@@ -2,7 +2,7 @@
 
 import * as React from "react"
 import { Sparkles } from "lucide-react"
-import { motion, useReducedMotion } from "motion/react"
+import { motion, useAnimationControls, useReducedMotion } from "motion/react"
 
 import {
   Tooltip,
@@ -17,17 +17,8 @@ import {
 import {
   aiAmbientDelay,
   createAiAmbientTarget,
-  type AiAmbientTarget,
 } from "@/lib/assistant/motion"
 import { cn } from "@/lib/utils"
-
-const STILL_TARGET: AiAmbientTarget = {
-  x: 0,
-  y: 0,
-  rotate: 0,
-  duration: 0,
-  restMs: 0,
-}
 
 export function AiAssistantEntry() {
   if (!aiAssistantEntryEnabled()) return null
@@ -37,11 +28,10 @@ export function AiAssistantEntry() {
 
 function EnabledAiAssistantEntry() {
   const reduceMotion = useReducedMotion()
+  const controls = useAnimationControls()
   const ambientMotionEnabled = aiAssistantAmbientMotionEnabled()
   const [desktopRoaming, setDesktopRoaming] = React.useState(false)
   const [tooltipOpen, setTooltipOpen] = React.useState(false)
-  const [target, setTarget] =
-    React.useState<AiAmbientTarget>(STILL_TARGET)
   const clickTimer = React.useRef<number | null>(null)
 
   React.useEffect(() => {
@@ -60,18 +50,39 @@ function EnabledAiAssistantEntry() {
     ambientMotionEnabled && !reduceMotion && desktopRoaming
 
   React.useEffect(() => {
-    if (!canRoam || tooltipOpen) return
+    if (!canRoam) {
+      controls.stop()
+      controls.set({ x: 0, y: 0, rotate: 0 })
+      return
+    }
+
+    if (tooltipOpen) {
+      controls.stop()
+      return
+    }
 
     let timer = window.setTimeout(drift, 2_800)
 
     function drift() {
       const next = createAiAmbientTarget()
-      setTarget(next)
+
+      void controls.start(
+        {
+          x: next.x,
+          y: next.y,
+          rotate: next.rotate,
+        },
+        {
+          duration: next.duration,
+          ease: [0.22, 0.75, 0.25, 1],
+        }
+      )
+
       timer = window.setTimeout(drift, aiAmbientDelay(next))
     }
 
     return () => window.clearTimeout(timer)
-  }, [canRoam, tooltipOpen])
+  }, [canRoam, controls, tooltipOpen])
 
   React.useEffect(
     () => () => {
@@ -98,25 +109,8 @@ function EnabledAiAssistantEntry() {
   return (
     <motion.div
       className="pointer-events-none fixed bottom-24 right-4 z-40 md:bottom-auto md:left-7 md:right-auto md:top-[54%]"
-      animate={
-        canRoam
-          ? {
-              x: target.x,
-              y: target.y,
-              rotate: target.rotate,
-            }
-          : { x: 0, y: 0, rotate: 0 }
-      }
-      transition={
-        reduceMotion
-          ? { duration: 0 }
-          : canRoam
-            ? {
-                duration: Math.max(target.duration, 0.2),
-                ease: [0.22, 0.75, 0.25, 1],
-              }
-            : { duration: 0.18, ease: [0.2, 0.8, 0.2, 1] }
-      }
+      initial={false}
+      animate={controls}
     >
       <TooltipProvider delay={120}>
         <Tooltip
