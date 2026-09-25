@@ -820,11 +820,15 @@ def _guard_loop(config: GuardianConfig, dashboard: GuardianDashboard) -> int:
 
         if code == _EXIT_PAUSED:
             message = "Operator requested a graceful pause; Guardian will not auto-resume."
+            paused_state = state
+            with suppress(Exception):
+                paused_state = campaign_status(config.run_id)
             payload = _view(
                 config,
                 phase="PAUSED",
                 recovery_count=recovery_count,
                 message=message,
+                state=paused_state,
                 package_health=package_health,
             )
             dashboard.close(payload)
@@ -870,6 +874,31 @@ def _guard_loop(config: GuardianConfig, dashboard: GuardianDashboard) -> int:
         )
         if terminal is not None:
             return terminal
+
+        if code == 2:
+            message = (
+                "Local fleet capacity was exhausted while durable work remains; "
+                "operator diagnosis is required before resume."
+            )
+            payload = _view(
+                config,
+                phase="CAPACITY_EXHAUSTED",
+                recovery_count=recovery_count,
+                message=message,
+                state=after,
+                package_health=package_health,
+                last_failure="supervisor_exit_2",
+            )
+            dashboard.close(payload)
+            _write_guardian_state(
+                config,
+                phase="CAPACITY_EXHAUSTED",
+                terminal=True,
+                recovery_count=recovery_count,
+                message=message,
+                exit_code=2,
+            )
+            return 2
 
         recovery_count += 1
         if code == 0:

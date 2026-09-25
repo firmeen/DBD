@@ -293,6 +293,20 @@ while ($true) {
     $exitCode = $LASTEXITCODE
     $state = Get-GuardianState
 
+    $stateIsFresh = (
+        $null -ne $state -and
+        $null -ne $state.updated_at -and
+        [double]$state.updated_at -ge $launchEpoch
+    )
+    if ($stateIsFresh -and [bool]$state.terminal) {
+        $terminalExitCode = $exitCode
+        if ($null -ne $state.exit_code) {
+            $terminalExitCode = [int]$state.exit_code
+        }
+        Write-GuardianHeader ([string]$state.phase) ([string]$state.message)
+        exit $terminalExitCode
+    }
+
     if ($exitCode -eq 75) {
         Write-GuardianHeader "ALREADY MANAGED" "another local Guardian owns this run"
         exit 75
@@ -311,20 +325,6 @@ while ($true) {
     if ($exitCode -eq 130) {
         Write-GuardianHeader "PAUSED" "operator requested graceful pause"
         exit 130
-    }
-
-    $stateIsFresh = (
-        $null -ne $state -and
-        $null -ne $state.updated_at -and
-        [double]$state.updated_at -ge $launchEpoch
-    )
-    if ($stateIsFresh -and [bool]$state.terminal) {
-        $terminalExitCode = $exitCode
-        if ($null -ne $state.exit_code) {
-            $terminalExitCode = [int]$state.exit_code
-        }
-        Write-GuardianHeader ([string]$state.phase) ([string]$state.message)
-        exit $terminalExitCode
     }
 
     $restartCount++
