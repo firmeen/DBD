@@ -826,6 +826,50 @@ async def test_fabric_retry_reopens_failed_bits_embedded_in_pending_state(repo):
     assert state["attempts"] == 0
 
 
+async def test_recovery_run_cleans_historical_done_failed_overlap(repo):
+    resources = ("profile", "financial_submissions")
+    fabric, source_run, _ = await new_fabric_run(repo, resources)
+    profile = endpoint_bit("profile")
+    financial = endpoint_bit("financial_submissions")
+
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                "UPDATE company_collection_state "
+                "SET done_mask=:financial,not_available_mask=0,"
+                "failed_mask=:failed,dirty_mask=0,next_endpoint=NULL,"
+                "status='failed',attempts=3,last_error='DbdForbiddenError',"
+                "finished_at=UTC_TIMESTAMP(6) WHERE run_id=:run"
+            ),
+            {
+                "financial": financial,
+                "failed": profile | financial,
+                "run": source_run,
+            },
+        )
+
+    created = await fabric.create_recovery_run(source_run)
+    recovery_run = created["recovery_run_id"]
+
+    async with repo.engine.connect() as conn:
+        target = (
+            await conn.execute(
+                text(
+                    "SELECT done_mask,not_available_mask,failed_mask,dirty_mask,"
+                    "next_endpoint,status FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": recovery_run},
+            )
+        ).mappings().one()
+
+    assert int(target["done_mask"]) == financial
+    assert int(target["not_available_mask"]) == 0
+    assert int(target["failed_mask"]) == profile
+    assert int(target["dirty_mask"]) == profile
+    assert target["next_endpoint"] == "profile"
+    assert target["status"] == "pending"
+
+
 async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_rest(repo):
     resources = ("profile", "committees", "transformations")
     fabric, source_run, _ = await new_fabric_run(repo, resources)
