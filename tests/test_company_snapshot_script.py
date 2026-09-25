@@ -113,3 +113,51 @@ def test_classify_rows_separates_all_write_paths():
     assert [row["company_id"] for row in changed_rows] == [2]
     assert [row["company_id"] for row in source_only_rows] == [3]
     assert [row["company_id"] for row in unchanged_rows] == [4]
+
+
+class _FakeCursor:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, sql, params):
+        del sql, params
+
+    def fetchone(self):
+        return self.rows[0]
+
+    def fetchall(self):
+        return self.rows
+
+
+class _FakeConnection:
+    db = "dbd"
+
+    def __init__(self, rows):
+        self.rows = rows
+
+    def cursor(self):
+        return _FakeCursor(self.rows)
+
+
+def test_information_schema_dict_keys_are_case_insensitive():
+    module = load_module()
+
+    columns_conn = _FakeConnection(
+        [
+            {"COLUMN_NAME": "jp_no"},
+            {"COLUMN_NAME": "JP_TYPE_CODE"},
+        ]
+    )
+    assert module.get_table_columns(columns_conn, "companies") == {
+        "jp_no",
+        "jp_type_code",
+    }
+
+    table_conn = _FakeConnection([{"N": 1}])
+    assert module.table_exists(table_conn, "companies") is True
