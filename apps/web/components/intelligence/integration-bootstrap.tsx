@@ -17,11 +17,14 @@ export function IntegrationBootstrap({
   const hydrateExternalContext = useWorkspaceStore(
     (state) => state.hydrateExternalContext
   )
-  const [ready, setReady] = React.useState(context === null)
+  const contextKey = JSON.stringify(context)
+  const [hydratedContextKey, setHydratedContextKey] =
+    React.useState<string | null>(context === null ? contextKey : null)
+  const ready = hydratedContextKey === contextKey
 
   React.useEffect(() => {
     if (!context) {
-      setReady(true)
+      setHydratedContextKey(contextKey)
       return
     }
 
@@ -38,8 +41,8 @@ export function IntegrationBootstrap({
       activeSurface: context.target.surface,
       focus,
     })
-    setReady(true)
-  }, [context, hydrateExternalContext])
+    setHydratedContextKey(contextKey)
+  }, [context, contextKey, hydrateExternalContext])
 
   if (!ready) {
     return <IntegrationLaunchLoader sourceApp={context?.sourceApp ?? null} />
