@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 
 import {
   buildTipxLaunchHref,
+  buildTipxReturnEndpointHref,
   normalizeIntegrationLaunchRequest,
   parseTipxIntegrationSearchParams,
 } from "./launch-url"
@@ -38,6 +39,23 @@ describe("TIPX integration launch URL", () => {
     expect(url.searchParams.get("tipStatus")).toBe("prospect")
     expect(url.searchParams.has("user")).toBe(false)
     expect(url.searchParams.has("permissions")).toBe(false)
+  })
+
+  it("builds a local return endpoint without exposing the source origin", () => {
+    const context = normalizeIntegrationLaunchRequest({
+      version: "v1",
+      sourceApp: "central",
+      returnContext: {
+        path: "/companies/0100000000000",
+      },
+    })
+
+    const href = buildTipxReturnEndpointHref(context)
+
+    expect(href).toContain("/api/tipx/integration/v1/return?")
+    expect(href).toContain("source=central")
+    expect(href).toContain("path=%2Fcompanies%2F0100000000000")
+    expect(href).not.toContain("central.example.com")
   })
 
   it("round-trips launch context from page search params", () => {
