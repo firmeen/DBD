@@ -19,7 +19,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from ..core.exceptions import DbdForbiddenError, DbdTokenExpiredError
+from ..core.exceptions import DbdAuthError, DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
 from ..core.telemetry import (
     EFFECTIVE_RATE,
@@ -37,11 +37,15 @@ from .session import WARMUP_PAGE_URL, create_session
 
 
 class TransientHttpError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class PermanentHttpError(ValueError):
-    pass
+    def __init__(self, message: str, *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 @dataclass
@@ -131,11 +135,8 @@ class AsyncDbdClient:
         await self.endpoint_rate.open()
         self._session = AsyncSession(impersonate="chrome", max_clients=self.concurrency)
         self._auth_session = create_session()
-        try:
-            await self._ensure_token()
-        except BaseException:
-            await self.__aexit__()
-            raise
+        # Authenticate lazily on the first admitted request. A temporary DBD or
+        # network outage must not crash every worker before it can heartbeat.
         return self
 
     async def __aexit__(self, *args):
@@ -173,6 +174,25 @@ class AsyncDbdClient:
             "Sec-Fetch-Site": "same-origin",
         }
 
+    async def _penalize_access(self, endpoint: str | None, cooldown_seconds: float = 5.0):
+        if endpoint is not None:
+            await self.endpoint_rate.penalize(endpoint, cooldown_seconds)
+            return
+        if self._shared_admission:
+            await self.endpoint_rate.penalize_global(cooldown_seconds)
+            return
+        new_rate = self.rate.slow_down()
+        self.rate.cooldown(cooldown_seconds)
+        EFFECTIVE_RATE.set(new_rate)
+
+    async def _penalize_auth(self, rate_key: str | None, cooldown_seconds: float = 5.0):
+        if rate_key is not None or self._shared_admission:
+            await self.endpoint_rate.penalize_global(cooldown_seconds)
+            return
+        new_rate = self.rate.slow_down()
+        self.rate.cooldown(cooldown_seconds)
+        EFFECTIVE_RATE.set(new_rate)
+
     async def fetch(
         self,
         method,
@@ -190,7 +210,14 @@ class AsyncDbdClient:
             stop=stop_after_attempt(self.max_retries + 1),
             wait=wait_random_exponential(multiplier=1, max=30),
             retry=retry_if_exception_type(
-                (TransientHttpError, DbdTokenExpiredError, RequestsError, TimeoutError)
+                (
+                    TransientHttpError,
+                    DbdTokenExpiredError,
+                    DbdForbiddenError,
+                    DbdAuthError,
+                    RequestsError,
+                    TimeoutError,
+                )
             ),
             reraise=True,
         )
@@ -205,7 +232,11 @@ class AsyncDbdClient:
                         admission = await self.endpoint_rate.acquire(rate_key)
                     else:
                         await self.rate.acquire()
-                    token = await self._ensure_token()
+                    try:
+                        token = await self._ensure_token()
+                    except DbdAuthError:
+                        await self._penalize_auth(rate_key)
+                        raise
                     requested = datetime.now(timezone.utc).replace(tzinfo=None)
                     self.requests_made += 1
                     with LATENCY.time():
@@ -284,13 +315,15 @@ class AsyncDbdClient:
                         )
                     if status == 401:
                         await self._ensure_token(rejected=token)
-                        raise TransientHttpError("HTTP 401")
+                        raise TransientHttpError("HTTP 401", status_code=401)
                     if status == 403:
+                        await self._penalize_access(rate_key)
+                        await self._ensure_token(rejected=token)
                         raise DbdForbiddenError("HTTP 403")
                     if status in (429, 500, 502, 503, 504):
-                        raise TransientHttpError(f"HTTP {status}")
+                        raise TransientHttpError(f"HTTP {status}", status_code=status)
                     if status >= 400:
-                        raise PermanentHttpError(f"HTTP {status}")
+                        raise PermanentHttpError(f"HTTP {status}", status_code=status)
                     try:
                         data = self._decode(response, path, token)
                     except DbdTokenExpiredError:

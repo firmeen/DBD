@@ -45,16 +45,23 @@ class DbdAuth:
             "Sec-Fetch-Site": "same-origin",
         }
 
+        last_error = None
+        last_status = None
         for attempt in range(1, settings.dbd_max_auth_attempts + 1):
             try:
                 response = session.post(REFRESH_URL, headers=headers, timeout=settings.request_timeout)
             except RequestsError as exc:
                 code = getattr(exc, "code", None) or getattr(exc, "curl_code", None)
                 suffix = f" curl={code}" if code is not None else ""
-                raise DbdAuthError(
+                last_error = (
                     f"auth_refresh transport {type(exc).__name__}{suffix} path=/api/refresh"
-                ) from None
+                )
+                if attempt < settings.dbd_max_auth_attempts:
+                    time.sleep(min(5, attempt))
+                    continue
+                raise DbdAuthError(last_error) from None
 
+            last_status = int(response.status_code)
             if response.status_code == 403:
                 import_chrome_cookies(session, "datawarehouse.dbd.go.th")
                 time.sleep(1)
@@ -81,12 +88,21 @@ class DbdAuth:
                 time.sleep(1)
                 continue
 
-            raise DbdAuthError(
+            last_error = (
                 f"auth_refresh failed: HTTP {response.status_code} path=/api/refresh"
             )
+            if attempt < settings.dbd_max_auth_attempts:
+                time.sleep(min(5, attempt))
+                continue
+            raise DbdAuthError(last_error, status_code=last_status)
 
         raise DbdAuthError(
-            f"auth_refresh exhausted after {settings.dbd_max_auth_attempts} attempts path=/api/refresh"
+            last_error
+            or (
+                f"auth_refresh exhausted after {settings.dbd_max_auth_attempts} "
+                "attempts path=/api/refresh"
+            ),
+            status_code=last_status,
         )
 
 

@@ -150,8 +150,12 @@ def advance_state(
     if endpoint == "profile":
         financial_required = required_mask & FINANCIAL_MASK
         if outcome == "failed":
-            failed_mask |= financial_required
-            dirty_mask &= ~financial_required
+            # Preserve financial resources already observed as DONE/N/A. A
+            # profile failure may only dependency-fail work that still depends
+            # on the profile outcome.
+            dependency_failed = financial_required & ~(done_mask | not_available_mask)
+            failed_mask |= dependency_failed
+            dirty_mask &= ~dependency_failed
         else:
             if fiscal_year is None:
                 fiscal_year = derive_fiscal_year(profile_submit_fin_year)

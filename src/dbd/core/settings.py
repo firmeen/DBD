@@ -61,6 +61,7 @@ class Settings(BaseSettings):
     dbd_lease_seconds: int = Field(300, ge=30)
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
+    dbd_upstream_defer_seconds: int = Field(30, ge=1, le=3600)
     dbd_refresh_stale_hours: dict[str, float] = Field(
         default_factory=lambda: {
             "profile": 24.0,

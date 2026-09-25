@@ -6,7 +6,9 @@ import time
 from pathlib import Path
 from uuid import uuid4
 
-from ..client.async_client import AsyncDbdClient
+from curl_cffi.requests.exceptions import RequestException as RequestsError
+
+from ..client.async_client import AsyncDbdClient, TransientHttpError
 from ..contracts.identity import parse_code
 from ..core.exceptions import (
     ContractError,
@@ -203,6 +205,46 @@ def _apply_failure_stats(runtime_stats, outcome) -> None:
         runtime_stats["retry_wait"] += 1
 
 
+def _http_status(exc: BaseException) -> int | None:
+    value = getattr(exc, "status_code", None)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _upstream_transient(exc: BaseException) -> bool:
+    return isinstance(
+        exc,
+        (
+            DbdForbiddenError,
+            DbdAuthError,
+            TransientHttpError,
+            RequestsError,
+            TimeoutError,
+        ),
+    )
+
+
+async def _record_failure_event(repo, task, exc, *, outcome: str, archive_id=None) -> None:
+    try:
+        await repo.record_failure_event(
+            task,
+            outcome=outcome,
+            error_code=type(exc).__name__,
+            http_status=_http_status(exc),
+            attempt=_attempt_count(task),
+            archive_id=archive_id,
+        )
+    except Exception as event_exc:
+        log.warning(
+            "failure_event_write_failed",
+            task_id=task.get("id"),
+            endpoint=task.get("endpoint"),
+            error_code=type(event_exc).__name__,
+        )
+
+
 async def _fail_task(repo, task, exc, archive_id=None) -> FailureOutcome | None:
     if isinstance(exc, IdentityConflict):
         code = type(exc).__name__
@@ -217,10 +259,44 @@ async def _fail_task(repo, task, exc, archive_id=None) -> FailureOutcome | None:
                 endpoint=task["endpoint"],
                 error_code=code,
             )
+            await _record_failure_event(
+                repo,
+                task,
+                exc,
+                outcome="conflict",
+                archive_id=archive_id,
+            )
             return FailureOutcome("failed", finished)
         return None
 
-    terminal = isinstance(exc, (ContractError, DbdForbiddenError, DbdAuthError, ValueError, TypeError))
+    if task.get("stage", "fetch") == "fetch" and _upstream_transient(exc):
+        code = type(exc).__name__
+        finished = await repo.defer(
+            task,
+            code,
+            delay_seconds=settings.dbd_upstream_defer_seconds,
+        )
+        if finished:
+            TASKS.labels(task["endpoint"], "retry_wait").inc()
+            PIPELINE_STAGE_TOTAL.labels("fetch", "retry_wait").inc()
+            log.warning(
+                "upstream_deferred",
+                task_id=task["id"],
+                endpoint=task["endpoint"],
+                error_code=code,
+                defer_seconds=settings.dbd_upstream_defer_seconds,
+            )
+            await _record_failure_event(
+                repo,
+                task,
+                exc,
+                outcome="deferred",
+                archive_id=archive_id,
+            )
+            return FailureOutcome("retry_wait", finished)
+        return None
+
+    terminal = isinstance(exc, (ContractError, ValueError, TypeError))
     exhausted = _attempt_count(task) >= settings.dbd_max_task_attempts
     status = "failed" if terminal or exhausted else "retry_wait"
     code = type(exc).__name__
@@ -239,6 +315,13 @@ async def _fail_task(repo, task, exc, archive_id=None) -> FailureOutcome | None:
             stage=task.get("stage"),
             error_code=code,
             status=status,
+        )
+        await _record_failure_event(
+            repo,
+            task,
+            exc,
+            outcome=status,
+            archive_id=archive_id,
         )
         return FailureOutcome(status, finished)
     return None
