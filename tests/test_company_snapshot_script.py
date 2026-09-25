@@ -161,3 +161,26 @@ def test_information_schema_dict_keys_are_case_insensitive():
 
     table_conn = _FakeConnection([{"N": 1}])
     assert module.table_exists(table_conn, "companies") is True
+
+
+def test_report_catalog_covers_existing_dbd_domains():
+    module = load_module()
+    assert module.REPORT_SECTIONS == (
+        "executive",
+        "discovery",
+        "campaign",
+        "coverage",
+        "financial",
+        "people",
+        "ownership_history",
+        "freshness",
+        "data_quality",
+        "storage",
+    )
+
+
+def test_snapshot_off_mode_is_supported_without_changing_auto_logic():
+    module = load_module()
+    assert module.determine_mode("off", 1_315_245) == "OFF"
+    assert module.determine_mode("auto", 0) == "FULL"
+    assert module.determine_mode("auto", 1) == "INCREMENTAL"

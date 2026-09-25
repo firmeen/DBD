@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Build and maintain the DBD company serving snapshot with a Rich terminal UI."""
+"""Query existing DBD data and maintain the derived company snapshot with a Rich terminal UI."""
 
 from __future__ import annotations
 
@@ -192,10 +192,10 @@ CREATE TABLE IF NOT EXISTS dbd_company_snapshot (
     total_income DECIMAL(20,2) NULL,
     net_profit DECIMAL(20,2) NULL,
     board_member_count INT UNSIGNED NOT NULL DEFAULT 0,
-    has_financial TINYINT(1) NOT NULL DEFAULT 0,
-    has_board TINYINT(1) NOT NULL DEFAULT 0,
-    has_ownership TINYINT(1) NOT NULL DEFAULT 0,
-    has_history TINYINT(1) NOT NULL DEFAULT 0,
+    has_financial TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    has_board TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    has_ownership TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    has_history TINYINT UNSIGNED NOT NULL DEFAULT 0,
     phone VARCHAR(50) NULL,
     email VARCHAR(255) NULL,
     source_updated_at DATETIME(6) NOT NULL,
@@ -378,7 +378,7 @@ def render_dashboard(state: RuntimeState, config: Config) -> Group:
     hero = Text()
     hero.append("DBD DATA PLATFORM", style="bold")
     hero.append("  ·  ")
-    hero.append("COMPANY SNAPSHOT FABRIC", style="bold cyan")
+    hero.append("DATA INTELLIGENCE · SNAPSHOT", style="bold cyan")
     hero.append("  ")
     hero.append(state.status, style=status_style)
 
@@ -530,8 +530,8 @@ def render_dashboard(state: RuntimeState, config: Config) -> Group:
         Group(
             hero,
             Text(
-                "Canonical serving snapshot · 1 company = 1 row · "
-                "MySQL → SQL Server handoff ready",
+                "SELECT existing DBD data · source tables read only · "
+                "derived company snapshot maintained separately",
                 style="dim",
             ),
             Text(""),
@@ -1318,8 +1318,7 @@ def process_snapshot(
     state.status = "COMPLETE"
     if state.missing_snapshot == 0:
         state.last_event = (
-            "Snapshot reconciliation complete · "
-            "SQL Server handoff dataset is ready"
+            "Snapshot reconciliation complete · source intelligence remains authoritative"
         )
     else:
         state.last_event = (
@@ -1327,32 +1326,1168 @@ def process_snapshot(
         )
 
 
+
+# =============================================================================
+# QUERY-FIRST DATA INTELLIGENCE
+# =============================================================================
+
+REPORT_SECTIONS = (
+    "executive",
+    "discovery",
+    "campaign",
+    "coverage",
+    "financial",
+    "people",
+    "ownership_history",
+    "freshness",
+    "data_quality",
+    "storage",
+)
+
+
+@dataclass
+class QueryMetric:
+    name: str
+    elapsed_s: float
+    rows: int
+    ok: bool
+    error: str = ""
+
+
+@dataclass
+class IntelligenceReport:
+    executive: dict[str, Any] = field(default_factory=dict)
+    discovery: dict[str, Any] = field(default_factory=dict)
+    discovery_pages: dict[str, Any] = field(default_factory=dict)
+    campaign: dict[str, Any] = field(default_factory=dict)
+    campaign_progress: dict[str, Any] = field(default_factory=dict)
+    coverage: dict[str, Any] = field(default_factory=dict)
+    financial: dict[str, Any] = field(default_factory=dict)
+    people: dict[str, Any] = field(default_factory=dict)
+    ownership_history: dict[str, Any] = field(default_factory=dict)
+    freshness: dict[str, Any] = field(default_factory=dict)
+    data_quality: dict[str, Any] = field(default_factory=dict)
+    storage: list[dict[str, Any]] = field(default_factory=list)
+    company: dict[str, Any] | None = None
+    company_board: list[dict[str, Any]] = field(default_factory=list)
+    company_financials: list[dict[str, Any]] = field(default_factory=list)
+    metrics: list[QueryMetric] = field(default_factory=list)
+    errors: dict[str, str] = field(default_factory=dict)
+
+
+def timed_query(
+    conn,
+    report: IntelligenceReport,
+    name: str,
+    sql: str,
+    params: tuple[Any, ...] = (),
+    *,
+    many: bool = False,
+):
+    started = time.monotonic()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            result = cur.fetchall() if many else cur.fetchone()
+        elapsed = time.monotonic() - started
+        row_count = len(result) if many else (1 if result else 0)
+        report.metrics.append(
+            QueryMetric(
+                name=name,
+                elapsed_s=elapsed,
+                rows=row_count,
+                ok=True,
+            )
+        )
+        return result
+    except Exception as exc:
+        elapsed = time.monotonic() - started
+        message = f"{type(exc).__name__}: {exc}"
+        report.metrics.append(
+            QueryMetric(
+                name=name,
+                elapsed_s=elapsed,
+                rows=0,
+                ok=False,
+                error=message,
+            )
+        )
+        report.errors[name] = message
+        return [] if many else {}
+
+
+def gather_intelligence(
+    conn,
+    state: RuntimeState,
+    config: Config,
+    live: Live,
+    *,
+    run_id: int | None,
+    jp_no: str | None,
+    top: int,
+) -> IntelligenceReport:
+    report = IntelligenceReport()
+
+    def set_query_phase(label: str):
+        state.phase = "DATA INTELLIGENCE"
+        state.status = "RUNNING"
+        state.last_event = f"SELECT · {label}"
+        live.update(render_dashboard(state, config))
+
+    set_query_phase("Executive")
+    report.executive = timed_query(
+        conn,
+        report,
+        "executive",
+        """
+        SELECT
+            (SELECT COUNT(*) FROM company_master) AS master_total,
+            (SELECT COUNT(*) FROM company_master WHERE identity_status='verified') AS verified_total,
+            (SELECT COUNT(*) FROM companies) AS profile_total,
+            (SELECT COUNT(DISTINCT jp_no) FROM financial_statements) AS financial_companies,
+            (SELECT COUNT(DISTINCT jp_no) FROM company_committees) AS board_companies,
+            (SELECT COUNT(*) FROM company_committees) AS board_rows,
+            (SELECT COUNT(DISTINCT jp_no) FROM company_nations) AS ownership_companies,
+            (SELECT COUNT(DISTINCT jp_no) FROM company_transformations) AS transformation_companies
+        """,
+    ) or {}
+
+    set_query_phase("Discovery")
+    report.discovery = timed_query(
+        conn,
+        report,
+        "discovery",
+        """
+        SELECT
+            COUNT(*) AS buckets_total,
+            SUM(status='done') AS buckets_done,
+            SUM(status='split') AS buckets_split,
+            SUM(status IN ('pending','counted','draining')) AS buckets_open,
+            SUM(status='failed') AS buckets_failed,
+            SUM(total_items IS NULL AND status<>'split') AS buckets_uncounted,
+            SUM(
+                CASE
+                    WHEN pages_total IS NOT NULL
+                    THEN GREATEST(pages_total-pages_done,0)
+                    ELSE 0
+                END
+            ) AS remaining_pages,
+            SUM(partition_lossless=0) AS lossy_partitions,
+            MAX(updated_at) AS latest_bucket_activity
+        FROM discovery_buckets
+        """,
+    ) or {}
+    report.discovery_pages = timed_query(
+        conn,
+        report,
+        "discovery_pages",
+        """
+        SELECT
+            COUNT(*) AS pages_total,
+            SUM(status='done') AS pages_done,
+            SUM(status='partial') AS pages_partial,
+            SUM(status='failed') AS pages_failed,
+            SUM(rejected_rows) AS rejected_rows,
+            MAX(updated_at) AS latest_page_activity,
+            (SELECT COUNT(*) FROM discovery_sightings) AS unique_companies,
+            (SELECT COUNT(*) FROM discovery_rejections WHERE resolved_at IS NULL)
+                AS unresolved_rejections
+        FROM discovery_pages
+        """,
+    ) or {}
+
+    set_query_phase("Campaign")
+    if run_id is None:
+        campaign_sql = """
+        SELECT
+            id,
+            source_label,
+            parts,
+            fiscal_year,
+            status,
+            scheduler_mode,
+            force_refresh_mask,
+            created_at,
+            finished_at
+        FROM worker_runs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+        campaign_params: tuple[Any, ...] = ()
+    else:
+        campaign_sql = """
+        SELECT
+            id,
+            source_label,
+            parts,
+            fiscal_year,
+            status,
+            scheduler_mode,
+            force_refresh_mask,
+            created_at,
+            finished_at
+        FROM worker_runs
+        WHERE id=%s
+        LIMIT 1
+        """
+        campaign_params = (run_id,)
+
+    report.campaign = timed_query(
+        conn,
+        report,
+        "campaign_header",
+        campaign_sql,
+        campaign_params,
+    ) or {}
+
+    selected_run_id = report.campaign.get("id")
+    scheduler_mode = str(report.campaign.get("scheduler_mode") or "legacy")
+    if selected_run_id is not None:
+        if scheduler_mode == "fabric_v2":
+            report.campaign_progress = timed_query(
+                conn,
+                report,
+                "campaign_progress_fabric",
+                """
+                SELECT
+                    COUNT(*) AS companies,
+                    COALESCE(SUM(BIT_COUNT(required_mask)),0) AS total_units,
+                    COALESCE(SUM(BIT_COUNT(done_mask)),0) AS done_units,
+                    COALESCE(SUM(BIT_COUNT(not_available_mask)),0) AS na_units,
+                    COALESCE(SUM(BIT_COUNT(failed_mask)),0) AS failed_units,
+                    SUM(status='pending') AS pending_companies,
+                    SUM(status='running') AS running_companies,
+                    SUM(status='retry_wait') AS retry_wait_companies,
+                    SUM(status='done') AS done_companies,
+                    SUM(status='failed') AS failed_companies,
+                    MAX(updated_at) AS latest_activity
+                FROM company_collection_state
+                WHERE run_id=%s
+                """,
+                (selected_run_id,),
+            ) or {}
+        else:
+            report.campaign_progress = timed_query(
+                conn,
+                report,
+                "campaign_progress_legacy",
+                """
+                SELECT
+                    COUNT(*) AS total_units,
+                    SUM(status='done') AS done_units,
+                    SUM(status='not_available') AS na_units,
+                    SUM(status='failed') AS failed_units,
+                    SUM(status IN ('pending','running','retry_wait')) AS remaining_units,
+                    SUM(status='running') AS running_units,
+                    MAX(finished_at) AS latest_activity
+                FROM endpoint_tasks
+                WHERE run_id=%s
+                """,
+                (selected_run_id,),
+            ) or {}
+
+    set_query_phase("Company coverage")
+    report.coverage = timed_query(
+        conn,
+        report,
+        "coverage",
+        """
+        SELECT
+            COUNT(*) AS companies,
+            ROUND(100*AVG(jp_name IS NOT NULL AND TRIM(jp_name)<>''),2) AS pct_name,
+            ROUND(100*AVG(jp_stat_code IS NOT NULL AND TRIM(jp_stat_code)<>''),2) AS pct_status,
+            ROUND(100*AVG(cap_amt IS NOT NULL),2) AS pct_capital,
+            ROUND(
+                100*AVG(business_type_code IS NOT NULL AND TRIM(business_type_code)<>''),
+                2
+            ) AS pct_business,
+            ROUND(100*AVG(pv_code IS NOT NULL AND TRIM(pv_code)<>''),2) AS pct_province,
+            ROUND(100*AVG(ampur_code IS NOT NULL AND TRIM(ampur_code)<>''),2) AS pct_district,
+            ROUND(
+                100*AVG(tumbon_code IS NOT NULL AND TRIM(tumbon_code)<>''),
+                2
+            ) AS pct_subdistrict,
+            ROUND(100*AVG(phone_no IS NOT NULL AND TRIM(phone_no)<>''),2) AS pct_phone,
+            ROUND(100*AVG(email IS NOT NULL AND TRIM(email)<>''),2) AS pct_email
+        FROM companies
+        """,
+    ) or {}
+
+    set_query_phase("Financial")
+    report.financial = timed_query(
+        conn,
+        report,
+        "financial",
+        """
+        SELECT
+            COUNT(*) AS statement_rows,
+            COUNT(DISTINCT jp_no) AS companies,
+            SUM(
+                CHAR_LENGTH(fiscal_year)=4
+                AND fiscal_year REGEXP '^[0-9][0-9][0-9][0-9]'
+                AND CAST(fiscal_year AS UNSIGNED) BETWEEN 2400 AND 2700
+            ) AS valid_year_rows,
+            SUM(
+                fiscal_year IS NULL
+                OR CHAR_LENGTH(fiscal_year)<>4
+                OR fiscal_year NOT REGEXP '^[0-9][0-9][0-9][0-9]'
+                OR CAST(fiscal_year AS UNSIGNED) NOT BETWEEN 2400 AND 2700
+            ) AS invalid_year_rows,
+            MIN(
+                CASE
+                    WHEN CHAR_LENGTH(fiscal_year)=4
+                     AND fiscal_year REGEXP '^[0-9][0-9][0-9][0-9]'
+                     AND CAST(fiscal_year AS UNSIGNED) BETWEEN 2400 AND 2700
+                    THEN CAST(fiscal_year AS UNSIGNED)
+                END
+            ) AS earliest_year,
+            MAX(
+                CASE
+                    WHEN CHAR_LENGTH(fiscal_year)=4
+                     AND fiscal_year REGEXP '^[0-9][0-9][0-9][0-9]'
+                     AND CAST(fiscal_year AS UNSIGNED) BETWEEN 2400 AND 2700
+                    THEN CAST(fiscal_year AS UNSIGNED)
+                END
+            ) AS latest_year,
+            MAX(last_seen_at) AS latest_financial_activity
+        FROM financial_statements
+        """,
+    ) or {}
+
+    set_query_phase("People")
+    report.people = timed_query(
+        conn,
+        report,
+        "people",
+        """
+        SELECT
+            COUNT(*) AS board_rows,
+            COUNT(DISTINCT jp_no) AS companies,
+            COUNT(DISTINCT NULLIF(cmt_no,'')) AS distinct_person_ids,
+            MAX(created_at) AS latest_board_write
+        FROM company_committees
+        """,
+    ) or {}
+
+    set_query_phase("Ownership and history")
+    report.ownership_history = timed_query(
+        conn,
+        report,
+        "ownership_history",
+        """
+        SELECT
+            (SELECT COUNT(*) FROM company_nations) AS ownership_rows,
+            (SELECT COUNT(DISTINCT jp_no) FROM company_nations) AS ownership_companies,
+            (SELECT COUNT(*) FROM company_nation_history) AS nation_history_rows,
+            (SELECT COUNT(DISTINCT jp_no) FROM company_nation_history)
+                AS nation_history_companies,
+            (SELECT COUNT(*) FROM company_name_history) AS name_history_rows,
+            (SELECT COUNT(*) FROM company_capital_history) AS capital_history_rows,
+            (SELECT COUNT(*) FROM company_transformations) AS transformation_rows,
+            (SELECT COUNT(DISTINCT jp_no) FROM company_transformations)
+                AS transformation_companies
+        """,
+    ) or {}
+
+    set_query_phase("Freshness")
+    report.freshness = timed_query(
+        conn,
+        report,
+        "freshness",
+        """
+        SELECT
+            (SELECT MAX(last_seen_at) FROM companies) AS latest_company_projection,
+            (SELECT MAX(last_seen_at) FROM financial_statements) AS latest_financial_projection,
+            (SELECT requested_at FROM response_archive ORDER BY id DESC LIMIT 1)
+                AS latest_archive_requested,
+            (SELECT received_at FROM response_archive ORDER BY id DESC LIMIT 1)
+                AS latest_archive_received,
+            (SELECT MAX(requested_at) FROM company_endpoint_state) AS latest_endpoint_state
+        """,
+    ) or {}
+
+    set_query_phase("Data quality")
+    report.data_quality = timed_query(
+        conn,
+        report,
+        "data_quality",
+        """
+        SELECT
+            (SELECT COUNT(*) FROM company_master WHERE identity_status='conflict')
+                AS identity_conflicts,
+            (
+                SELECT COUNT(*)
+                FROM (
+                    SELECT jp_type_code,jp_no
+                    FROM company_master
+                    GROUP BY jp_type_code,jp_no
+                    HAVING COUNT(*)>1
+                ) duplicate_identity_rows
+            ) AS duplicate_identities,
+            (SELECT COUNT(*) FROM discovery_buckets WHERE status='failed') AS failed_buckets,
+            (SELECT COUNT(*) FROM discovery_pages WHERE status='failed') AS failed_pages,
+            (SELECT COUNT(*) FROM discovery_pages WHERE status='partial') AS partial_pages,
+            (SELECT COUNT(*) FROM discovery_rejections WHERE resolved_at IS NULL)
+                AS unresolved_rejections,
+            (SELECT COUNT(*) FROM discovery_buckets WHERE partition_lossless=0)
+                AS lossy_partitions,
+            (
+                SELECT COUNT(*)
+                FROM financial_statements
+                WHERE fiscal_year IS NULL
+                   OR CHAR_LENGTH(fiscal_year)<>4
+                   OR fiscal_year NOT REGEXP '^[0-9][0-9][0-9][0-9]'
+                   OR CAST(fiscal_year AS UNSIGNED) NOT BETWEEN 2400 AND 2700
+            ) AS invalid_fiscal_rows
+        """,
+    ) or {}
+
+    set_query_phase("Storage")
+    report.storage = timed_query(
+        conn,
+        report,
+        "storage",
+        """
+        SELECT
+            TABLE_NAME AS table_name,
+            TABLE_ROWS AS table_rows,
+            ROUND(DATA_LENGTH/1024/1024,1) AS data_mb,
+            ROUND(INDEX_LENGTH/1024/1024,1) AS index_mb,
+            ROUND((DATA_LENGTH+INDEX_LENGTH)/1024/1024,1) AS total_mb
+        FROM information_schema.tables
+        WHERE table_schema=DATABASE()
+          AND table_type='BASE TABLE'
+        ORDER BY (DATA_LENGTH+INDEX_LENGTH) DESC
+        LIMIT %s
+        """,
+        (top,),
+        many=True,
+    ) or []
+
+    if jp_no:
+        set_query_phase(f"Company {jp_no}")
+        report.company = timed_query(
+            conn,
+            report,
+            "company_profile",
+            """
+            SELECT
+                cm.company_id,
+                c.jp_no,
+                c.jp_type_code,
+                c.jp_name,
+                c.jp_name_e,
+                c.jp_type_desc,
+                c.jp_stat_code,
+                c.jp_stat_desc,
+                c.reg_date,
+                c.stat_change_date,
+                c.cap_amt,
+                c.paid_amt,
+                c.business_type_code,
+                c.business_type_desc,
+                c.business_size_code,
+                COALESCE(NULLIF(c.setup_obj_name_keyin,''),c.setup_obj_desc)
+                    AS setup_objective,
+                c.address,
+                c.pv_desc,
+                c.ampur_desc,
+                c.tumbon_desc,
+                c.zip_code,
+                c.phone_no,
+                c.email,
+                c.website_1,
+                c.submit_fin_year,
+                c.total_asset,
+                c.total_equity,
+                c.total_income,
+                c.net_profit,
+                c.last_seen_at
+            FROM companies c
+            LEFT JOIN company_master cm
+              ON cm.jp_type_code=c.jp_type_code
+             AND cm.jp_no=c.jp_no
+            WHERE c.jp_no=%s
+            LIMIT 1
+            """,
+            (jp_no,),
+        ) or None
+
+        report.company_board = timed_query(
+            conn,
+            report,
+            "company_board",
+            """
+            SELECT
+                cmt_seq,
+                CONCAT_WS(' ',title_name,first_name,middle_name,last_name) AS person_name,
+                cmt_no,
+                cmt_type_code,
+                nt_code,
+                invest_amt,
+                update_date
+            FROM company_committees
+            WHERE jp_no=%s
+            ORDER BY cmt_seq
+            LIMIT %s
+            """,
+            (jp_no, top),
+            many=True,
+        ) or []
+
+        report.company_financials = timed_query(
+            conn,
+            report,
+            "company_financials",
+            """
+            SELECT
+                fiscal_year,
+                fiscal_year_end_date,
+                business_size_desc,
+                current_ratio,
+                debt_to_equity,
+                net_profit_margin,
+                return_on_asset,
+                return_on_equity,
+                last_seen_at
+            FROM financial_statements
+            WHERE jp_no=%s
+            ORDER BY
+                CASE
+                    WHEN CHAR_LENGTH(fiscal_year)=4
+                     AND fiscal_year REGEXP '^[0-9][0-9][0-9][0-9]'
+                    THEN CAST(fiscal_year AS UNSIGNED)
+                    ELSE 0
+                END DESC
+            LIMIT %s
+            """,
+            (jp_no, top),
+            many=True,
+        ) or []
+
+    state.last_event = (
+        f"Data intelligence complete · "
+        f"{sum(metric.ok for metric in report.metrics)}/{len(report.metrics)} queries succeeded"
+    )
+    return report
+
+
+def _value(row: dict[str, Any], key: str, default: Any = 0) -> Any:
+    value = row.get(key)
+    return default if value is None else value
+
+
+def _kv_table(items: list[tuple[str, Any, str, Any]]) -> Table:
+    table = Table.grid(expand=True, padding=(0, 2))
+    table.add_column(style="dim", no_wrap=True)
+    table.add_column(justify="right")
+    table.add_column(style="dim", no_wrap=True)
+    table.add_column(justify="right")
+    for left_label, left_value, right_label, right_value in items:
+        table.add_row(
+            left_label,
+            str(left_value),
+            right_label,
+            str(right_value),
+        )
+    return table
+
+
+def render_intelligence_report(
+    report: IntelligenceReport,
+    state: RuntimeState,
+    config: Config,
+) -> Group:
+    executive = report.executive
+    discovery = report.discovery
+    pages = report.discovery_pages
+    campaign = report.campaign
+    progress = report.campaign_progress
+    coverage = report.coverage
+    financial = report.financial
+    people = report.people
+    ownership = report.ownership_history
+    freshness = report.freshness
+    quality = report.data_quality
+
+    hero = Text()
+    hero.append("DBD DATA PLATFORM", style="bold")
+    hero.append("  ·  ")
+    hero.append("DATA INTELLIGENCE", style="bold cyan")
+    hero.append("  ")
+    hero.append("COMPLETE", style="bold green")
+
+    header = Panel(
+        Group(
+            hero,
+            Text(
+                "SELECT existing DBD data · source tables read only · "
+                "derived snapshot maintained separately",
+                style="dim",
+            ),
+            Text(""),
+            _kv_table(
+                [
+                    (
+                        "DATABASE",
+                        f"{config.user}@{config.host}:{config.port}/{config.database}",
+                        "SNAPSHOT MODE",
+                        state.mode,
+                    ),
+                    (
+                        "QUERIES",
+                        f"{sum(metric.ok for metric in report.metrics)}/{len(report.metrics)}",
+                        "FAILED",
+                        sum(not metric.ok for metric in report.metrics),
+                    ),
+                ]
+            ),
+        ),
+        border_style="cyan",
+        box=box.ROUNDED,
+        padding=(1, 2),
+    )
+
+    executive_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "MASTER",
+                    fmt_int(_value(executive, "master_total")),
+                    "PROFILES",
+                    fmt_int(_value(executive, "profile_total")),
+                ),
+                (
+                    "VERIFIED",
+                    fmt_int(_value(executive, "verified_total")),
+                    "FINANCIAL",
+                    fmt_int(_value(executive, "financial_companies")),
+                ),
+                (
+                    "BOARD COMPANIES",
+                    fmt_int(_value(executive, "board_companies")),
+                    "BOARD ROWS",
+                    fmt_int(_value(executive, "board_rows")),
+                ),
+                (
+                    "OWNERSHIP",
+                    fmt_int(_value(executive, "ownership_companies")),
+                    "TRANSFORMATION",
+                    fmt_int(_value(executive, "transformation_companies")),
+                ),
+            ]
+        ),
+        title="EXECUTIVE SNAPSHOT",
+        border_style="cyan",
+        box=box.ROUNDED,
+    )
+
+    discovery_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "BUCKETS",
+                    fmt_int(_value(discovery, "buckets_total")),
+                    "DONE",
+                    fmt_int(_value(discovery, "buckets_done")),
+                ),
+                (
+                    "OPEN",
+                    fmt_int(_value(discovery, "buckets_open")),
+                    "FAILED",
+                    fmt_int(_value(discovery, "buckets_failed")),
+                ),
+                (
+                    "SPLIT",
+                    fmt_int(_value(discovery, "buckets_split")),
+                    "UNCOUNTED",
+                    fmt_int(_value(discovery, "buckets_uncounted")),
+                ),
+                (
+                    "REMAINING PAGES",
+                    fmt_int(_value(discovery, "remaining_pages")),
+                    "LOSSY",
+                    fmt_int(_value(discovery, "lossy_partitions")),
+                ),
+                (
+                    "UNIQUE COMPANIES",
+                    fmt_int(_value(pages, "unique_companies")),
+                    "REJECTIONS",
+                    fmt_int(_value(pages, "unresolved_rejections")),
+                ),
+                (
+                    "PAGE FAILED",
+                    fmt_int(_value(pages, "pages_failed")),
+                    "PAGE PARTIAL",
+                    fmt_int(_value(pages, "pages_partial")),
+                ),
+            ]
+        ),
+        title="DISCOVERY",
+        border_style="blue",
+        box=box.ROUNDED,
+    )
+
+    total_units = int(_value(progress, "total_units"))
+    done_units = int(_value(progress, "done_units"))
+    na_units = int(_value(progress, "na_units"))
+    failed_units = int(_value(progress, "failed_units"))
+    calculated_remaining = max(
+        0,
+        total_units - done_units - na_units - failed_units,
+    )
+    remaining_units = int(
+        _value(
+            progress,
+            "remaining_units",
+            calculated_remaining,
+        )
+    )
+    campaign_pct = (
+        100.0 * (done_units + na_units) / total_units
+        if total_units
+        else 0.0
+    )
+
+    campaign_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "RUN",
+                    _value(campaign, "id", "--"),
+                    "MODE",
+                    _value(campaign, "scheduler_mode", "--"),
+                ),
+                (
+                    "STATUS",
+                    _value(campaign, "status", "--"),
+                    "PROGRESS",
+                    f"{campaign_pct:.2f}%",
+                ),
+                (
+                    "TOTAL",
+                    fmt_int(total_units),
+                    "DONE",
+                    fmt_int(done_units),
+                ),
+                (
+                    "N/A",
+                    fmt_int(na_units),
+                    "FAILED",
+                    fmt_int(failed_units),
+                ),
+                (
+                    "REMAINING",
+                    fmt_int(remaining_units),
+                    "LATEST",
+                    _value(progress, "latest_activity", "--"),
+                ),
+            ]
+        ),
+        title="CAMPAIGN",
+        border_style="blue",
+        box=box.ROUNDED,
+    )
+
+    coverage_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "COMPANIES",
+                    fmt_int(_value(coverage, "companies")),
+                    "NAME",
+                    f"{float(_value(coverage, 'pct_name')):.2f}%",
+                ),
+                (
+                    "STATUS",
+                    f"{float(_value(coverage, 'pct_status')):.2f}%",
+                    "CAPITAL",
+                    f"{float(_value(coverage, 'pct_capital')):.2f}%",
+                ),
+                (
+                    "BUSINESS",
+                    f"{float(_value(coverage, 'pct_business')):.2f}%",
+                    "PROVINCE",
+                    f"{float(_value(coverage, 'pct_province')):.2f}%",
+                ),
+                (
+                    "DISTRICT",
+                    f"{float(_value(coverage, 'pct_district')):.2f}%",
+                    "SUBDISTRICT",
+                    f"{float(_value(coverage, 'pct_subdistrict')):.2f}%",
+                ),
+                (
+                    "PHONE",
+                    f"{float(_value(coverage, 'pct_phone')):.2f}%",
+                    "EMAIL",
+                    f"{float(_value(coverage, 'pct_email')):.2f}%",
+                ),
+            ]
+        ),
+        title="COMPANY DATA COVERAGE",
+        border_style="green",
+        box=box.ROUNDED,
+    )
+
+    domain_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "FINANCIAL COMPANIES",
+                    fmt_int(_value(financial, "companies")),
+                    "STATEMENT ROWS",
+                    fmt_int(_value(financial, "statement_rows")),
+                ),
+                (
+                    "VALID YEARS",
+                    fmt_int(_value(financial, "valid_year_rows")),
+                    "INVALID YEARS",
+                    fmt_int(_value(financial, "invalid_year_rows")),
+                ),
+                (
+                    "YEAR RANGE",
+                    f"{_value(financial, 'earliest_year', '--')} → "
+                    f"{_value(financial, 'latest_year', '--')}",
+                    "BOARD PERSON IDS",
+                    fmt_int(_value(people, "distinct_person_ids")),
+                ),
+                (
+                    "OWNERSHIP ROWS",
+                    fmt_int(_value(ownership, "ownership_rows")),
+                    "NATION HISTORY",
+                    fmt_int(_value(ownership, "nation_history_rows")),
+                ),
+                (
+                    "NAME HISTORY",
+                    fmt_int(_value(ownership, "name_history_rows")),
+                    "CAPITAL HISTORY",
+                    fmt_int(_value(ownership, "capital_history_rows")),
+                ),
+                (
+                    "TRANSFORM ROWS",
+                    fmt_int(_value(ownership, "transformation_rows")),
+                    "TRANSFORM CO.",
+                    fmt_int(_value(ownership, "transformation_companies")),
+                ),
+            ]
+        ),
+        title="FINANCIAL · PEOPLE · OWNERSHIP · HISTORY",
+        border_style="magenta",
+        box=box.ROUNDED,
+    )
+
+    quality_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "IDENTITY CONFLICT",
+                    fmt_int(_value(quality, "identity_conflicts")),
+                    "DUPLICATE",
+                    fmt_int(_value(quality, "duplicate_identities")),
+                ),
+                (
+                    "FAILED BUCKETS",
+                    fmt_int(_value(quality, "failed_buckets")),
+                    "FAILED PAGES",
+                    fmt_int(_value(quality, "failed_pages")),
+                ),
+                (
+                    "PARTIAL PAGES",
+                    fmt_int(_value(quality, "partial_pages")),
+                    "REJECTIONS",
+                    fmt_int(_value(quality, "unresolved_rejections")),
+                ),
+                (
+                    "LOSSY PARTITIONS",
+                    fmt_int(_value(quality, "lossy_partitions")),
+                    "INVALID FISCAL",
+                    fmt_int(_value(quality, "invalid_fiscal_rows")),
+                ),
+            ]
+        ),
+        title="DATA QUALITY",
+        border_style="yellow",
+        box=box.ROUNDED,
+    )
+
+    snapshot_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "ROWS BEFORE",
+                    fmt_int(state.snapshot_before),
+                    "ROWS NOW",
+                    fmt_int(state.snapshot_after),
+                ),
+                (
+                    "NEW",
+                    fmt_int(state.inserted),
+                    "CHANGED",
+                    fmt_int(state.changed),
+                ),
+                (
+                    "SOURCE ONLY",
+                    fmt_int(state.source_refreshed),
+                    "UNCHANGED",
+                    fmt_int(state.unchanged),
+                ),
+                (
+                    "EXPECTED",
+                    fmt_int(state.expected_companies),
+                    "MISSING",
+                    fmt_int(state.missing_snapshot),
+                ),
+                (
+                    "LATEST SOURCE",
+                    state.latest_source_activity or "--",
+                    "LATEST CHANGE",
+                    state.latest_business_change or "--",
+                ),
+            ]
+        ),
+        title="DBD COMPANY SNAPSHOT",
+        subtitle="Only this derived table is writable",
+        border_style="green",
+        box=box.ROUNDED,
+    )
+
+    freshness_panel = Panel(
+        _kv_table(
+            [
+                (
+                    "COMPANY",
+                    _value(freshness, "latest_company_projection", "--"),
+                    "FINANCIAL",
+                    _value(freshness, "latest_financial_projection", "--"),
+                ),
+                (
+                    "ARCHIVE REQUEST",
+                    _value(freshness, "latest_archive_requested", "--"),
+                    "ARCHIVE RECEIVE",
+                    _value(freshness, "latest_archive_received", "--"),
+                ),
+                (
+                    "ENDPOINT STATE",
+                    _value(freshness, "latest_endpoint_state", "--"),
+                    "REPORT TIME",
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            ]
+        ),
+        title="FRESHNESS",
+        border_style="magenta",
+        box=box.ROUNDED,
+    )
+
+    storage_table = Table(
+        box=box.SIMPLE_HEAVY,
+        expand=True,
+        show_header=True,
+        header_style="bold",
+    )
+    storage_table.add_column("TABLE")
+    storage_table.add_column("ROWS EST.", justify="right")
+    storage_table.add_column("DATA MB", justify="right")
+    storage_table.add_column("INDEX MB", justify="right")
+    storage_table.add_column("TOTAL MB", justify="right")
+    for row in report.storage:
+        storage_table.add_row(
+            str(_value(row, "table_name", "--")),
+            fmt_int(_value(row, "table_rows")),
+            f"{float(_value(row, 'data_mb')):,.1f}",
+            f"{float(_value(row, 'index_mb')):,.1f}",
+            f"{float(_value(row, 'total_mb')):,.1f}",
+        )
+    storage_panel = Panel(
+        storage_table,
+        title="STORAGE · LARGEST TABLES",
+        border_style="cyan",
+        box=box.ROUNDED,
+    )
+
+    query_table = Table(
+        box=box.SIMPLE_HEAVY,
+        expand=True,
+        show_header=True,
+        header_style="bold",
+    )
+    query_table.add_column("QUERY")
+    query_table.add_column("STATUS", justify="center")
+    query_table.add_column("ROWS", justify="right")
+    query_table.add_column("TIME", justify="right")
+    for metric in report.metrics:
+        query_table.add_row(
+            metric.name,
+            "[green]OK[/green]" if metric.ok else "[red]FAILED[/red]",
+            fmt_int(metric.rows),
+            f"{metric.elapsed_s:,.2f}s",
+        )
+    query_panel = Panel(
+        query_table,
+        title="QUERY EXECUTION",
+        subtitle=(
+            f"{sum(metric.ok for metric in report.metrics)}/"
+            f"{len(report.metrics)} succeeded"
+        ),
+        border_style="cyan" if not report.errors else "yellow",
+        box=box.ROUNDED,
+    )
+
+    panels: list[Any] = [
+        header,
+        executive_panel,
+        discovery_panel,
+        campaign_panel,
+        coverage_panel,
+        domain_panel,
+        quality_panel,
+        snapshot_panel,
+        freshness_panel,
+        storage_panel,
+    ]
+
+    if report.company:
+        company = report.company
+        company_table = Table.grid(expand=True, padding=(0, 2))
+        company_table.add_column(style="dim", no_wrap=True)
+        company_table.add_column()
+        company_table.add_row("JP NO", str(_value(company, "jp_no", "--")))
+        company_table.add_row("NAME", str(_value(company, "jp_name", "--")))
+        company_table.add_row("STATUS", str(_value(company, "jp_stat_desc", "--")))
+        company_table.add_row("TYPE", str(_value(company, "jp_type_desc", "--")))
+        company_table.add_row(
+            "BUSINESS",
+            str(_value(company, "business_type_desc", "--")),
+        )
+        location = " · ".join(
+            str(value)
+            for value in (
+                company.get("tumbon_desc"),
+                company.get("ampur_desc"),
+                company.get("pv_desc"),
+                company.get("zip_code"),
+            )
+            if value
+        )
+        company_table.add_row("LOCATION", location or "--")
+        company_table.add_row("CAPITAL", str(_value(company, "cap_amt", "--")))
+        company_table.add_row(
+            "LATEST YEAR",
+            str(_value(company, "submit_fin_year", "--")),
+        )
+        company_table.add_row(
+            "TOTAL INCOME",
+            str(_value(company, "total_income", "--")),
+        )
+        company_table.add_row(
+            "NET PROFIT",
+            str(_value(company, "net_profit", "--")),
+        )
+        panels.append(
+            Panel(
+                company_table,
+                title="SELECTED COMPANY",
+                border_style="blue",
+                box=box.ROUNDED,
+            )
+        )
+
+        if report.company_board:
+            board_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+            board_table.add_column("SEQ", justify="right")
+            board_table.add_column("PERSON")
+            board_table.add_column("PERSON ID")
+            board_table.add_column("NATION")
+            for row in report.company_board:
+                board_table.add_row(
+                    str(_value(row, "cmt_seq", "")),
+                    str(_value(row, "person_name", "")),
+                    str(_value(row, "cmt_no", "")),
+                    str(_value(row, "nt_code", "")),
+                )
+            panels.append(
+                Panel(
+                    board_table,
+                    title="SELECTED COMPANY · BOARD",
+                    border_style="blue",
+                    box=box.ROUNDED,
+                )
+            )
+
+        if report.company_financials:
+            fin_table = Table(box=box.SIMPLE_HEAVY, expand=True)
+            fin_table.add_column("YEAR")
+            fin_table.add_column("CURRENT", justify="right")
+            fin_table.add_column("D/E", justify="right")
+            fin_table.add_column("NPM", justify="right")
+            fin_table.add_column("ROA", justify="right")
+            fin_table.add_column("ROE", justify="right")
+            for row in report.company_financials:
+                fin_table.add_row(
+                    str(_value(row, "fiscal_year", "")),
+                    str(_value(row, "current_ratio", "")),
+                    str(_value(row, "debt_to_equity", "")),
+                    str(_value(row, "net_profit_margin", "")),
+                    str(_value(row, "return_on_asset", "")),
+                    str(_value(row, "return_on_equity", "")),
+                )
+            panels.append(
+                Panel(
+                    fin_table,
+                    title="SELECTED COMPANY · FINANCIAL",
+                    border_style="blue",
+                    box=box.ROUNDED,
+                )
+            )
+
+    panels.append(query_panel)
+    return Group(*panels)
+
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description=(
-            "DBD Company Snapshot Fabric · exclusive terminal runtime"
+            "DBD Data Intelligence · query existing source data and "
+            "maintain dbd_company_snapshot"
         )
     )
     parser.add_argument(
         "--mode",
-        choices=["auto", "full", "incremental", "status"],
+        choices=["auto", "full", "incremental", "status", "off"],
         default="auto",
         help=(
-            "auto=full when snapshot is empty, "
-            "otherwise incremental"
+            "Snapshot maintenance mode only. "
+            "Intelligence SELECT queries always run."
         ),
+    )
+    parser.add_argument(
+        "--run-id",
+        type=int,
+        default=None,
+        help="Campaign run to report; default is latest run",
+    )
+    parser.add_argument(
+        "--jp-no",
+        default=None,
+        help="Optional company registration number for detailed SELECT output",
+    )
+    parser.add_argument(
+        "--top",
+        type=int,
+        default=12,
+        help="Maximum rows for storage and company detail sections",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=5000,
-        help="Companies per durable transaction",
+        help="Snapshot companies per durable transaction",
     )
     parser.add_argument(
         "--retries",
         type=int,
         default=3,
-        help="Database retry budget per batch",
+        help="Snapshot database retry budget per batch",
     )
     return parser.parse_args()
 
@@ -1363,26 +2498,26 @@ def run() -> int:
         raise SystemExit("--batch-size must be >= 100")
     if args.batch_size > 20000:
         raise SystemExit("--batch-size must be <= 20000")
+    if args.top < 1 or args.top > 100:
+        raise SystemExit("--top must be between 1 and 100")
 
     config = Config(
         batch_size=args.batch_size,
         retry_count=max(1, args.retries),
     )
-    state = RuntimeState(
-        batch_size=config.batch_size,
-    )
+    state = RuntimeState(batch_size=config.batch_size)
     conn = None
     lock_acquired = False
 
     with Live(
         render_dashboard(state, config),
         console=console,
-        refresh_per_second=8,
+        refresh_per_second=6,
         transient=False,
     ) as live:
         try:
             state.phase = "DATABASE PREFLIGHT"
-            state.last_event = "Connecting to MySQL durable source"
+            state.last_event = "Connecting to MySQL DBD source"
             live.update(render_dashboard(state, config))
 
             conn = db_connect(config)
@@ -1397,32 +2532,54 @@ def run() -> int:
             state.last_event = "Validating source schema"
             preflight_source_schema(conn)
 
-            state.last_event = "Ensuring serving snapshot schema"
+            state.last_event = "Ensuring derived snapshot schema"
             ensure_snapshot_schema(conn)
             load_source_counts(conn, state)
-            state.mode = determine_mode(
-                args.mode,
-                state.snapshot_before,
-            )
-            live.update(render_dashboard(state, config))
+            state.mode = determine_mode(args.mode, state.snapshot_before)
 
-            if state.mode == "STATUS":
+            if state.mode == "OFF":
+                state.last_event = (
+                    "Snapshot writes disabled; existing source queries remain active"
+                )
+                validate_snapshot(conn, state)
+                state.mode = "OFF"
+            elif state.mode == "STATUS":
                 status_mode(conn, state)
             else:
                 acquire_lock(conn, config.advisory_lock)
                 lock_acquired = True
-                state.last_event = (
-                    "Exclusive snapshot writer lock acquired"
-                )
-                process_snapshot(
-                    conn,
-                    state,
-                    config,
-                    live,
-                )
+                state.last_event = "Snapshot writer lock acquired"
+                process_snapshot(conn, state, config, live)
+                if state.interrupted:
+                    live.update(render_dashboard(state, config))
+                    return 130
 
+            state.phase = "DATA INTELLIGENCE"
+            state.status = "RUNNING"
+            state.last_event = (
+                "Running SELECT intelligence against existing DBD tables"
+            )
             live.update(render_dashboard(state, config))
-            return 130 if state.interrupted else 0
+
+            report = gather_intelligence(
+                conn,
+                state,
+                config,
+                live,
+                run_id=args.run_id,
+                jp_no=args.jp_no,
+                top=args.top,
+            )
+
+            state.phase = "READY"
+            state.status = "COMPLETE"
+            state.last_event = (
+                f"SELECT intelligence complete · "
+                f"{sum(metric.ok for metric in report.metrics)}/"
+                f"{len(report.metrics)} queries succeeded"
+            )
+            live.update(render_intelligence_report(report, state, config))
+            return 0 if not report.errors else 2
 
         except Exception as exc:
             if conn is not None:
@@ -1433,22 +2590,17 @@ def run() -> int:
 
             state.phase = "FAILED"
             state.status = "FAILED"
-            state.last_error = (
-                f"{type(exc).__name__}: {exc}"
-            )
+            state.last_error = f"{type(exc).__name__}: {exc}"
             state.last_event = (
-                "Current transaction rolled back; "
-                "previous committed batches remain durable."
+                "Current snapshot transaction rolled back; "
+                "existing DBD source tables were never modified."
             )
             live.update(render_dashboard(state, config))
             return 1
 
         finally:
             if conn is not None and lock_acquired:
-                release_lock(
-                    conn,
-                    config.advisory_lock,
-                )
+                release_lock(conn, config.advisory_lock)
             if conn is not None:
                 try:
                     conn.close()
