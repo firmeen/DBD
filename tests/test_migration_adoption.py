@@ -6,7 +6,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0010_incremental_refresh"
+HEAD = "0011_fabric_recovery"
 
 
 def test_correctness_migration_adopts_existing_objects():
@@ -183,6 +183,14 @@ def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data()
         assert cur.fetchone()["n"] == 1
         cur.execute(
             """
+            SELECT COUNT(*) AS n FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='collection_failure_events'
+              AND column_name='error_message'
+            """
+        )
+        assert cur.fetchone()["n"] == 1
+        cur.execute(
+            """
             SELECT COUNT(*) AS n FROM information_schema.statistics
             WHERE table_schema=DATABASE() AND table_name='company_collection_state'
               AND index_name='idx_collection_active'
@@ -241,3 +249,42 @@ def test_incremental_refresh_migration_is_adoption_safe():
             """
         )
         assert [row["name"] for row in cur.fetchall()] == ["force_refresh_mask"]
+
+
+def test_fabric_recovery_migration_is_adoption_safe():
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE alembic_version SET version_num='0010_incremental_refresh'")
+        conn.commit()
+
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='worker_runs'
+              AND column_name IN ('parent_run_id','recovery_kind')
+            ORDER BY column_name
+            """
+        )
+        assert [row["name"] for row in cur.fetchall()] == [
+            "parent_run_id",
+            "recovery_kind",
+        ]
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM information_schema.tables
+            WHERE table_schema=DATABASE() AND table_name='collection_failure_events'
+            """
+        )
+        assert cur.fetchone()["n"] == 1
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM information_schema.statistics
+            WHERE table_schema=DATABASE() AND table_name='worker_runs'
+              AND index_name='idx_worker_runs_parent'
+            """
+        )
+        assert cur.fetchone()["n"] > 0

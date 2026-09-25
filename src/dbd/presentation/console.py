@@ -522,6 +522,7 @@ class TerminalPresenter:
     def failure_diagnostics(self, diagnostics: Mapping[str, Any]) -> None:
         by_endpoint = list(diagnostics.get("by_endpoint") or [])
         latest_errors = list(diagnostics.get("latest_errors") or [])
+        failure_events = list(diagnostics.get("failure_events") or [])
         if by_endpoint:
             table = Table(title="FAILED RESOURCES BY ENDPOINT", box=box.SIMPLE_HEAVY)
             table.caption = "Exact durable endpoint-bit counts"
@@ -552,6 +553,21 @@ class TerminalPresenter:
                     str(row.get("stage") or "unknown"),
                     str(row.get("status") or "unknown"),
                     f"{_int(row.get('states')):,}",
+                )
+            self.console.print(table)
+
+        if failure_events:
+            table = Table(title="DURABLE FAILURE EVENT HISTORY", box=box.SIMPLE_HEAVY)
+            for name in ("ERROR", "HTTP", "STAGE", "OUTCOME", "EVENTS", "SAMPLE"):
+                table.add_column(name)
+            for row in failure_events:
+                table.add_row(
+                    str(row.get("error_code") or "unknown"),
+                    str(row.get("http_status") or "--"),
+                    str(row.get("stage") or "unknown"),
+                    str(row.get("outcome") or "unknown"),
+                    f"{_int(row.get('events')):,}",
+                    str(row.get("sample_message") or "")[:72],
                 )
             self.console.print(table)
 
