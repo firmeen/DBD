@@ -1,9 +1,11 @@
 "use client"
 
-import { Command, CornerDownLeft, Layers3, X } from "lucide-react"
+import { ArrowLeft, Command, CornerDownLeft, Layers3, X } from "lucide-react"
 
+import { useTipxIntegrationContext } from "./integration-context"
 import { useGlobalLens } from "@/hooks/use-global-lens"
 import { SURFACE_BY_ID } from "@/lib/intelligence/surfaces"
+import { buildTipxReturnEndpointHref } from "@/lib/integration/launch-url"
 import { useWorkspaceStore } from "@/stores/workspace-store"
 
 export function ContextBar() {
@@ -14,10 +16,34 @@ export function ContextBar() {
   const setPopulation = useWorkspaceStore((state) => state.setPopulation)
   const setCommandOpen = useWorkspaceStore((state) => state.setCommandOpen)
   const { activeCount } = useGlobalLens()
+  const integrationContext = useTipxIntegrationContext()
+  const returnHref = integrationContext
+    ? buildTipxReturnEndpointHref(integrationContext)
+    : null
   const surface = SURFACE_BY_ID[activeSurface]
 
   return (
     <div className="pointer-events-auto fixed bottom-5 left-1/2 z-[35] hidden -translate-x-1/2 items-center gap-1 rounded-2xl border border-tipx-line/9 bg-tipx-floating/78 p-1 shadow-2xl shadow-black/20 backdrop-blur-xl md:flex">
+      {returnHref && integrationContext?.returnContext ? (
+        <>
+          <a
+            href={returnHref}
+            aria-label={
+              integrationContext.returnContext.label ??
+              `Return to ${integrationContext.sourceApp}`
+            }
+            className="flex max-w-48 items-center gap-2 rounded-xl border border-tipx-line/8 bg-tipx-ink/[0.035] px-3 py-2 text-[10px] font-medium text-tipx-ink/52 transition hover:bg-tipx-ink/[0.065] hover:text-tipx-ink"
+          >
+            <ArrowLeft className="size-3.5 shrink-0" aria-hidden />
+            <span className="truncate">
+              {integrationContext.returnContext.label ??
+                `Back to ${integrationContext.sourceApp}`}
+            </span>
+          </a>
+          <span className="h-6 w-px bg-tipx-ink/8" />
+        </>
+      ) : null}
+
       <div className="flex items-center gap-2 px-3 py-2">
         <span className="grid size-5 place-items-center rounded-md bg-tipx-brand text-[9px] font-bold text-tipx-on-brand">
           {activeSurface}
