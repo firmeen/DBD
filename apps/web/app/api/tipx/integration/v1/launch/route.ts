@@ -21,7 +21,12 @@ export const runtime = "nodejs"
 
 export async function POST(request: Request) {
   const origin = request.headers.get("origin")
-  const responseHeaders = integrationCorsHeaders(origin)
+  const responseHeaders = isIntegrationPreflightOriginAllowed(
+    origin,
+    request.url
+  )
+    ? integrationCorsHeaders(origin)
+    : {}
 
   let input: unknown
   try {
