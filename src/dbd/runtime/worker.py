@@ -380,8 +380,13 @@ async def process(
     health=None,
     endpoint_rates=None,
     distributed=False,
+    runtime_callback=None,
 ):
-    """Run staged claim -> fetch -> archive -> project with graceful fleet draining."""
+    """Run staged claim -> fetch -> archive -> project with graceful draining.
+
+    The default collector uses this pipeline in one Python process without Redis.
+    Distributed coordination remains available only for legacy compatibility.
+    """
     fetch_workers = concurrency if concurrency is not None else settings.dbd_concurrency
     if not 1 <= fetch_workers <= 256 or (limit is not None and limit < 1):
         raise ValueError("Concurrency must be 1..256 and limit must be positive")
@@ -468,6 +473,12 @@ async def process(
                     circuit_global = str(controller.circuit_state())
                 except Exception:
                     circuit_global = "unknown"
+            else:
+                try:
+                    effective_rate = float(getattr(client, "effective_rate"))
+                except (AttributeError, TypeError, ValueError):
+                    effective_rate = None
+                circuit_global = str(getattr(client, "upstream_state", "open"))
         active = {
             "fetch": int(runtime_stats["fetch_active"]),
             "archive": int(runtime_stats["archive_active"]),
@@ -509,7 +520,11 @@ async def process(
             "http_retries": int(getattr(client, "retries_made", 0) or 0),
             "rate_limit_hits": int(getattr(client, "rate_limit_hits", 0) or 0),
             "effective_rate": effective_rate,
+            "target_rate": float(getattr(client, "target_rate", rate or settings.dbd_rate_per_second) or 0),
             "circuit_global": circuit_global,
+            "upstream_state": str(getattr(client, "upstream_state", circuit_global)),
+            "last_error": getattr(client, "last_error", None),
+            "last_error_at": getattr(client, "last_error_at", None),
             "redis_commands": redis_commands,
             "redis_admissions": redis_admissions,
             "redis_pool_in_use": int(pool.get("in_use", 0)),
@@ -565,6 +580,22 @@ async def process(
             await publish_heartbeat()
             try:
                 await asyncio.wait_for(stop.wait(), _REDIS_HEARTBEAT_SECONDS)
+            except TimeoutError:
+                pass
+
+    async def runtime_reporter():
+        if runtime_callback is None:
+            return
+        while not stop.is_set():
+            try:
+                runtime_callback(heartbeat_metrics())
+            except Exception as exc:
+                log.warning(
+                    "runtime_callback_failed",
+                    error_code=type(exc).__name__,
+                )
+            try:
+                await asyncio.wait_for(stop.wait(), 0.5)
             except TimeoutError:
                 pass
 
@@ -873,6 +904,8 @@ async def process(
             async with asyncio.TaskGroup() as group:
                 if coordinator is not None:
                     group.create_task(redis_heartbeat())
+                if runtime_callback is not None:
+                    group.create_task(runtime_reporter())
                 group.create_task(mysql_heartbeat())
                 group.create_task(scheduler())
                 for _ in range(fetch_workers):
