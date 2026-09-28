@@ -823,6 +823,10 @@ return {
         self._next_shared_recovery_at = (
             now + float(settings.dbd_redis_recovery_interval_seconds)
         )
+        if admission.global_state == "half_open":
+            self._last_global_circuit_state = "closed"
+        if endpoint is not None and admission.endpoint_state == "half_open":
+            self._last_endpoint_circuit_state[endpoint] = "closed"
         previous_global = self._global_shared.rate
         global_rate = float(result[0])
         global_target = float(result[2])
@@ -968,8 +972,10 @@ return {
         local_global_recovered = self._global_local.recover()
 
         if self._redis is None:
-            await self._breaker.success(endpoint)
-            await self._breaker.success("__global__")
+            endpoint_state = await self._breaker.success(endpoint)
+            global_state = await self._breaker.success("__global__")
+            self._last_endpoint_circuit_state[endpoint] = endpoint_state
+            self._last_global_circuit_state = global_state
             endpoint_effective = self._endpoint_effective(endpoint)
             global_effective = self._global_effective()
             ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_effective)
@@ -1006,7 +1012,7 @@ return {
     ) -> float | None:
         local_recovered = self._global_local.recover()
         if self._redis is None:
-            await self._breaker.success("__global__")
+            self._last_global_circuit_state = await self._breaker.success("__global__")
             effective = self._global_effective()
             EFFECTIVE_RATE.set(effective)
             return effective if local_recovered is not None else None

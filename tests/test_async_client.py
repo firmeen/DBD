@@ -204,7 +204,10 @@ async def test_auth_outage_opens_availability_circuit_without_rate_penalty():
     with pytest.raises(DbdAuthError):
         await c.fetch("GET", "/profile", rate_key="profile")
 
-    c.endpoint_rate.availability_failure.assert_awaited_once_with()
+    assert c.endpoint_rate.availability_failure.await_count == 2
+    for call in c.endpoint_rate.availability_failure.await_args_list:
+        assert call.args == ()
+        assert call.kwargs == {}
     assert c.endpoint_rate.global_effective_rate() == 1000
     assert c.endpoint_rate.effective_rate("profile") == 1000
 
