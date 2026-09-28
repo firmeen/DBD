@@ -21,15 +21,23 @@ After that, the normal operator command is only:
 dbd-data campaign guard 8
 ~~~
 
-For a Windows outer watchdog that can also relaunch the Python Guardian after an unexpected interpreter or terminal loss:
+The former Windows outer-watchdog launcher is no longer the default operator path.
+`Run-DBD.ps1` now launches the single-process Simple Collector instead.
+
+To operate the legacy Guardian intentionally, invoke it directly:
 
 ~~~powershell
-.\Run-DBD.ps1 8 -Headless
+dbd-data campaign guard 8
 ~~~
 
-Use `-OpenPowerShell` instead when separate worker consoles are intentionally required. The two display switches are mutually exclusive.
+If the persisted Guardian profile needs explicit overrides, use the documented
+`dbd-data campaign guard` options. Do not pass Guardian worker/fleet options to
+`Run-DBD.ps1`.
 
-`Run-DBD.ps1` is intentionally ASCII-only so the same checked-out file parses safely in both Windows PowerShell 5.1 and PowerShell 7 without depending on BOM/code-page behavior. The watchdog also prepends the repository `src` directory to its process-local `PYTHONPATH` and verifies `import dbd` before launch. This lets the watchdog execute the checked-out source even if an old editable-install entry point in `.venv` has become stale; it does not change the permanent user environment.
+The Simple Collector launcher remains ASCII-only so the checked-out file parses
+safely in Windows PowerShell 5.1 and PowerShell 7. It prepends the repository
+`src` directory to its process-local `PYTHONPATH` and verifies `import dbd`
+before launching `python -m dbd collect RUN_ID`.
 
 ## Recovery contract
 
@@ -41,7 +49,11 @@ A replacement supervisor then uses the existing supervisor handoff logic to drai
 
 Workers spawned by the Guardian carry a host-bound per-Guardian generation token in their durable lease owner ID (for example, `local-8-ga1b2c3d4e5f60718-...`). The Windows watchdog still uses the lost Guardian PID only for local process ancestry. After a hard Guardian loss it performs a bounded, fail-closed Win32 inventory that includes both PowerShell worker wrappers and Python workers, and writes a recovery marker only after that inventory confirms zero owned descendants. The marker carries both the dead PID and its generation token. Once Redis is stable and the previous supervisor lease is absent, the replacement Guardian reconciles only MySQL leases whose owner prefix matches that confirmed-dead generation. It returns those tasks to pending and rolls back one process-loss stage attempt. There is no run-wide or PID-only reclaim: independently supervised, manually launched, multi-host, or later PID-reuse workers for the same Run ID remain outside durable reconciliation.
 
-The PowerShell watchdog waits for the Python Guardian process. If that process is unexpectedly lost, it reads the fresh Guardian PID from the current state file, gives only that Guardian's worker descendants a bounded grace period, and terminates only matching python -m dbd bulk descendants for the same Run ID. Process ownership verification is fail-closed: the CIM/WMI inventory has a bounded operation timeout, inaccessible descendant command lines never count as zero workers, and PowerShell wrappers count as owned work even before their Python child appears. Independently supervised or manually launched workers for the same Run ID are never selected by this containment path. If containment or recovery-marker persistence cannot be verified, the watchdog relaunches without immediate lease reconciliation and relies on Redis handoff / durable lease expiry instead. Command-line parsing errors (exit 2) are treated as fatal operator errors rather than crash-looped.
+The historical PowerShell watchdog containment implementation remains available
+in Git history but is no longer executed by the default launcher. Guardian
+recovery continues to use its persisted profile/state, Redis coordination,
+supervisor handoff, and durable MySQL lease fencing when
+`dbd-data campaign guard` is invoked directly.
 
 ## Repairing a stale local CLI install
 
@@ -53,7 +65,7 @@ If `.venv\Scripts\dbd-data.exe` exists but running `dbd-data` fails with `Module
 .\.venv\Scripts\python.exe -m dbd --version
 ~~~
 
-The bootstrap now treats both import and module-CLI smoke tests as required post-install checks. Guardian watchdog execution is separately protected by its source-checkout bootstrap described above.
+The bootstrap now treats both import and module-CLI smoke tests as required post-install checks. The current `Run-DBD.ps1` launcher performs its own source-checkout import verification before starting the Simple Collector.
 
 ## Failure classes
 
@@ -65,6 +77,6 @@ Terminal resource failures are deliberately separate. When pending, running, and
 
 ## Operator intent
 
-Ctrl+C remains authoritative. A graceful pause is written to data/guardian/run-<id>.state.json and is not interpreted by the PowerShell watchdog as a crash that should be resumed.
+Ctrl+C remains authoritative for the Guardian when it is invoked directly. A graceful pause is written to `data/guardian/run-<id>.state.json` and is preserved for later Guardian resume.
 
 The Guardian profile and state files contain no database password, Redis URL, or API credential.
