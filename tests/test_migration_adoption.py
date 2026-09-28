@@ -293,6 +293,14 @@ def test_fabric_recovery_migration_is_adoption_safe():
 
 def test_run9_data_repair_migration_widens_profile_objective_text():
     with connect() as conn, conn.cursor() as cur:
+        # The integration database is session-scoped and earlier tests may have
+        # intentionally stored >500 characters. Clear only this tested field
+        # before simulating the pre-0012 VARCHAR schema so test order cannot
+        # make the narrowing setup fail before the migration is exercised.
+        cur.execute(
+            "UPDATE companies SET setup_obj_name_keyin=NULL "
+            "WHERE CHAR_LENGTH(setup_obj_name_keyin)>500"
+        )
         cur.execute(
             "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin VARCHAR(500) NULL"
         )
