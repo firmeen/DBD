@@ -2334,6 +2334,54 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
     return state
 
 
+def collector_handoff_status(run_id: int) -> dict:
+    """Fail-closed startup view used when switching from the legacy fleet.
+
+    Redis is intentionally not part of the collector HTTP hot path. When a
+    legacy Redis control plane is configured, however, startup must prove that
+    no Supervisor or registered distributed worker can race the new collector.
+    """
+    if not settings.dbd_redis_url:
+        return {
+            "redis_configured": False,
+            "control_status": "not_configured",
+            "supervisor_active": False,
+            "workers": 0,
+        }
+
+    redis = None
+    try:
+        redis = _redis_client(settings.dbd_redis_max_connections)
+        redis.ping()
+        runtime = _read_runtime_state(redis, run_id)
+        workers = _registered_worker_states(redis, run_id)
+        supervisor_active = bool(redis.exists(_supervisor_lease_key(run_id)))
+        runtime_status = str((runtime or {}).get("status") or "").lower()
+        if supervisor_active:
+            control_status = runtime_status or "active"
+        elif workers:
+            control_status = "workers_without_supervisor"
+        else:
+            control_status = runtime_status or "offline"
+        return {
+            "redis_configured": True,
+            "control_status": control_status,
+            "supervisor_active": supervisor_active,
+            "workers": len(workers),
+        }
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot prove the legacy runtime is offline because its Redis "
+            "control plane is unavailable"
+        ) from exc
+    finally:
+        if redis is not None:
+            try:
+                redis.close()
+            except Exception:
+                pass
+
+
 def request_campaign_stop(run_id: int) -> None:
     if not settings.dbd_redis_url:
         raise ValueError("Campaign stop requires DBD_REDIS_URL")
