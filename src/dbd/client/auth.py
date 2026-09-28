@@ -22,10 +22,15 @@ class DbdAuth:
         self._expires_at: float = 0.0
         self._warmed_up = False
 
-    def get_token(self, session: requests.Session) -> str:
+    def get_token(
+        self,
+        session: requests.Session,
+        *,
+        max_attempts: int | None = None,
+    ) -> str:
         if self._token and time.time() < self._expires_at - _EXPIRY_SAFETY_MARGIN_SECONDS:
             return self._token
-        return self._refresh(session)
+        return self._refresh(session, max_attempts=max_attempts)
 
     def invalidate(self, *, reset_warmup: bool = False) -> None:
         self._token = None
@@ -33,7 +38,17 @@ class DbdAuth:
         if reset_warmup:
             self._warmed_up = False
 
-    def _refresh(self, session: requests.Session) -> str:
+    def _refresh(
+        self,
+        session: requests.Session,
+        *,
+        max_attempts: int | None = None,
+    ) -> str:
+        attempts = (
+            settings.dbd_max_auth_attempts
+            if max_attempts is None
+            else max(1, int(max_attempts))
+        )
         if not self._warmed_up:
             warm_up(session)
             self._warmed_up = True
@@ -49,7 +64,7 @@ class DbdAuth:
 
         last_error = None
         last_status = None
-        for attempt in range(1, settings.dbd_max_auth_attempts + 1):
+        for attempt in range(1, attempts + 1):
             try:
                 response = session.post(REFRESH_URL, headers=headers, timeout=settings.request_timeout)
             except RequestsError as exc:
@@ -58,7 +73,7 @@ class DbdAuth:
                 last_error = (
                     f"auth_refresh transport {type(exc).__name__}{suffix} path=/api/refresh"
                 )
-                if attempt < settings.dbd_max_auth_attempts:
+                if attempt < attempts:
                     time.sleep(min(5, attempt))
                     continue
                 raise DbdAuthError(last_error) from None
@@ -93,7 +108,7 @@ class DbdAuth:
             last_error = (
                 f"auth_refresh failed: HTTP {response.status_code} path=/api/refresh"
             )
-            if attempt < settings.dbd_max_auth_attempts:
+            if attempt < attempts:
                 time.sleep(min(5, attempt))
                 continue
             raise DbdAuthError(last_error, status_code=last_status)
@@ -101,7 +116,7 @@ class DbdAuth:
         raise DbdAuthError(
             last_error
             or (
-                f"auth_refresh exhausted after {settings.dbd_max_auth_attempts} "
+                f"auth_refresh exhausted after {attempts} "
                 "attempts path=/api/refresh"
             ),
             status_code=last_status,
