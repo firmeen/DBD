@@ -56,14 +56,22 @@ the guarded Alembic revision is the authoritative upgrade path.
 dbd-data campaign repair 9 --json
 ```
 
-Dry-run is the default. Eligible archive replay is limited to:
+Dry-run is the default. The report separates all verified candidates from
+`planned_resources_this_execution`, which is the exact snapshot count that can be
+reopened in this execution after applying the one-state/one-archive rule. Additional
+verified endpoints on the same state are reported as `deferred_verified_resources`.
+
+Eligible archive replay is limited to:
 
 1. `financial_submissions + IntegrityError` where the archived source has one or
    more structurally identical duplicate rows for a submit year and no conflicting
    same-year revision.
 2. `profile + DataError` where the durable failure names
    `setup_obj_name_keyin`, the archived value exceeds 500 characters, and the live
-   column has already been migrated to a lossless text type.
+   column has already been migrated to a text type whose reported character capacity
+   is at least the archived value length. A value larger than the live TEXT capacity is
+   reported but remains blocked rather than being truncated or replayed into another
+   failure.
 
 Everything else remains untouched.
 

@@ -1158,12 +1158,13 @@ class FabricWorkerRepository(WorkerRepository):
             "projection_payload_evidence": payload_evidence,
         }
 
-    async def _profile_text_repair_ready(self) -> bool:
+    async def _profile_text_repair_capacity(self) -> int | None:
+        """Return live lossless character capacity for supported text types."""
         async with self.engine.connect() as conn:
             row = (
                 await conn.execute(
                     text("""
-                        SELECT data_type
+                        SELECT data_type,character_maximum_length
                         FROM information_schema.columns
                         WHERE table_schema=DATABASE()
                           AND table_name='companies'
@@ -1171,10 +1172,23 @@ class FabricWorkerRepository(WorkerRepository):
                     """)
                 )
             ).mappings().first()
+        if (
+            row is None
+            or str(row["data_type"] or "").lower()
+            not in {"text", "mediumtext", "longtext"}
+        ):
+            return None
+        value = row.get("character_maximum_length")
+        return int(value) if value is not None else None
+
+    @staticmethod
+    def _profile_overflow_repairable(error_message, value, capacity) -> bool:
+        """Require the repaired live column to fit the archived value losslessly."""
         return (
-            row is not None
-            and str(row["data_type"] or "").lower()
-            in {"text", "mediumtext", "longtext"}
+            capacity is not None
+            and "setup_obj_name_keyin" in str(error_message or "").lower()
+            and isinstance(value, str)
+            and 500 < len(value) <= int(capacity)
         )
 
     async def _projection_repair_candidates(self, run_id):
@@ -1231,7 +1245,7 @@ class FabricWorkerRepository(WorkerRepository):
                 )
             ).mappings().all()
 
-        profile_text_ready = await self._profile_text_repair_ready()
+        profile_text_capacity = await self._profile_text_repair_capacity()
         candidates = []
         for source in rows:
             row = dict(source)
@@ -1272,11 +1286,10 @@ class FabricWorkerRepository(WorkerRepository):
                     if isinstance(payload, dict)
                     else None
                 )
-                if (
-                    profile_text_ready
-                    and "setup_obj_name_keyin" in message
-                    and isinstance(value, str)
-                    and len(value) > 500
+                if self._profile_overflow_repairable(
+                    message,
+                    value,
+                    profile_text_capacity,
                 ):
                     repair_class = "profile_setup_objective_text_overflow"
 
@@ -1326,12 +1339,15 @@ class FabricWorkerRepository(WorkerRepository):
         )
         return by_endpoint.get(next_item)
 
-    @staticmethod
-    def _projection_repair_summary(candidates):
+    @classmethod
+    def _projection_repair_summary(cls, candidates):
         grouped = {}
+        by_state = {}
         states = set()
         for row in candidates:
-            states.add(int(row["state_id"]))
+            state_id = int(row["state_id"])
+            states.add(state_id)
+            by_state.setdefault(state_id, []).append(row)
             key = (
                 str(row["endpoint"]),
                 str(row["error_code"]),
@@ -1361,9 +1377,15 @@ class FabricWorkerRepository(WorkerRepository):
                 }
             )
         by_error.sort(key=lambda row: (-row["resources"], row["endpoint"], row["error_code"]))
+        planned = sum(
+            cls._select_next_repair_candidate(rows[0], rows) is not None
+            for rows in by_state.values()
+        )
         return {
             "candidate_resources": len(candidates),
             "candidate_states": len(states),
+            "planned_resources_this_execution": int(planned),
+            "deferred_verified_resources": max(0, len(candidates) - int(planned)),
             "by_endpoint_error": by_error,
         }
 
