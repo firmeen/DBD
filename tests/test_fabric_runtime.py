@@ -994,10 +994,7 @@ async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_re
 
 
 
-async def test_fabric_drain_releases_unstarted_fetch_leases_attempt_neutrally(
-    repo,
-    monkeypatch,
-):
+async def test_fabric_drain_releases_unstarted_fetch_leases_attempt_neutrally(repo):
     class BlockingProfileApi:
         calls = 0
         active = 0
@@ -1040,7 +1037,7 @@ async def test_fabric_drain_releases_unstarted_fetch_leases_attempt_neutrally(
             finally:
                 type(self).active -= 1
 
-    monkeypatch.setattr(settings, "dbd_fetch_claim_window_factor", 2)
+    assert settings.dbd_fetch_claim_window_factor == 2
     BlockingProfileApi.calls = 0
     BlockingProfileApi.active = 0
     BlockingProfileApi.active_ready = asyncio.Event()

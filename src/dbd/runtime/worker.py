@@ -343,6 +343,10 @@ async def _queue_get(
         except TimeoutError:
             continue
         if halt is not None and halt.is_set():
+            # A drain can race with queue.get(). Put the leased item back so
+            # the scheduler can release it together with the rest of the
+            # queued-unstarted fetch work.
+            queue.put_nowait(item)
             queue.task_done()
             return None
         return item
