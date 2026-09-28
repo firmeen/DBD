@@ -218,7 +218,11 @@ dbd-data collect RUN_ID --concurrency 64 --rate 50
 
 Collector ใช้ process Python เดียว, async HTTP pool, MySQL durable leases และ pipeline `fetch -> archive -> project` เดิม จึง resume Run เดิมได้โดยไม่ยิง resource ที่ DONE/N/A ซ้ำ Redis, Guardian, Supervisor, autoscaling และ worker fleet ไม่อยู่ใน request hot path
 
-Ctrl+C ครั้งแรกหยุด claim งานใหม่และ drain งานที่กำลังทำอย่างปลอดภัย งาน queued ที่ยังไม่เริ่มจะคืน lease กลับ MySQL แบบ attempt-neutral
+ก่อน claim แรก collector จะตรวจ schema revision/required columns, archive configuration, legacy Supervisor/worker handoff และ durable leases แบบ fail-closed โดยอัตโนมัติ ถ้ามี live lease หรือ legacy runtime ยังทำงานอยู่ collector จะไม่เริ่มยิง HTTP
+
+ถ้า process ถูก kill หรือเครื่องดับ lease ที่หมดอายุจะถูก reclaim แบบ attempt-neutral; งาน stage `project` ที่มี archive แล้วจะกลับมา replay archive เดิมโดยไม่ refetch DBD
+
+Ctrl+C ครั้งแรกหยุด claim งานใหม่และ drain งานที่กำลังทำอย่างปลอดภัย งาน queued ที่ยังไม่เริ่มจะคืน lease กลับ MySQL แบบ attempt-neutral หลัง drain จะมี exact postflight check ว่า total ไม่เปลี่ยน, DONE/N/A/FAILED ไม่ย้อน และ RUNNING กลับ 0
 
 ดูรายละเอียดที่ [Single-process collector](docs/COLLECTOR.md)
 
