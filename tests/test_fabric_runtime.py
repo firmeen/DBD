@@ -1659,3 +1659,89 @@ async def test_external_stop_releases_queued_fetch_without_releasing_active_leas
             )
         ).scalar_one()
     assert int(still_running) == 0
+
+
+async def test_external_stop_timeout_cancels_active_fetch_and_returns_lease_attempt_neutrally(repo):
+    class NeverReturningApi:
+        active_ready = None
+
+        def __init__(self, **kwargs):
+            self.requests_made = 0
+            self.retries_made = 0
+            self.rate_limit_hits = 0
+            self.redis_commands = 0
+            self.redis_admissions = 0
+            self.target_rate = 60.0
+            self.auth_state = "healthy"
+            self.availability_state = "healthy"
+            self.last_error = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def fetch(self, method, path, **kwargs):
+            self.requests_made += 1
+            type(self).active_ready.set()
+            await asyncio.Event().wait()
+
+    NeverReturningApi.active_ready = asyncio.Event()
+    stop_requested = asyncio.Event()
+    _, run_id, _ = await new_fabric_run(repo, ("profile",), count=4)
+
+    running = asyncio.create_task(
+        process(
+            repo,
+            run_id,
+            concurrency=1,
+            client_factory=NeverReturningApi,
+            stop_requested=stop_requested,
+            drain_timeout=0.2,
+        )
+    )
+    await asyncio.wait_for(NeverReturningApi.active_ready.wait(), timeout=5)
+
+    # With the default claim-window factor of two, one lease is active in fetch()
+    # and one is queued-but-unstarted.
+    for _ in range(50):
+        async with repo.engine.connect() as conn:
+            state = (
+                await conn.execute(
+                    text(
+                        "SELECT "
+                        "SUM(status='running') running, "
+                        "SUM(status='pending') pending "
+                        "FROM company_collection_state WHERE run_id=:run"
+                    ),
+                    {"run": run_id},
+                )
+            ).mappings().one()
+        if int(state["running"] or 0) == 2:
+            break
+        await asyncio.sleep(0.02)
+
+    assert int(state["running"] or 0) == 2
+    stop_requested.set()
+
+    result = await asyncio.wait_for(running, timeout=5)
+    assert result["pending"] == 4
+
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "SUM(status='running') running, "
+                    "SUM(status='pending') pending, "
+                    "SUM(attempts) attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert int(state["running"] or 0) == 0
+    assert int(state["pending"] or 0) == 4
+    assert int(state["attempts"] or 0) == 0
