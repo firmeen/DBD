@@ -4,6 +4,8 @@ The Campaign Guardian is the long-running operations layer for an existing durab
 
 The Guardian does not create a new campaign, change the run scope, issue bulk-retry, delete Redis coordination keys, or reinterpret terminal data failures.
 
+The legacy Supervisor now holds the same MySQL `dbd-api-manager` advisory lock as the Simple Collector for its full lifetime. This prevents a Guardian/Supervisor fleet and `dbd-data collect` from owning ingestion concurrently on the same database.
+
 ## First activation
 
 Run the Guardian once with the intended operational profile:
