@@ -70,14 +70,20 @@ class DbdAuth:
 
             last_status = int(response.status_code)
             if response.status_code == 403:
-                import_chrome_cookies(session, "datawarehouse.dbd.go.th")
-                time.sleep(1)
-                continue
+                last_error = "auth_refresh failed: HTTP 403 path=/api/refresh"
+                if attempt < self.max_attempts:
+                    import_chrome_cookies(session, "datawarehouse.dbd.go.th")
+                    time.sleep(1)
+                    continue
+                break
 
             if response.status_code == 409:
-                delay = _parse_retry_after(response.headers.get("retry-after"))
-                time.sleep(delay)
-                continue
+                last_error = "auth_refresh failed: HTTP 409 path=/api/refresh"
+                if attempt < self.max_attempts:
+                    delay = _parse_retry_after(response.headers.get("retry-after"))
+                    time.sleep(delay)
+                    continue
+                break
 
             try:
                 data = response.json()
@@ -92,13 +98,16 @@ class DbdAuth:
                 return token
 
             if response.status_code == 401:
-                time.sleep(1)
-                continue
+                last_error = "auth_refresh failed: HTTP 401 path=/api/refresh"
+                if attempt < self.max_attempts:
+                    time.sleep(1)
+                    continue
+                break
 
             last_error = (
                 f"auth_refresh failed: HTTP {response.status_code} path=/api/refresh"
             )
-            if attempt < settings.dbd_max_auth_attempts:
+            if attempt < self.max_attempts:
                 time.sleep(min(5, attempt))
                 continue
             raise DbdAuthError(last_error, status_code=last_status)

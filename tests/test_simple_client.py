@@ -4,6 +4,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+import dbd.client.auth as auth_module
+from dbd.client.auth import DbdAuth
 from dbd.client.simple_client import SimpleDbdClient
 from dbd.core.exceptions import DbdAuthError
 
@@ -117,3 +119,27 @@ async def test_business_404_clears_availability_without_reclassifying_response()
     assert value._availability_failures == 0
     assert value._pause_until == 0
     assert value.auth_state == "healthy"
+
+
+@pytest.mark.parametrize("status", [401, 403, 409, 502])
+def test_single_attempt_auth_does_not_sleep_after_terminal_refresh_response(
+    monkeypatch,
+    status,
+):
+    auth = DbdAuth(max_attempts=1)
+    auth._warmed_up = True
+    sleeps = []
+    monkeypatch.setattr(auth_module.time, "sleep", lambda seconds: sleeps.append(seconds))
+    session = SimpleNamespace(
+        post=lambda *args, **kwargs: SimpleNamespace(
+            status_code=status,
+            ok=False,
+            headers={},
+            json=lambda: {},
+        )
+    )
+
+    with pytest.raises(DbdAuthError):
+        auth.get_token(session)
+
+    assert sleeps == []
