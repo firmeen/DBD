@@ -111,6 +111,10 @@ class SimpleDbdClient:
                 self.auth_state = "refreshing"
                 try:
                     self._token = await asyncio.to_thread(self._blocking_token)
+                except DbdAuthError as exc:
+                    self.auth_state = "unavailable"
+                    await self._pause_availability(exc)
+                    raise
                 except BaseException:
                     self.auth_state = "unavailable"
                     raise
@@ -200,7 +204,8 @@ class SimpleDbdClient:
                 try:
                     token = await self._ensure_token()
                 except DbdAuthError as exc:
-                    await self._pause_availability(exc)
+                    if self._pause_until <= time.monotonic():
+                        await self._pause_availability(exc)
                     # DbdAuth already owns its bounded refresh retry budget. Do not
                     # multiply it by another HTTP retry loop.
                     raise
@@ -291,6 +296,11 @@ class SimpleDbdClient:
                     )
 
                 if status >= 400:
+                    # A business-level 4xx still proves that DBD is reachable.
+                    # Preserve its endpoint semantics while clearing availability
+                    # outage state.
+                    await self._availability_ok()
+                    self.auth_state = "healthy"
                     raise PermanentHttpError(
                         f"HTTP {status}", status_code=status
                     )
