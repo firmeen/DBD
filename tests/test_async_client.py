@@ -194,3 +194,64 @@ def test_auth_invalidate_can_force_session_rewarm():
     assert auth._token is None
     assert auth._expires_at == 0.0
     assert auth._warmed_up is False
+
+
+async def test_auth_outage_opens_availability_circuit_without_rate_penalty():
+    c = client()
+    c._ensure_token = AsyncMock(side_effect=DbdAuthError("auth_refresh failed: HTTP 502"))
+    c.endpoint_rate.availability_failure = AsyncMock(return_value="closed")
+
+    with pytest.raises(DbdAuthError):
+        await c.fetch("GET", "/profile", rate_key="profile")
+
+    assert c.endpoint_rate.availability_failure.await_count == 2
+    for call in c.endpoint_rate.availability_failure.await_args_list:
+        assert call.args == ()
+        assert call.kwargs == {}
+    assert c.endpoint_rate.global_effective_rate() == 1000
+    assert c.endpoint_rate.effective_rate("profile") == 1000
+
+
+async def test_502_is_availability_failure_without_rate_penalty():
+    c = client()
+    c.endpoint_rate.acquire = AsyncMock()
+    c.endpoint_rate.availability_failure = AsyncMock(return_value="closed")
+    c._session.request.side_effect = [response(502), response()]
+
+    result = await c.fetch("GET", "/profile", rate_key="profile")
+
+    assert result.status == 200
+    c.endpoint_rate.availability_failure.assert_awaited_once_with("profile")
+    assert c.endpoint_rate.global_effective_rate() == 1000
+    assert c.endpoint_rate.effective_rate("profile") == 1000
+
+
+async def test_503_without_retry_after_is_availability_not_rate_pressure():
+    c = client()
+    c.endpoint_rate.acquire = AsyncMock()
+    c.endpoint_rate.availability_failure = AsyncMock(return_value="closed")
+    c._session.request.side_effect = [response(503), response()]
+
+    result = await c.fetch("GET", "/profile", rate_key="profile")
+
+    assert result.status == 200
+    assert c.rate_limit_hits == 0
+    c.endpoint_rate.availability_failure.assert_awaited_once_with("profile")
+    assert c.endpoint_rate.effective_rate("profile") == 1000
+
+
+async def test_503_with_retry_after_remains_rate_pressure():
+    c = client()
+    c.endpoint_rate.acquire = AsyncMock()
+    c.endpoint_rate.availability_failure = AsyncMock(return_value="closed")
+    c._session.request.side_effect = [
+        response(503, {"retry-after": "0"}),
+        response(),
+    ]
+
+    result = await c.fetch("GET", "/profile", rate_key="profile")
+
+    assert result.status == 200
+    assert c.rate_limit_hits == 1
+    c.endpoint_rate.availability_failure.assert_not_awaited()
+    assert c.endpoint_rate.effective_rate("profile") == 500

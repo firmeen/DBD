@@ -12,11 +12,12 @@ from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
 from dbd.core.exceptions import ContractError, DbdForbiddenError
 from dbd.core.settings import settings
+from dbd.core.telemetry import IN_FLIGHT
 from dbd.runtime.collection_fabric import endpoint_bit
 from dbd.runtime.replay import replay_archive
 from dbd.runtime.resources import DEFAULT_PARTS, endpoints
 from dbd.runtime.supervisor import _failure_diagnostics, _has_active_work, _task_progress
-from dbd.runtime.worker import process
+from dbd.runtime.worker import _release_queued_fetch_work, process
 
 pytestmark = pytest.mark.integration
 
@@ -991,3 +992,149 @@ async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_re
     assert final["failed_mask"] == 0
     assert final["dirty_mask"] == 0
     assert final["status"] == "done"
+
+
+
+async def test_fabric_claim_window_bounds_leases_and_limit_finishes_claimed_work(repo):
+    class BlockingProfileApi:
+        calls = 0
+        active = 0
+        active_ready = None
+        release = None
+
+        def __init__(self, **kwargs):
+            self.requests_made = 0
+            self.retries_made = 0
+            self.rate_limit_hits = 0
+            self.endpoint_rate = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def fetch(self, method, path, **kwargs):
+            type(self).calls += 1
+            self.requests_made += 1
+            type(self).active += 1
+            if type(self).active >= 2:
+                type(self).active_ready.set()
+            try:
+                await type(self).release.wait()
+                kind, number = path.split("/")[-2:]
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                return ApiResponse(
+                    {
+                        "jpNo": number,
+                        "jpTypeCode": kind,
+                        "jpName": "Drain Synthetic",
+                        "submitFinYear": None,
+                    },
+                    200,
+                    now,
+                    now,
+                )
+            finally:
+                type(self).active -= 1
+
+    assert settings.dbd_fetch_claim_window_factor == 2
+    BlockingProfileApi.calls = 0
+    BlockingProfileApi.active = 0
+    BlockingProfileApi.active_ready = asyncio.Event()
+    BlockingProfileApi.release = asyncio.Event()
+
+    _, run_id, _ = await new_fabric_run(
+        repo,
+        ("profile",),
+        count=20,
+    )
+
+    processing = asyncio.create_task(
+        process(
+            repo,
+            run_id,
+            concurrency=2,
+            limit=4,
+            client_factory=BlockingProfileApi,
+        )
+    )
+    await asyncio.wait_for(BlockingProfileApi.active_ready.wait(), timeout=5)
+
+    running = None
+    for _ in range(50):
+        async with repo.engine.connect() as conn:
+            running = int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM company_collection_state "
+                            "WHERE run_id=:run AND status='running'"
+                        ),
+                        {"run": run_id},
+                    )
+                ).scalar_one()
+            )
+        if running == 4:
+            break
+        await asyncio.sleep(0.02)
+
+    assert running == 4
+    BlockingProfileApi.release.set()
+    result = await asyncio.wait_for(processing, timeout=10)
+
+    assert BlockingProfileApi.calls == 4
+    assert result["done"] == 4
+    assert result["pending"] == 16
+
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "SUM(status='running') running, "
+                    "SUM(status='pending') pending, "
+                    "SUM(attempts) attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert int(state["running"] or 0) == 0
+    assert int(state["pending"] or 0) == 16
+    assert int(state["attempts"] or 0) == 0
+
+
+async def test_release_queued_fetch_work_is_attempt_neutral(repo):
+    fabric, run_id, _ = await new_fabric_run(repo, ("profile",), count=4)
+    owner = "drain-release-test"
+    tasks = await fabric.claim_batch(run_id, owner, stage="fetch", limit=4)
+    assert len(tasks) == 4
+
+    queue = asyncio.Queue()
+    for task in tasks:
+        IN_FLIGHT.inc()
+        await queue.put(task)
+
+    released = await _release_queued_fetch_work(fabric, owner, queue)
+
+    assert released == 4
+    assert queue.empty()
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "SUM(status='running') running, "
+                    "SUM(status='pending') pending, "
+                    "SUM(attempts) attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert int(state["running"] or 0) == 0
+    assert int(state["pending"] or 0) == 4
+    assert int(state["attempts"] or 0) == 0

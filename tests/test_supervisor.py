@@ -11,13 +11,17 @@ from dbd.runtime.supervisor import (
     WorkerProcess,
     _campaign_terminal_snapshot,
     _drain_registered_workers,
+    _fleet_circuit_state,
     _fleet_rate_target,
     _force_kill_worker,
+    _force_stop_and_reconcile,
     _live_progress,
     _refresh_lease_with_grace,
+    _restore_sigint,
     _runtime_progress_baseline,
     _seed_rate,
     _spawn_worker,
+    _suppress_sigint,
     _terminate_workers,
     _with_retired_metrics,
     _worker_command,
@@ -232,6 +236,10 @@ def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) ->
         "done_only": 180,
         "not_available": 100,
         "failed": 12,
+        "retry_wait": None,
+        "pending_includes_retry_wait": True,
+        "status": "running",
+        "circuit_state": "open",
         "progress_source": "redis_worker_heartbeat",
     }
     worker = {
@@ -299,6 +307,10 @@ def test_campaign_status_prefers_live_runtime_without_exact_scan(monkeypatch) ->
     assert state["done"] == 180
     assert state["not_available"] == 100
     assert state["failed"] == 12
+    assert state["retry_wait"] is None
+    assert state["pending_includes_retry_wait"] is True
+    assert state["control_status"] == "running"
+    assert state["circuit_state"] == "open"
     assert state["workers"] == 1
     assert state["supervisor_active"] is True
 
@@ -482,3 +494,143 @@ def test_campaign_terminal_snapshot_uses_existing_loop_values_only() -> None:
     assert snap.redis_commands == 10000
     assert snap.http_rate == 11.8
     assert snap.control_healthy is True
+
+
+
+def test_fleet_circuit_state_prefers_most_restrictive_worker_state() -> None:
+    assert _fleet_circuit_state([]) == "unknown"
+    assert _fleet_circuit_state(
+        [
+            {"circuit_global": "closed"},
+            {"circuit_global": "half_open"},
+            {"circuit_global": "open"},
+        ]
+    ) == "open"
+
+
+def test_force_stop_reconciles_only_confirmed_dead_workers(monkeypatch) -> None:
+    released = []
+    cleaned = []
+    closed = []
+
+    dead_process = SimpleNamespace(poll=lambda: 1)
+    live_process = SimpleNamespace(poll=lambda: None)
+    dead = WorkerProcess(1, "dead-worker", dead_process)
+    live = WorkerProcess(2, "live-worker", live_process)
+
+    monkeypatch.setattr(supervisor, "_terminate_workers", lambda workers: None)
+    monkeypatch.setattr(
+        supervisor,
+        "_release_dead_worker_leases",
+        lambda run_id, worker_id: released.append((run_id, worker_id)) or 3,
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_cleanup_worker_control",
+        lambda redis, run_id, worker_id: cleaned.append((run_id, worker_id)),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_close_worker_handle",
+        lambda worker: closed.append(worker.worker_id),
+    )
+
+    reclaimed = _force_stop_and_reconcile(object(), 9, [dead, live])
+
+    assert reclaimed == 3
+    assert released == [(9, "dead-worker")]
+    assert cleaned == [(9, "dead-worker")]
+    assert closed == ["dead-worker"]
+
+
+def test_campaign_status_offline_exposes_exact_retry_wait_and_paused_control(
+    monkeypatch,
+) -> None:
+    runtime = {
+        "status": "paused",
+        "circuit_state": "open",
+        "pending": 7551822,
+        "retry_wait": 2100,
+    }
+
+    class FakeRedis:
+        def ping(self):
+            return True
+
+        def get(self, key):
+            if key.endswith(":supervisor:state"):
+                return json.dumps(runtime)
+            return None
+
+        def exists(self, key):
+            return False
+
+        def smembers(self, key):
+            return set()
+
+        def mget(self, keys):
+            return []
+
+        def srem(self, *args):
+            return 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(supervisor, "_redis_client", lambda *args, **kwargs: FakeRedis())
+    monkeypatch.setattr(
+        supervisor,
+        "settings",
+        SimpleNamespace(
+            dbd_redis_url="redis://test",
+            dbd_redis_rate_key="dbd:test:rate",
+            dbd_rate_per_second=60.0,
+            dbd_redis_max_connections=4,
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_task_progress",
+        lambda run_id: {
+            "total": 9206715,
+            "pending": 7551822,
+            "retry_wait": 2100,
+            "running": 0,
+            "failed": 12562,
+            "done": 907249,
+            "not_available": 732982,
+        },
+    )
+    monkeypatch.setattr(supervisor, "_run_status", lambda run_id: "ready")
+
+    state = supervisor.campaign_status(9)
+
+    assert state["progress_exact"] is True
+    assert state["pending_includes_retry_wait"] is False
+    assert state["retry_wait"] == 2100
+    assert state["pending"] == 7551822
+    assert state["run_status"] == "ready"
+    assert state["control_status"] == "paused"
+    assert state["circuit_state"] == "open"
+
+
+
+def test_force_stop_sigint_shield_restores_previous_handler(monkeypatch) -> None:
+    calls = []
+    previous = object()
+
+    monkeypatch.setattr(supervisor.signal, "getsignal", lambda sig: previous)
+    monkeypatch.setattr(
+        supervisor.signal,
+        "signal",
+        lambda sig, handler: calls.append((sig, handler)),
+    )
+
+    captured = _suppress_sigint()
+    _restore_sigint(captured)
+
+    assert captured is previous
+    assert calls == [
+        (supervisor.signal.SIGINT, supervisor.signal.SIG_IGN),
+        (supervisor.signal.SIGINT, previous),
+    ]

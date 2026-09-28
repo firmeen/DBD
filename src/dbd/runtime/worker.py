@@ -328,14 +328,45 @@ async def _fail_task(repo, task, exc, archive_id=None) -> FailureOutcome | None:
     return None
 
 
-async def _queue_get(queue: asyncio.Queue, stop: asyncio.Event):
+async def _queue_get(
+    queue: asyncio.Queue,
+    stop: asyncio.Event,
+    halt: asyncio.Event | None = None,
+):
     while True:
+        if halt is not None and halt.is_set():
+            return None
         if stop.is_set() and queue.empty():
             return None
         try:
-            return await asyncio.wait_for(queue.get(), 0.25)
+            item = await asyncio.wait_for(queue.get(), 0.25)
         except TimeoutError:
             continue
+        if halt is not None and halt.is_set():
+            # A drain can race with queue.get(). Put the leased item back so
+            # the scheduler can release it together with the rest of the
+            # queued-unstarted fetch work.
+            queue.put_nowait(item)
+            queue.task_done()
+            return None
+        return item
+
+
+async def _release_queued_fetch_work(repo, owner: str, queue: asyncio.Queue) -> int:
+    """Return queued-but-unstarted fetch leases to durable state attempt-neutrally."""
+    released = 0
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        else:
+            queue.task_done()
+            IN_FLIGHT.dec()
+            released += 1
+    if released:
+        await repo.release(owner)
+    return released
 
 
 async def process(
@@ -363,9 +394,14 @@ async def process(
 
     projection_workers = min(settings.dbd_projection_workers, settings.db_pool_size)
     archive_workers = settings.dbd_archive_workers
+    fetch_claim_window = max(
+        fetch_workers,
+        fetch_workers * int(settings.dbd_fetch_claim_window_factor),
+    )
     owner = os.environ.get("DBD_WORKER_ID") or uuid4().hex
     stop = asyncio.Event()
     drain_requested = asyncio.Event()
+    release_queued_fetch = asyncio.Event()
     fetch_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     archive_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     project_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
@@ -407,6 +443,7 @@ async def process(
             registration_status = await coordinator.register_worker(identity)
             if registration_status == "draining":
                 drain_requested.set()
+                release_queued_fetch.set()
         except BaseException:
             await close_async_redis(redis_client)
             raise
@@ -419,6 +456,7 @@ async def process(
     def heartbeat_metrics() -> dict[str, object]:
         client = client_ref
         effective_rate = None
+        circuit_global = "unknown"
         if client is not None:
             controller = getattr(client, "endpoint_rate", None)
             if controller is not None:
@@ -426,6 +464,10 @@ async def process(
                     effective_rate = float(controller.global_effective_rate())
                 except Exception:
                     effective_rate = None
+                try:
+                    circuit_global = str(controller.circuit_state())
+                except Exception:
+                    circuit_global = "unknown"
         active = {
             "fetch": int(runtime_stats["fetch_active"]),
             "archive": int(runtime_stats["archive_active"]),
@@ -456,6 +498,7 @@ async def process(
             "archive_active": active["archive"],
             "project_active": active["project"],
             "fetch_queue": fetch_queue.qsize(),
+            "fetch_claim_window": fetch_claim_window,
             "archive_queue": archive_queue.qsize(),
             "project_queue": project_queue.qsize(),
             "inflight": sum(active.values())
@@ -466,6 +509,7 @@ async def process(
             "http_retries": int(getattr(client, "retries_made", 0) or 0),
             "rate_limit_hits": int(getattr(client, "rate_limit_hits", 0) or 0),
             "effective_rate": effective_rate,
+            "circuit_global": circuit_global,
             "redis_commands": redis_commands,
             "redis_admissions": redis_admissions,
             "redis_pool_in_use": int(pool.get("in_use", 0)),
@@ -474,7 +518,11 @@ async def process(
             "drain_requested": drain_requested.is_set(),
         }
 
-    async def publish_heartbeat(*, status: str | None = None) -> str | None:
+    async def publish_heartbeat(
+        *,
+        status: str | None = None,
+        release_on_drain: bool = True,
+    ) -> str | None:
         if coordinator is None or identity is None:
             return None
         try:
@@ -496,6 +544,8 @@ async def process(
         # This replaces the separate 0.5s control polling Redis round trip.
         if resolved == "draining":
             drain_requested.set()
+            if release_on_drain:
+                release_queued_fetch.set()
         return resolved
 
     async def mysql_heartbeat():
@@ -542,10 +592,43 @@ async def process(
                 maintenance_at = now + _MAINTENANCE_INTERVAL_SECONDS
 
             if drain_requested.is_set():
-                # Do not hammer MySQL while in-memory work is visibly still moving.
-                if not (fetch_queue.empty() and archive_queue.empty() and project_queue.empty()):
-                    await asyncio.sleep(0.1)
-                    continue
+                if release_queued_fetch.is_set():
+                    # External/Guardian drain: fetchers stop dequeuing immediately.
+                    # Finish only work already inside active HTTP/archive/project,
+                    # then return queued-unstarted fetch leases to MySQL.
+                    downstream_busy = (
+                        int(runtime_stats["fetch_active"]) > 0
+                        or not archive_queue.empty()
+                        or int(runtime_stats["archive_active"]) > 0
+                        or not project_queue.empty()
+                        or int(runtime_stats["project_active"]) > 0
+                    )
+                    if downstream_busy:
+                        await asyncio.sleep(0.1)
+                        continue
+                    released = await _release_queued_fetch_work(repo, owner, fetch_queue)
+                    if released:
+                        log.info(
+                            "drain_released_queued_fetch",
+                            worker_id=owner,
+                            run_id=run_id,
+                            released=released,
+                        )
+                        queue_metrics()
+                else:
+                    # Internal bounded invocation (--limit) still finishes every
+                    # task it deliberately claimed before stopping.
+                    if not (
+                        fetch_queue.empty()
+                        and archive_queue.empty()
+                        and project_queue.empty()
+                        and int(runtime_stats["fetch_active"]) == 0
+                        and int(runtime_stats["archive_active"]) == 0
+                        and int(runtime_stats["project_active"]) == 0
+                    ):
+                        await asyncio.sleep(0.1)
+                        continue
+
                 now = time.monotonic()
                 if now < drain_db_check_at:
                     await asyncio.sleep(min(0.1, drain_db_check_at - now))
@@ -554,13 +637,17 @@ async def process(
                 if await repo.owner_running(owner) == 0:
                     stop.set()
                     return
+                if release_queued_fetch.is_set():
+                    # Any residual owned lease is no longer represented by active
+                    # in-memory work. Release it attempt-neutrally before rechecking.
+                    await repo.release(owner)
                 await asyncio.sleep(0.1)
                 continue
 
             remaining = None if limit is None else max(0, limit - claimed_attempts)
             if remaining == 0:
                 drain_requested.set()
-                await publish_heartbeat(status="draining")
+                await publish_heartbeat(status="draining", release_on_drain=False)
                 continue
 
             batch_limit = settings.dbd_claim_batch_size
@@ -583,7 +670,8 @@ async def process(
                 continue
 
             remaining = None if limit is None else max(0, limit - claimed_attempts)
-            fetch_room = fetch_queue.maxsize - fetch_queue.qsize()
+            fetch_inflight = int(runtime_stats["fetch_active"]) + fetch_queue.qsize()
+            fetch_room = max(0, fetch_claim_window - fetch_inflight)
             fetch_batch = []
             if fetch_room > 0:
                 take = min(settings.dbd_claim_batch_size, fetch_room)
@@ -607,13 +695,13 @@ async def process(
                 idle_progress_at = now + _IDLE_PROGRESS_POLL_SECONDS
                 if not await repo.has_active_work(run_id):
                     drain_requested.set()
-                    await publish_heartbeat(status="draining")
+                    await publish_heartbeat(status="draining", release_on_drain=False)
                     continue
             await asyncio.sleep(0.1)
 
     async def fetcher(client):
         while True:
-            task = await _queue_get(fetch_queue, stop)
+            task = await _queue_get(fetch_queue, stop, release_queued_fetch)
             if task is None:
                 return
             runtime_stats["fetch_active"] += 1

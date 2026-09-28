@@ -174,24 +174,16 @@ class AsyncDbdClient:
             "Sec-Fetch-Site": "same-origin",
         }
 
-    async def _penalize_access(self, endpoint: str | None, cooldown_seconds: float = 5.0):
-        if endpoint is not None:
-            await self.endpoint_rate.penalize(endpoint, cooldown_seconds)
-            return
-        if self._shared_admission:
-            await self.endpoint_rate.penalize_global(cooldown_seconds)
-            return
-        new_rate = self.rate.slow_down()
-        self.rate.cooldown(cooldown_seconds)
-        EFFECTIVE_RATE.set(new_rate)
+    async def _mark_auth_unavailable(self) -> None:
+        # Authentication/session availability is not evidence that the caller is
+        # exceeding upstream capacity. Open the global availability circuit
+        # without ratcheting the configured pacer down.
+        await self.endpoint_rate.availability_failure()
 
-    async def _penalize_auth(self, rate_key: str | None, cooldown_seconds: float = 5.0):
-        if rate_key is not None or self._shared_admission:
-            await self.endpoint_rate.penalize_global(cooldown_seconds)
-            return
-        new_rate = self.rate.slow_down()
-        self.rate.cooldown(cooldown_seconds)
-        EFFECTIVE_RATE.set(new_rate)
+    async def _mark_upstream_unavailable(self, rate_key: str | None) -> None:
+        # Transport and ordinary upstream 5xx failures are endpoint-scoped when
+        # possible. They gate admission but do not alter throughput pacing.
+        await self.endpoint_rate.availability_failure(rate_key)
 
     async def fetch(
         self,
@@ -235,7 +227,7 @@ class AsyncDbdClient:
                     try:
                         token = await self._ensure_token()
                     except DbdAuthError:
-                        await self._penalize_auth(rate_key)
+                        await self._mark_auth_unavailable()
                         raise
                     requested = datetime.now(timezone.utc).replace(tzinfo=None)
                     self.requests_made += 1
@@ -251,6 +243,7 @@ class AsyncDbdClient:
                             )
                         except (RequestsError, TimeoutError) as exc:
                             REQUESTS.labels("network_error").inc()
+                            await self._mark_upstream_unavailable(rate_key)
                             log.warning(
                                 "http_transport_error",
                                 stage="request",
@@ -262,9 +255,15 @@ class AsyncDbdClient:
                             raise
                     status = response.status_code
                     REQUESTS.labels(str(status)).inc()
-                    if status in (429, 503):
+                    retry_after_header = response.headers.get("retry-after")
+                    rate_pressure = status == 429 or (
+                        status == 503
+                        and retry_after_header is not None
+                        and str(retry_after_header).strip() != ""
+                    )
+                    if rate_pressure:
                         self.rate_limit_hits += 1
-                        server_cooldown = retry_after(response.headers.get("retry-after"))
+                        server_cooldown = retry_after(retry_after_header)
                         penalty_key = rate_key or "__global__"
                         streak = self._next_penalty_streak(penalty_key)
                         global_escalated = rate_key is None
@@ -317,9 +316,11 @@ class AsyncDbdClient:
                         await self._ensure_token(rejected=token)
                         raise TransientHttpError("HTTP 401", status_code=401)
                     if status == 403:
-                        await self._penalize_access(rate_key)
+                        await self._mark_auth_unavailable()
                         await self._ensure_token(rejected=token, reset_warmup=True)
                         raise DbdForbiddenError("HTTP 403")
+                    if status in (500, 502, 504) or (status == 503 and not rate_pressure):
+                        await self._mark_upstream_unavailable(rate_key)
                     if status in (429, 500, 502, 503, 504):
                         raise TransientHttpError(f"HTTP {status}", status_code=status)
                     if status >= 400:
