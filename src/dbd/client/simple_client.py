@@ -15,8 +15,8 @@ from curl_cffi.requests.exceptions import RequestException as RequestsError
 from ..core.exceptions import DbdAuthError, DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
 from ..core.telemetry import EFFECTIVE_RATE, HTTP_RETRIES, LATENCY, REQUESTS, log
-from .async_client import ApiResponse, PermanentHttpError, TransientHttpError, retry_after
 from .auth import DbdAuth
+from .http import ApiResponse, PermanentHttpError, TransientHttpError, retry_after
 from .crypto import decrypt_envelope
 from .session import WARMUP_PAGE_URL, create_session
 
