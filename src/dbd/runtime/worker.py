@@ -427,6 +427,7 @@ async def process(
         "done": 0,
         "failed": 0,
         "retry_wait": 0,
+        "retry_wait_claimed": 0,
         "not_available": 0,
         "fetch_active": 0,
         "archive_active": 0,
@@ -507,6 +508,7 @@ async def process(
             "done": int(runtime_stats["done"]),
             "failed": int(runtime_stats["failed"]),
             "retry_wait": int(runtime_stats["retry_wait"]),
+            "retry_wait_claimed": int(runtime_stats["retry_wait_claimed"]),
             "not_available": int(runtime_stats["not_available"]),
             "fetch_active": active["fetch"],
             "archive_active": active["archive"],
@@ -701,6 +703,8 @@ async def process(
                     run_id, owner, min(batch_limit, project_room)
                 )
                 for task in project_batch:
+                    if task.get("status") == "retry_wait":
+                        runtime_stats["retry_wait_claimed"] += 1
                     IN_FLIGHT.inc()
                     await project_queue.put({"task": task, "project_attempt_started": True})
                 claimed_attempts += len(project_batch)
@@ -720,6 +724,8 @@ async def process(
                 if take > 0:
                     fetch_batch = await repo.claim_batch(run_id, owner, stage="fetch", limit=take)
                     for task in fetch_batch:
+                        if task.get("status") == "retry_wait":
+                            runtime_stats["retry_wait_claimed"] += 1
                         IN_FLIGHT.inc()
                         await fetch_queue.put(task)
                     claimed_attempts += len(fetch_batch)
