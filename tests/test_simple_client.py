@@ -1,3 +1,4 @@
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -85,3 +86,34 @@ async def test_auth_failure_uses_auth_budget_only_not_outer_http_retry():
     assert value.requests_made == 0
     assert value.retries_made == 0
     value._pause_availability.assert_awaited_once()
+
+
+async def test_auth_refresh_failure_publishes_pause_before_refresh_lock_is_released():
+    value = client(retries=0)
+    value._token = None
+
+    def fail_refresh():
+        raise DbdAuthError("refresh unavailable")
+
+    value._blocking_token = fail_refresh
+
+    with pytest.raises(DbdAuthError, match="refresh unavailable"):
+        await value._ensure_token()
+
+    assert value.auth_state == "unavailable"
+    assert value._pause_until > time.monotonic()
+
+
+async def test_business_404_clears_availability_without_reclassifying_response():
+    value = client(retries=0)
+    value._pause_until = time.monotonic() + 30
+    value._availability_failures = 3
+    value._wait_availability = AsyncMock()
+    value._session.request.return_value = response(404)
+
+    with pytest.raises(Exception, match="HTTP 404"):
+        await value.fetch("GET", "/industry-benchmark", rate_key="industry_benchmark")
+
+    assert value._availability_failures == 0
+    assert value._pause_until == 0
+    assert value.auth_state == "healthy"
