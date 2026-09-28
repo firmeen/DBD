@@ -533,6 +533,30 @@ class WorkerRepository:
             )
 
     @transaction_retry
+    async def release_tasks(self, owner, task_ids, *, stage="fetch"):
+        """Release only explicitly queued leases without touching active work."""
+        ids = [int(task_id) for task_id in task_ids]
+        if not ids:
+            return 0
+        query = text("""
+            UPDATE endpoint_tasks
+            SET status='pending',lease_owner=NULL,lease_expires_at=NULL,
+              attempts=CASE
+                WHEN stage='fetch' AND attempts>0 THEN attempts-1 ELSE attempts END,
+              project_attempts=CASE
+                WHEN stage='project' AND project_attempts>0
+                THEN project_attempts-1 ELSE project_attempts END,
+              available_at=UTC_TIMESTAMP(6)
+            WHERE id IN :ids AND lease_owner=:owner AND status='running' AND stage=:stage
+        """).bindparams(bindparam("ids", expanding=True))
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                query,
+                {"ids": ids, "owner": owner, "stage": stage},
+            )
+            return int(result.rowcount or 0)
+
+    @transaction_retry
     async def release(self, owner):
         async with self.engine.begin() as conn:
             await conn.execute(
