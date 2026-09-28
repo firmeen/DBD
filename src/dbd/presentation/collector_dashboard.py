@@ -88,6 +88,17 @@ class CollectorDashboard:
         table.add_column("key", style="bold")
         table.add_column("value")
 
+        preflight = state.get("preflight") or {}
+        if preflight:
+            table.add_row(
+                "PREFLIGHT",
+                (
+                    f"schema {preflight.get('schema_revision', 'unknown')}   "
+                    f"legacy {preflight.get('legacy_control', 'unknown')}   "
+                    f"leases clear   recovered {int(preflight.get('reclaimed_leases', 0))}"
+                ),
+            )
+
         table.add_row(
             "PROGRESS",
             f"{progress:6.2f}%   {terminal:,} / {total:,} terminal",
