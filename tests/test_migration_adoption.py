@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 
 from dbd.storage.mysql.engine import connect
@@ -134,7 +136,9 @@ def test_project_attempt_migration_adopts_existing_column():
 
 
 def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data():
-    marker = "lease-adoption-marker"
+    # The disposable integration database is intentionally reusable across
+    # sessions, so this preservation marker must not collide with a prior run.
+    marker = "lease-adoption-" + uuid4().hex
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO discovery_buckets(bucket_key,keyword,search_type,created_at,updated_at) "
@@ -199,6 +203,10 @@ def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data()
         assert cur.fetchone()["n"] > 0
         cur.execute("SELECT bucket_key FROM discovery_buckets WHERE id=%s", (bucket_id,))
         assert cur.fetchone()["bucket_key"] == marker
+        # Keep the reusable disposable DB tidy after proving the migration
+        # preserved pre-existing data.
+        cur.execute("DELETE FROM discovery_buckets WHERE id=%s", (bucket_id,))
+        conn.commit()
 
 
 def test_incremental_refresh_migration_is_adoption_safe():
@@ -316,8 +324,12 @@ def test_run9_data_repair_migration_widens_profile_objective_text():
         cur.execute(
             """
             SELECT
-              data_type,character_maximum_length,character_octet_length,
-              is_nullable,character_set_name,collation_name
+              data_type AS actual_data_type,
+              character_maximum_length AS actual_character_maximum_length,
+              character_octet_length AS actual_character_octet_length,
+              is_nullable AS actual_is_nullable,
+              character_set_name AS actual_character_set_name,
+              collation_name AS actual_collation_name
             FROM information_schema.columns
             WHERE table_schema=DATABASE()
               AND table_name='companies'
@@ -326,9 +338,11 @@ def test_run9_data_repair_migration_widens_profile_objective_text():
         )
         column = cur.fetchone()
 
-    assert column["data_type"] == "text"
-    assert int(column["character_maximum_length"]) > 500
-    assert int(column["character_octet_length"]) >= int(column["character_maximum_length"])
-    assert column["is_nullable"] == "YES"
-    assert column["character_set_name"] == "utf8mb4"
-    assert column["collation_name"] == "utf8mb4_0900_ai_ci"
+    assert str(column["actual_data_type"]).lower() == "text"
+    assert int(column["actual_character_maximum_length"]) > 500
+    assert int(column["actual_character_octet_length"]) >= int(
+        column["actual_character_maximum_length"]
+    )
+    assert str(column["actual_is_nullable"]).upper() == "YES"
+    assert str(column["actual_character_set_name"]).lower() == "utf8mb4"
+    assert str(column["actual_collation_name"]).lower() == "utf8mb4_0900_ai_ci"
