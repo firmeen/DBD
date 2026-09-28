@@ -21,6 +21,7 @@ from .crypto import decrypt_envelope
 from .session import WARMUP_PAGE_URL, create_session
 
 _AUTH_RETRY_SECONDS = 5.0
+_AUTH_REQUEST_TIMEOUT_SECONDS = min(10.0, float(settings.request_timeout))
 
 
 def _curl_code(exc) -> object:
@@ -174,7 +175,8 @@ class SimpleAsyncDbdClient:
             token = await asyncio.to_thread(
                 self._auth.get_token,
                 self._auth_session,
-                max_attempts=2,
+                max_attempts=1,
+                timeout_seconds=_AUTH_REQUEST_TIMEOUT_SECONDS,
             )
             self._token = token
             self._auth_backoff_until = 0.0
