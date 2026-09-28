@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -738,9 +739,6 @@ async def process(
                 await asyncio.sleep(0.1)
                 continue
 
-            if distributed:
-                await _assert_distributed_manager_free(repo)
-
             remaining = None if limit is None else max(0, limit - claimed_attempts)
             if remaining == 0:
                 drain_requested.set()
@@ -753,38 +751,55 @@ async def process(
 
             project_inflight = int(runtime_stats["project_active"]) + project_queue.qsize()
             project_room = max(0, project_claim_window - project_inflight)
-            project_batch = []
-            if project_room > 0:
-                project_batch = await repo.claim_project_batch(
-                    run_id, owner, min(batch_limit, project_room)
-                )
-                for task in project_batch:
-                    if task.get("status") == "retry_wait":
-                        runtime_stats["retry_wait_claimed"] += 1
-                    IN_FLIGHT.inc()
-                    await project_queue.put({"task": task, "project_attempt_started": True})
-                claimed_attempts += len(project_batch)
-
-            if limit is not None and claimed_attempts >= limit:
-                queue_metrics()
-                continue
-
-            remaining = None if limit is None else max(0, limit - claimed_attempts)
             fetch_inflight = int(runtime_stats["fetch_active"]) + fetch_queue.qsize()
             fetch_room = max(0, fetch_claim_window - fetch_inflight)
+            project_batch = []
             fetch_batch = []
-            if fetch_room > 0:
-                take = min(settings.dbd_claim_batch_size, fetch_room)
-                if remaining is not None:
-                    take = min(take, remaining)
-                if take > 0:
-                    fetch_batch = await repo.claim_batch(run_id, owner, stage="fetch", limit=take)
-                    for task in fetch_batch:
-                        if task.get("status") == "retry_wait":
-                            runtime_stats["retry_wait_claimed"] += 1
-                        IN_FLIGHT.inc()
-                        await fetch_queue.put(task)
-                    claimed_attempts += len(fetch_batch)
+
+            # Legacy distributed workers serialize their manager check and
+            # durable claims with collector startup. The single-process
+            # collector takes the no-op branch and pays no hot-path lock cost.
+            claim_fence = runtime_handoff_lock() if distributed else nullcontext()
+            with claim_fence:
+                if distributed:
+                    await _assert_distributed_manager_free(repo)
+
+                if project_room > 0:
+                    project_batch = await repo.claim_project_batch(
+                        run_id, owner, min(batch_limit, project_room)
+                    )
+                    claimed_attempts += len(project_batch)
+
+                remaining = (
+                    None if limit is None else max(0, limit - claimed_attempts)
+                )
+                if remaining is None or remaining > 0:
+                    if fetch_room > 0:
+                        take = min(settings.dbd_claim_batch_size, fetch_room)
+                        if remaining is not None:
+                            take = min(take, remaining)
+                        if take > 0:
+                            fetch_batch = await repo.claim_batch(
+                                run_id,
+                                owner,
+                                stage="fetch",
+                                limit=take,
+                            )
+                            claimed_attempts += len(fetch_batch)
+
+            for task in project_batch:
+                if task.get("status") == "retry_wait":
+                    runtime_stats["retry_wait_claimed"] += 1
+                IN_FLIGHT.inc()
+                await project_queue.put(
+                    {"task": task, "project_attempt_started": True}
+                )
+
+            for task in fetch_batch:
+                if task.get("status") == "retry_wait":
+                    runtime_stats["retry_wait_claimed"] += 1
+                IN_FLIGHT.inc()
+                await fetch_queue.put(task)
 
             queue_metrics()
             if project_batch or fetch_batch:
