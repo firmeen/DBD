@@ -74,8 +74,12 @@ dbd-data campaign repair 9 --execute --json
 ```
 
 Execution refuses an active campaign. It takes the manager lock, revalidates current
-terminal state and archive identity, marks only eligible failed bits dirty, resets their
-projection-attempt budget, and reopens the state at `stage=project`.
+terminal state and archive identity, and reopens **at most one evidence-verified endpoint
+per company scheduler state per execution** at `stage=project`. This prevents a later
+Fabric transition from chaining into a different replayable archive that was not the
+exact archive inspected by the repair evidence. If one state has several independently
+repairable failed endpoints, run the dry-run/execute cycle again after the first replay
+finishes.
 
 No DBD fetch is scheduled for these resources. The normal worker projection path loads
 the existing `response_archive` payload and preserves archive-before-project and

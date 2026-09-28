@@ -1288,6 +1288,45 @@ class FabricWorkerRepository(WorkerRepository):
         return candidates
 
     @staticmethod
+    def _select_next_repair_candidate(state, candidates):
+        """Select exactly one evidence-verified endpoint for one scheduler state.
+
+        Fabric can carry several terminal failed bits in one row. Reopening more
+        than one at once would let the normal transition code choose a later
+        archive by endpoint rather than by the exact failure event we verified.
+        Keep the evidence boundary strict: one state, one verified archive per
+        repair execution.
+        """
+        verified_mask = 0
+        by_endpoint = {}
+        terminal_failed = (
+            int(state["failed_mask"])
+            & ~int(state["dirty_mask"])
+            & ~int(state["done_mask"])
+            & ~int(state["not_available_mask"])
+            & int(state["required_mask"])
+        )
+        for candidate in candidates:
+            endpoint = str(candidate["endpoint"])
+            bit = int(candidate["endpoint_bit"])
+            if not terminal_failed & bit:
+                continue
+            verified_mask |= bit
+            by_endpoint[endpoint] = candidate
+
+        if not verified_mask:
+            return None
+        next_item = next_endpoint(
+            int(state["required_mask"]),
+            int(state["done_mask"]),
+            int(state["not_available_mask"]),
+            failed=int(state["failed_mask"]),
+            dirty=int(state["dirty_mask"]) | verified_mask,
+            fiscal_year=state["fiscal_year"],
+        )
+        return by_endpoint.get(next_item)
+
+    @staticmethod
     def _projection_repair_summary(candidates):
         grouped = {}
         states = set()
@@ -1399,8 +1438,7 @@ class FabricWorkerRepository(WorkerRepository):
                     ):
                         continue
 
-                    current_mask = 0
-                    archive_by_endpoint = {}
+                    verified_candidates = []
                     for candidate in grouped.get(int(state["id"]), []):
                         endpoint = str(candidate["endpoint"])
                         bit = int(candidate["endpoint_bit"])
@@ -1433,28 +1471,19 @@ class FabricWorkerRepository(WorkerRepository):
                                 },
                             )
                         ).first()
-                        if archive_ok is None:
-                            continue
-                        current_mask |= bit
-                        archive_by_endpoint[endpoint] = int(candidate["archive_id"])
+                        if archive_ok is not None:
+                            verified_candidates.append(candidate)
 
-                    if not current_mask:
-                        continue
-                    retry_dirty = int(state["dirty_mask"]) | current_mask
-                    next_item = next_endpoint(
-                        int(state["required_mask"]),
-                        int(state["done_mask"]),
-                        int(state["not_available_mask"]),
-                        failed=int(state["failed_mask"]),
-                        dirty=retry_dirty,
-                        fiscal_year=state["fiscal_year"],
+                    selected = self._select_next_repair_candidate(
+                        state,
+                        verified_candidates,
                     )
-                    if next_item is None or next_item not in archive_by_endpoint:
-                        raise RuntimeError(
-                            f"Targeted repair state {state['id']} cannot select an archived "
-                            "project endpoint without widening repair scope"
-                        )
-                    archive_id = archive_by_endpoint[next_item]
+                    if selected is None:
+                        continue
+                    next_item = str(selected["endpoint"])
+                    selected_bit = int(selected["endpoint_bit"])
+                    retry_dirty = int(state["dirty_mask"]) | selected_bit
+                    archive_id = int(selected["archive_id"])
                     update = await conn.execute(
                         text("""
                             UPDATE company_collection_state
@@ -1486,7 +1515,7 @@ class FabricWorkerRepository(WorkerRepository):
                     )
                     if update.rowcount == 1:
                         changed_states += 1
-                        changed_resources += int(current_mask).bit_count()
+                        changed_resources += 1
 
                 if changed_states:
                     await conn.execute(
