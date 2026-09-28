@@ -524,6 +524,7 @@ async def process(
             "target_rate": float(getattr(client, "target_rate", rate or settings.dbd_rate_per_second) or 0),
             "circuit_global": circuit_global,
             "upstream_state": str(getattr(client, "upstream_state", circuit_global)),
+            "auth_state": str(getattr(client, "auth_state", "unknown")),
             "last_error": getattr(client, "last_error", None),
             "last_error_at": getattr(client, "last_error_at", None),
             "redis_commands": redis_commands,
