@@ -3,12 +3,39 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 
+from sqlalchemy import text
+
 from ..client.simple_client import SimpleAsyncDbdClient
 from ..core.settings import settings
 from ..presentation.collector_dashboard import CollectorDashboard
 from ..storage.mysql.async_engine import create_engine
+from ..storage.mysql.migrations import migration_head_revision
 from ..storage.mysql.repositories.worker_repository import WorkerRepository
 from .worker import process
+
+_REQUIRED_SCHEMA = {
+    "worker_runs": {"id", "status", "scheduler_mode"},
+    "company_collection_state": {
+        "run_id",
+        "company_id",
+        "required_mask",
+        "done_mask",
+        "not_available_mask",
+        "failed_mask",
+        "dirty_mask",
+        "next_endpoint",
+        "stage",
+        "status",
+        "attempts",
+        "project_attempts",
+        "available_at",
+        "lease_owner",
+        "lease_version",
+        "lease_expires_at",
+        "raw_response_id",
+    },
+    "response_archive": {"id", "run_id", "endpoint", "processing_status"},
+}
 
 
 def _total(progress: dict) -> int:
@@ -25,7 +52,13 @@ def _total(progress: dict) -> int:
     )
 
 
-def _live_state(run_id: int, baseline: dict, runtime: dict) -> dict:
+def _live_state(
+    run_id: int,
+    baseline: dict,
+    runtime: dict,
+    *,
+    preflight: dict | None = None,
+) -> dict:
     total = _total(baseline)
     done = int(baseline.get("done", 0)) + int(runtime.get("done", 0))
     not_available = int(baseline.get("not_available", 0)) + int(
@@ -47,25 +80,137 @@ def _live_state(run_id: int, baseline: dict, runtime: dict) -> dict:
             - int(runtime.get("retry_wait_claimed", 0))
             + int(runtime.get("retry_wait", 0)),
         ),
+        "preflight": dict(preflight or {}),
     }
 
 
-async def _wait_for_prior_leases(repo, run_id: int) -> None:
-    """Let leases from a crashed prior process expire before same-run resume."""
-    await repo.maintain(run_id)
-    progress = await repo.progress(run_id)
-    if int(progress.get("running", 0) or 0) == 0:
-        return
+def _assert_postflight_invariants(baseline: dict, exact: dict) -> None:
+    """Protect same-run migration invariants after a bounded or full invocation."""
+    violations = []
+    baseline_total = _total(baseline)
+    exact_total = _total(exact)
+    if exact_total != baseline_total:
+        violations.append(f"total changed {baseline_total}->{exact_total}")
 
-    # Avoid repeatedly scanning a million-row run while waiting for one lease TTL.
-    await asyncio.sleep(float(settings.dbd_lease_seconds) + 1.0)
-    await repo.maintain(run_id)
-    progress = await repo.progress(run_id)
-    if int(progress.get("running", 0) or 0):
+    for key, label in (
+        ("done", "DONE"),
+        ("not_available", "N/A"),
+        ("failed", "FAILED"),
+    ):
+        before = int(baseline.get(key, 0) or 0)
+        after = int(exact.get(key, 0) or 0)
+        if after < before:
+            violations.append(f"{label} decreased {before}->{after}")
+
+    running = int(exact.get("running", 0) or 0)
+    if running:
+        violations.append(f"RUNNING is {running}, expected 0 after collector drain")
+
+    if violations:
         raise RuntimeError(
-            f"Run {run_id} still has active durable leases; "
-            "verify no previous collector process remains and retry after lease expiry"
+            "Collector invariant violation: " + "; ".join(violations)
         )
+
+
+async def _assert_schema_ready(repo) -> str:
+    expected_revision = migration_head_revision()
+    async with repo.engine.connect() as conn:
+        current_revision = (
+            await conn.execute(text("SELECT version_num FROM alembic_version LIMIT 1"))
+        ).scalar_one_or_none()
+        if str(current_revision or "") != expected_revision:
+            raise RuntimeError(
+                "Collector schema is not current: "
+                f"database={current_revision!r}, required={expected_revision!r}. "
+                "Run dbd-data migrate before starting the collector."
+            )
+
+        rows = (
+            await conn.execute(
+                text("""
+                SELECT table_name,column_name
+                FROM information_schema.columns
+                WHERE table_schema=DATABASE()
+                  AND table_name IN (
+                    'worker_runs','company_collection_state','response_archive'
+                  )
+                """)
+            )
+        ).all()
+
+    present: dict[str, set[str]] = {}
+    for table_name, column_name in rows:
+        present.setdefault(str(table_name), set()).add(str(column_name))
+
+    missing = []
+    for table_name, required_columns in _REQUIRED_SCHEMA.items():
+        absent = sorted(required_columns - present.get(table_name, set()))
+        if absent:
+            missing.append(f"{table_name}({','.join(absent)})")
+    if missing:
+        raise RuntimeError(
+            "Collector schema contract is incomplete: " + "; ".join(missing)
+        )
+    return expected_revision
+
+
+async def _assert_legacy_runtime_offline(run_id: int) -> dict:
+    # This is a startup-only migration fence. Redis remains absent from the
+    # collector request path after the handoff is proven safe.
+    from .supervisor import collector_handoff_status
+
+    status = await asyncio.to_thread(collector_handoff_status, run_id)
+    supervisor_active = bool(status.get("supervisor_active"))
+    workers = int(status.get("workers", 0) or 0)
+    if supervisor_active or workers:
+        raise RuntimeError(
+            "Collector handoff refused: legacy runtime is still active "
+            f"(supervisor_active={supervisor_active}, workers={workers}, "
+            f"control_status={status.get('control_status', 'unknown')!r})"
+        )
+    return status
+
+
+async def _collector_preflight(repo, run_id: int, *, health=None) -> dict:
+    if health is not None:
+        await asyncio.to_thread(health)
+
+    schema_revision = await _assert_schema_ready(repo)
+    # Constructing the backend validates archive configuration before any claim.
+    _ = repo.archive_backend
+    legacy = await _assert_legacy_runtime_offline(run_id)
+
+    leases = await repo.collector_lease_summary(run_id)
+    if int(leases.get("invalid", 0) or 0):
+        raise RuntimeError(
+            "Collector handoff refused: running rows exist without a lease expiry"
+        )
+    live = int(leases.get("live", 0) or 0)
+    if live:
+        raise RuntimeError(
+            f"Collector handoff refused: Run {run_id} still has {live} live "
+            "durable lease(s). Verify the previous process is stopped and retry "
+            "after those leases expire."
+        )
+
+    reclaimed = await repo.reclaim_expired_collector_leases(run_id)
+    after = await repo.collector_lease_summary(run_id)
+    if int(after.get("running", 0) or 0):
+        raise RuntimeError(
+            f"Collector handoff refused: Run {run_id} still has "
+            f"{int(after.get('running', 0) or 0)} running durable lease(s)"
+        )
+
+    if health is not None:
+        await asyncio.to_thread(health)
+
+    return {
+        "schema_revision": schema_revision,
+        "archive_backend": settings.dbd_archive_backend,
+        "legacy_control": str(legacy.get("control_status") or "offline"),
+        "legacy_workers": int(legacy.get("workers", 0) or 0),
+        "reclaimed_leases": int(reclaimed),
+    }
 
 
 async def collect_run(
@@ -96,17 +241,35 @@ async def collect_run(
                 "legacy runs remain available through dbd-data bulk"
             )
 
-        await _wait_for_prior_leases(scheduler_repo, run_id)
-        baseline = await scheduler_repo.progress(run_id)
-        runtime: dict = {}
-
-        def on_runtime(snapshot: dict) -> None:
-            runtime.clear()
-            runtime.update(snapshot)
-            dashboard.render(_live_state(run_id, baseline, runtime))
-
         with dashboard:
-            dashboard.render(_live_state(run_id, baseline, runtime))
+            preflight = await _collector_preflight(
+                scheduler_repo,
+                run_id,
+                health=health,
+            )
+            baseline = await scheduler_repo.progress(run_id)
+            runtime: dict = {}
+
+            def on_runtime(snapshot: dict) -> None:
+                runtime.clear()
+                runtime.update(snapshot)
+                dashboard.render(
+                    _live_state(
+                        run_id,
+                        baseline,
+                        runtime,
+                        preflight=preflight,
+                    )
+                )
+
+            dashboard.render(
+                _live_state(
+                    run_id,
+                    baseline,
+                    runtime,
+                    preflight=preflight,
+                )
+            )
             operator_stop = asyncio.Event()
             paused = False
             process_task = asyncio.create_task(
@@ -145,7 +308,10 @@ async def collect_run(
                         await process_task
                     raise
 
+            if health is not None:
+                await asyncio.to_thread(health)
             exact = await scheduler_repo.progress(run_id)
+            _assert_postflight_invariants(baseline, exact)
             final = {
                 "run_id": int(run_id),
                 "total": _total(exact),
@@ -154,6 +320,7 @@ async def collect_run(
                 "failed": int(exact.get("failed", 0)),
                 "retry_wait": int(exact.get("retry_wait", 0)),
                 "running": int(exact.get("running", 0)),
+                "preflight": preflight,
             }
             final["remaining"] = max(
                 0,
