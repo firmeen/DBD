@@ -60,6 +60,8 @@ class SimpleDbdClient:
         self._auth = DbdAuth(max_attempts=1)
         self._auth_lock = asyncio.Lock()
         self._token: str | None = None
+        self._auth_error: DbdAuthError | None = None
+        self._auth_error_until = 0.0
         self._session = None
         self._auth_session = None
 
@@ -92,6 +94,18 @@ class SimpleDbdClient:
     def _blocking_token(self):
         return self._auth.get_token(self._auth_session)
 
+    def _shared_auth_error(self) -> DbdAuthError | None:
+        if self._auth_error is None:
+            return None
+        if time.monotonic() >= self._auth_error_until:
+            self._auth_error = None
+            self._auth_error_until = 0.0
+            return None
+        return DbdAuthError(
+            str(self._auth_error),
+            status_code=getattr(self._auth_error, "status_code", None),
+        )
+
     async def _ensure_token(
         self,
         *,
@@ -102,25 +116,40 @@ class SimpleDbdClient:
             if rejected is not None and rejected == self._token:
                 self._auth.invalidate(reset_warmup=reset_warmup)
                 self._token = None
-            if self._token is None:
-                delay = self._pause_until - time.monotonic()
-                if delay > 0:
-                    self.auth_state = "waiting"
-                    await asyncio.sleep(delay)
-            if self._token is None or time.time() >= self._auth._expires_at - 15:
-                self.auth_state = "refreshing"
-                try:
-                    self._token = await asyncio.to_thread(self._blocking_token)
-                except DbdAuthError as exc:
-                    self.auth_state = "unavailable"
-                    await self._pause_availability(exc)
-                    raise
-                except BaseException:
-                    self.auth_state = "unavailable"
-                    raise
-                self.auth_state = "healthy"
-                if self._session is not None and self._auth_session is not None:
-                    self._session.cookies.update(self._auth_session.cookies)
+
+            token_valid = (
+                self._token is not None
+                and time.time() < self._auth._expires_at - 15
+            )
+            if token_valid:
+                return self._token
+
+            shared_error = self._shared_auth_error()
+            if shared_error is not None:
+                self.auth_state = "unavailable"
+                raise shared_error
+
+            self.auth_state = "refreshing"
+            try:
+                self._token = await asyncio.to_thread(self._blocking_token)
+            except DbdAuthError as exc:
+                self.auth_state = "unavailable"
+                delay = await self._pause_availability(exc)
+                self._auth_error = exc
+                self._auth_error_until = max(
+                    self._pause_until,
+                    time.monotonic() + delay,
+                )
+                raise
+            except BaseException:
+                self.auth_state = "unavailable"
+                raise
+
+            self._auth_error = None
+            self._auth_error_until = 0.0
+            self.auth_state = "healthy"
+            if self._session is not None and self._auth_session is not None:
+                self._session.cookies.update(self._auth_session.cookies)
             return self._token
 
     async def _wait_availability(self) -> None:
