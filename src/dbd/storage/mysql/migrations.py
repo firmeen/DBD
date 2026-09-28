@@ -6,9 +6,24 @@ from pathlib import Path
 import sqlparse
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import URL, create_engine
 
 from ...core.settings import PROJECT_ROOT, settings
+
+
+def _alembic_config() -> Config:
+    cfg = Config()
+    cfg.set_main_option("script_location", str(Path(__file__).parent / "alembic"))
+    return cfg
+
+
+def migration_head_revision() -> str:
+    """Return the repository migration head without touching the database."""
+    head = ScriptDirectory.from_config(_alembic_config()).get_current_head()
+    if not head:
+        raise RuntimeError("Alembic migration head is unavailable")
+    return str(head)
 
 
 def migrate():
@@ -37,8 +52,7 @@ def migrate():
                 conn.exec_driver_sql(f"USE `{settings.db_name}`")
                 conn.dialect.default_schema_name = settings.db_name
                 conn.commit()
-                cfg = Config()
-                cfg.set_main_option("script_location", str(Path(__file__).parent / "alembic"))
+                cfg = _alembic_config()
                 cfg.attributes["connection"] = conn
                 command.upgrade(cfg, "head")
                 conn.commit()
