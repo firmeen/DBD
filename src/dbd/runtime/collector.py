@@ -155,8 +155,16 @@ async def _assert_schema_ready(repo) -> str:
 
 
 async def _assert_legacy_runtime_offline(run_id: int) -> dict:
-    # This is a startup-only migration fence. Redis remains absent from the
-    # collector request path after the handoff is proven safe.
+    # This is a startup-only migration fence. Keep legacy Redis imports out of
+    # collector startup entirely when no legacy control plane is configured.
+    if not settings.dbd_redis_url:
+        return {
+            "redis_configured": False,
+            "control_status": "not_configured",
+            "supervisor_active": False,
+            "workers": 0,
+        }
+
     from .supervisor import collector_handoff_status
 
     status = await asyncio.to_thread(collector_handoff_status, run_id)
