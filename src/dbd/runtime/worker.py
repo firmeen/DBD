@@ -383,6 +383,8 @@ async def process(
     distributed=False,
     observer=None,
     stop_requested: asyncio.Event | None = None,
+    force_stop_requested: asyncio.Event | None = None,
+    drain_timeout: float | None = None,
 ):
     """Run staged claim -> fetch -> archive -> project with graceful fleet draining."""
     fetch_workers = concurrency if concurrency is not None else settings.dbd_concurrency
@@ -414,6 +416,9 @@ async def process(
     drain_db_check_at = 0.0
     idle_progress_at = 0.0
     observer_at = 0.0
+    drain_deadline = None
+    fetch_cancelled = False
+    fetcher_tasks: list[asyncio.Task] = []
     coordinator = None
     identity = None
     client_ref = None
@@ -590,13 +595,36 @@ async def process(
                 pass
 
     async def scheduler():
-        nonlocal claimed_attempts, maintenance_at, drain_db_check_at, idle_progress_at, observer_at
+        nonlocal claimed_attempts, maintenance_at, drain_db_check_at, idle_progress_at
+        nonlocal observer_at, drain_deadline, fetch_cancelled
         while not stop.is_set():
             now = time.monotonic()
             if stop_requested is not None and stop_requested.is_set() and not drain_requested.is_set():
                 drain_requested.set()
                 release_queued_fetch.set()
+                if drain_timeout is not None:
+                    drain_deadline = now + max(0.1, float(drain_timeout))
                 log.info("collector_stop_requested", worker_id=owner, run_id=run_id)
+
+            force_fetch_cancel = (
+                force_stop_requested is not None and force_stop_requested.is_set()
+            )
+            drain_expired = drain_deadline is not None and now >= drain_deadline
+            if (
+                drain_requested.is_set()
+                and not fetch_cancelled
+                and (force_fetch_cancel or drain_expired)
+            ):
+                fetch_cancelled = True
+                for task in fetcher_tasks:
+                    if not task.done():
+                        task.cancel()
+                log.warning(
+                    "collector_fetch_cancelled_for_drain",
+                    worker_id=owner,
+                    run_id=run_id,
+                    forced=force_fetch_cancel,
+                )
 
             if now >= observer_at:
                 observer_at = now + 0.5
@@ -907,7 +935,7 @@ async def process(
                 group.create_task(mysql_heartbeat())
                 group.create_task(scheduler())
                 for _ in range(fetch_workers):
-                    group.create_task(fetcher(client))
+                    fetcher_tasks.append(group.create_task(fetcher(client)))
                 for _ in range(archive_workers):
                     group.create_task(archiver())
                 for _ in range(projection_workers):

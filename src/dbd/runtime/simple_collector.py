@@ -24,7 +24,7 @@ async def _collect(
     engine = create_engine()
     repo = WorkerRepository(engine)
     stop_requested = asyncio.Event()
-    processing: asyncio.Task | None = None
+    force_stop_requested = asyncio.Event()
     previous_handler = signal.getsignal(signal.SIGINT)
     interrupts = 0
 
@@ -51,55 +51,30 @@ async def _collect(
             nonlocal interrupts
             interrupts += 1
             loop.call_soon_threadsafe(stop_requested.set)
-            if interrupts >= 2 and processing is not None:
-                loop.call_soon_threadsafe(processing.cancel)
+            if interrupts >= 2:
+                loop.call_soon_threadsafe(force_stop_requested.set)
 
         signal.signal(signal.SIGINT, handle_interrupt)
 
         def observe(snapshot) -> None:
             dashboard.update(snapshot)
 
-        processing = asyncio.create_task(
-            process(
-                repo,
-                run_id,
-                concurrency=concurrency,
-                rate=rate,
-                client_factory=SimpleDbdClient,
-                health=lambda: assert_manager_lock(manager_connection),
-                distributed=False,
-                observer=observe,
-                stop_requested=stop_requested,
-            )
+        result = await process(
+            repo,
+            run_id,
+            concurrency=concurrency,
+            rate=rate,
+            client_factory=SimpleDbdClient,
+            health=lambda: assert_manager_lock(manager_connection),
+            distributed=False,
+            observer=observe,
+            stop_requested=stop_requested,
+            force_stop_requested=force_stop_requested,
+            drain_timeout=float(settings.dbd_collector_drain_timeout_seconds),
         )
-
-        async def bounded_drain() -> None:
-            await stop_requested.wait()
-            try:
-                await asyncio.wait_for(
-                    asyncio.shield(processing),
-                    timeout=float(settings.dbd_collector_drain_timeout_seconds),
-                )
-            except TimeoutError:
-                processing.cancel()
-
-        drain_watch = asyncio.create_task(bounded_drain())
-        try:
-            result = await processing
-            status = "FINISHED" if not await scheduler_repo.has_active_work(run_id) else (
-                "PAUSED" if stop_requested.is_set() else "IDLE"
-            )
-        except asyncio.CancelledError:
-            if not stop_requested.is_set():
-                raise
-            result = await scheduler_repo.progress(run_id)
-            status = "PAUSED"
-        finally:
-            drain_watch.cancel()
-            try:
-                await drain_watch
-            except asyncio.CancelledError:
-                pass
+        status = "FINISHED" if not await scheduler_repo.has_active_work(run_id) else (
+            "PAUSED" if stop_requested.is_set() else "IDLE"
+        )
 
         exact = await scheduler_repo.progress(run_id)
         dashboard.close(exact, status=status)
