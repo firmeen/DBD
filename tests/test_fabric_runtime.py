@@ -991,3 +991,118 @@ async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_re
     assert final["failed_mask"] == 0
     assert final["dirty_mask"] == 0
     assert final["status"] == "done"
+
+
+
+async def test_fabric_drain_releases_unstarted_fetch_leases_attempt_neutrally(
+    repo,
+    monkeypatch,
+):
+    class BlockingProfileApi:
+        calls = 0
+        active = 0
+        active_ready = None
+        release = None
+
+        def __init__(self, **kwargs):
+            self.requests_made = 0
+            self.retries_made = 0
+            self.rate_limit_hits = 0
+            self.endpoint_rate = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def fetch(self, method, path, **kwargs):
+            type(self).calls += 1
+            self.requests_made += 1
+            type(self).active += 1
+            if type(self).active >= 2:
+                type(self).active_ready.set()
+            try:
+                await type(self).release.wait()
+                kind, number = path.split("/")[-2:]
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                return ApiResponse(
+                    {
+                        "jpNo": number,
+                        "jpTypeCode": kind,
+                        "jpName": "Drain Synthetic",
+                        "submitFinYear": None,
+                    },
+                    200,
+                    now,
+                    now,
+                )
+            finally:
+                type(self).active -= 1
+
+    monkeypatch.setattr(settings, "dbd_fetch_claim_window_factor", 2)
+    BlockingProfileApi.calls = 0
+    BlockingProfileApi.active = 0
+    BlockingProfileApi.active_ready = asyncio.Event()
+    BlockingProfileApi.release = asyncio.Event()
+
+    _, run_id, _ = await new_fabric_run(
+        repo,
+        ("profile",),
+        count=20,
+    )
+
+    processing = asyncio.create_task(
+        process(
+            repo,
+            run_id,
+            concurrency=2,
+            limit=4,
+            client_factory=BlockingProfileApi,
+        )
+    )
+    await asyncio.wait_for(BlockingProfileApi.active_ready.wait(), timeout=5)
+
+    running = None
+    for _ in range(50):
+        async with repo.engine.connect() as conn:
+            running = int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM company_collection_state "
+                            "WHERE run_id=:run AND status='running'"
+                        ),
+                        {"run": run_id},
+                    )
+                ).scalar_one()
+            )
+        if running == 4:
+            break
+        await asyncio.sleep(0.02)
+
+    assert running == 4
+    BlockingProfileApi.release.set()
+    result = await asyncio.wait_for(processing, timeout=10)
+
+    assert BlockingProfileApi.calls == 2
+    assert result["done"] == 2
+    assert result["pending"] == 18
+
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "SUM(status='running') running, "
+                    "SUM(status='pending') pending, "
+                    "SUM(attempts) attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert int(state["running"] or 0) == 0
+    assert int(state["pending"] or 0) == 18
+    assert int(state["attempts"] or 0) == 0
