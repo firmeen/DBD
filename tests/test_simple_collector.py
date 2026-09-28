@@ -90,6 +90,7 @@ def test_live_state_preserves_existing_run_totals() -> None:
         "not_available": 3,
         "failed": 0,
         "retry_wait": 1,
+        "retry_wait_claimed": 12,
         "requests": 18,
     }
 
@@ -100,6 +101,7 @@ def test_live_state_preserves_existing_run_totals() -> None:
     assert state["not_available"] == 733_531
     assert state["failed"] == 12_476
     assert state["remaining"] == 7_551_386
+    assert state["retry_wait"] == 2_089
     assert state["requests"] == 18
 
 
