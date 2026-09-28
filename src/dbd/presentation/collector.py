@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import time
 from collections.abc import Mapping
 
@@ -25,6 +26,29 @@ def _rate(value) -> str:
         return "--"
 
 
+def _duration(value) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return "--"
+    if seconds < 0 or not math.isfinite(seconds):
+        return "--"
+    if seconds < 1:
+        return "<1s"
+
+    whole = int(round(seconds))
+    days, remainder = divmod(whole, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes, secs = divmod(remainder, 60)
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
+
+
 class SimpleCollectorDashboard:
     """One live operator surface for the single-process collector."""
 
@@ -45,7 +69,9 @@ class SimpleCollectorDashboard:
         self.started_at = time.monotonic()
         self._last_sample_at = self.started_at
         self._last_requests = 0
+        self._last_completed = 0
         self._http_rate = 0.0
+        self._resource_rate = 0.0
         self._last_snapshot: dict[str, object] = {}
         self._live = Live(
             self._render({}),
@@ -68,10 +94,13 @@ class SimpleCollectorDashboard:
         self._last_snapshot = dict(snapshot)
         now = time.monotonic()
         requests = _int(snapshot.get("requests"))
+        completed = _int(snapshot.get("completed"))
         elapsed = max(0.001, now - self._last_sample_at)
         if now - self._last_sample_at >= 0.5:
             self._http_rate = max(0, requests - self._last_requests) / elapsed
+            self._resource_rate = max(0, completed - self._last_completed) / elapsed
             self._last_requests = requests
+            self._last_completed = completed
             self._last_sample_at = now
         if self._live is not None:
             self._live.update(self._render(snapshot), refresh=True)
@@ -85,6 +114,7 @@ class SimpleCollectorDashboard:
         if progress is not None:
             self.baseline = {key: _int(value) for key, value in progress.items()}
             self._last_snapshot = {}
+            self._resource_rate = 0.0
         if self._live is not None:
             self._live.update(self._render(self._last_snapshot, status=status), refresh=True)
             self._live.stop()
@@ -150,9 +180,17 @@ class SimpleCollectorDashboard:
         )
         elapsed = max(0.001, time.monotonic() - self.started_at)
         completed = max(0, _int(snapshot.get("completed")))
+        session_rate = completed / elapsed
+        eta_rate = self._resource_rate if self._resource_rate > 0 else session_rate
+        eta = (
+            "done"
+            if remaining == 0
+            else _duration(remaining / eta_rate) if eta_rate > 0 else "--"
+        )
         pipeline.add_row(
             "FLOW",
-            f"session {completed / elapsed:.2f}/s · completed {completed:,}",
+            f"recent {_rate(self._resource_rate)} · session {_rate(session_rate)} · "
+            f"completed {completed:,} · ETA {eta}",
         )
 
         pieces = [
