@@ -20,6 +20,8 @@ from .auth import DbdAuth
 from .crypto import decrypt_envelope
 from .session import WARMUP_PAGE_URL, create_session
 
+_AUTH_RETRY_SECONDS = 5.0
+
 
 def _curl_code(exc) -> object:
     code = getattr(exc, "code", None)
@@ -64,7 +66,7 @@ class SimpleGlobalLimiter:
             now = time.monotonic()
             self.effective_rate = max(0.5, self.target_rate * 0.5)
             self._pause_until = max(self._pause_until, now + max(0.0, retry_after_seconds))
-            self._penalty_until = max(self._penalty_until, now + max(1.0, quiet_seconds))
+            self._penalty_until = max(self._penalty_until, now + max(0.01, quiet_seconds))
             self._next_at = max(self._next_at, self._pause_until)
             EFFECTIVE_RATE.set(self.effective_rate)
 
@@ -143,6 +145,14 @@ class SimpleAsyncDbdClient:
     def upstream_state(self) -> str:
         return self._upstream.state
 
+    @property
+    def auth_state(self) -> str:
+        if time.monotonic() < self._auth_backoff_until:
+            return "cooldown"
+        if self._auth_refresh_task is not None and not self._auth_refresh_task.done():
+            return "refreshing"
+        return "ready" if self._token_valid() else "needed"
+
     async def __aenter__(self):
         self._session = AsyncSession(impersonate="chrome", max_clients=self.concurrency)
         self._auth_session = create_session()
@@ -161,18 +171,20 @@ class SimpleAsyncDbdClient:
 
     async def _refresh_token_once(self) -> str:
         try:
-            token = await asyncio.to_thread(self._auth.get_token, self._auth_session)
+            token = await asyncio.to_thread(
+                self._auth.get_token,
+                self._auth_session,
+                max_attempts=2,
+            )
             self._token = token
             self._auth_backoff_until = 0.0
             self._auth_last_error = None
             if self._session is not None and self._auth_session is not None:
                 self._session.cookies.update(self._auth_session.cookies)
             return token
-        except BaseException as exc:
+        except Exception as exc:
             self._auth_last_error = exc
-            self._auth_backoff_until = time.monotonic() + max(
-                1.0, float(settings.dbd_upstream_defer_seconds)
-            )
+            self._auth_backoff_until = time.monotonic() + _AUTH_RETRY_SECONDS
             raise
 
     async def _ensure_token(self, *, rejected=None, reset_warmup=False) -> str:
