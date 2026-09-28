@@ -1,6 +1,21 @@
 # Campaign quick start
 
-Campaign คือโหมดที่ supervisor เปิดและควบคุม worker หลาย process โดยใช้ MySQL เป็น durable task state และ Redis เป็น shared coordination/rate-control layer
+Campaign คือโหมด legacy/distributed ที่ supervisor เปิดและควบคุม worker หลาย
+process โดยใช้ MySQL เป็น durable task state และ Redis เป็น shared
+coordination/rate-control layer
+
+สำหรับ existing `fabric_v2` run บนเครื่องเดียว ให้ใช้ Simple Collector เป็น
+default operator path:
+
+```powershell
+dbd-data collect RUN_ID
+# หรือ
+.\\Run-DBD.ps1 RUN_ID -Headless
+```
+
+ใช้ Campaign ต่อเมื่อจำเป็นต้องใช้ distributed/multi-process compatibility หรือ
+rollback path โดยตั้งใจ และห้ามรัน Campaign กับ Simple Collector บน Run ID
+เดียวกันพร้อมกัน
 
 ## 1. Preflight
 
