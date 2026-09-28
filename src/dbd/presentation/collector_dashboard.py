@@ -20,7 +20,8 @@ class CollectorDashboard:
         self.console = Console()
         self._live: Live | None = None
         self._started_at = time.monotonic()
-        self._samples: deque[tuple[float, int]] = deque(maxlen=600)
+        self._progress_samples: deque[tuple[float, int]] = deque(maxlen=600)
+        self._request_samples: deque[tuple[float, int]] = deque(maxlen=600)
         self._last_plain = 0.0
 
     def __enter__(self):
@@ -39,15 +40,19 @@ class CollectorDashboard:
             self._live.__exit__(exc_type, exc, tb)
             self._live = None
 
-    def _rate(self, current: int) -> float | None:
+    @staticmethod
+    def _window_rate(
+        samples: deque[tuple[float, int]],
+        current: int,
+    ) -> float | None:
         now = time.monotonic()
-        self._samples.append((now, int(current)))
+        samples.append((now, int(current)))
         cutoff = now - 60.0
-        while len(self._samples) > 2 and self._samples[0][0] < cutoff:
-            self._samples.popleft()
-        if len(self._samples) < 2:
+        while len(samples) > 2 and samples[0][0] < cutoff:
+            samples.popleft()
+        if len(samples) < 2:
             return None
-        started, first = self._samples[0]
+        started, first = samples[0]
         elapsed = now - started
         delta = int(current) - int(first)
         if elapsed < 2.0 or delta <= 0:
@@ -67,7 +72,11 @@ class CollectorDashboard:
         remaining = max(0, int(state.get("remaining", total - terminal)))
         retry_wait = int(state.get("retry_wait", 0))
         progress = (100.0 * terminal / total) if total else 0.0
-        flow = self._rate(terminal)
+        flow = self._window_rate(self._progress_samples, terminal)
+        http_rate = self._window_rate(
+            self._request_samples,
+            int(state.get("requests", 0)),
+        )
         eta = remaining / flow if flow and flow > 0 else None
 
         table = Table(
@@ -90,7 +99,7 @@ class CollectorDashboard:
         table.add_row(
             "HTTP",
             (
-                f"flow {self._fmt_rate(flow)}   "
+                f"actual {self._fmt_rate(http_rate)}   "
                 f"rate {float(state.get('effective_rate', 0.0)):.2f}/s "
                 f"/ target {float(state.get('target_rate', 0.0)):.2f}/s   "
                 f"active {int(state.get('fetch_active', 0))}   "
@@ -116,8 +125,12 @@ class CollectorDashboard:
             ),
         )
         table.add_row(
+            "FLOW",
+            f"terminal {self._fmt_rate(flow)}   ETA {format_duration(eta)}",
+        )
+        table.add_row(
             "TIME",
-            f"elapsed {format_duration(time.monotonic() - self._started_at)}   ETA {format_duration(eta)}",
+            f"elapsed {format_duration(time.monotonic() - self._started_at)}",
         )
 
         last_error = state.get("last_error")
