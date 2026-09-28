@@ -41,8 +41,12 @@ def _live_state(run_id: int, baseline: dict, runtime: dict) -> dict:
         "not_available": not_available,
         "failed": failed,
         "remaining": max(0, total - terminal),
-        "retry_wait": int(baseline.get("retry_wait", 0))
-        + int(runtime.get("retry_wait", 0)),
+        "retry_wait": max(
+            0,
+            int(baseline.get("retry_wait", 0))
+            - int(runtime.get("retry_wait_claimed", 0))
+            + int(runtime.get("retry_wait", 0)),
+        ),
     }
 
 
