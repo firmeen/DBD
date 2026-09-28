@@ -34,6 +34,7 @@ def _live_state(run_id: int, baseline: dict, runtime: dict) -> dict:
     failed = int(baseline.get("failed", 0)) + int(runtime.get("failed", 0))
     terminal = done + not_available + failed
     return {
+        **runtime,
         "run_id": int(run_id),
         "total": total,
         "done": done,
@@ -42,7 +43,6 @@ def _live_state(run_id: int, baseline: dict, runtime: dict) -> dict:
         "remaining": max(0, total - terminal),
         "retry_wait": int(baseline.get("retry_wait", 0))
         + int(runtime.get("retry_wait", 0)),
-        **runtime,
     }
 
 
