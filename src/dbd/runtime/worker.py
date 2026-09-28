@@ -381,6 +381,7 @@ async def process(
     endpoint_rates=None,
     distributed=False,
     runtime_callback=None,
+    stop_signal=None,
 ):
     """Run staged claim -> fetch -> archive -> project with graceful draining.
 
@@ -602,6 +603,9 @@ async def process(
     async def scheduler():
         nonlocal claimed_attempts, maintenance_at, drain_db_check_at, idle_progress_at
         while not stop.is_set():
+            if stop_signal is not None and stop_signal.is_set() and not drain_requested.is_set():
+                drain_requested.set()
+                release_queued_fetch.set()
             now = time.monotonic()
             if now >= maintenance_at:
                 should_maintain = True
