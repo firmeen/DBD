@@ -14,18 +14,7 @@ proven by the repository. It does not turn transport errors into business outcom
 - Do not globally map HTTP 404 to `not_available`.
 - Do not resume the campaign until the dry-run output has been reviewed.
 
-## 1. Apply the lossless schema migration
-
-```powershell
-dbd-data migrate
-```
-
-Revision `0012_run9_data_repair` widens
-`companies.setup_obj_name_keyin` from `VARCHAR(500)` to `TEXT` only after
-checking the live column type and refusing automatic change when an index or generated
-column depends on that field.
-
-## 2. Collect exact repair evidence
+## 1. Collect exact repair evidence before changing schema
 
 ```powershell
 dbd-data campaign evidence 9 --json
@@ -43,6 +32,23 @@ The report contains:
 
 The benchmark section is deliberately non-executable. A 404 transport result is not
 proof that DBD means “no published benchmark”.
+
+Review the payload-shape evidence before migrating. In particular, confirm that profile
+overflow samples really contain a valid `setupObjNameKeyin` value longer than 500
+characters and inspect whether submission collisions are exact duplicate rows or
+conflicting same-year revisions.
+
+## 2. Apply the guarded lossless schema migration
+
+```powershell
+dbd-data migrate
+```
+
+Revision `0012_run9_data_repair` widens
+`companies.setup_obj_name_keyin` from `VARCHAR(500)` to `TEXT` only after
+checking the live column type and refusing automatic change when an index or generated
+column depends on that field. There is intentionally no standalone raw ALTER migration:
+the guarded Alembic revision is the authoritative upgrade path.
 
 ## 3. Dry-run targeted repair
 
