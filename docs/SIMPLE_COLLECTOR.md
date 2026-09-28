@@ -151,7 +151,8 @@ try {
         tests/test_mysql_workers.py::test_cancellation_returns_leases `
         tests/test_fabric_runtime.py::test_fabric_claim_window_bounds_leases_and_limit_finishes_claimed_work `
         tests/test_fabric_runtime.py::test_release_queued_fetch_work_is_attempt_neutral `
-        tests/test_fabric_runtime.py::test_external_stop_releases_queued_fetch_without_releasing_active_lease
+        tests/test_fabric_runtime.py::test_external_stop_releases_queued_fetch_without_releasing_active_lease `
+        tests/test_fabric_runtime.py::test_external_stop_timeout_cancels_active_fetch_and_returns_lease_attempt_neutrally
 }
 finally {
     $env:DBD_INTEGRATION = $OldIntegration
