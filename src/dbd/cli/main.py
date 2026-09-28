@@ -810,6 +810,8 @@ def main():
                 )
                 assert_manager_lock(conn)
             presenter.command_result("DBD · COLLECTOR RESULT", result)
+            if result.get("paused"):
+                raise SystemExit(130)
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
                 from ..runtime.supervisor import campaign_status
