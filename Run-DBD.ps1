@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $true, Position = 0)]
-    [ValidateRange(1, [int]::MaxValue)]
+    [ValidateRange(1, 2147483647)]
     [int]$RunId,
 
     # Compatibility switch from the former Guardian launcher. The simple
@@ -42,7 +42,7 @@ if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($modulePath)) {
 
 Write-Host ""
 Write-Host "+----------------------- DBD SIMPLE COLLECTOR -----------------------+"
-Write-Host ("| RUN {0,-8} single process · MySQL durable state · no Redis hot path |" -f $RunId)
+Write-Host ("| RUN {0,-8} single process | MySQL durable state | no Redis hot path |" -f $RunId)
 Write-Host "+--------------------------------------------------------------------+"
 Write-Host ("DBD source: {0}" -f $modulePath)
 if ($Headless) {
