@@ -2,7 +2,10 @@ import importlib
 
 import pytest
 
-from dbd.storage.mysql.repositories.fabric_worker_repository import _canonical_metadata
+from dbd.storage.mysql.repositories.fabric_worker_repository import (
+    FabricWorkerRepository,
+    _canonical_metadata,
+)
 
 
 migration = importlib.import_module(
@@ -109,3 +112,63 @@ def test_metadata_normalization_preserves_missing_required_key_behavior():
     metadata = _canonical_metadata({"CHARACTER_MAXIMUM_LENGTH": 500})
 
     assert "data_type" not in metadata
+
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        {
+            "DATA_TYPE": "TEXT",
+            "CHARACTER_MAXIMUM_LENGTH": 65535,
+            "CHARACTER_OCTET_LENGTH": 65535,
+        },
+        {
+            "data_type": "text",
+            "character_maximum_length": 65535,
+            "character_octet_length": 65535,
+        },
+    ],
+)
+def test_runtime_profile_capacity_accepts_driver_label_casing(source):
+    capacity = FabricWorkerRepository._profile_text_capacity_from_metadata(source)
+
+    assert capacity == {"characters": 65535, "octets": 65535}
+
+
+def test_runtime_profile_capacity_fails_closed_when_required_metadata_is_missing():
+    with pytest.raises(RuntimeError, match="missing data_type"):
+        FabricWorkerRepository._profile_text_capacity_from_metadata(
+            {"CHARACTER_MAXIMUM_LENGTH": 65535, "CHARACTER_OCTET_LENGTH": 65535}
+        )
+
+    with pytest.raises(RuntimeError, match="missing text capacity"):
+        FabricWorkerRepository._profile_text_capacity_from_metadata(
+            {"DATA_TYPE": "text", "CHARACTER_MAXIMUM_LENGTH": 65535}
+        )
+
+
+def test_migration_missing_type_metadata_fails_with_domain_error(monkeypatch):
+    monkeypatch.setattr(
+        migration,
+        "_column",
+        lambda _connection: {
+            "COLUMN_TYPE": None,
+            "IS_NULLABLE": "YES",
+            "CHARACTER_SET_NAME": "utf8mb4",
+            "COLLATION_NAME": "utf8mb4_0900_ai_ci",
+            "COLUMN_DEFAULT": None,
+            "EXTRA": "",
+            "COLUMN_COMMENT": "",
+        },
+    )
+
+    class Op:
+        @staticmethod
+        def get_bind():
+            return object()
+
+    monkeypatch.setattr(migration, "op", Op)
+
+    with pytest.raises(RuntimeError, match="Unexpected companies.setup_obj_name_keyin type"):
+        migration.upgrade()

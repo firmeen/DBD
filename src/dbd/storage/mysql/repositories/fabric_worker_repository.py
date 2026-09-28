@@ -1188,6 +1188,32 @@ class FabricWorkerRepository(WorkerRepository):
             "projection_payload_evidence": payload_evidence,
         }
 
+    @staticmethod
+    def _profile_text_capacity_from_metadata(row) -> dict | None:
+        """Interpret canonicalized live text-column metadata fail-closed."""
+        row = _canonical_metadata(row)
+        if row is None:
+            return None
+        data_type = row.get("data_type")
+        if data_type is None:
+            raise RuntimeError(
+                "information_schema metadata is missing data_type for "
+                "companies.setup_obj_name_keyin"
+            )
+        if str(data_type).lower() not in {"text", "mediumtext", "longtext"}:
+            return None
+        characters = row.get("character_maximum_length")
+        octets = row.get("character_octet_length")
+        if characters is None or octets is None:
+            raise RuntimeError(
+                "information_schema metadata is missing text capacity for "
+                "companies.setup_obj_name_keyin"
+            )
+        return {
+            "characters": int(characters),
+            "octets": int(octets),
+        }
+
     async def _profile_text_repair_capacity(self) -> dict | None:
         """Return live character/octet capacity for supported text types."""
         async with self.engine.connect() as conn:
@@ -1205,19 +1231,7 @@ class FabricWorkerRepository(WorkerRepository):
                     """)
                 )
             ).mappings().first()
-        row = _canonical_metadata(row)
-        if (
-            row is None
-            or str(row["data_type"] or "").lower()
-            not in {"text", "mediumtext", "longtext"}
-        ):
-            return None
-        characters = row.get("character_maximum_length")
-        octets = row.get("character_octet_length")
-        return {
-            "characters": int(characters) if characters is not None else None,
-            "octets": int(octets) if octets is not None else None,
-        }
+        return self._profile_text_capacity_from_metadata(row)
 
     @staticmethod
     def _profile_overflow_repairable(error_message, value, capacity) -> bool:

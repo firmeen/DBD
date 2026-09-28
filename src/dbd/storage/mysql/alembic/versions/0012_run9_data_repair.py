@@ -90,13 +90,13 @@ def upgrade():
             "companies.setup_obj_name_keyin is missing; refusing an unverified repair migration"
         )
 
-    data_type = str(column["data_type"] or "").lower()
+    data_type = str(column.get("data_type") or "").lower()
     if data_type in {"text", "mediumtext", "longtext"}:
         return
     if data_type != "varchar":
         raise RuntimeError(
             "Unexpected companies.setup_obj_name_keyin type "
-            f"{column['column_type']!r}; manual review is required"
+            f"{column.get('column_type')!r}; manual review is required"
         )
 
     indexes = list(_indexes(connection))
