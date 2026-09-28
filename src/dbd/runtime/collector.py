@@ -11,6 +11,7 @@ from ..presentation.collector_dashboard import CollectorDashboard
 from ..storage.mysql.async_engine import create_engine
 from ..storage.mysql.migrations import migration_head_revision
 from ..storage.mysql.repositories.worker_repository import WorkerRepository
+from .locking import runtime_handoff_lock
 from .worker import process
 
 _REQUIRED_SCHEMA = {
@@ -186,28 +187,32 @@ async def _collector_preflight(repo, run_id: int, *, health=None) -> dict:
     schema_revision = await _assert_schema_ready(repo)
     # Constructing the backend validates archive configuration before any claim.
     _ = repo.archive_backend
-    legacy = await _assert_legacy_runtime_offline(run_id)
 
-    leases = await repo.collector_lease_summary(run_id)
-    if int(leases.get("invalid", 0) or 0):
-        raise RuntimeError(
-            "Collector handoff refused: running rows exist without a lease expiry"
-        )
-    live = int(leases.get("live", 0) or 0)
-    if live:
-        raise RuntimeError(
-            f"Collector handoff refused: Run {run_id} still has {live} live "
-            "durable lease(s). Verify the previous process is stopped and retry "
-            "after those leases expire."
-        )
+    # Serialize this migration gate against legacy distributed-worker startup.
+    # The CLI already holds the long-lived manager lock for the collector.
+    with runtime_handoff_lock():
+        legacy = await _assert_legacy_runtime_offline(run_id)
 
-    reclaimed = await repo.reclaim_expired_collector_leases(run_id)
-    after = await repo.collector_lease_summary(run_id)
-    if int(after.get("running", 0) or 0):
-        raise RuntimeError(
-            f"Collector handoff refused: Run {run_id} still has "
-            f"{int(after.get('running', 0) or 0)} running durable lease(s)"
-        )
+        leases = await repo.collector_lease_summary(run_id)
+        if int(leases.get("invalid", 0) or 0):
+            raise RuntimeError(
+                "Collector handoff refused: running rows exist without a lease expiry"
+            )
+        live = int(leases.get("live", 0) or 0)
+        if live:
+            raise RuntimeError(
+                f"Collector handoff refused: Run {run_id} still has {live} live "
+                "durable lease(s). Verify the previous process is stopped and retry "
+                "after those leases expire."
+            )
+
+        reclaimed = await repo.reclaim_expired_collector_leases(run_id)
+        after = await repo.collector_lease_summary(run_id)
+        if int(after.get("running", 0) or 0):
+            raise RuntimeError(
+                f"Collector handoff refused: Run {run_id} still has "
+                f"{int(after.get('running', 0) or 0)} running durable lease(s)"
+            )
 
     if health is not None:
         await asyncio.to_thread(health)
