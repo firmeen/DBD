@@ -64,7 +64,7 @@ jobs:
           python -c "import dbd; print(dbd.__version__)"
           python -m dbd --version
           dbd-data --version
-      - name: Watchdog source encoding contract
+      - name: Launcher source encoding contract
         run: |
           python - <<'PY'
           from pathlib import Path
@@ -81,7 +81,7 @@ jobs:
           PY
       - name: Compile
         run: python -m compileall -q src scripts tests
-      - name: PowerShell watchdog syntax
+      - name: PowerShell launcher syntax
         shell: pwsh
         run: |
           $tokens = $null
@@ -121,12 +121,12 @@ jobs:
           --max-average-ms 2
           --max-p95-ms 5
 
-  windows-watchdog:
+  windows-launcher:
     runs-on: windows-latest
     timeout-minutes: 5
     steps:
       - uses: actions/checkout@v4
-      - name: Windows PowerShell 5.1 watchdog syntax
+      - name: Windows PowerShell 5.1 launcher syntax
         shell: powershell
         run: |
           $tokens = $null
@@ -141,7 +141,7 @@ jobs:
             exit 1
           }
           Write-Host "Run-DBD.ps1 parses under Windows PowerShell $($PSVersionTable.PSVersion)"
-      - name: PowerShell 7 watchdog syntax
+      - name: PowerShell 7 launcher syntax
         shell: pwsh
         run: |
           $tokens = $null
