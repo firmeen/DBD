@@ -799,6 +799,9 @@ async def process(
                 )
                 PIPELINE_STAGE_TOTAL.labels("fetch", "success").inc()
             except asyncio.CancelledError:
+                # The active fetch is leaving in-memory ownership. Durable lease
+                # release is handled by the drain/release path below.
+                IN_FLIGHT.dec()
                 raise
             except Exception as exc:
                 status = await _fail_task(repo, task, exc)
