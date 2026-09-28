@@ -768,3 +768,43 @@ def test_legacy_supervisor_refuses_active_collector_before_redis_start(
             worker_concurrency=1,
             worker_rate=1.0,
         )
+
+
+
+def test_atomic_supervisor_activation_orders_handoff_before_lease(monkeypatch) -> None:
+    calls = []
+
+    class Handoff:
+        def __enter__(self):
+            calls.append("handoff_enter")
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            calls.append("handoff_exit")
+            return None
+
+    class FakeRedis:
+        def ping(self):
+            calls.append("redis_ping")
+
+    monkeypatch.setattr(supervisor, "runtime_handoff_lock", lambda: Handoff())
+    monkeypatch.setattr(
+        supervisor,
+        "assert_manager_lock_free",
+        lambda: calls.append("manager_free"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_acquire_supervisor_lease",
+        lambda redis, run_id, token: calls.append(("lease", run_id, token)),
+    )
+
+    supervisor._activate_supervisor_lease(FakeRedis(), 9, "token-9")
+
+    assert calls == [
+        "handoff_enter",
+        "manager_free",
+        "redis_ping",
+        ("lease", 9, "token-9"),
+        "handoff_exit",
+    ]
