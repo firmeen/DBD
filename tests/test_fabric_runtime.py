@@ -1774,3 +1774,44 @@ async def test_collector_reclaims_expired_project_lease_without_losing_archive(r
     assert state["lease_owner"] is None
     assert state["lease_expires_at"] is None
     assert state["last_error"] == "collector_process_recovery"
+
+    NoFetchApi.calls = 0
+    result = await process(repo, run_id, concurrency=1, client_factory=NoFetchApi)
+
+    assert result == {"done": 1}
+    assert NoFetchApi.calls == 0
+
+
+
+async def test_collector_never_reclaims_live_lease(repo):
+    fabric, run_id, _ = await new_fabric_run(repo, ("profile",))
+    owner = "collector-live-owner"
+    task = await fabric.claim(run_id, owner)
+    assert task is not None
+
+    summary = await fabric.collector_lease_summary(run_id)
+    assert summary["live"] == 1
+    assert summary["expired"] == 0
+
+    reclaimed = await fabric.reclaim_expired_collector_leases(run_id)
+
+    assert reclaimed == 0
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT status,lease_owner,attempts
+                    FROM company_collection_state
+                    WHERE id=:id
+                    """
+                ),
+                {"id": task["id"]},
+            )
+        ).mappings().one()
+
+    assert state["status"] == "running"
+    assert state["lease_owner"] == owner
+    assert int(state["attempts"]) == 1
+
+    await fabric.release(owner)
