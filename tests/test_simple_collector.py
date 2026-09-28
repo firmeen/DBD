@@ -5,10 +5,10 @@ import time
 
 import pytest
 
+import dbd.runtime.collector as collector_runtime
 from dbd.client.async_client import PermanentHttpError, TransientHttpError
 from dbd.client.simple_client import SimpleAsyncDbdClient, SimpleGlobalLimiter
 from dbd.core.exceptions import DbdAuthError
-import dbd.runtime.collector as collector_runtime
 from dbd.runtime.collector import _assert_postflight_invariants, _live_state
 
 
