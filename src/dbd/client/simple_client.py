@@ -88,7 +88,7 @@ class _BackoffState:
 
     @property
     def state(self) -> str:
-        return "paused" if self.pause_until > time.monotonic() else "open"
+        return "paused" if self.pause_until > time.monotonic() else "healthy"
 
 
 class SimpleAsyncDbdClient:
@@ -182,23 +182,32 @@ class SimpleAsyncDbdClient:
                     self._auth.invalidate(reset_warmup=reset_warmup)
                     self._token = None
                     self._auth_refresh_task = None
+                    self._auth_backoff_until = 0.0
+                    self._auth_last_error = None
 
-        if self._token_valid():
-            return str(self._token)
-
-        async with self._auth_lock:
+        while True:
             if self._token_valid():
                 return str(self._token)
 
-            now = time.monotonic()
-            if now < self._auth_backoff_until and self._auth_last_error is not None:
-                raise self._auth_last_error
+            task = None
+            wait_seconds = 0.0
+            async with self._auth_lock:
+                if self._token_valid():
+                    return str(self._token)
 
-            if self._auth_refresh_task is None or self._auth_refresh_task.done():
-                self._auth_refresh_task = asyncio.create_task(self._refresh_token_once())
-            task = self._auth_refresh_task
+                now = time.monotonic()
+                wait_seconds = max(0.0, self._auth_backoff_until - now)
+                if wait_seconds <= 0:
+                    if self._auth_refresh_task is None or self._auth_refresh_task.done():
+                        self._auth_refresh_task = asyncio.create_task(self._refresh_token_once())
+                    task = self._auth_refresh_task
 
-        return await task
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+                continue
+
+            assert task is not None
+            return await task
 
     async def _wait_upstream(self) -> None:
         while True:
