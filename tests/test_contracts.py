@@ -9,7 +9,7 @@ from dbd.contracts.company import (
     normalize_nation_history,
     normalize_nations,
 )
-from dbd.contracts.financial import normalize_submissions
+from dbd.contracts.financial import normalize_submissions, submission_collision_evidence
 from dbd.contracts.identity import parse_code
 from dbd.contracts.strict import normalize_collection, normalize_industry_benchmark
 from dbd.core.exceptions import ContractError
@@ -174,6 +174,21 @@ def test_financial_submission_conflicting_same_year_requires_revision_identity()
         {"submitYear": "2566", "statusCode": "1"},
         {"submitYear": "2566", "statusCode": "2"},
     ]
+
+    with pytest.raises(ContractError, match="source revision identity is required"):
+        normalize_submissions(payload)
+
+
+
+def test_financial_submission_different_raw_rows_are_not_collapsed():
+    payload = [
+        {"submitYear": "2566", "statusCode": "1", "sourceRevision": "A"},
+        {"submitYear": "2566", "statusCode": "1", "sourceRevision": "B"},
+    ]
+
+    evidence = submission_collision_evidence(payload)
+    assert evidence["exact_duplicate_years"] == []
+    assert evidence["conflicting_years"] == ["2566"]
 
     with pytest.raises(ContractError, match="source revision identity is required"):
         normalize_submissions(payload)

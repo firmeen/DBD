@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import bindparam, text
 
+from ....contracts.financial import submission_collision_evidence
 from ....core.settings import settings
 from ....core.telemetry import (
     PIPELINE_BATCH_SIZE,
@@ -1051,6 +1052,75 @@ class FabricWorkerRepository(WorkerRepository):
                     """)
                 )
             ).mappings().all()
+            payload_rows = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          e.id AS event_id,
+                          e.company_id,
+                          m.jp_no,
+                          e.endpoint,
+                          e.error_code,
+                          e.error_message,
+                          e.archive_id
+                        FROM collection_failure_events e
+                        JOIN (
+                          SELECT company_id,endpoint,MAX(id) AS event_id
+                          FROM collection_failure_events
+                          WHERE run_id=:run
+                            AND stage='project'
+                            AND outcome='failed'
+                          GROUP BY company_id,endpoint
+                        ) latest ON latest.event_id=e.id
+                        JOIN company_master m ON m.company_id=e.company_id
+                        WHERE e.run_id=:run
+                          AND e.archive_id IS NOT NULL
+                          AND (
+                            (e.endpoint='financial_submissions'
+                             AND e.error_code='IntegrityError')
+                            OR
+                            (e.endpoint='profile'
+                             AND e.error_code='DataError')
+                          )
+                        ORDER BY e.id DESC
+                        LIMIT :limit
+                    """),
+                    {"run": int(run_id), "limit": sample_limit},
+                )
+            ).mappings().all()
+
+        payload_evidence = []
+        for source in payload_rows:
+            item = dict(source)
+            evidence_item = {
+                "event_id": int(item["event_id"]),
+                "company_id": int(item["company_id"]),
+                "jp_no": item["jp_no"],
+                "endpoint": item["endpoint"],
+                "error_code": item["error_code"],
+                "archive_id": int(item["archive_id"]),
+            }
+            try:
+                archive = await self.load_archive(int(item["archive_id"]))
+                payload = archive["data"]
+                if item["endpoint"] == "financial_submissions":
+                    evidence_item["submission_collisions"] = (
+                        submission_collision_evidence(payload)
+                    )
+                elif item["endpoint"] == "profile":
+                    value = (
+                        payload.get("setupObjNameKeyin")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    evidence_item["setup_obj_name_keyin"] = {
+                        "value_type": type(value).__name__ if value is not None else None,
+                        "length": len(value) if isinstance(value, str) else None,
+                        "exceeds_500": isinstance(value, str) and len(value) > 500,
+                    }
+            except Exception as exc:
+                evidence_item["archive_load_error"] = type(exc).__name__
+            payload_evidence.append(evidence_item)
 
         benchmark_404 = next(
             (
@@ -1085,7 +1155,27 @@ class FabricWorkerRepository(WorkerRepository):
                 "indexes": [dict(row) for row in indexes],
                 "generated_dependencies": [dict(row) for row in generated],
             },
+            "projection_payload_evidence": payload_evidence,
         }
+
+    async def _profile_text_repair_ready(self) -> bool:
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                        SELECT data_type
+                        FROM information_schema.columns
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND column_name='setup_obj_name_keyin'
+                    """)
+                )
+            ).mappings().first()
+        return (
+            row is not None
+            and str(row["data_type"] or "").lower()
+            in {"text", "mediumtext", "longtext"}
+        )
 
     async def _projection_repair_candidates(self, run_id):
         """Return exact current terminal project failures that can replay an archive."""
@@ -1098,6 +1188,7 @@ class FabricWorkerRepository(WorkerRepository):
                           e.company_id,
                           e.endpoint,
                           e.error_code,
+                          e.error_message,
                           e.archive_id,
                           s.id AS state_id,
                           s.required_mask,
@@ -1140,11 +1231,14 @@ class FabricWorkerRepository(WorkerRepository):
                 )
             ).mappings().all()
 
+        profile_text_ready = await self._profile_text_repair_ready()
         candidates = []
         for source in rows:
             row = dict(source)
+            endpoint = str(row["endpoint"])
+            error_code = str(row["error_code"])
             try:
-                bit = endpoint_bit(str(row["endpoint"]))
+                bit = endpoint_bit(endpoint)
             except ValueError:
                 continue
             terminal_failed = (
@@ -1156,7 +1250,40 @@ class FabricWorkerRepository(WorkerRepository):
             )
             if not terminal_failed & bit:
                 continue
+
+            try:
+                archive = await self.load_archive(int(row["archive_id"]))
+                payload = archive["data"]
+            except Exception:
+                continue
+
+            repair_class = None
+            if endpoint == "financial_submissions" and error_code == "IntegrityError":
+                collisions = submission_collision_evidence(payload)
+                if (
+                    collisions["exact_duplicate_years"]
+                    and not collisions["conflicting_years"]
+                ):
+                    repair_class = "financial_submission_exact_duplicate"
+            elif endpoint == "profile" and error_code == "DataError":
+                message = str(row.get("error_message") or "").lower()
+                value = (
+                    payload.get("setupObjNameKeyin")
+                    if isinstance(payload, dict)
+                    else None
+                )
+                if (
+                    profile_text_ready
+                    and "setup_obj_name_keyin" in message
+                    and isinstance(value, str)
+                    and len(value) > 500
+                ):
+                    repair_class = "profile_setup_objective_text_overflow"
+
+            if repair_class is None:
+                continue
             row["endpoint_bit"] = bit
+            row["repair_class"] = repair_class
             candidates.append(row)
         return candidates
 
@@ -1166,12 +1293,17 @@ class FabricWorkerRepository(WorkerRepository):
         states = set()
         for row in candidates:
             states.add(int(row["state_id"]))
-            key = (str(row["endpoint"]), str(row["error_code"]))
+            key = (
+                str(row["endpoint"]),
+                str(row["error_code"]),
+                str(row["repair_class"]),
+            )
             item = grouped.setdefault(
                 key,
                 {
                     "endpoint": key[0],
                     "error_code": key[1],
+                    "repair_class": key[2],
                     "resources": 0,
                     "states": set(),
                 },
@@ -1184,6 +1316,7 @@ class FabricWorkerRepository(WorkerRepository):
                 {
                     "endpoint": item["endpoint"],
                     "error_code": item["error_code"],
+                    "repair_class": item["repair_class"],
                     "resources": int(item["resources"]),
                     "states": len(item["states"]),
                 }

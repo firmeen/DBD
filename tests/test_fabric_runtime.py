@@ -1226,6 +1226,9 @@ async def test_targeted_projection_repair_is_dry_run_idempotent_and_never_refetc
     assert plan["action"] == "plan_only"
     assert plan["projection_archive_replay"]["candidate_resources"] == 1
     assert plan["projection_archive_replay"]["candidate_states"] == 1
+    assert plan["projection_archive_replay"]["by_endpoint_error"][0]["repair_class"] == (
+        "financial_submission_exact_duplicate"
+    )
     assert plan["changed_states"] == 0
 
     async with repo.engine.connect() as conn:
@@ -1308,3 +1311,94 @@ async def test_targeted_projection_repair_is_dry_run_idempotent_and_never_refetc
     assert final["status"] == "done"
     assert int(final["failed_mask"]) == 0
     assert int(final["dirty_mask"]) == 0
+
+
+
+async def test_targeted_repair_refuses_conflicting_submission_revisions(repo):
+    fabric, run_id, identities = await new_fabric_run(
+        repo,
+        ("financial_submissions",),
+        fiscal_year="2568",
+    )
+    owner = "targeted-repair-conflict"
+    task = await fabric.claim(run_id, owner)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    response = ApiResponse(
+        [
+            {"submitYear": "2568", "statusCode": "1", "sourceRevision": "A"},
+            {"submitYear": "2568", "statusCode": "1", "sourceRevision": "B"},
+        ],
+        200,
+        now,
+        now,
+    )
+    archive_id = await fabric.archive(
+        task,
+        response,
+        "/synthetic/fin/submit/7/" + identities[0].jp_no,
+        {"fiscalYear": "2568"},
+    )
+    bit = endpoint_bit("financial_submissions")
+
+    async with repo.engine.begin() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT id,company_id FROM company_collection_state "
+                    "WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+        await conn.execute(
+            text("""
+                UPDATE company_collection_state
+                SET status='failed',stage='project',failed_mask=:bit,
+                    dirty_mask=0,next_endpoint=NULL,raw_response_id=:archive,
+                    lease_owner=NULL,lease_expires_at=NULL,
+                    last_error='IntegrityError'
+                WHERE id=:state
+            """),
+            {"bit": bit, "archive": archive_id, "state": int(state["id"])},
+        )
+        await conn.execute(
+            text(
+                "UPDATE response_archive "
+                "SET processing_status='failed',error_code='IntegrityError' "
+                "WHERE id=:archive"
+            ),
+            {"archive": archive_id},
+        )
+        await conn.execute(
+            text("""
+                INSERT INTO collection_failure_events(
+                    run_id,company_id,endpoint,stage,outcome,error_code,
+                    error_message,http_status,attempt,archive_id,occurred_at
+                ) VALUES (
+                    :run,:company,'financial_submissions','project','failed',
+                    'IntegrityError','duplicate submit year',200,3,:archive,
+                    UTC_TIMESTAMP(6)
+                )
+            """),
+            {
+                "run": run_id,
+                "company": int(state["company_id"]),
+                "archive": archive_id,
+            },
+        )
+
+    plan = await fabric.targeted_repair(run_id, execute=False)
+    assert plan["projection_archive_replay"]["candidate_resources"] == 0
+
+    evidence = await fabric.repair_evidence(run_id, sample_limit=10)
+    collision = next(
+        item["submission_collisions"]
+        for item in evidence["projection_payload_evidence"]
+        if item["endpoint"] == "financial_submissions"
+    )
+    assert collision["exact_duplicate_years"] == []
+    assert collision["conflicting_years"] == ["2568"]
+
+    executed = await fabric.targeted_repair(run_id, execute=True)
+    assert executed["changed_states"] == 0
+    assert executed["changed_resources"] == 0
