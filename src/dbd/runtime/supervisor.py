@@ -16,7 +16,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from ..core.progress import LiveCampaignDashboard, TerminalSnapshot
 from ..core.settings import PROJECT_ROOT, settings
 from ..storage.mysql.engine import connect
-from .locking import assert_manager_lock_free
+from .locking import assert_manager_lock_free, runtime_handoff_lock
 
 _RATE_MODES = {"shared", "multiply", "adaptive"}
 _SUPERVISOR_LEASE_SECONDS = 30
@@ -1531,9 +1531,14 @@ def supervise_campaign(
         return replacement
 
     try:
-        redis.ping()
-        _acquire_supervisor_lease(redis, run_id, token)
-        lease_acquired = True
+        # Serialize legacy control-plane activation with collector handoff.
+        # The early manager check above is a fast failure; this second check is
+        # the atomic fence immediately before publishing the Supervisor lease.
+        with runtime_handoff_lock():
+            assert_manager_lock_free()
+            redis.ping()
+            _acquire_supervisor_lease(redis, run_id, token)
+            lease_acquired = True
 
         orphaned = _drain_registered_workers(redis, run_id)
         if orphaned:
