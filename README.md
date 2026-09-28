@@ -183,6 +183,47 @@ Financial endpoints ต้องพึ่งข้อมูลจาก profile 
 
 ---
 
+## Simple collector (recommended)
+
+For an existing `fabric_v2` run, the default operator path is now a single Python
+process backed by MySQL durable state. It does not require Redis in the ingestion
+hot path.
+
+Resume the same run ID:
+
+```powershell
+dbd-data collect 9
+```
+
+Defaults are intentionally explicit and configurable:
+
+```text
+DBD_COLLECTOR_CONCURRENCY=32
+DBD_COLLECTOR_RATE_PER_SECOND=60
+DBD_COLLECTOR_DRAIN_TIMEOUT_SECONDS=45
+```
+
+Override them when needed:
+
+```powershell
+dbd-data collect 9 --concurrency 48 --rate 60
+```
+
+The collector keeps the existing fetch -> archive -> project durability model.
+A single `Ctrl+C` stops new claims and returns queued-unstarted fetch leases.
+Already archived/projecting work is allowed to finish. If active fetch work does
+not drain before the configured timeout, only fetch tasks are cancelled; archive
+and projection work are not force-cancelled.
+
+The legacy Campaign/Guardian path remains available for compatibility and
+distributed operation, but it is not required to continue an existing
+single-machine `fabric_v2` run.
+
+See [Simple collector](docs/SIMPLE_COLLECTOR.md) for the runtime contract and
+validation gates.
+
+---
+
 ## Campaign
 
 Campaign เป็นวิธีที่ง่ายที่สุดในการเปิด worker fleet ที่ coordinated ผ่าน Redis
@@ -277,7 +318,7 @@ dbd-data bulk-retry N
 
 ## Redis
 
-Redis จำเป็นสำหรับ:
+Redis ไม่จำเป็นสำหรับ `dbd-data collect`. Redis ยังจำเป็นสำหรับ:
 
 - Campaign supervisor
 - distributed bulk workers
@@ -361,6 +402,9 @@ dbd-data migrate
 dbd-data discover
 dbd-data discover-status
 dbd-data master-status
+
+# Simple collector
+dbd-data collect RUN_ID
 
 # Campaign
 dbd-data campaign start --help
