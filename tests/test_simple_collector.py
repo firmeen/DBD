@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -264,6 +265,11 @@ def test_postflight_invariants_fail_closed(exact, message) -> None:
 @pytest.mark.asyncio
 async def test_legacy_handoff_refuses_supervisor_or_registered_workers(monkeypatch) -> None:
     monkeypatch.setattr(
+        collector_runtime,
+        "settings",
+        SimpleNamespace(dbd_redis_url="redis://test"),
+    )
+    monkeypatch.setattr(
         "dbd.runtime.supervisor.collector_handoff_status",
         lambda run_id: {
             "redis_configured": True,
@@ -275,6 +281,26 @@ async def test_legacy_handoff_refuses_supervisor_or_registered_workers(monkeypat
 
     with pytest.raises(RuntimeError, match="legacy runtime is still active"):
         await collector_runtime._assert_legacy_runtime_offline(9)
+
+
+
+
+
+@pytest.mark.asyncio
+async def test_legacy_handoff_skips_legacy_import_when_redis_is_not_configured(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        collector_runtime,
+        "settings",
+        SimpleNamespace(dbd_redis_url=None),
+    )
+
+    status = await collector_runtime._assert_legacy_runtime_offline(9)
+
+    assert status["redis_configured"] is False
+    assert status["supervisor_active"] is False
+    assert status["workers"] == 0
 
 
 @pytest.mark.asyncio
