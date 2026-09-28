@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from contextlib import nullcontext
 from types import SimpleNamespace
 
 import pytest
@@ -307,6 +308,11 @@ async def test_legacy_handoff_skips_legacy_import_when_redis_is_not_configured(
 async def test_collector_preflight_refuses_live_foreign_leases_before_reclaim(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        collector_runtime,
+        "runtime_handoff_lock",
+        lambda: nullcontext(),
+    )
     class FakeRepo:
         archive_backend = None
 
@@ -341,6 +347,11 @@ async def test_collector_preflight_refuses_live_foreign_leases_before_reclaim(
 async def test_collector_preflight_reclaims_only_expired_process_loss(
     monkeypatch,
 ) -> None:
+    monkeypatch.setattr(
+        collector_runtime,
+        "runtime_handoff_lock",
+        lambda: nullcontext(),
+    )
     class FakeRepo:
         archive_backend = None
 
