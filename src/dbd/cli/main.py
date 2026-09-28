@@ -437,6 +437,19 @@ def _add_campaign_guard_options(parser):
     parser.set_defaults(open_powershell=None)
 
 
+async def _collect_command(args, health=None) -> dict:
+    from ..runtime.collector import collect_run
+
+    return await collect_run(
+        args.run_id,
+        concurrency=args.concurrency,
+        rate=args.rate,
+        limit=args.limit,
+        dashboard_enabled=not bool(getattr(args, "json", False)),
+        health=health,
+    )
+
+
 def _campaign_command(args, presenter: TerminalPresenter) -> None:
     from ..runtime.supervisor import campaign_status, request_campaign_stop, supervise_campaign
 
@@ -568,7 +581,36 @@ def main():
     )
     replay.add_argument("archive_id", type=positive)
 
-    campaign = sub.add_parser("campaign", help="Supervise a coordinated local worker fleet")
+    collect = _add_output_options(
+        sub.add_parser(
+            "collect",
+            help="Resume one durable fabric run in a single Python process",
+        )
+    )
+    collect.add_argument("run_id", type=positive)
+    collect.add_argument(
+        "--concurrency",
+        type=positive,
+        default=48,
+        help="Concurrent HTTP fetch tasks in this process (default: 48)",
+    )
+    collect.add_argument(
+        "--rate",
+        type=positive_rate,
+        default=50.0,
+        help="Process-wide HTTP request ceiling per second (default: 50)",
+    )
+    collect.add_argument(
+        "--limit",
+        type=positive,
+        help="Optional maximum claims for a bounded validation run",
+    )
+    collect.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+
+    campaign = sub.add_parser(
+        "campaign",
+        help="Legacy coordinated worker-fleet commands; prefer dbd-data collect",
+    )
     campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
     campaign_start = campaign_sub.add_parser("start", help="Create a run and launch coordinated workers")
     source = campaign_start.add_mutually_exclusive_group(required=True)
@@ -757,6 +799,17 @@ def main():
             presenter.master_status({key: int(value or 0) for key, value in row.items()})
         elif args.command == "campaign":
             _campaign_command(args, presenter)
+        elif args.command == "collect":
+            configure(args.metrics_port)
+            with manager_lock() as conn:
+                result = asyncio.run(
+                    _collect_command(
+                        args,
+                        health=lambda: assert_manager_lock(conn),
+                    )
+                )
+                assert_manager_lock(conn)
+            presenter.command_result("DBD · COLLECTOR RESULT", result)
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
                 from ..runtime.supervisor import campaign_status
