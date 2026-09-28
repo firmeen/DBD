@@ -79,6 +79,66 @@ DONE and N/A resources are not reopened. FAILED resources remain failed unless a
 
 Do not create a new recovery run merely to switch runtime engines.
 
+## Automatic startup preflight
+
+Before the first claim, the collector now proves the handoff is safe:
+
+~~~text
+manager lock held
+        |
+schema revision == repository migration head
+        |
+required Fabric/archive columns present
+        |
+archive backend configuration valid
+        |
+legacy Supervisor offline
+legacy registered workers = 0
+        |
+no live foreign MySQL leases
+        |
+expired process-loss leases reclaimed attempt-neutrally
+        |
+baseline captured
+        |
+first claim allowed
+~~~
+
+If a legacy Redis control plane is configured, startup checks it once and fails
+closed when the control plane is unavailable. Redis is still not used in the
+collector HTTP hot path. When Redis is not configured, the collector keeps the
+legacy Supervisor/Redis modules out of startup entirely.
+
+A live durable lease is never stolen. The collector refuses to start and asks
+the operator to verify the previous process is stopped and retry after lease
+expiry.
+
+Expired leases are different: expiry has already fenced the previous owner from
+durable writes. The collector returns only those expired rows to pending and
+decrements the corresponding fetch/project attempt so a process crash does not
+consume a data-failure attempt.
+
+## Hard-crash resume
+
+Graceful Ctrl+C is not the only supported recovery path. If Python is killed,
+the terminal closes unexpectedly, or the machine loses power after a claim:
+
+~~~text
+process lost
+   |
+lease eventually expires
+   |
+next collector startup
+   |
+expired lease -> pending, attempt-neutral
+   |
+fetch-stage work -> fetch again
+project-stage work with raw_response_id -> replay archive
+~~~
+
+A project-stage crash therefore preserves the archive reference and does not
+call the DBD endpoint again.
+
 ## Fetch -> archive -> project
 
 The durable boundary is unchanged:
@@ -117,7 +177,9 @@ one refresh task
 
 This prevents the previous refresh convoy where many admitted requests serialized behind repeated /api/refresh attempts.
 
-The collector bounds one refresh cycle to two auth attempts, then waits briefly before one shared retry.
+The collector uses one bounded refresh request per shared recovery wave, with a
+request timeout capped at 10 seconds. A failed wave enters one short shared
+cooldown before exactly one later refresh wave is allowed.
 
 ## Rate control
 
@@ -153,6 +215,23 @@ First Ctrl+C:
 
 A second interrupt is treated as a force stop. The pipeline still runs its final lease-release cleanup.
 
+## Postflight invariants
+
+After a bounded run, normal completion, or graceful Ctrl+C drain, the collector
+performs an exact durable reconciliation before returning:
+
+~~~text
+total        == startup total
+DONE         >= startup DONE
+N/A          >= startup N/A
+FAILED       >= startup FAILED
+RUNNING      == 0
+~~~
+
+The collector itself does not reopen terminal FAILED resources. If any of these
+same-run invariants are violated it exits with an explicit invariant error
+instead of presenting the run as healthy.
+
 ## Duplicate collector protection
 
 manager_lock() uses MySQL GET_LOCK() on the database connection.
@@ -181,7 +260,7 @@ Static/unit validation:
 ~~~powershell
 python -m compileall -q src scripts tests
 python -m ruff check .
-python -m pytest -q tests/test_simple_collector.py
+python -m pytest -q tests/test_simple_collector.py tests/test_cli_collector.py
 ~~~
 
 Focused compatibility validation:
@@ -196,18 +275,21 @@ Redis admission tests are legacy-path tests only:
 python -m pytest -q tests/test_redis_rate_control.py
 ~~~
 
-Before resuming a production run, verify:
+MySQL integration validation must additionally exercise the Fabric crash/restart
+tests on a disposable `dbd_test_*` database before a production canary.
+
+The collector now enforces the runtime handoff itself. Operators should still
+inspect:
 
 ~~~powershell
 dbd-data campaign status RUN_ID --verbose
 ~~~
 
-Expected safe handoff:
+for visibility, but `dbd-data collect RUN_ID` refuses its first claim if the
+legacy Supervisor/workers or live durable leases are still present.
 
-~~~text
-RUNNING 0
-WORKERS 0
-supervisor OFFLINE
+After local validation, start with the same Run ID and a bounded canary:
+
+~~~powershell
+dbd-data collect RUN_ID --concurrency 16 --rate 20 --limit 200
 ~~~
-
-Then start the collector with the same Run ID.
