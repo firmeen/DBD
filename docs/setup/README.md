@@ -9,10 +9,11 @@
 1. [ติดตั้งและเตรียมโปรเจกต์บน Windows](WINDOWS_PROJECT_SETUP.md)
 2. [ตั้งค่า MySQL](MYSQL.md)
 3. รัน `dbd-data check-db` และ `dbd-data migrate`
-4. ถ้าจะใช้ Campaign หรือ distributed workers ให้ [ตั้งค่า Redis](REDIS.md)
-5. ถ้าต้องการเปิดดูฐานข้อมูลแบบ GUI ให้ [ตั้งค่า DBeaver](DBEAVER.md)
-6. ถ้าจะพัฒนา/รันหน้าเว็บ ให้ [ตั้งค่า Web app](WEB_APP.md)
-7. เมื่อระบบพื้นฐานผ่านแล้ว ไปที่ [Campaign quick start](../CAMPAIGN_QUICKSTART.md)
+4. สำหรับ existing `fabric_v2` run บนเครื่องเดียว ใช้ [Simple Collector](../SIMPLE_COLLECTOR.md) ได้ทันทีโดยไม่ต้องมี Redis
+5. ถ้าจะใช้ Campaign หรือ distributed workers ให้ [ตั้งค่า Redis](REDIS.md)
+6. ถ้าต้องการเปิดดูฐานข้อมูลแบบ GUI ให้ [ตั้งค่า DBeaver](DBEAVER.md)
+7. ถ้าจะพัฒนา/รันหน้าเว็บ ให้ [ตั้งค่า Web app](WEB_APP.md)
+8. ใช้ [Campaign quick start](../CAMPAIGN_QUICKSTART.md) เฉพาะเมื่อจำเป็นต้องใช้ legacy/distributed compatibility
 
 ## เครื่องมือไหนจำเป็น
 
