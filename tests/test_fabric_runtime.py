@@ -1138,3 +1138,173 @@ async def test_release_queued_fetch_work_is_attempt_neutral(repo):
     assert int(state["running"] or 0) == 0
     assert int(state["pending"] or 0) == 4
     assert int(state["attempts"] or 0) == 0
+
+
+
+async def test_targeted_projection_repair_is_dry_run_idempotent_and_never_refetches(repo):
+    NoFetchApi.calls = 0
+    fabric, run_id, identities = await new_fabric_run(
+        repo,
+        ("financial_submissions",),
+        fiscal_year="2568",
+    )
+    owner = "targeted-repair-seed"
+    task = await fabric.claim(run_id, owner)
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    duplicate_row = {
+        "submitYear": "2568",
+        "submitDate": [2026, 1, 1],
+        "statusCode": "1",
+    }
+    response = ApiResponse([duplicate_row, dict(duplicate_row)], 200, now, now)
+    archive_id = await fabric.archive(
+        task,
+        response,
+        "/synthetic/fin/submit/7/" + identities[0].jp_no,
+        {"fiscalYear": "2568"},
+    )
+    bit = endpoint_bit("financial_submissions")
+
+    async with repo.engine.begin() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT id,company_id FROM company_collection_state "
+                    "WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+        await conn.execute(
+            text("""
+                UPDATE company_collection_state
+                SET status='failed',stage='project',
+                    failed_mask=:bit,dirty_mask=0,next_endpoint=NULL,
+                    raw_response_id=:archive,
+                    attempts=0,project_attempts=3,
+                    lease_owner=NULL,lease_expires_at=NULL,
+                    last_error='IntegrityError',
+                    finished_at=UTC_TIMESTAMP(6)
+                WHERE id=:state
+            """),
+            {"bit": bit, "archive": archive_id, "state": int(state["id"])},
+        )
+        await conn.execute(
+            text(
+                "UPDATE response_archive "
+                "SET processing_status='failed',error_code='IntegrityError' "
+                "WHERE id=:archive"
+            ),
+            {"archive": archive_id},
+        )
+        await conn.execute(
+            text("""
+                INSERT INTO collection_failure_events(
+                    run_id,company_id,endpoint,stage,outcome,error_code,
+                    error_message,http_status,attempt,archive_id,occurred_at
+                ) VALUES (
+                    :run,:company,'financial_submissions','project','failed',
+                    'IntegrityError','duplicate submit year',200,3,:archive,
+                    UTC_TIMESTAMP(6)
+                )
+            """),
+            {
+                "run": run_id,
+                "company": int(state["company_id"]),
+                "archive": archive_id,
+            },
+        )
+        await conn.execute(
+            text(
+                "UPDATE worker_runs SET status='failed',finished_at=UTC_TIMESTAMP(6) "
+                "WHERE id=:run"
+            ),
+            {"run": run_id},
+        )
+
+    plan = await fabric.targeted_repair(run_id, execute=False)
+    assert plan["action"] == "plan_only"
+    assert plan["projection_archive_replay"]["candidate_resources"] == 1
+    assert plan["projection_archive_replay"]["candidate_states"] == 1
+    assert plan["changed_states"] == 0
+
+    async with repo.engine.connect() as conn:
+        before = (
+            await conn.execute(
+                text(
+                    "SELECT status,stage,dirty_mask,project_attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+    assert before["status"] == "failed"
+    assert before["stage"] == "project"
+    assert int(before["dirty_mask"]) == 0
+    assert int(before["project_attempts"]) == 3
+
+    executed = await fabric.targeted_repair(run_id, execute=True)
+    assert executed["changed_states"] == 1
+    assert executed["changed_resources"] == 1
+
+    async with repo.engine.connect() as conn:
+        repaired = (
+            await conn.execute(
+                text(
+                    "SELECT status,stage,dirty_mask,next_endpoint,raw_response_id,"
+                    "attempts,project_attempts FROM company_collection_state "
+                    "WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+        run_status = (
+            await conn.execute(
+                text("SELECT status FROM worker_runs WHERE id=:run"),
+                {"run": run_id},
+            )
+        ).scalar_one()
+
+    assert repaired["status"] == "pending"
+    assert repaired["stage"] == "project"
+    assert int(repaired["dirty_mask"]) & bit
+    assert repaired["next_endpoint"] == "financial_submissions"
+    assert int(repaired["raw_response_id"]) == int(archive_id)
+    assert int(repaired["attempts"]) == 0
+    assert int(repaired["project_attempts"]) == 0
+    assert run_status == "ready"
+
+    repeated = await fabric.targeted_repair(run_id, execute=True)
+    assert repeated["changed_states"] == 0
+    assert repeated["changed_resources"] == 0
+
+    result = await process(repo, run_id, concurrency=1, client_factory=NoFetchApi)
+    assert result == {"done": 1}
+    assert NoFetchApi.calls == 0
+
+    async with repo.engine.connect() as conn:
+        stored = int(
+            (
+                await conn.execute(
+                    text(
+                        "SELECT COUNT(*) FROM financial_submissions "
+                        "WHERE jp_no=:jp_no AND submit_year='2568'"
+                    ),
+                    {"jp_no": identities[0].jp_no},
+                )
+            ).scalar_one()
+        )
+        final = (
+            await conn.execute(
+                text(
+                    "SELECT status,failed_mask,dirty_mask "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert stored == 1
+    assert final["status"] == "done"
+    assert int(final["failed_mask"]) == 0
+    assert int(final["dirty_mask"]) == 0

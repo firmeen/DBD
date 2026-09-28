@@ -1087,6 +1087,267 @@ class FabricWorkerRepository(WorkerRepository):
             },
         }
 
+    async def _projection_repair_candidates(self, run_id):
+        """Return exact current terminal project failures that can replay an archive."""
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          e.id AS event_id,
+                          e.company_id,
+                          e.endpoint,
+                          e.error_code,
+                          e.archive_id,
+                          s.id AS state_id,
+                          s.required_mask,
+                          s.done_mask,
+                          s.not_available_mask,
+                          s.failed_mask,
+                          s.dirty_mask,
+                          s.fiscal_year,
+                          s.status,
+                          s.stage,
+                          m.identity_status,
+                          a.processing_status AS archive_status
+                        FROM collection_failure_events e
+                        JOIN (
+                          SELECT company_id,endpoint,MAX(id) AS event_id
+                          FROM collection_failure_events
+                          WHERE run_id=:run
+                            AND stage='project'
+                            AND outcome='failed'
+                          GROUP BY company_id,endpoint
+                        ) latest ON latest.event_id=e.id
+                        JOIN company_collection_state s
+                          ON s.run_id=e.run_id AND s.company_id=e.company_id
+                        JOIN company_master m ON m.company_id=e.company_id
+                        JOIN response_archive a
+                          ON a.id=e.archive_id
+                         AND a.run_id=e.run_id
+                         AND a.company_id=e.company_id
+                         AND a.endpoint=e.endpoint
+                        WHERE e.run_id=:run
+                          AND e.error_code IN ('IntegrityError','DataError')
+                          AND e.archive_id IS NOT NULL
+                          AND s.status IN ('pending','failed')
+                          AND s.dirty_mask=0
+                          AND m.identity_status<>'conflict'
+                          AND a.processing_status IN ('pending','invalid','failed')
+                        ORDER BY s.id,e.endpoint
+                    """),
+                    {"run": int(run_id)},
+                )
+            ).mappings().all()
+
+        candidates = []
+        for source in rows:
+            row = dict(source)
+            try:
+                bit = endpoint_bit(str(row["endpoint"]))
+            except ValueError:
+                continue
+            terminal_failed = (
+                int(row["failed_mask"])
+                & ~int(row["dirty_mask"])
+                & ~int(row["done_mask"])
+                & ~int(row["not_available_mask"])
+                & int(row["required_mask"])
+            )
+            if not terminal_failed & bit:
+                continue
+            row["endpoint_bit"] = bit
+            candidates.append(row)
+        return candidates
+
+    @staticmethod
+    def _projection_repair_summary(candidates):
+        grouped = {}
+        states = set()
+        for row in candidates:
+            states.add(int(row["state_id"]))
+            key = (str(row["endpoint"]), str(row["error_code"]))
+            item = grouped.setdefault(
+                key,
+                {
+                    "endpoint": key[0],
+                    "error_code": key[1],
+                    "resources": 0,
+                    "states": set(),
+                },
+            )
+            item["resources"] += 1
+            item["states"].add(int(row["state_id"]))
+        by_error = []
+        for item in grouped.values():
+            by_error.append(
+                {
+                    "endpoint": item["endpoint"],
+                    "error_code": item["error_code"],
+                    "resources": int(item["resources"]),
+                    "states": len(item["states"]),
+                }
+            )
+        by_error.sort(key=lambda row: (-row["resources"], row["endpoint"], row["error_code"]))
+        return {
+            "candidate_resources": len(candidates),
+            "candidate_states": len(states),
+            "by_endpoint_error": by_error,
+        }
+
+    async def targeted_repair(self, run_id, *, execute=False):
+        """Plan or reopen only evidence-backed project failures for archive replay.
+
+        Benchmark HTTP 404 remains deliberately non-executable until its upstream
+        business semantics are proven separately.
+        """
+        candidates = await self._projection_repair_candidates(run_id)
+        evidence = await self.repair_evidence(run_id, limit=500, sample_limit=20)
+        projection = self._projection_repair_summary(candidates)
+        result = {
+            "run_id": int(run_id),
+            "action": "execute" if execute else "plan_only",
+            "projection_archive_replay": projection,
+            "benchmark_404": evidence["benchmark_404"],
+            "changed_states": 0,
+            "changed_resources": 0,
+        }
+        if not execute or not candidates:
+            return result
+
+        grouped = {}
+        for item in candidates:
+            grouped.setdefault(int(item["state_id"]), []).append(item)
+
+        batch_size = max(1, int(settings.dbd_write_batch_size))
+        state_ids = sorted(grouped)
+        changed_states = 0
+        changed_resources = 0
+        for offset in range(0, len(state_ids), batch_size):
+            batch_ids = state_ids[offset : offset + batch_size]
+            async with self.engine.begin() as conn:
+                states = (
+                    await conn.execute(
+                        text("""
+                            SELECT s.*
+                            FROM company_collection_state s
+                            WHERE s.run_id=:run AND s.id IN :ids
+                            ORDER BY s.id
+                            FOR UPDATE
+                        """).bindparams(bindparam("ids", expanding=True)),
+                        {"run": int(run_id), "ids": batch_ids},
+                    )
+                ).mappings().all()
+                for source_state in states:
+                    state = dict(source_state)
+                    if (
+                        str(state["status"]) not in {"pending", "failed"}
+                        or int(state["dirty_mask"]) != 0
+                    ):
+                        continue
+
+                    current_mask = 0
+                    archive_by_endpoint = {}
+                    for candidate in grouped.get(int(state["id"]), []):
+                        endpoint = str(candidate["endpoint"])
+                        bit = int(candidate["endpoint_bit"])
+                        terminal_failed = (
+                            int(state["failed_mask"])
+                            & ~int(state["dirty_mask"])
+                            & ~int(state["done_mask"])
+                            & ~int(state["not_available_mask"])
+                            & int(state["required_mask"])
+                        )
+                        if not terminal_failed & bit:
+                            continue
+                        archive_ok = (
+                            await conn.execute(
+                                text("""
+                                    SELECT 1
+                                    FROM response_archive
+                                    WHERE id=:archive
+                                      AND run_id=:run
+                                      AND company_id=:company
+                                      AND endpoint=:endpoint
+                                      AND processing_status IN ('pending','invalid','failed')
+                                    LIMIT 1
+                                """),
+                                {
+                                    "archive": int(candidate["archive_id"]),
+                                    "run": int(run_id),
+                                    "company": int(state["company_id"]),
+                                    "endpoint": endpoint,
+                                },
+                            )
+                        ).first()
+                        if archive_ok is None:
+                            continue
+                        current_mask |= bit
+                        archive_by_endpoint[endpoint] = int(candidate["archive_id"])
+
+                    if not current_mask:
+                        continue
+                    retry_dirty = int(state["dirty_mask"]) | current_mask
+                    next_item = next_endpoint(
+                        int(state["required_mask"]),
+                        int(state["done_mask"]),
+                        int(state["not_available_mask"]),
+                        failed=int(state["failed_mask"]),
+                        dirty=retry_dirty,
+                        fiscal_year=state["fiscal_year"],
+                    )
+                    if next_item is None or next_item not in archive_by_endpoint:
+                        raise RuntimeError(
+                            f"Targeted repair state {state['id']} cannot select an archived "
+                            "project endpoint without widening repair scope"
+                        )
+                    archive_id = archive_by_endpoint[next_item]
+                    update = await conn.execute(
+                        text("""
+                            UPDATE company_collection_state
+                            SET dirty_mask=:dirty,
+                                next_endpoint=:next,
+                                stage='project',
+                                status='pending',
+                                attempts=0,
+                                project_attempts=0,
+                                available_at=UTC_TIMESTAMP(6),
+                                raw_response_id=:archive,
+                                lease_owner=NULL,
+                                lease_expires_at=NULL,
+                                last_error=NULL,
+                                finished_at=NULL,
+                                updated_at=UTC_TIMESTAMP(6)
+                            WHERE id=:state
+                              AND run_id=:run
+                              AND status IN ('pending','failed')
+                              AND dirty_mask=0
+                        """),
+                        {
+                            "dirty": retry_dirty,
+                            "next": next_item,
+                            "archive": archive_id,
+                            "state": int(state["id"]),
+                            "run": int(run_id),
+                        },
+                    )
+                    if update.rowcount == 1:
+                        changed_states += 1
+                        changed_resources += int(current_mask).bit_count()
+
+                if changed_states:
+                    await conn.execute(
+                        text(
+                            "UPDATE worker_runs "
+                            "SET status='ready',finished_at=NULL WHERE id=:run"
+                        ),
+                        {"run": int(run_id)},
+                    )
+
+        result["changed_states"] = changed_states
+        result["changed_resources"] = changed_resources
+        return result
+
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
             await conn.execute(
