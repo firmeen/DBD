@@ -85,7 +85,7 @@ class CollectorDashboard:
         )
         table.add_row(
             "STATE",
-            f"done {done:,}   N/A {na:,}   failed {failed:,}   retry {retry_wait:,}   remaining {remaining:,}",
+            f"done {done:,}   N/A {na:,}   failed {failed:,}   retry~ {retry_wait:,}   remaining {remaining:,}",
         )
         table.add_row(
             "HTTP",
