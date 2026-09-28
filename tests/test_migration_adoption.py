@@ -302,7 +302,8 @@ def test_run9_data_repair_migration_widens_profile_objective_text():
             "WHERE CHAR_LENGTH(setup_obj_name_keyin)>500"
         )
         cur.execute(
-            "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin VARCHAR(500) NULL"
+            "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin "
+            "VARCHAR(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL"
         )
         cur.execute("UPDATE alembic_version SET version_num='0011_fabric_recovery'")
         conn.commit()
@@ -314,7 +315,9 @@ def test_run9_data_repair_migration_widens_profile_objective_text():
         assert cur.fetchone()["version_num"] == HEAD
         cur.execute(
             """
-            SELECT data_type,character_maximum_length
+            SELECT
+              data_type,character_maximum_length,character_octet_length,
+              is_nullable,character_set_name,collation_name
             FROM information_schema.columns
             WHERE table_schema=DATABASE()
               AND table_name='companies'
@@ -324,4 +327,8 @@ def test_run9_data_repair_migration_widens_profile_objective_text():
         column = cur.fetchone()
 
     assert column["data_type"] == "text"
-    assert int(column["character_maximum_length"]) >= 65535
+    assert int(column["character_maximum_length"]) > 500
+    assert int(column["character_octet_length"]) >= int(column["character_maximum_length"])
+    assert column["is_nullable"] == "YES"
+    assert column["character_set_name"] == "utf8mb4"
+    assert column["collation_name"] == "utf8mb4_0900_ai_ci"

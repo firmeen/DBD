@@ -1,5 +1,7 @@
 """Widen valid Run 9 profile objective text without truncation."""
 
+import re
+
 from alembic import op
 
 revision = "0012_run9_data_repair"
@@ -9,7 +11,11 @@ down_revision = "0011_fabric_recovery"
 def _column(connection):
     return connection.exec_driver_sql(
         """
-        SELECT data_type,column_type,character_maximum_length,is_nullable
+        SELECT
+          data_type,column_type,character_maximum_length,
+          character_octet_length,is_nullable,
+          character_set_name,collation_name,column_default,
+          extra,column_comment
         FROM information_schema.columns
         WHERE table_schema=DATABASE()
           AND table_name='companies'
@@ -46,6 +52,15 @@ def _generated_dependencies(connection):
     ).scalars().all()
 
 
+def _identifier(value, label: str) -> str:
+    value = str(value or "")
+    if not re.fullmatch(r"[A-Za-z0-9_]+", value):
+        raise RuntimeError(
+            f"Unexpected {label} {value!r}; refusing unsafe automatic migration"
+        )
+    return value
+
+
 def upgrade():
     connection = op.get_bind()
     column = _column(connection)
@@ -71,9 +86,28 @@ def upgrade():
             f"indexes={indexes!r} generated_columns={generated!r}. "
             "Refusing automatic widening."
         )
+    if column.get("column_default") is not None:
+        raise RuntimeError(
+            "companies.setup_obj_name_keyin has a non-null default; "
+            "manual migration review is required"
+        )
+    if str(column.get("extra") or "").strip():
+        raise RuntimeError(
+            "companies.setup_obj_name_keyin has unexpected EXTRA metadata; "
+            "manual migration review is required"
+        )
+    if str(column.get("column_comment") or ""):
+        raise RuntimeError(
+            "companies.setup_obj_name_keyin has a column comment; "
+            "manual migration review is required so it is not silently dropped"
+        )
 
+    character_set = _identifier(column.get("character_set_name"), "character set")
+    collation = _identifier(column.get("collation_name"), "collation")
+    nullable = "NULL" if str(column.get("is_nullable") or "").upper() == "YES" else "NOT NULL"
     connection.exec_driver_sql(
-        "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin TEXT NULL"
+        "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin "
+        f"TEXT CHARACTER SET {character_set} COLLATE {collation} {nullable}"
     )
 
 

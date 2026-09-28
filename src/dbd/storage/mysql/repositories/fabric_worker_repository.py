@@ -1004,7 +1004,11 @@ class FabricWorkerRepository(WorkerRepository):
                         JOIN company_master m ON m.company_id=e.company_id
                         LEFT JOIN company_collection_state s
                           ON s.run_id=e.run_id AND s.company_id=e.company_id
-                        LEFT JOIN response_archive a ON a.id=e.archive_id
+                        LEFT JOIN response_archive a
+                          ON a.id=e.archive_id
+                         AND a.run_id=e.run_id
+                         AND a.company_id=e.company_id
+                         AND a.endpoint=e.endpoint
                         WHERE e.run_id=:run
                         ORDER BY e.id DESC
                         LIMIT :limit
@@ -1018,7 +1022,9 @@ class FabricWorkerRepository(WorkerRepository):
                     text("""
                         SELECT
                           data_type,column_type,character_maximum_length,
-                          character_octet_length,is_nullable
+                          character_octet_length,is_nullable,
+                          character_set_name,collation_name,column_default,
+                          extra,column_comment
                         FROM information_schema.columns
                         WHERE table_schema=DATABASE()
                           AND table_name='companies'
@@ -1074,6 +1080,11 @@ class FabricWorkerRepository(WorkerRepository):
                           GROUP BY company_id,endpoint
                         ) latest ON latest.event_id=e.id
                         JOIN company_master m ON m.company_id=e.company_id
+                        JOIN response_archive a
+                          ON a.id=e.archive_id
+                         AND a.run_id=e.run_id
+                         AND a.company_id=e.company_id
+                         AND a.endpoint=e.endpoint
                         WHERE e.run_id=:run
                           AND e.archive_id IS NOT NULL
                           AND (
