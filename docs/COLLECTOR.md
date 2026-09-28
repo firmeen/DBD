@@ -109,6 +109,13 @@ closed when the control plane is unavailable. Redis is still not used in the
 collector HTTP hot path. When Redis is not configured, the collector keeps the
 legacy Supervisor/Redis modules out of startup entirely.
 
+The handoff is serialized with a short MySQL named lock. The collector already
+holds the long-lived API manager lock; legacy distributed workers must pass the
+same short handoff fence before registration and then verify that the manager
+lock is free. A legacy worker that is already running also rechecks manager-lock
+availability before claiming additional work. This closes the startup race in
+both directions without putting a lock query in the new collector HTTP path.
+
 A live durable lease is never stolen. The collector refuses to start and asks
 the operator to verify the previous process is stopped and retry after lease
 expiry.
