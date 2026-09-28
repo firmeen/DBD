@@ -23,6 +23,22 @@ from ....runtime.delta import refresh_plan
 from .worker_repository import FinishResult, WorkerRepository, now, transaction_retry
 
 
+def _canonical_metadata(row):
+    """Normalize information_schema RowMapping keys across MySQL drivers."""
+    if row is None:
+        return None
+    normalized = {}
+    for key, value in row.items():
+        name = str(key).casefold()
+        if name in normalized and normalized[name] != value:
+            raise RuntimeError(
+                f"Ambiguous information_schema metadata for {name!r}; "
+                "refusing automatic repair"
+            )
+        normalized[name] = value
+    return normalized
+
+
 class FabricWorkerRepository(WorkerRepository):
     """One durable scheduler row per company/run.
 
@@ -1163,11 +1179,39 @@ class FabricWorkerRepository(WorkerRepository):
                 ),
             },
             "profile_text_schema": {
-                "column": dict(column) if column is not None else None,
-                "indexes": [dict(row) for row in indexes],
-                "generated_dependencies": [dict(row) for row in generated],
+                "column": _canonical_metadata(column),
+                "indexes": [_canonical_metadata(row) for row in indexes],
+                "generated_dependencies": [
+                    _canonical_metadata(row) for row in generated
+                ],
             },
             "projection_payload_evidence": payload_evidence,
+        }
+
+    @staticmethod
+    def _profile_text_capacity_from_metadata(row) -> dict | None:
+        """Interpret canonicalized live text-column metadata fail-closed."""
+        row = _canonical_metadata(row)
+        if row is None:
+            return None
+        data_type = row.get("data_type")
+        if data_type is None:
+            raise RuntimeError(
+                "information_schema metadata is missing data_type for "
+                "companies.setup_obj_name_keyin"
+            )
+        if str(data_type).lower() not in {"text", "mediumtext", "longtext"}:
+            return None
+        characters = row.get("character_maximum_length")
+        octets = row.get("character_octet_length")
+        if characters is None or octets is None:
+            raise RuntimeError(
+                "information_schema metadata is missing text capacity for "
+                "companies.setup_obj_name_keyin"
+            )
+        return {
+            "characters": int(characters),
+            "octets": int(octets),
         }
 
     async def _profile_text_repair_capacity(self) -> dict | None:
@@ -1187,18 +1231,7 @@ class FabricWorkerRepository(WorkerRepository):
                     """)
                 )
             ).mappings().first()
-        if (
-            row is None
-            or str(row["data_type"] or "").lower()
-            not in {"text", "mediumtext", "longtext"}
-        ):
-            return None
-        characters = row.get("character_maximum_length")
-        octets = row.get("character_octet_length")
-        return {
-            "characters": int(characters) if characters is not None else None,
-            "octets": int(octets) if octets is not None else None,
-        }
+        return self._profile_text_capacity_from_metadata(row)
 
     @staticmethod
     def _profile_overflow_repairable(error_message, value, capacity) -> bool:

@@ -8,6 +8,27 @@ revision = "0012_run9_data_repair"
 down_revision = "0011_fabric_recovery"
 
 
+def _canonical_metadata(row):
+    """Normalize driver-specific information_schema label casing.
+
+    MySQL/PyMySQL/SQLAlchemy combinations can expose information_schema labels
+    as DATA_TYPE, data_type, or another case variant. Migration decisions must
+    not depend on that presentation detail.
+    """
+    if row is None:
+        return None
+    normalized = {}
+    for key, value in row.items():
+        name = str(key).casefold()
+        if name in normalized and normalized[name] != value:
+            raise RuntimeError(
+                f"Ambiguous information_schema metadata for {name!r}; "
+                "refusing automatic migration"
+            )
+        normalized[name] = value
+    return normalized
+
+
 def _column(connection):
     return connection.exec_driver_sql(
         """
@@ -63,19 +84,19 @@ def _identifier(value, label: str) -> str:
 
 def upgrade():
     connection = op.get_bind()
-    column = _column(connection)
+    column = _canonical_metadata(_column(connection))
     if column is None:
         raise RuntimeError(
             "companies.setup_obj_name_keyin is missing; refusing an unverified repair migration"
         )
 
-    data_type = str(column["data_type"] or "").lower()
+    data_type = str(column.get("data_type") or "").lower()
     if data_type in {"text", "mediumtext", "longtext"}:
         return
     if data_type != "varchar":
         raise RuntimeError(
             "Unexpected companies.setup_obj_name_keyin type "
-            f"{column['column_type']!r}; manual review is required"
+            f"{column.get('column_type')!r}; manual review is required"
         )
 
     indexes = list(_indexes(connection))
