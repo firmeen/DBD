@@ -37,6 +37,35 @@ def assert_manager_lock_free() -> None:
 
 
 @contextmanager
+def runtime_handoff_lock(timeout_seconds: int = 5):
+    """Serialize legacy-worker registration against collector handoff.
+
+    The collector keeps the normal API manager lock for its full lifetime. This
+    short lock only closes the startup race between that collector and legacy
+    distributed workers registering themselves.
+    """
+    timeout = max(0, int(timeout_seconds))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT GET_LOCK(CONCAT(DATABASE(), ':dbd-runtime-handoff'), %s) AS acquired",
+                (timeout,),
+            )
+            if cur.fetchone()["acquired"] != 1:
+                raise RuntimeError("DBD runtime handoff is busy; retry shortly")
+        try:
+            yield
+        finally:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT RELEASE_LOCK(CONCAT(DATABASE(), ':dbd-runtime-handoff'))"
+                    )
+            except Exception:
+                pass
+
+
+@contextmanager
 def manager_lock():
     """One API manager per database: an in-memory rate limit has one owner."""
     with connect() as conn:
