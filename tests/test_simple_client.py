@@ -1,3 +1,4 @@
+import asyncio
 import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -104,6 +105,53 @@ async def test_auth_refresh_failure_publishes_pause_before_refresh_lock_is_relea
 
     assert value.auth_state == "unavailable"
     assert value._pause_until > time.monotonic()
+
+
+async def test_concurrent_auth_failure_is_shared_without_refresh_convoy():
+    value = client(retries=0)
+    value._token = None
+    refresh_calls = 0
+
+    def fail_refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        raise DbdAuthError("shared refresh unavailable", status_code=503)
+
+    value._blocking_token = fail_refresh
+
+    results = await asyncio.gather(
+        *(value._ensure_token() for _ in range(8)),
+        return_exceptions=True,
+    )
+
+    assert refresh_calls == 1
+    assert all(isinstance(result, DbdAuthError) for result in results)
+    assert all(str(result) == "shared refresh unavailable" for result in results)
+    assert all(result.status_code == 503 for result in results)
+    assert value.auth_state == "unavailable"
+
+
+async def test_shared_auth_failure_allows_one_refresh_after_pause_window():
+    value = client(retries=0)
+    value._token = None
+    value._auth_error = DbdAuthError("previous refresh unavailable")
+    value._auth_error_until = time.monotonic() - 1
+    refresh_calls = 0
+
+    def refresh():
+        nonlocal refresh_calls
+        refresh_calls += 1
+        return "fresh-token"
+
+    value._blocking_token = refresh
+
+    token = await value._ensure_token()
+
+    assert token == "fresh-token"
+    assert refresh_calls == 1
+    assert value._auth_error is None
+    assert value._auth_error_until == 0
+    assert value.auth_state == "healthy"
 
 
 async def test_business_404_clears_availability_without_reclassifying_response():
