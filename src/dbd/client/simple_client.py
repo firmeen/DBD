@@ -228,14 +228,20 @@ class SimpleAsyncDbdClient:
                 return
             await asyncio.sleep(delay)
 
-    async def _mark_upstream_failure(self) -> None:
+    async def _mark_upstream_failure(self, *, minimum_pause: float = 0.0) -> None:
         async with self._upstream_lock:
             self._upstream.failures += 1
+            now = time.monotonic()
+            if minimum_pause > 0:
+                self._upstream.pause_until = max(
+                    self._upstream.pause_until,
+                    now + float(minimum_pause),
+                )
             if self._upstream.failures >= 3:
                 step = min(15.0, 5.0 * (2 ** min(self._upstream.failures - 3, 2)))
                 self._upstream.pause_until = max(
                     self._upstream.pause_until,
-                    time.monotonic() + step,
+                    now + step,
                 )
 
     async def _mark_upstream_success(self) -> None:
@@ -311,7 +317,12 @@ class SimpleAsyncDbdClient:
                     raise DbdForbiddenError("HTTP 403")
 
                 if status in (500, 502, 503, 504):
-                    await self._mark_upstream_failure()
+                    minimum_pause = 0.0
+                    if status == 503:
+                        header = response.headers.get("retry-after")
+                        if header is not None and str(header).strip():
+                            minimum_pause = retry_after(header)
+                    await self._mark_upstream_failure(minimum_pause=minimum_pause)
                     raise TransientHttpError(f"HTTP {status}", status_code=status)
 
                 await self._mark_upstream_success()
