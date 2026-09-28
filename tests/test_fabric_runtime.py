@@ -1106,6 +1106,115 @@ async def test_fabric_claim_window_bounds_leases_and_limit_finishes_claimed_work
     assert int(state["attempts"] or 0) == 0
 
 
+async def test_external_stop_signal_drains_active_and_releases_unstarted_fetches(repo):
+    class BlockingProfileApi:
+        calls = 0
+        active = 0
+        active_ready = None
+        release = None
+
+        def __init__(self, **kwargs):
+            self.requests_made = 0
+            self.retries_made = 0
+            self.rate_limit_hits = 0
+            self.endpoint_rate = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def fetch(self, method, path, **kwargs):
+            type(self).calls += 1
+            self.requests_made += 1
+            type(self).active += 1
+            if type(self).active >= 2:
+                type(self).active_ready.set()
+            try:
+                await type(self).release.wait()
+                kind, number = path.split("/")[-2:]
+                now = datetime.now(timezone.utc).replace(tzinfo=None)
+                return ApiResponse(
+                    {
+                        "jpNo": number,
+                        "jpTypeCode": kind,
+                        "jpName": "Stop Signal Synthetic",
+                        "submitFinYear": None,
+                    },
+                    200,
+                    now,
+                    now,
+                )
+            finally:
+                type(self).active -= 1
+
+    BlockingProfileApi.calls = 0
+    BlockingProfileApi.active = 0
+    BlockingProfileApi.active_ready = asyncio.Event()
+    BlockingProfileApi.release = asyncio.Event()
+    stop_signal = asyncio.Event()
+
+    _, run_id, _ = await new_fabric_run(repo, ("profile",), count=20)
+    processing = asyncio.create_task(
+        process(
+            repo,
+            run_id,
+            concurrency=2,
+            client_factory=BlockingProfileApi,
+            stop_signal=stop_signal,
+        )
+    )
+
+    await asyncio.wait_for(BlockingProfileApi.active_ready.wait(), timeout=5)
+
+    for _ in range(50):
+        async with repo.engine.connect() as conn:
+            running = int(
+                (
+                    await conn.execute(
+                        text(
+                            "SELECT COUNT(*) FROM company_collection_state "
+                            "WHERE run_id=:run AND status='running'"
+                        ),
+                        {"run": run_id},
+                    )
+                ).scalar_one()
+            )
+        if running == 4:
+            break
+        await asyncio.sleep(0.02)
+
+    assert running == 4
+
+    stop_signal.set()
+    await asyncio.sleep(0.1)
+    BlockingProfileApi.release.set()
+    result = await asyncio.wait_for(processing, timeout=10)
+
+    assert BlockingProfileApi.calls == 2
+    assert result["done"] == 2
+    assert result["pending"] == 18
+
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "SUM(status='running') running, "
+                    "SUM(status='pending') pending, "
+                    "SUM(attempts) attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert int(state["running"] or 0) == 0
+    assert int(state["pending"] or 0) == 18
+    assert int(state["attempts"] or 0) == 0
+
+
 async def test_release_queued_fetch_work_is_attempt_neutral(repo):
     fabric, run_id, _ = await new_fabric_run(repo, ("profile",), count=4)
     owner = "drain-release-test"
