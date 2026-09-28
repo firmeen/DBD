@@ -16,8 +16,8 @@ from ..core.exceptions import DbdAuthError, DbdForbiddenError, DbdTokenExpiredEr
 from ..core.settings import settings
 from ..core.telemetry import EFFECTIVE_RATE, HTTP_RETRIES, LATENCY, REQUESTS, log
 from .auth import DbdAuth
-from .http import ApiResponse, PermanentHttpError, TransientHttpError, retry_after
 from .crypto import decrypt_envelope
+from .http import ApiResponse, PermanentHttpError, TransientHttpError, retry_after
 from .session import WARMUP_PAGE_URL, create_session
 
 _AUTH_RETRY_SECONDS = 5.0
