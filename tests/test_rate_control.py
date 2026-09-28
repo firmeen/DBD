@@ -94,3 +94,18 @@ async def test_distinct_endpoint_availability_can_escalate_global_without_rate_c
     assert controller.global_effective_rate() == 60
     assert controller.effective_rate("profile") == 30
     assert controller.effective_rate("committees") == 20
+
+
+
+async def test_rate_penalty_updates_observed_circuit_state():
+    controller = EndpointRateController(
+        60,
+        endpoint_rates={"profile": 30},
+        circuit_failure_threshold=2,
+    )
+
+    await controller.penalize("profile", 0)
+    await controller.penalize("profile", 0)
+
+    assert controller.circuit_state("profile") == "open"
+    assert controller.effective_rate("profile") < 30

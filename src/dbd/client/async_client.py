@@ -257,7 +257,9 @@ class AsyncDbdClient:
                     REQUESTS.labels(str(status)).inc()
                     retry_after_header = response.headers.get("retry-after")
                     rate_pressure = status == 429 or (
-                        status == 503 and retry_after_header is not None
+                        status == 503
+                        and retry_after_header is not None
+                        and str(retry_after_header).strip() != ""
                     )
                     if rate_pressure:
                         self.rate_limit_hits += 1

@@ -922,7 +922,8 @@ return {
         endpoint: str,
         cooldown_seconds: float,
     ) -> tuple[float, float, float, float, bool]:
-        await self._breaker.failure(endpoint)
+        endpoint_state = await self._breaker.failure(endpoint)
+        self._last_endpoint_circuit_state[endpoint] = endpoint_state
         self._endpoint_recovery_needed.add(endpoint)
         endpoint_bucket = self._bucket(endpoint)
         shared_endpoint = self._shared_endpoint(endpoint)
@@ -940,7 +941,7 @@ return {
         global_escalated = await self._breaker.record_endpoint_pressure(endpoint)
         if global_escalated:
             self._global_recovery_needed = True
-            await self._breaker.failure("__global__")
+            self._last_global_circuit_state = await self._breaker.failure("__global__")
             self._global_local.slow_down()
             self._global_local.cooldown(cooldown_seconds)
             if self._global_shared is not None:
@@ -953,7 +954,7 @@ return {
 
     async def penalize_global(self, cooldown_seconds: float) -> tuple[float, float]:
         self._global_recovery_needed = True
-        await self._breaker.failure("__global__")
+        self._last_global_circuit_state = await self._breaker.failure("__global__")
         old_global = self._global_effective()
         self._global_local.slow_down()
         self._global_local.cooldown(cooldown_seconds)

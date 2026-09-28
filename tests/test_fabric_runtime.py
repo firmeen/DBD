@@ -12,11 +12,12 @@ from dbd.client.async_client import ApiResponse
 from dbd.contracts.identity import parse_code
 from dbd.core.exceptions import ContractError, DbdForbiddenError
 from dbd.core.settings import settings
+from dbd.core.telemetry import IN_FLIGHT
 from dbd.runtime.collection_fabric import endpoint_bit
 from dbd.runtime.replay import replay_archive
 from dbd.runtime.resources import DEFAULT_PARTS, endpoints
 from dbd.runtime.supervisor import _failure_diagnostics, _has_active_work, _task_progress
-from dbd.runtime.worker import process
+from dbd.runtime.worker import _release_queued_fetch_work, process
 
 pytestmark = pytest.mark.integration
 
@@ -994,7 +995,7 @@ async def test_recovery_run_preserves_good_resource_outcomes_and_reopens_only_re
 
 
 
-async def test_fabric_drain_releases_unstarted_fetch_leases_attempt_neutrally(repo):
+async def test_fabric_claim_window_bounds_leases_and_limit_finishes_claimed_work(repo):
     class BlockingProfileApi:
         calls = 0
         active = 0
@@ -1082,9 +1083,9 @@ async def test_fabric_drain_releases_unstarted_fetch_leases_attempt_neutrally(re
     BlockingProfileApi.release.set()
     result = await asyncio.wait_for(processing, timeout=10)
 
-    assert BlockingProfileApi.calls == 2
-    assert result["done"] == 2
-    assert result["pending"] == 18
+    assert BlockingProfileApi.calls == 4
+    assert result["done"] == 4
+    assert result["pending"] == 16
 
     async with repo.engine.connect() as conn:
         state = (
@@ -1101,5 +1102,39 @@ async def test_fabric_drain_releases_unstarted_fetch_leases_attempt_neutrally(re
         ).mappings().one()
 
     assert int(state["running"] or 0) == 0
-    assert int(state["pending"] or 0) == 18
+    assert int(state["pending"] or 0) == 16
+    assert int(state["attempts"] or 0) == 0
+
+
+async def test_release_queued_fetch_work_is_attempt_neutral(repo):
+    fabric, run_id, _ = await new_fabric_run(repo, ("profile",), count=4)
+    owner = "drain-release-test"
+    tasks = await fabric.claim_batch(run_id, owner, stage="fetch", limit=4)
+    assert len(tasks) == 4
+
+    queue = asyncio.Queue()
+    for task in tasks:
+        IN_FLIGHT.inc()
+        await queue.put(task)
+
+    released = await _release_queued_fetch_work(fabric, owner, queue)
+
+    assert released == 4
+    assert queue.empty()
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    "SELECT "
+                    "SUM(status='running') running, "
+                    "SUM(status='pending') pending, "
+                    "SUM(attempts) attempts "
+                    "FROM company_collection_state WHERE run_id=:run"
+                ),
+                {"run": run_id},
+            )
+        ).mappings().one()
+
+    assert int(state["running"] or 0) == 0
+    assert int(state["pending"] or 0) == 4
     assert int(state["attempts"] or 0) == 0

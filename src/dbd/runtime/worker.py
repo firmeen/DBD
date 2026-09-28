@@ -352,6 +352,23 @@ async def _queue_get(
         return item
 
 
+async def _release_queued_fetch_work(repo, owner: str, queue: asyncio.Queue) -> int:
+    """Return queued-but-unstarted fetch leases to durable state attempt-neutrally."""
+    released = 0
+    while True:
+        try:
+            queue.get_nowait()
+        except asyncio.QueueEmpty:
+            break
+        else:
+            queue.task_done()
+            IN_FLIGHT.dec()
+            released += 1
+    if released:
+        await repo.release(owner)
+    return released
+
+
 async def process(
     repo,
     run_id,
@@ -384,6 +401,7 @@ async def process(
     owner = os.environ.get("DBD_WORKER_ID") or uuid4().hex
     stop = asyncio.Event()
     drain_requested = asyncio.Event()
+    release_queued_fetch = asyncio.Event()
     fetch_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     archive_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     project_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
@@ -425,6 +443,7 @@ async def process(
             registration_status = await coordinator.register_worker(identity)
             if registration_status == "draining":
                 drain_requested.set()
+                release_queued_fetch.set()
         except BaseException:
             await close_async_redis(redis_client)
             raise
@@ -521,6 +540,7 @@ async def process(
         # This replaces the separate 0.5s control polling Redis round trip.
         if resolved == "draining":
             drain_requested.set()
+            release_queued_fetch.set()
         return resolved
 
     async def mysql_heartbeat():
@@ -567,39 +587,42 @@ async def process(
                 maintenance_at = now + _MAINTENANCE_INTERVAL_SECONDS
 
             if drain_requested.is_set():
-                # Fetchers stop dequeuing as soon as drain begins. Allow only
-                # work that already crossed into active HTTP/archive/project to
-                # reach a durable boundary, then release queued fetch leases.
-                downstream_busy = (
-                    int(runtime_stats["fetch_active"]) > 0
-                    or not archive_queue.empty()
-                    or int(runtime_stats["archive_active"]) > 0
-                    or not project_queue.empty()
-                    or int(runtime_stats["project_active"]) > 0
-                )
-                if downstream_busy:
-                    await asyncio.sleep(0.1)
-                    continue
-
-                released = 0
-                while True:
-                    try:
-                        fetch_queue.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    else:
-                        fetch_queue.task_done()
-                        IN_FLIGHT.dec()
-                        released += 1
-                if released:
-                    await repo.release(owner)
-                    log.info(
-                        "drain_released_queued_fetch",
-                        worker_id=owner,
-                        run_id=run_id,
-                        released=released,
+                if release_queued_fetch.is_set():
+                    # External/Guardian drain: fetchers stop dequeuing immediately.
+                    # Finish only work already inside active HTTP/archive/project,
+                    # then return queued-unstarted fetch leases to MySQL.
+                    downstream_busy = (
+                        int(runtime_stats["fetch_active"]) > 0
+                        or not archive_queue.empty()
+                        or int(runtime_stats["archive_active"]) > 0
+                        or not project_queue.empty()
+                        or int(runtime_stats["project_active"]) > 0
                     )
-                    queue_metrics()
+                    if downstream_busy:
+                        await asyncio.sleep(0.1)
+                        continue
+                    released = await _release_queued_fetch_work(repo, owner, fetch_queue)
+                    if released:
+                        log.info(
+                            "drain_released_queued_fetch",
+                            worker_id=owner,
+                            run_id=run_id,
+                            released=released,
+                        )
+                        queue_metrics()
+                else:
+                    # Internal bounded invocation (--limit) still finishes every
+                    # task it deliberately claimed before stopping.
+                    if not (
+                        fetch_queue.empty()
+                        and archive_queue.empty()
+                        and project_queue.empty()
+                        and int(runtime_stats["fetch_active"]) == 0
+                        and int(runtime_stats["archive_active"]) == 0
+                        and int(runtime_stats["project_active"]) == 0
+                    ):
+                        await asyncio.sleep(0.1)
+                        continue
 
                 now = time.monotonic()
                 if now < drain_db_check_at:
@@ -609,9 +632,10 @@ async def process(
                 if await repo.owner_running(owner) == 0:
                     stop.set()
                     return
-                # Any residual owned lease is no longer represented by active
-                # in-memory work. Release it attempt-neutrally before rechecking.
-                await repo.release(owner)
+                if release_queued_fetch.is_set():
+                    # Any residual owned lease is no longer represented by active
+                    # in-memory work. Release it attempt-neutrally before rechecking.
+                    await repo.release(owner)
                 await asyncio.sleep(0.1)
                 continue
 
@@ -672,7 +696,7 @@ async def process(
 
     async def fetcher(client):
         while True:
-            task = await _queue_get(fetch_queue, stop, drain_requested)
+            task = await _queue_get(fetch_queue, stop, release_queued_fetch)
             if task is None:
                 return
             runtime_stats["fetch_active"] += 1
