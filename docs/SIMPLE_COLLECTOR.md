@@ -123,9 +123,10 @@ distributed compatibility and rollback during this transition. It is not on the
 `dbd-data collect` execution path.
 
 Do not run the old Campaign supervisor and the simple collector against the same
-run at the same time. The collector holds the MySQL manager lock and, after
-expired-lease maintenance, refuses to start while any durable RUNNING lease is
-still live. The legacy Campaign path remains a rollback-only path until the
+run at the same time. Both runtime managers now contend for the same MySQL
+`dbd-api-manager` advisory lock, so a new Supervisor and the Simple Collector
+cannot own ingestion concurrently. The collector also runs expired-lease
+maintenance and refuses startup while any durable RUNNING lease is still live. The legacy Campaign path remains a rollback-only path until the
 simple collector has passed the local validation gates.
 
 ## Validation gates
