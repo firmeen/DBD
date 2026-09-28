@@ -11,6 +11,15 @@ from .locking import assert_manager_lock, manager_lock
 from .worker import process
 
 
+def _assert_resume_safe(progress) -> None:
+    running = int(progress.get("running", 0) or 0)
+    if running:
+        raise ValueError(
+            f"Run still has {running} live RUNNING lease(s); stop the existing worker/campaign "
+            "and let its leases release before starting dbd collect"
+        )
+
+
 async def _collect(
     run_id: int,
     *,
@@ -36,6 +45,7 @@ async def _collect(
         scheduler_repo = repo.for_run(run)
         await scheduler_repo.maintain(run_id)
         baseline = await scheduler_repo.progress(run_id)
+        _assert_resume_safe(baseline)
         dashboard = SimpleCollectorDashboard(
             run_id,
             baseline,

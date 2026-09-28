@@ -226,7 +226,7 @@ validation gates.
 
 ## Campaign
 
-Campaign เป็นวิธีที่ง่ายที่สุดในการเปิด worker fleet ที่ coordinated ผ่าน Redis
+Campaign เป็น legacy/distributed worker-fleet path ที่ coordinated ผ่าน Redis; สำหรับ single-machine `fabric_v2` run ให้ใช้ `dbd-data collect` เป็นหลัก
 
 ก่อน production ให้รัน canary ก่อน ดูขั้นตอนเต็มใน [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md)
 
