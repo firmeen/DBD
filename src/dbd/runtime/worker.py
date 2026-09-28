@@ -437,7 +437,15 @@ async def process(
         "fetch_active": 0,
         "archive_active": 0,
         "project_active": 0,
+        "last_error": None,
+        "last_error_at": None,
     }
+
+    def remember_runtime_error(exc: BaseException) -> None:
+        runtime_stats["last_error"] = (
+            f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"
+        )
+        runtime_stats["last_error_at"] = time.time()
 
     if distributed:
         from ..core.redis import (
@@ -548,8 +556,10 @@ async def process(
             "circuit_global": circuit_global,
             "upstream_state": str(getattr(client, "upstream_state", circuit_global)),
             "auth_state": str(getattr(client, "auth_state", "unknown")),
-            "last_error": getattr(client, "last_error", None),
-            "last_error_at": getattr(client, "last_error_at", None),
+            "last_error": runtime_stats["last_error"]
+            or getattr(client, "last_error", None),
+            "last_error_at": runtime_stats["last_error_at"]
+            or getattr(client, "last_error_at", None),
             "redis_commands": redis_commands,
             "redis_admissions": redis_admissions,
             "redis_pool_in_use": int(pool.get("in_use", 0)),
@@ -806,6 +816,7 @@ async def process(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                remember_runtime_error(exc)
                 status = await _fail_task(repo, task, exc)
                 _apply_failure_stats(runtime_stats, status)
                 IN_FLIGHT.dec()
@@ -844,6 +855,7 @@ async def process(
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
+                remember_runtime_error(exc)
                 for item in batch:
                     status = await _fail_task(repo, item["task"], exc)
                     _apply_failure_stats(runtime_stats, status)
@@ -909,10 +921,12 @@ async def process(
                 runtime_stats["failed"] += int(getattr(outcome, "failed_delta", 0))
             except asyncio.CancelledError:
                 raise
-            except LeaseLost:
+            except LeaseLost as exc:
+                remember_runtime_error(exc)
                 PIPELINE_STAGE_TOTAL.labels("project", "lease_lost").inc()
                 log.warning("lease_lost", task_id=task["id"], endpoint=task["endpoint"])
             except Exception as exc:
+                remember_runtime_error(exc)
                 status = await _fail_task(repo, task, exc, archive_id)
                 _apply_failure_stats(runtime_stats, status)
             finally:
