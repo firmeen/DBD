@@ -7,7 +7,6 @@ from dbd.storage.mysql.repositories.fabric_worker_repository import (
     _canonical_metadata,
 )
 
-
 migration = importlib.import_module(
     "dbd.storage.mysql.alembic.versions.0012_run9_data_repair"
 )
