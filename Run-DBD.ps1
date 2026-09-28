@@ -10,11 +10,9 @@ param(
 
     [switch]$NoUI,
 
-    [ValidateRange(1, 256)]
-    [int]$Concurrency,
+    [int]$Concurrency = 0,
 
-    [ValidateScript({ $_ -gt 0 })]
-    [double]$Rate
+    [double]$Rate = 0
 )
 
 Set-StrictMode -Version Latest
@@ -22,6 +20,13 @@ $ErrorActionPreference = "Stop"
 
 $ProjectRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Python = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+
+if ($PSBoundParameters.ContainsKey("Concurrency") -and ($Concurrency -lt 1 -or $Concurrency -gt 256)) {
+    throw "-Concurrency must be between 1 and 256."
+}
+if ($PSBoundParameters.ContainsKey("Rate") -and $Rate -le 0) {
+    throw "-Rate must be greater than 0."
+}
 
 if (-not (Test-Path -LiteralPath $Python)) {
     throw "Project virtualenv Python was not found: $Python"
