@@ -171,3 +171,32 @@ def test_migration_missing_type_metadata_fails_with_domain_error(monkeypatch):
 
     with pytest.raises(RuntimeError, match="Unexpected companies.setup_obj_name_keyin type"):
         migration.upgrade()
+
+
+
+def test_generated_dependency_like_pattern_is_bound():
+    calls = []
+
+    class Scalars:
+        @staticmethod
+        def all():
+            return []
+
+    class Result:
+        @staticmethod
+        def scalars():
+            return Scalars()
+
+    class Connection:
+        @staticmethod
+        def exec_driver_sql(statement, parameters=None):
+            calls.append((statement, parameters))
+            return Result()
+
+    assert migration._generated_dependencies(Connection()) == []
+
+    assert len(calls) == 1
+    statement, parameters = calls[0]
+    assert "LIKE %s" in statement
+    assert "LIKE '%setup_obj_name_keyin%'" not in statement
+    assert parameters == ("%setup_obj_name_keyin%",)

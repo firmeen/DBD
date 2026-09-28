@@ -67,9 +67,10 @@ def _generated_dependencies(connection):
           AND table_name='companies'
           AND generation_expression IS NOT NULL
           AND generation_expression<>''
-          AND LOWER(generation_expression) LIKE '%setup_obj_name_keyin%'
+          AND LOWER(generation_expression) LIKE %s
         ORDER BY column_name
-        """
+        """,
+        ("%setup_obj_name_keyin%",),
     ).scalars().all()
 
 
