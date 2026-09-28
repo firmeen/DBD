@@ -634,3 +634,103 @@ def test_force_stop_sigint_shield_restores_previous_handler(monkeypatch) -> None
         (supervisor.signal.SIGINT, supervisor.signal.SIG_IGN),
         (supervisor.signal.SIGINT, previous),
     ]
+
+
+
+def test_collector_handoff_status_skips_redis_when_not_configured(monkeypatch) -> None:
+    monkeypatch.setattr(
+        supervisor,
+        "settings",
+        SimpleNamespace(
+            dbd_redis_url=None,
+            dbd_redis_max_connections=4,
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_redis_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Redis must not be touched when it is not configured")
+        ),
+    )
+
+    state = supervisor.collector_handoff_status(9)
+
+    assert state == {
+        "redis_configured": False,
+        "control_status": "not_configured",
+        "supervisor_active": False,
+        "workers": 0,
+    }
+
+
+def test_collector_handoff_status_reports_registered_legacy_worker(monkeypatch) -> None:
+    class FakeRedis:
+        def ping(self):
+            return True
+
+        def get(self, key):
+            return None
+
+        def exists(self, key):
+            return False
+
+        def smembers(self, key):
+            return {"legacy-worker"}
+
+        def mget(self, keys):
+            return [
+                json.dumps(
+                    {
+                        "worker_id": "legacy-worker",
+                        "status": "active",
+                        "heartbeat_at": time.time(),
+                    }
+                )
+            ]
+
+        def srem(self, *args):
+            return 0
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(supervisor, "_redis_client", lambda *args, **kwargs: FakeRedis())
+    monkeypatch.setattr(
+        supervisor,
+        "settings",
+        SimpleNamespace(
+            dbd_redis_url="redis://test",
+            dbd_redis_max_connections=4,
+        ),
+    )
+
+    state = supervisor.collector_handoff_status(9)
+
+    assert state["supervisor_active"] is False
+    assert state["workers"] == 1
+    assert state["control_status"] == "workers_without_supervisor"
+
+
+def test_collector_handoff_status_fails_closed_when_redis_is_unavailable(
+    monkeypatch,
+) -> None:
+    class BrokenRedis:
+        def ping(self):
+            raise OSError("redis unavailable")
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(supervisor, "_redis_client", lambda *args, **kwargs: BrokenRedis())
+    monkeypatch.setattr(
+        supervisor,
+        "settings",
+        SimpleNamespace(
+            dbd_redis_url="redis://test",
+            dbd_redis_max_connections=4,
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="Cannot prove the legacy runtime is offline"):
+        supervisor.collector_handoff_status(9)
