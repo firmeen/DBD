@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from curl_cffi.requests.exceptions import RequestException as RequestsError
 
-from ..client.async_client import AsyncDbdClient, TransientHttpError
+from ..client.http import TransientHttpError
 from ..contracts.identity import parse_code
 from ..core.exceptions import (
     ContractError,
@@ -17,7 +17,6 @@ from ..core.exceptions import (
     IdentityConflict,
 )
 from ..core.prepare_dashboard import PreparationSnapshot
-from ..core.redis import close_async_redis, create_async_redis, redis_pool_snapshot
 from ..core.settings import settings
 from ..core.telemetry import (
     IN_FLIGHT,
@@ -29,7 +28,6 @@ from ..core.telemetry import (
 from ..storage.mysql.repositories.projection_repository import project
 from ..storage.mysql.repositories.projection_scheduler import LeaseLost
 from .collection_fabric import mask_for_endpoints
-from .coordination import CampaignCoordinator, WorkerIdentity
 from .resources import DEFAULT_PARTS, FINANCIAL, endpoints, request_path
 
 STATUS_OPERATING = ("1",)
@@ -376,7 +374,7 @@ async def process(
     concurrency=None,
     rate=None,
     limit=None,
-    client_factory=AsyncDbdClient,
+    client_factory=None,
     health=None,
     endpoint_rates=None,
     distributed=False,
@@ -422,6 +420,13 @@ async def process(
     identity = None
     client_ref = None
     redis_client = None
+    close_async_redis = None
+    redis_pool_snapshot = None
+
+    if client_factory is None:
+        from ..client.async_client import AsyncDbdClient
+
+        client_factory = AsyncDbdClient
     runtime_stats = {
         "completed": 0,
         "done": 0,
@@ -435,6 +440,15 @@ async def process(
     }
 
     if distributed:
+        from ..core.redis import (
+            close_async_redis as _close_async_redis,
+            create_async_redis,
+            redis_pool_snapshot as _redis_pool_snapshot,
+        )
+        from .coordination import CampaignCoordinator, WorkerIdentity
+
+        close_async_redis = _close_async_redis
+        redis_pool_snapshot = _redis_pool_snapshot
         redis_client = create_async_redis(
             settings.dbd_redis_url,
             max_connections=settings.dbd_redis_max_connections,
@@ -500,7 +514,11 @@ async def process(
             if controller is not None:
                 redis_commands = int(getattr(controller, "redis_commands", 0) or 0)
                 redis_admissions = int(getattr(controller, "redis_admissions", 0) or 0)
-        pool = redis_pool_snapshot(redis_client) if redis_client is not None else {}
+        pool = (
+            redis_pool_snapshot(redis_client)
+            if redis_client is not None and redis_pool_snapshot is not None
+            else {}
+        )
         return {
             "current_stage": current_stage,
             "claimed": int(claimed_attempts),
@@ -936,7 +954,7 @@ async def process(
         if coordinator is not None and identity is not None:
             await coordinator.unregister_worker(identity)
             await coordinator.close()
-        if redis_client is not None:
+        if redis_client is not None and close_async_redis is not None:
             await close_async_redis(redis_client)
 
     await repo.close_if_complete(run_id)
