@@ -8,7 +8,8 @@ import pytest
 from dbd.client.async_client import PermanentHttpError, TransientHttpError
 from dbd.client.simple_client import SimpleAsyncDbdClient, SimpleGlobalLimiter
 from dbd.core.exceptions import DbdAuthError
-from dbd.runtime.collector import _live_state
+import dbd.runtime.collector as collector_runtime
+from dbd.runtime.collector import _assert_postflight_invariants, _live_state
 
 
 @pytest.mark.asyncio
@@ -184,3 +185,171 @@ async def test_503_retry_after_pauses_upstream_immediately() -> None:
     assert client._upstream.failures == 1
     assert client._upstream.pause_until > time.monotonic()
     assert client.upstream_state == "paused"
+
+
+
+def test_postflight_invariants_accept_monotonic_same_run_progress() -> None:
+    baseline = {
+        "pending": 10,
+        "retry_wait": 2,
+        "running": 0,
+        "failed": 3,
+        "done": 5,
+        "not_available": 4,
+    }
+    exact = {
+        "pending": 7,
+        "retry_wait": 1,
+        "running": 0,
+        "failed": 4,
+        "done": 7,
+        "not_available": 5,
+    }
+
+    _assert_postflight_invariants(baseline, exact)
+
+
+@pytest.mark.parametrize(
+    ("exact", "message"),
+    [
+        (
+            {
+                "pending": 9,
+                "retry_wait": 2,
+                "running": 0,
+                "failed": 3,
+                "done": 5,
+                "not_available": 4,
+            },
+            "total changed",
+        ),
+        (
+            {
+                "pending": 11,
+                "retry_wait": 2,
+                "running": 0,
+                "failed": 3,
+                "done": 4,
+                "not_available": 4,
+            },
+            "DONE decreased",
+        ),
+        (
+            {
+                "pending": 10,
+                "retry_wait": 2,
+                "running": 1,
+                "failed": 3,
+                "done": 4,
+                "not_available": 4,
+            },
+            "RUNNING is 1",
+        ),
+    ],
+)
+def test_postflight_invariants_fail_closed(exact, message) -> None:
+    baseline = {
+        "pending": 10,
+        "retry_wait": 2,
+        "running": 0,
+        "failed": 3,
+        "done": 5,
+        "not_available": 4,
+    }
+
+    with pytest.raises(RuntimeError, match=message):
+        _assert_postflight_invariants(baseline, exact)
+
+
+@pytest.mark.asyncio
+async def test_legacy_handoff_refuses_supervisor_or_registered_workers(monkeypatch) -> None:
+    monkeypatch.setattr(
+        "dbd.runtime.supervisor.collector_handoff_status",
+        lambda run_id: {
+            "redis_configured": True,
+            "control_status": "active",
+            "supervisor_active": True,
+            "workers": 2,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="legacy runtime is still active"):
+        await collector_runtime._assert_legacy_runtime_offline(9)
+
+
+@pytest.mark.asyncio
+async def test_collector_preflight_refuses_live_foreign_leases_before_reclaim(
+    monkeypatch,
+) -> None:
+    class FakeRepo:
+        archive_backend = None
+
+        async def collector_lease_summary(self, run_id):
+            return {"running": 2, "live": 2, "expired": 0, "invalid": 0}
+
+        async def reclaim_expired_collector_leases(self, run_id):
+            raise AssertionError("live leases must not be reclaimed")
+
+    async def schema_ready(repo):
+        return "0012_run9_data_repair"
+
+    async def legacy_offline(run_id):
+        return {
+            "control_status": "offline",
+            "supervisor_active": False,
+            "workers": 0,
+        }
+
+    monkeypatch.setattr(collector_runtime, "_assert_schema_ready", schema_ready)
+    monkeypatch.setattr(
+        collector_runtime,
+        "_assert_legacy_runtime_offline",
+        legacy_offline,
+    )
+
+    with pytest.raises(RuntimeError, match="still has 2 live durable lease"):
+        await collector_runtime._collector_preflight(FakeRepo(), 9)
+
+
+@pytest.mark.asyncio
+async def test_collector_preflight_reclaims_only_expired_process_loss(
+    monkeypatch,
+) -> None:
+    class FakeRepo:
+        archive_backend = None
+
+        def __init__(self):
+            self.reclaimed = False
+
+        async def collector_lease_summary(self, run_id):
+            if self.reclaimed:
+                return {"running": 0, "live": 0, "expired": 0, "invalid": 0}
+            return {"running": 3, "live": 0, "expired": 3, "invalid": 0}
+
+        async def reclaim_expired_collector_leases(self, run_id):
+            self.reclaimed = True
+            return 3
+
+    async def schema_ready(repo):
+        return "0012_run9_data_repair"
+
+    async def legacy_offline(run_id):
+        return {
+            "control_status": "offline",
+            "supervisor_active": False,
+            "workers": 0,
+        }
+
+    monkeypatch.setattr(collector_runtime, "_assert_schema_ready", schema_ready)
+    monkeypatch.setattr(
+        collector_runtime,
+        "_assert_legacy_runtime_offline",
+        legacy_offline,
+    )
+
+    repo = FakeRepo()
+    result = await collector_runtime._collector_preflight(repo, 9)
+
+    assert repo.reclaimed is True
+    assert result["reclaimed_leases"] == 3
+    assert result["schema_revision"] == "0012_run9_data_repair"
