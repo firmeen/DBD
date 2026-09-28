@@ -16,6 +16,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from ..core.progress import LiveCampaignDashboard, TerminalSnapshot
 from ..core.settings import PROJECT_ROOT, settings
 from ..storage.mysql.engine import connect
+from .locking import assert_manager_lock, manager_lock
 
 _RATE_MODES = {"shared", "multiply", "adaptive"}
 _SUPERVISOR_LEASE_SECONDS = 30
@@ -1445,6 +1446,7 @@ def supervise_campaign(
     lease_acquired = False
     supervisor_error = False
     next_lease_refresh = 0.0
+    next_manager_lock_check = 0.0
     next_state_write = 0.0
     next_work_check = 0.0
     next_worker_refresh = 0.0
@@ -1465,6 +1467,8 @@ def supervise_campaign(
     recent_rate_limit_delta = 0
     dashboard_started_at = time.monotonic()
     progress = LiveCampaignDashboard(run_id, interval=0.5)
+    manager_context = manager_lock()
+    manager_connection = None
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
         nonlocal next_index
@@ -1529,6 +1533,7 @@ def supervise_campaign(
         return replacement
 
     try:
+        manager_connection = manager_context.__enter__()
         redis.ping()
         _acquire_supervisor_lease(redis, run_id, token)
         lease_acquired = True
@@ -1610,6 +1615,10 @@ def supervise_campaign(
             now = time.monotonic()
             now_wall = time.time()
             control_plane_degraded = False
+
+            if now >= next_manager_lock_check:
+                assert_manager_lock(manager_connection)
+                next_manager_lock_check = now + _SUPERVISOR_REFRESH_SECONDS
 
             if now >= next_lease_refresh:
                 last_lease_confirmed, lease_error = _refresh_lease_with_grace(
@@ -2184,6 +2193,11 @@ def supervise_campaign(
             redis.close()
         except Exception:
             pass
+        if manager_connection is not None:
+            try:
+                manager_context.__exit__(None, None, None)
+            except Exception:
+                pass
         _restore_sigint(interrupt_handler)
 
     state = final_snapshot or _task_progress(run_id)
