@@ -84,8 +84,6 @@ async def test_distinct_endpoint_availability_can_escalate_global_without_rate_c
         circuit_failure_threshold=2,
         global_pressure_endpoint_threshold=2,
     )
-    controller._breaker._pressure_gate_seconds = 0
-
     await controller.availability_failure("profile")
     await controller.availability_failure("committees")
     await controller.availability_failure("profile")
