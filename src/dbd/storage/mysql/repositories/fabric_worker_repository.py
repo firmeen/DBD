@@ -1017,7 +1017,8 @@ class FabricWorkerRepository(WorkerRepository):
                 await conn.execute(
                     text("""
                         SELECT
-                          data_type,column_type,character_maximum_length,is_nullable
+                          data_type,column_type,character_maximum_length,
+                          character_octet_length,is_nullable
                         FROM information_schema.columns
                         WHERE table_schema=DATABASE()
                           AND table_name='companies'
@@ -1158,13 +1159,16 @@ class FabricWorkerRepository(WorkerRepository):
             "projection_payload_evidence": payload_evidence,
         }
 
-    async def _profile_text_repair_capacity(self) -> int | None:
-        """Return live lossless character capacity for supported text types."""
+    async def _profile_text_repair_capacity(self) -> dict | None:
+        """Return live character/octet capacity for supported text types."""
         async with self.engine.connect() as conn:
             row = (
                 await conn.execute(
                     text("""
-                        SELECT data_type,character_maximum_length
+                        SELECT
+                          data_type,
+                          character_maximum_length,
+                          character_octet_length
                         FROM information_schema.columns
                         WHERE table_schema=DATABASE()
                           AND table_name='companies'
@@ -1178,18 +1182,30 @@ class FabricWorkerRepository(WorkerRepository):
             not in {"text", "mediumtext", "longtext"}
         ):
             return None
-        value = row.get("character_maximum_length")
-        return int(value) if value is not None else None
+        characters = row.get("character_maximum_length")
+        octets = row.get("character_octet_length")
+        return {
+            "characters": int(characters) if characters is not None else None,
+            "octets": int(octets) if octets is not None else None,
+        }
 
     @staticmethod
     def _profile_overflow_repairable(error_message, value, capacity) -> bool:
         """Require the repaired live column to fit the archived value losslessly."""
-        return (
-            capacity is not None
-            and "setup_obj_name_keyin" in str(error_message or "").lower()
-            and isinstance(value, str)
-            and 500 < len(value) <= int(capacity)
-        )
+        if (
+            capacity is None
+            or "setup_obj_name_keyin" not in str(error_message or "").lower()
+            or not isinstance(value, str)
+            or len(value) <= 500
+        ):
+            return False
+        character_limit = capacity.get("characters")
+        octet_limit = capacity.get("octets")
+        if character_limit is not None and len(value) > int(character_limit):
+            return False
+        if octet_limit is not None and len(value.encode("utf-8")) > int(octet_limit):
+            return False
+        return True
 
     async def _projection_repair_candidates(self, run_id):
         """Return exact current terminal project failures that can replay an archive."""

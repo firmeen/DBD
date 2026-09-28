@@ -75,17 +75,22 @@ def test_profile_overflow_repair_requires_live_capacity():
     assert FabricWorkerRepository._profile_overflow_repairable(
         "Data too long for column 'setup_obj_name_keyin' at row 1",
         "X" * 1200,
-        65535,
+        {"characters": 65535, "octets": 65535},
     )
     assert not FabricWorkerRepository._profile_overflow_repairable(
         "Data too long for column 'setup_obj_name_keyin' at row 1",
         "X" * 70000,
-        65535,
+        {"characters": 65535, "octets": 65535},
+    )
+    assert not FabricWorkerRepository._profile_overflow_repairable(
+        "Data too long for column 'setup_obj_name_keyin' at row 1",
+        "ก" * 30000,
+        {"characters": 65535, "octets": 65535},
     )
     assert not FabricWorkerRepository._profile_overflow_repairable(
         "Data too long for column 'other_field' at row 1",
         "X" * 1200,
-        65535,
+        {"characters": 65535, "octets": 65535},
     )
 
 

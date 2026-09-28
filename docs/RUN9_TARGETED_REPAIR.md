@@ -68,10 +68,11 @@ Eligible archive replay is limited to:
    same-year revision.
 2. `profile + DataError` where the durable failure names
    `setup_obj_name_keyin`, the archived value exceeds 500 characters, and the live
-   column has already been migrated to a text type whose reported character capacity
-   is at least the archived value length. A value larger than the live TEXT capacity is
-   reported but remains blocked rather than being truncated or replayed into another
-   failure.
+   column has already been migrated to a text type whose live
+   `character_maximum_length` **and** `character_octet_length` can hold the archived
+   value. The octet check uses the UTF-8 encoded byte length, so Thai/multibyte text is
+   not accepted merely because its character count fits. Values larger than the live
+   capacity remain blocked rather than being truncated or replayed into another failure.
 
 Everything else remains untouched.
 
