@@ -118,6 +118,7 @@ async def collect_run(
                     client_factory=SimpleAsyncDbdClient,
                     runtime_callback=on_runtime,
                     stop_signal=operator_stop,
+                    periodic_maintenance=False,
                 )
             )
             try:
