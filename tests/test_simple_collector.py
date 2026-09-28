@@ -63,6 +63,35 @@ async def test_failed_auth_refresh_is_shared_then_retried_once_after_backoff(mon
     assert all(isinstance(item, DbdAuthError) for item in second)
 
 
+
+
+
+@pytest.mark.asyncio
+async def test_collector_auth_refresh_is_one_bounded_attempt() -> None:
+    captured = {}
+
+    class FakeAuth:
+        _expires_at = 0.0
+
+        def get_token(self, session, **kwargs):
+            captured.update(kwargs)
+            self._expires_at = time.time() + 900
+            return "bounded-token"
+
+        def invalidate(self, *, reset_warmup=False):
+            self._expires_at = 0.0
+
+    client = SimpleAsyncDbdClient(concurrency=1, rate_per_second=50, max_retries=0)
+    client._auth = FakeAuth()
+    client._auth_session = object()
+
+    token = await client._ensure_token()
+
+    assert token == "bounded-token"
+    assert captured["max_attempts"] == 1
+    assert 0 < captured["timeout_seconds"] <= 10.0
+
+
 @pytest.mark.asyncio
 async def test_rate_penalty_returns_directly_to_configured_target() -> None:
     limiter = SimpleGlobalLimiter(50)
