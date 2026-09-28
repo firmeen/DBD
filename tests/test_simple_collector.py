@@ -379,3 +379,104 @@ async def test_collector_preflight_reclaims_only_expired_process_loss(
     assert repo.reclaimed is True
     assert result["reclaimed_leases"] == 3
     assert result["schema_revision"] == "0012_run9_data_repair"
+
+
+
+class _FakeSchemaResult:
+    def __init__(self, *, scalar=None, rows=None):
+        self._scalar = scalar
+        self._rows = list(rows or [])
+
+    def scalar_one_or_none(self):
+        return self._scalar
+
+    def all(self):
+        return list(self._rows)
+
+
+class _FakeSchemaConnection:
+    def __init__(self, revision: str, *, omit: tuple[str, str] | None = None):
+        self.revision = revision
+        self.omit = omit
+
+    async def execute(self, statement):
+        sql = str(statement)
+        if "alembic_version" in sql:
+            return _FakeSchemaResult(scalar=self.revision)
+        rows = []
+        for table_name, columns in collector_runtime._REQUIRED_SCHEMA.items():
+            for column_name in columns:
+                if self.omit == (table_name, column_name):
+                    continue
+                rows.append((table_name, column_name))
+        return _FakeSchemaResult(rows=rows)
+
+
+class _FakeSchemaConnectContext:
+    def __init__(self, connection):
+        self.connection = connection
+
+    async def __aenter__(self):
+        return self.connection
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return None
+
+
+class _FakeSchemaEngine:
+    def __init__(self, revision: str, *, omit: tuple[str, str] | None = None):
+        self.connection = _FakeSchemaConnection(revision, omit=omit)
+
+    def connect(self):
+        return _FakeSchemaConnectContext(self.connection)
+
+
+class _FakeSchemaRepo:
+    def __init__(self, revision: str, *, omit: tuple[str, str] | None = None):
+        self.engine = _FakeSchemaEngine(revision, omit=omit)
+
+
+@pytest.mark.asyncio
+async def test_schema_preflight_requires_repository_migration_head(monkeypatch) -> None:
+    monkeypatch.setattr(
+        collector_runtime,
+        "migration_head_revision",
+        lambda: "0012_run9_data_repair",
+    )
+
+    with pytest.raises(RuntimeError, match="Collector schema is not current"):
+        await collector_runtime._assert_schema_ready(
+            _FakeSchemaRepo("0011_fabric_recovery")
+        )
+
+
+@pytest.mark.asyncio
+async def test_schema_preflight_rejects_missing_runtime_column(monkeypatch) -> None:
+    monkeypatch.setattr(
+        collector_runtime,
+        "migration_head_revision",
+        lambda: "0012_run9_data_repair",
+    )
+
+    with pytest.raises(RuntimeError, match="lease_version"):
+        await collector_runtime._assert_schema_ready(
+            _FakeSchemaRepo(
+                "0012_run9_data_repair",
+                omit=("company_collection_state", "lease_version"),
+            )
+        )
+
+
+@pytest.mark.asyncio
+async def test_schema_preflight_accepts_complete_current_contract(monkeypatch) -> None:
+    monkeypatch.setattr(
+        collector_runtime,
+        "migration_head_revision",
+        lambda: "0012_run9_data_repair",
+    )
+
+    revision = await collector_runtime._assert_schema_ready(
+        _FakeSchemaRepo("0012_run9_data_repair")
+    )
+
+    assert revision == "0012_run9_data_repair"
