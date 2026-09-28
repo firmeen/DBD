@@ -103,7 +103,8 @@ class CollectorDashboard:
                 f"{int(state.get('requests', 0)):,}   "
                 f"retries {int(state.get('http_retries', 0)):,}   "
                 f"429 {int(state.get('rate_limit_hits', 0)):,}   "
-                f"upstream {state.get('upstream_state', 'open')}"
+                f"auth {state.get('auth_state', 'unknown')}   "
+                f"upstream {state.get('upstream_state', 'healthy')}"
             ),
         )
         table.add_row(
