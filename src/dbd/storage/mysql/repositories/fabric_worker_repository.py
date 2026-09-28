@@ -1131,7 +1131,7 @@ class FabricWorkerRepository(WorkerRepository):
                         "exceeds_500": isinstance(value, str) and len(value) > 500,
                     }
             except Exception as exc:
-                evidence_item["archive_load_error"] = type(exc).__name__
+                evidence_item["payload_evidence_error"] = type(exc).__name__
             payload_evidence.append(evidence_item)
 
         benchmark_404 = next(
@@ -1299,26 +1299,31 @@ class FabricWorkerRepository(WorkerRepository):
                 continue
 
             repair_class = None
-            if endpoint == "financial_submissions" and error_code == "IntegrityError":
-                collisions = submission_collision_evidence(payload)
-                if (
-                    collisions["exact_duplicate_years"]
-                    and not collisions["conflicting_years"]
-                ):
-                    repair_class = "financial_submission_exact_duplicate"
-            elif endpoint == "profile" and error_code == "DataError":
-                message = str(row.get("error_message") or "").lower()
-                value = (
-                    payload.get("setupObjNameKeyin")
-                    if isinstance(payload, dict)
-                    else None
-                )
-                if self._profile_overflow_repairable(
-                    message,
-                    value,
-                    profile_text_capacity,
-                ):
-                    repair_class = "profile_setup_objective_text_overflow"
+            try:
+                if endpoint == "financial_submissions" and error_code == "IntegrityError":
+                    collisions = submission_collision_evidence(payload)
+                    if (
+                        collisions["exact_duplicate_years"]
+                        and not collisions["conflicting_years"]
+                    ):
+                        repair_class = "financial_submission_exact_duplicate"
+                elif endpoint == "profile" and error_code == "DataError":
+                    message = str(row.get("error_message") or "").lower()
+                    value = (
+                        payload.get("setupObjNameKeyin")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    if self._profile_overflow_repairable(
+                        message,
+                        value,
+                        profile_text_capacity,
+                    ):
+                        repair_class = "profile_setup_objective_text_overflow"
+            except Exception:
+                # Historical evidence that no longer satisfies the current
+                # source contract is never auto-repaired.
+                continue
 
             if repair_class is None:
                 continue

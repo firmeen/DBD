@@ -104,7 +104,13 @@ def upgrade():
 
     character_set = _identifier(column.get("character_set_name"), "character set")
     collation = _identifier(column.get("collation_name"), "collation")
-    nullable = "NULL" if str(column.get("is_nullable") or "").upper() == "YES" else "NOT NULL"
+    is_nullable = str(column.get("is_nullable") or "").upper()
+    if is_nullable not in {"YES", "NO"}:
+        raise RuntimeError(
+            "Unexpected nullability metadata for companies.setup_obj_name_keyin; "
+            "manual migration review is required"
+        )
+    nullable = "NULL" if is_nullable == "YES" else "NOT NULL"
     connection.exec_driver_sql(
         "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin "
         f"TEXT CHARACTER SET {character_set} COLLATE {collation} {nullable}"
