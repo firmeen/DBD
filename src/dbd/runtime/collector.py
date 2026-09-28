@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
 from ..client.simple_client import SimpleAsyncDbdClient
 from ..core.settings import settings
@@ -102,18 +103,43 @@ async def collect_run(
 
         with dashboard:
             dashboard.render(_live_state(run_id, baseline, runtime))
-            result = await process(
-                repo,
-                run_id,
-                concurrency=concurrency,
-                rate=rate,
-                limit=limit,
-                health=health,
-                endpoint_rates=None,
-                distributed=False,
-                client_factory=SimpleAsyncDbdClient,
-                runtime_callback=on_runtime,
+            operator_stop = asyncio.Event()
+            paused = False
+            process_task = asyncio.create_task(
+                process(
+                    repo,
+                    run_id,
+                    concurrency=concurrency,
+                    rate=rate,
+                    limit=limit,
+                    health=health,
+                    endpoint_rates=None,
+                    distributed=False,
+                    client_factory=SimpleAsyncDbdClient,
+                    runtime_callback=on_runtime,
+                    stop_signal=operator_stop,
+                )
             )
+            try:
+                result = await asyncio.shield(process_task)
+            except asyncio.CancelledError:
+                # First Ctrl+C becomes a bounded graceful drain instead of
+                # cancelling active archive/project work immediately.
+                paused = True
+                operator_stop.set()
+                current = asyncio.current_task()
+                if current is not None and hasattr(current, "uncancel"):
+                    current.uncancel()
+                try:
+                    result = await asyncio.shield(process_task)
+                except asyncio.CancelledError:
+                    # A second interrupt is an explicit force stop. The pipeline
+                    # still executes its finally block and releases owned leases.
+                    process_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await process_task
+                    raise
+
             exact = await scheduler_repo.progress(run_id)
             final = {
                 "run_id": int(run_id),
@@ -138,6 +164,7 @@ async def collect_run(
                     "rate_limit_hits": int(runtime.get("rate_limit_hits", 0)),
                     "effective_rate": float(runtime.get("effective_rate") or rate),
                     "target_rate": float(rate),
+                    "paused": paused,
                 }
             )
             dashboard.render(final)
