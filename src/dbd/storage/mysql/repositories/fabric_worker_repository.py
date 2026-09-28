@@ -919,6 +919,174 @@ class FabricWorkerRepository(WorkerRepository):
             "error_scope": "state_latest_error_not_per_endpoint",
         }
 
+    async def repair_evidence(self, run_id, *, limit=50, sample_limit=20):
+        """Read-only evidence for targeted repair decisions.
+
+        This intentionally joins endpoint + error/status evidence directly. It
+        must not infer benchmark semantics or mutate scheduler state.
+        """
+        limit = max(1, min(int(limit), 500))
+        sample_limit = max(1, min(int(sample_limit), 200))
+        endpoint_bit_case = """
+          CASE e.endpoint
+            WHEN 'profile' THEN 1
+            WHEN 'financial_submissions' THEN 2
+            WHEN 'financial_statements' THEN 4
+            WHEN 'industry_benchmark' THEN 8
+            WHEN 'committees' THEN 16
+            WHEN 'committee_signs' THEN 32
+            WHEN 'transformations' THEN 64
+            WHEN 'nations' THEN 128
+            WHEN 'nation_history' THEN 256
+            WHEN 'name_history' THEN 512
+            WHEN 'capital_history' THEN 1024
+            ELSE 0
+          END
+        """
+        async with self.engine.connect() as conn:
+            matrix = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                          e.endpoint,
+                          e.error_code,
+                          e.http_status,
+                          e.stage,
+                          e.outcome,
+                          COUNT(*) AS events,
+                          COUNT(DISTINCT e.company_id) AS companies,
+                          COUNT(DISTINCT CASE
+                            WHEN s.id IS NOT NULL
+                             AND (s.failed_mask & ~s.dirty_mask & ({endpoint_bit_case}))<>0
+                            THEN CONCAT(e.company_id, ':', e.endpoint)
+                            ELSE NULL
+                          END) AS current_terminal_resources,
+                          MAX(e.error_message) AS sample_message
+                        FROM collection_failure_events e
+                        LEFT JOIN company_collection_state s
+                          ON s.run_id=e.run_id AND s.company_id=e.company_id
+                        WHERE e.run_id=:run
+                        GROUP BY
+                          e.endpoint,e.error_code,e.http_status,e.stage,e.outcome
+                        ORDER BY events DESC,e.endpoint,e.error_code
+                        LIMIT :limit
+                        """
+                    ),
+                    {"run": int(run_id), "limit": limit},
+                )
+            ).mappings().all()
+
+            samples = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          e.id AS event_id,
+                          e.company_id,
+                          m.jp_type_code,
+                          m.jp_no,
+                          e.endpoint,
+                          e.error_code,
+                          e.http_status,
+                          e.stage AS event_stage,
+                          e.outcome,
+                          e.attempt,
+                          e.archive_id,
+                          e.occurred_at,
+                          s.fiscal_year,
+                          s.status AS current_status,
+                          s.stage AS current_stage,
+                          s.last_error AS current_error,
+                          a.processing_status AS archive_status,
+                          a.requested_at AS archive_requested_at
+                        FROM collection_failure_events e
+                        JOIN company_master m ON m.company_id=e.company_id
+                        LEFT JOIN company_collection_state s
+                          ON s.run_id=e.run_id AND s.company_id=e.company_id
+                        LEFT JOIN response_archive a ON a.id=e.archive_id
+                        WHERE e.run_id=:run
+                        ORDER BY e.id DESC
+                        LIMIT :limit
+                    """),
+                    {"run": int(run_id), "limit": sample_limit},
+                )
+            ).mappings().all()
+
+            column = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          data_type,column_type,character_maximum_length,is_nullable
+                        FROM information_schema.columns
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND column_name='setup_obj_name_keyin'
+                    """)
+                )
+            ).mappings().first()
+            indexes = (
+                await conn.execute(
+                    text("""
+                        SELECT DISTINCT index_name,non_unique,seq_in_index
+                        FROM information_schema.statistics
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND column_name='setup_obj_name_keyin'
+                        ORDER BY index_name,seq_in_index
+                    """)
+                )
+            ).mappings().all()
+            generated = (
+                await conn.execute(
+                    text("""
+                        SELECT column_name,generation_expression
+                        FROM information_schema.columns
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND generation_expression IS NOT NULL
+                          AND generation_expression<>''
+                          AND LOWER(generation_expression)
+                              LIKE '%setup_obj_name_keyin%'
+                        ORDER BY column_name
+                    """)
+                )
+            ).mappings().all()
+
+        benchmark_404 = next(
+            (
+                row for row in matrix
+                if row["endpoint"] == "industry_benchmark"
+                and row["error_code"] == "PermanentHttpError"
+                and int(row["http_status"] or 0) == 404
+                and row["stage"] == "fetch"
+                and row["outcome"] == "failed"
+            ),
+            None,
+        )
+        return {
+            "run_id": int(run_id),
+            "failure_matrix": [dict(row) for row in matrix],
+            "samples": [dict(row) for row in samples],
+            "benchmark_404": {
+                "status": "semantics_unverified",
+                "candidate_events": int((benchmark_404 or {}).get("events", 0) or 0),
+                "candidate_companies": int((benchmark_404 or {}).get("companies", 0) or 0),
+                "current_terminal_resources": int(
+                    (benchmark_404 or {}).get("current_terminal_resources", 0) or 0
+                ),
+                "executable": False,
+                "reason": (
+                    "HTTP 404 transport evidence does not by itself prove "
+                    "industry benchmark not-available semantics"
+                ),
+            },
+            "profile_text_schema": {
+                "column": dict(column) if column is not None else None,
+                "indexes": [dict(row) for row in indexes],
+                "generated_dependencies": [dict(row) for row in generated],
+            },
+        }
+
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:
             await conn.execute(
