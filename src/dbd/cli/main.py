@@ -568,6 +568,29 @@ def main():
     )
     replay.add_argument("archive_id", type=positive)
 
+    collect = sub.add_parser(
+        "collect",
+        help="Resume an existing fabric_v2 run with the simple single-process collector",
+    )
+    collect.add_argument("run_id", type=positive)
+    collect.add_argument(
+        "--concurrency",
+        type=positive,
+        default=settings.dbd_collector_concurrency,
+        help="Concurrent HTTP fetch slots (default: DBD_COLLECTOR_CONCURRENCY)",
+    )
+    collect.add_argument(
+        "--rate",
+        type=positive_rate,
+        default=settings.dbd_collector_rate_per_second,
+        help="Single global business-HTTP target in requests/second",
+    )
+    collect.add_argument(
+        "--no-ui",
+        action="store_true",
+        help="Disable the live terminal dashboard",
+    )
+
     campaign = sub.add_parser("campaign", help="Supervise a coordinated local worker fleet")
     campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
     campaign_start = campaign_sub.add_parser("start", help="Create a run and launch coordinated workers")
@@ -755,6 +778,16 @@ def main():
                 )
                 row = cur.fetchone()
             presenter.master_status({key: int(value or 0) for key, value in row.items()})
+        elif args.command == "collect":
+            from ..runtime.simple_collector import collect_run
+
+            configure(0)
+            collect_run(
+                args.run_id,
+                concurrency=args.concurrency,
+                rate=args.rate,
+                ui=not args.no_ui,
+            )
         elif args.command == "campaign":
             _campaign_command(args, presenter)
         elif args.command in ("bulk-status", "bulk-retry"):
