@@ -27,10 +27,15 @@ class DbdAuth:
         session: requests.Session,
         *,
         max_attempts: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> str:
         if self._token and time.time() < self._expires_at - _EXPIRY_SAFETY_MARGIN_SECONDS:
             return self._token
-        return self._refresh(session, max_attempts=max_attempts)
+        return self._refresh(
+            session,
+            max_attempts=max_attempts,
+            timeout_seconds=timeout_seconds,
+        )
 
     def invalidate(self, *, reset_warmup: bool = False) -> None:
         self._token = None
@@ -43,14 +48,23 @@ class DbdAuth:
         session: requests.Session,
         *,
         max_attempts: int | None = None,
+        timeout_seconds: float | None = None,
     ) -> str:
         attempts = (
             settings.dbd_max_auth_attempts
             if max_attempts is None
             else max(1, int(max_attempts))
         )
+        request_timeout = (
+            settings.request_timeout
+            if timeout_seconds is None
+            else max(0.1, float(timeout_seconds))
+        )
         if not self._warmed_up:
-            warm_up(session)
+            if timeout_seconds is None:
+                warm_up(session)
+            else:
+                warm_up(session, timeout=request_timeout)
             self._warmed_up = True
 
         headers = {
@@ -66,7 +80,7 @@ class DbdAuth:
         last_status = None
         for attempt in range(1, attempts + 1):
             try:
-                response = session.post(REFRESH_URL, headers=headers, timeout=settings.request_timeout)
+                response = session.post(REFRESH_URL, headers=headers, timeout=request_timeout)
             except RequestsError as exc:
                 code = getattr(exc, "code", None) or getattr(exc, "curl_code", None)
                 suffix = f" curl={code}" if code is not None else ""
