@@ -28,6 +28,7 @@ def client(*, retries=1):
         cookies={},
     )
     value.rate.acquire = AsyncMock()
+    assert value._auth.max_attempts == 1
     return value
 
 

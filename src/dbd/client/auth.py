@@ -17,10 +17,15 @@ _EXPIRY_SAFETY_MARGIN_SECONDS = 15
 class DbdAuth:
     """Owns the anonymous-token lifecycle for one session."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, max_attempts: int | None = None) -> None:
         self._token: str | None = None
         self._expires_at: float = 0.0
         self._warmed_up = False
+        self.max_attempts = int(
+            settings.dbd_max_auth_attempts if max_attempts is None else max_attempts
+        )
+        if not 1 <= self.max_attempts <= 10:
+            raise ValueError("max_attempts must be 1..10")
 
     def get_token(self, session: requests.Session) -> str:
         if self._token and time.time() < self._expires_at - _EXPIRY_SAFETY_MARGIN_SECONDS:
@@ -49,7 +54,7 @@ class DbdAuth:
 
         last_error = None
         last_status = None
-        for attempt in range(1, settings.dbd_max_auth_attempts + 1):
+        for attempt in range(1, self.max_attempts + 1):
             try:
                 response = session.post(REFRESH_URL, headers=headers, timeout=settings.request_timeout)
             except RequestsError as exc:
@@ -58,7 +63,7 @@ class DbdAuth:
                 last_error = (
                     f"auth_refresh transport {type(exc).__name__}{suffix} path=/api/refresh"
                 )
-                if attempt < settings.dbd_max_auth_attempts:
+                if attempt < self.max_attempts:
                     time.sleep(min(5, attempt))
                     continue
                 raise DbdAuthError(last_error) from None
@@ -101,7 +106,7 @@ class DbdAuth:
         raise DbdAuthError(
             last_error
             or (
-                f"auth_refresh exhausted after {settings.dbd_max_auth_attempts} "
+                f"auth_refresh exhausted after {self.max_attempts} "
                 "attempts path=/api/refresh"
             ),
             status_code=last_status,

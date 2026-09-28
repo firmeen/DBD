@@ -57,7 +57,7 @@ class SimpleDbdClient:
             raise ValueError("max_retries must be non-negative")
 
         self._semaphore = asyncio.Semaphore(self.concurrency)
-        self._auth = DbdAuth()
+        self._auth = DbdAuth(max_attempts=1)
         self._auth_lock = asyncio.Lock()
         self._token: str | None = None
         self._session = None
