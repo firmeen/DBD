@@ -299,12 +299,16 @@ local function circuit_status(state_key, opened_key, probe_key)
       return opened_until - now_ms, 'open', false
     end
     if redis.call('EXISTS', probe_key) == 1 then
+      local probe_wait = redis.call('PTTL', probe_key)
+      if probe_wait > 0 then return probe_wait, 'open', false end
       return 250, 'open', false
     end
     return 0, 'half_open', true
   end
   if state == 'half_open' then
     if redis.call('EXISTS', probe_key) == 1 then
+      local probe_wait = redis.call('PTTL', probe_key)
+      if probe_wait > 0 then return probe_wait, 'half_open', false end
       return 250, 'half_open', false
     end
     return 0, 'half_open', true
@@ -580,6 +584,8 @@ return {
         self._global_recovery_target = self.shared_rate_ceiling
         self._endpoint_recovery_needed: set[str] = set()
         self._endpoint_recovery_targets: dict[str, float] = {}
+        self._last_global_circuit_state = "closed"
+        self._last_endpoint_circuit_state: dict[str, str] = {}
         self.redis_commands = 0
         self.redis_admissions = 0
         self._breaker = AdaptiveCircuitBreaker(
@@ -726,8 +732,16 @@ return {
             mode = str(result[3])
             global_state = str(result[4])
             endpoint_state = str(result[5]) if endpoint is not None else None
+            self._last_global_circuit_state = global_state
+            if endpoint is not None and endpoint_state is not None:
+                self._last_endpoint_circuit_state[endpoint] = endpoint_state
             if mode == "circuit":
-                await asyncio.sleep(min(max(wait_ms / 1000.0, 0.001), 1.0))
+                # Respect the durable circuit window instead of waking every
+                # coroutine roughly once per second. Cap the sleep so callers
+                # notice a successful HALF_OPEN probe promptly.
+                wait_seconds = max(wait_ms / 1000.0, 0.05)
+                wait_cap = max(1.0, min(5.0, self._breaker.open_seconds / 2.0))
+                await asyncio.sleep(min(wait_seconds, wait_cap))
                 continue
 
             global_rate = float(result[1])
@@ -851,9 +865,11 @@ return {
     async def acquire(self, endpoint: str | None) -> AdmissionState:
         if self._redis is None:
             global_state = await self._breaker.before("__global__")
+            self._last_global_circuit_state = global_state
             endpoint_state = None
             if endpoint is not None:
                 endpoint_state = await self._breaker.before(endpoint)
+                self._last_endpoint_circuit_state[endpoint] = endpoint_state
                 await self._bucket(endpoint).acquire()
                 ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(
                     self._endpoint_effective(endpoint)
@@ -873,6 +889,26 @@ return {
             await self._bucket(endpoint).acquire()
         await self._global_local.acquire()
         return await self._shared_admit(endpoint)
+
+    async def availability_failure(self, endpoint: str | None = None) -> str:
+        """Record upstream availability failure without changing pacing rate.
+
+        Endpoint-scoped failures isolate one API surface. Authentication/session
+        failures pass endpoint=None and open the shared global availability
+        circuit without converting availability loss into throughput pressure.
+        """
+        key = "__global__" if endpoint is None else endpoint
+        state = await self._breaker.failure(key)
+        if endpoint is None:
+            self._last_global_circuit_state = state
+        else:
+            self._last_endpoint_circuit_state[endpoint] = state
+        return state
+
+    def circuit_state(self, endpoint: str | None = None) -> str:
+        if endpoint is None:
+            return self._last_global_circuit_state
+        return self._last_endpoint_circuit_state.get(endpoint, "closed")
 
     async def penalize(
         self,
