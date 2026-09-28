@@ -7,6 +7,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from curl_cffi.requests.exceptions import RequestException as RequestsError
+from sqlalchemy import text
 
 from ..client.http import TransientHttpError
 from ..contracts.identity import parse_code
@@ -604,6 +605,24 @@ async def process(
                 release_queued_fetch.set()
         return resolved
 
+    async def assert_distributed_manager_free():
+        if not distributed:
+            return
+        async with repo.engine.connect() as conn:
+            available = (
+                await conn.execute(
+                    text(
+                        "SELECT IS_FREE_LOCK("
+                        "CONCAT(DATABASE(), ':dbd-api-manager'))"
+                    )
+                )
+            ).scalar_one()
+        if int(available or 0) != 1:
+            raise RuntimeError(
+                "Single-process DBD collector/API manager became active; "
+                "legacy distributed worker is stopping"
+            )
+
     async def mysql_heartbeat():
         while not stop.is_set():
             if health:
@@ -718,6 +737,9 @@ async def process(
                     await repo.release(owner)
                 await asyncio.sleep(0.1)
                 continue
+
+            if distributed:
+                await assert_distributed_manager_free()
 
             remaining = None if limit is None else max(0, limit - claimed_attempts)
             if remaining == 0:
