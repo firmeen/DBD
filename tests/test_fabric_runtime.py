@@ -1650,3 +1650,127 @@ async def test_targeted_profile_overflow_replays_only_after_lossless_text_migrat
             ).scalar_one()
         )
     assert stored_length == 1200
+
+
+
+async def test_collector_reclaims_expired_fetch_lease_attempt_neutrally(repo):
+    fabric, run_id, _ = await new_fabric_run(repo, ("profile",))
+    owner = "collector-crash-fetch"
+    task = await fabric.claim(run_id, owner)
+    assert task is not None
+
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                """
+                UPDATE company_collection_state
+                SET attempts=:attempts,
+                    lease_expires_at=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6))
+                WHERE id=:id
+                """
+            ),
+            {
+                "attempts": settings.dbd_max_task_attempts,
+                "id": task["id"],
+            },
+        )
+
+    before = await fabric.collector_lease_summary(run_id)
+    assert before["expired"] == 1
+    assert before["live"] == 0
+
+    reclaimed = await fabric.reclaim_expired_collector_leases(run_id)
+
+    assert reclaimed == 1
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT status,stage,attempts,project_attempts,
+                           failed_mask,lease_owner,lease_expires_at,last_error
+                    FROM company_collection_state
+                    WHERE id=:id
+                    """
+                ),
+                {"id": task["id"]},
+            )
+        ).mappings().one()
+
+    assert state["status"] == "pending"
+    assert state["stage"] == "fetch"
+    assert int(state["attempts"]) == settings.dbd_max_task_attempts - 1
+    assert int(state["project_attempts"]) == 0
+    assert int(state["failed_mask"]) == 0
+    assert state["lease_owner"] is None
+    assert state["lease_expires_at"] is None
+    assert state["last_error"] == "collector_process_recovery"
+
+
+async def test_collector_reclaims_expired_project_lease_without_losing_archive(repo):
+    fabric, run_id, identities = await new_fabric_run(repo, ("profile",))
+    owner = "collector-crash-project"
+    task = await fabric.claim(run_id, owner)
+    assert task is not None
+
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    response = ApiResponse(
+        {
+            "jpNo": identities[0].jp_no,
+            "jpTypeCode": identities[0].jp_type_code,
+            "jpName": "Collector Crash Recovery",
+            "submitFinYear": None,
+        },
+        200,
+        now,
+        now,
+    )
+    archive_id = await fabric.archive(
+        task,
+        response,
+        "/synthetic/profile/7/" + identities[0].jp_no,
+        None,
+    )
+
+    async with repo.engine.begin() as conn:
+        await conn.execute(
+            text(
+                """
+                UPDATE company_collection_state
+                SET project_attempts=:attempts,
+                    lease_expires_at=TIMESTAMPADD(SECOND,-1,UTC_TIMESTAMP(6))
+                WHERE id=:id
+                """
+            ),
+            {
+                "attempts": settings.dbd_max_task_attempts,
+                "id": task["id"],
+            },
+        )
+
+    reclaimed = await fabric.reclaim_expired_collector_leases(run_id)
+
+    assert reclaimed == 1
+    async with repo.engine.connect() as conn:
+        state = (
+            await conn.execute(
+                text(
+                    """
+                    SELECT status,stage,attempts,project_attempts,raw_response_id,
+                           failed_mask,lease_owner,lease_expires_at,last_error
+                    FROM company_collection_state
+                    WHERE id=:id
+                    """
+                ),
+                {"id": task["id"]},
+            )
+        ).mappings().one()
+
+    assert state["status"] == "pending"
+    assert state["stage"] == "project"
+    assert int(state["project_attempts"]) == settings.dbd_max_task_attempts - 1
+    assert int(state["raw_response_id"]) == int(archive_id)
+    assert int(state["failed_mask"]) == 0
+    assert state["lease_owner"] is None
+    assert state["lease_expires_at"] is None
+    assert state["last_error"] == "collector_process_recovery"
