@@ -88,6 +88,7 @@ async def test_distinct_endpoint_availability_can_escalate_global_without_rate_c
 
     await controller.availability_failure("profile")
     await controller.availability_failure("committees")
+    controller._breaker._last_global_availability_at = -float("inf")
     await controller.availability_failure("profile")
 
     assert controller.circuit_state() == "open"
