@@ -5,7 +5,7 @@ import time
 
 import pytest
 
-from dbd.client.async_client import PermanentHttpError
+from dbd.client.async_client import PermanentHttpError, TransientHttpError
 from dbd.client.simple_client import SimpleAsyncDbdClient, SimpleGlobalLimiter
 from dbd.core.exceptions import DbdAuthError
 from dbd.runtime.collector import _live_state
@@ -130,3 +130,28 @@ async def test_permanent_404_marks_upstream_reachable() -> None:
     assert client._upstream.failures == 0
     assert client._upstream.pause_until == 0.0
     assert client.upstream_state == "healthy"
+
+
+
+@pytest.mark.asyncio
+async def test_503_retry_after_pauses_upstream_immediately() -> None:
+    class Response:
+        status_code = 503
+        headers = {"retry-after": "2"}
+        content = b"{}"
+
+    class Session:
+        async def request(self, *args, **kwargs):
+            return Response()
+
+    client = SimpleAsyncDbdClient(concurrency=1, rate_per_second=500, max_retries=0)
+    client._session = Session()
+    client._token = "valid-token"
+    client._auth._expires_at = time.time() + 900
+
+    with pytest.raises(TransientHttpError, match="HTTP 503"):
+        await client.fetch("GET", "/synthetic/unavailable")
+
+    assert client._upstream.failures == 1
+    assert client._upstream.pause_until > time.monotonic()
+    assert client.upstream_state == "paused"
