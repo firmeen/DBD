@@ -3,10 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from email.utils import parsedate_to_datetime
 from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
@@ -31,41 +29,10 @@ from ..core.telemetry import (
 )
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
+from .http import ApiResponse, PermanentHttpError, TransientHttpError, retry_after
 from .rate_control import EndpointRateController
 from .rate_limit import TokenBucket, protective_cooldown
 from .session import WARMUP_PAGE_URL, create_session
-
-
-class TransientHttpError(RuntimeError):
-    def __init__(self, message: str, *, status_code: int | None = None):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-class PermanentHttpError(ValueError):
-    def __init__(self, message: str, *, status_code: int | None = None):
-        super().__init__(message)
-        self.status_code = status_code
-
-
-@dataclass
-class ApiResponse:
-    data: object
-    status: int
-    requested_at: datetime
-    received_at: datetime
-
-
-def retry_after(value: str | None) -> float:
-    if not value:
-        return 1.0
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        try:
-            return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
-        except (ValueError, TypeError, OverflowError):
-            return 1.0
 
 
 def _curl_code(exc) -> object:
