@@ -273,6 +273,39 @@ async def _recover_campaign(args) -> dict:
         await engine.dispose()
 
 
+async def _campaign_evidence(args) -> dict:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        run = await repo.get_run(args.run_id)
+        scheduler_repo = repo.for_run(run)
+        if scheduler_repo.scheduler_mode != "fabric_v2":
+            raise ValueError("campaign evidence requires a fabric_v2 run")
+        return await scheduler_repo.repair_evidence(
+            args.run_id,
+            limit=args.limit,
+            sample_limit=args.samples,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _campaign_repair(args) -> dict:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        run = await repo.get_run(args.run_id)
+        scheduler_repo = repo.for_run(run)
+        if scheduler_repo.scheduler_mode != "fabric_v2":
+            raise ValueError("campaign repair requires a fabric_v2 run")
+        return await scheduler_repo.targeted_repair(
+            args.run_id,
+            execute=bool(args.execute),
+        )
+    finally:
+        await engine.dispose()
+
+
 async def _validate_campaign_run(run_id: int) -> None:
     engine = create_engine()
     repo = WorkerRepository(engine)
@@ -419,6 +452,28 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
             {"run_id": int(args.run_id), "action": "graceful_stop_requested"},
         )
         return
+    if args.campaign_command == "evidence":
+        payload = asyncio.run(_campaign_evidence(args))
+        presenter.command_result("DBD · CAMPAIGN REPAIR EVIDENCE", payload)
+        return
+    if args.campaign_command == "repair":
+        if args.execute:
+            state = campaign_status(args.run_id)
+            if (
+                state.get("supervisor_active")
+                or int(state.get("workers", 0) or 0)
+                or int(state.get("running", 0) or 0)
+            ):
+                raise ValueError(
+                    "Campaign is still active; pause/stop it before targeted repair"
+                )
+            with manager_lock() as conn:
+                payload = asyncio.run(_campaign_repair(args))
+                assert_manager_lock(conn)
+        else:
+            payload = asyncio.run(_campaign_repair(args))
+        presenter.command_result("DBD · TARGETED REPAIR", payload)
+        return
     if args.campaign_command == "recover":
         source_state = campaign_status(args.source_run_id)
         if (
@@ -564,6 +619,37 @@ def main():
         campaign_sub.add_parser("status", help="Show fleet and durable queue status")
     )
     campaign_status_parser.add_argument("run_id", type=positive)
+    campaign_evidence = _add_output_options(
+        campaign_sub.add_parser(
+            "evidence",
+            help="Read exact endpoint/error evidence before targeted repair",
+        )
+    )
+    campaign_evidence.add_argument("run_id", type=positive)
+    campaign_evidence.add_argument(
+        "--limit",
+        type=positive,
+        default=50,
+        help="Maximum grouped endpoint/error rows",
+    )
+    campaign_evidence.add_argument(
+        "--samples",
+        type=positive,
+        default=20,
+        help="Maximum latest failure-event samples with company/archive context",
+    )
+    campaign_repair = _add_output_options(
+        campaign_sub.add_parser(
+            "repair",
+            help="Plan or execute evidence-backed same-run archive repairs",
+        )
+    )
+    campaign_repair.add_argument("run_id", type=positive)
+    campaign_repair.add_argument(
+        "--execute",
+        action="store_true",
+        help="Reopen only verified project failures; default is read-only dry-run",
+    )
     campaign_stop = _add_output_options(
         campaign_sub.add_parser("stop", help="Request graceful draining of all workers")
     )

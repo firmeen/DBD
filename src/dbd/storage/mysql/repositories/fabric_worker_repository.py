@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import bindparam, text
 
+from ....contracts.financial import submission_collision_evidence
 from ....core.settings import settings
 from ....core.telemetry import (
     PIPELINE_BATCH_SIZE,
@@ -918,6 +919,670 @@ class FabricWorkerRepository(WorkerRepository):
             "failure_events": [dict(row) for row in event_errors],
             "error_scope": "state_latest_error_not_per_endpoint",
         }
+
+    async def repair_evidence(self, run_id, *, limit=50, sample_limit=20):
+        """Read-only evidence for targeted repair decisions.
+
+        This intentionally joins endpoint + error/status evidence directly. It
+        must not infer benchmark semantics or mutate scheduler state.
+        """
+        limit = max(1, min(int(limit), 500))
+        sample_limit = max(1, min(int(sample_limit), 200))
+        endpoint_bit_case = """
+          CASE e.endpoint
+            WHEN 'profile' THEN 1
+            WHEN 'financial_submissions' THEN 2
+            WHEN 'financial_statements' THEN 4
+            WHEN 'industry_benchmark' THEN 8
+            WHEN 'committees' THEN 16
+            WHEN 'committee_signs' THEN 32
+            WHEN 'transformations' THEN 64
+            WHEN 'nations' THEN 128
+            WHEN 'nation_history' THEN 256
+            WHEN 'name_history' THEN 512
+            WHEN 'capital_history' THEN 1024
+            ELSE 0
+          END
+        """
+        async with self.engine.connect() as conn:
+            matrix = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                          e.endpoint,
+                          e.error_code,
+                          e.http_status,
+                          e.stage,
+                          e.outcome,
+                          COUNT(*) AS events,
+                          COUNT(DISTINCT e.company_id) AS companies,
+                          COUNT(DISTINCT CASE
+                            WHEN s.id IS NOT NULL
+                             AND (s.failed_mask & ~s.dirty_mask & ({endpoint_bit_case}))<>0
+                            THEN CONCAT(e.company_id, ':', e.endpoint)
+                            ELSE NULL
+                          END) AS current_terminal_resources,
+                          MAX(e.error_message) AS sample_message
+                        FROM collection_failure_events e
+                        LEFT JOIN company_collection_state s
+                          ON s.run_id=e.run_id AND s.company_id=e.company_id
+                        WHERE e.run_id=:run
+                        GROUP BY
+                          e.endpoint,e.error_code,e.http_status,e.stage,e.outcome
+                        ORDER BY events DESC,e.endpoint,e.error_code
+                        LIMIT :limit
+                        """
+                    ),
+                    {"run": int(run_id), "limit": limit},
+                )
+            ).mappings().all()
+
+            samples = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          e.id AS event_id,
+                          e.company_id,
+                          m.jp_type_code,
+                          m.jp_no,
+                          e.endpoint,
+                          e.error_code,
+                          e.http_status,
+                          e.stage AS event_stage,
+                          e.outcome,
+                          e.attempt,
+                          e.archive_id,
+                          e.occurred_at,
+                          s.fiscal_year,
+                          s.status AS current_status,
+                          s.stage AS current_stage,
+                          s.last_error AS current_error,
+                          a.processing_status AS archive_status,
+                          a.requested_at AS archive_requested_at
+                        FROM collection_failure_events e
+                        JOIN company_master m ON m.company_id=e.company_id
+                        LEFT JOIN company_collection_state s
+                          ON s.run_id=e.run_id AND s.company_id=e.company_id
+                        LEFT JOIN response_archive a
+                          ON a.id=e.archive_id
+                         AND a.run_id=e.run_id
+                         AND a.company_id=e.company_id
+                         AND a.endpoint=e.endpoint
+                        WHERE e.run_id=:run
+                        ORDER BY e.id DESC
+                        LIMIT :limit
+                    """),
+                    {"run": int(run_id), "limit": sample_limit},
+                )
+            ).mappings().all()
+
+            column = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          data_type,column_type,character_maximum_length,
+                          character_octet_length,is_nullable,
+                          character_set_name,collation_name,column_default,
+                          extra,column_comment
+                        FROM information_schema.columns
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND column_name='setup_obj_name_keyin'
+                    """)
+                )
+            ).mappings().first()
+            indexes = (
+                await conn.execute(
+                    text("""
+                        SELECT DISTINCT index_name,non_unique,seq_in_index
+                        FROM information_schema.statistics
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND column_name='setup_obj_name_keyin'
+                        ORDER BY index_name,seq_in_index
+                    """)
+                )
+            ).mappings().all()
+            generated = (
+                await conn.execute(
+                    text("""
+                        SELECT column_name,generation_expression
+                        FROM information_schema.columns
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND generation_expression IS NOT NULL
+                          AND generation_expression<>''
+                          AND LOWER(generation_expression)
+                              LIKE '%setup_obj_name_keyin%'
+                        ORDER BY column_name
+                    """)
+                )
+            ).mappings().all()
+            payload_rows = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          e.id AS event_id,
+                          e.company_id,
+                          m.jp_no,
+                          e.endpoint,
+                          e.error_code,
+                          e.error_message,
+                          e.archive_id
+                        FROM collection_failure_events e
+                        JOIN (
+                          SELECT company_id,endpoint,MAX(id) AS event_id
+                          FROM collection_failure_events
+                          WHERE run_id=:run
+                            AND stage='project'
+                            AND outcome='failed'
+                          GROUP BY company_id,endpoint
+                        ) latest ON latest.event_id=e.id
+                        JOIN company_master m ON m.company_id=e.company_id
+                        JOIN response_archive a
+                          ON a.id=e.archive_id
+                         AND a.run_id=e.run_id
+                         AND a.company_id=e.company_id
+                         AND a.endpoint=e.endpoint
+                        WHERE e.run_id=:run
+                          AND e.archive_id IS NOT NULL
+                          AND (
+                            (e.endpoint='financial_submissions'
+                             AND e.error_code='IntegrityError')
+                            OR
+                            (e.endpoint='profile'
+                             AND e.error_code='DataError')
+                          )
+                        ORDER BY e.id DESC
+                        LIMIT :limit
+                    """),
+                    {"run": int(run_id), "limit": sample_limit},
+                )
+            ).mappings().all()
+
+        payload_evidence = []
+        for source in payload_rows:
+            item = dict(source)
+            evidence_item = {
+                "event_id": int(item["event_id"]),
+                "company_id": int(item["company_id"]),
+                "jp_no": item["jp_no"],
+                "endpoint": item["endpoint"],
+                "error_code": item["error_code"],
+                "archive_id": int(item["archive_id"]),
+            }
+            try:
+                archive = await self.load_archive(int(item["archive_id"]))
+                payload = archive["data"]
+                if item["endpoint"] == "financial_submissions":
+                    evidence_item["submission_collisions"] = (
+                        submission_collision_evidence(payload)
+                    )
+                elif item["endpoint"] == "profile":
+                    value = (
+                        payload.get("setupObjNameKeyin")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    evidence_item["setup_obj_name_keyin"] = {
+                        "value_type": type(value).__name__ if value is not None else None,
+                        "length": len(value) if isinstance(value, str) else None,
+                        "exceeds_500": isinstance(value, str) and len(value) > 500,
+                    }
+            except Exception as exc:
+                evidence_item["payload_evidence_error"] = type(exc).__name__
+            payload_evidence.append(evidence_item)
+
+        benchmark_404 = next(
+            (
+                row for row in matrix
+                if row["endpoint"] == "industry_benchmark"
+                and row["error_code"] == "PermanentHttpError"
+                and int(row["http_status"] or 0) == 404
+                and row["stage"] == "fetch"
+                and row["outcome"] == "failed"
+            ),
+            None,
+        )
+        return {
+            "run_id": int(run_id),
+            "failure_matrix": [dict(row) for row in matrix],
+            "samples": [dict(row) for row in samples],
+            "benchmark_404": {
+                "status": "semantics_unverified",
+                "candidate_events": int((benchmark_404 or {}).get("events", 0) or 0),
+                "candidate_companies": int((benchmark_404 or {}).get("companies", 0) or 0),
+                "current_terminal_resources": int(
+                    (benchmark_404 or {}).get("current_terminal_resources", 0) or 0
+                ),
+                "executable": False,
+                "reason": (
+                    "HTTP 404 transport evidence does not by itself prove "
+                    "industry benchmark not-available semantics"
+                ),
+            },
+            "profile_text_schema": {
+                "column": dict(column) if column is not None else None,
+                "indexes": [dict(row) for row in indexes],
+                "generated_dependencies": [dict(row) for row in generated],
+            },
+            "projection_payload_evidence": payload_evidence,
+        }
+
+    async def _profile_text_repair_capacity(self) -> dict | None:
+        """Return live character/octet capacity for supported text types."""
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          data_type,
+                          character_maximum_length,
+                          character_octet_length
+                        FROM information_schema.columns
+                        WHERE table_schema=DATABASE()
+                          AND table_name='companies'
+                          AND column_name='setup_obj_name_keyin'
+                    """)
+                )
+            ).mappings().first()
+        if (
+            row is None
+            or str(row["data_type"] or "").lower()
+            not in {"text", "mediumtext", "longtext"}
+        ):
+            return None
+        characters = row.get("character_maximum_length")
+        octets = row.get("character_octet_length")
+        return {
+            "characters": int(characters) if characters is not None else None,
+            "octets": int(octets) if octets is not None else None,
+        }
+
+    @staticmethod
+    def _profile_overflow_repairable(error_message, value, capacity) -> bool:
+        """Require the repaired live column to fit the archived value losslessly."""
+        if (
+            capacity is None
+            or "setup_obj_name_keyin" not in str(error_message or "").lower()
+            or not isinstance(value, str)
+            or len(value) <= 500
+        ):
+            return False
+        character_limit = capacity.get("characters")
+        octet_limit = capacity.get("octets")
+        if character_limit is not None and len(value) > int(character_limit):
+            return False
+        if octet_limit is not None and len(value.encode("utf-8")) > int(octet_limit):
+            return False
+        return True
+
+    async def _projection_repair_candidates(self, run_id):
+        """Return exact current terminal project failures that can replay an archive."""
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text("""
+                        SELECT
+                          e.id AS event_id,
+                          e.company_id,
+                          e.endpoint,
+                          e.error_code,
+                          e.error_message,
+                          e.archive_id,
+                          s.id AS state_id,
+                          s.required_mask,
+                          s.done_mask,
+                          s.not_available_mask,
+                          s.failed_mask,
+                          s.dirty_mask,
+                          s.fiscal_year,
+                          s.status,
+                          s.stage,
+                          m.identity_status,
+                          a.processing_status AS archive_status
+                        FROM collection_failure_events e
+                        JOIN (
+                          SELECT company_id,endpoint,MAX(id) AS event_id
+                          FROM collection_failure_events
+                          WHERE run_id=:run
+                            AND stage='project'
+                            AND outcome='failed'
+                          GROUP BY company_id,endpoint
+                        ) latest ON latest.event_id=e.id
+                        JOIN company_collection_state s
+                          ON s.run_id=e.run_id AND s.company_id=e.company_id
+                        JOIN company_master m ON m.company_id=e.company_id
+                        JOIN response_archive a
+                          ON a.id=e.archive_id
+                         AND a.run_id=e.run_id
+                         AND a.company_id=e.company_id
+                         AND a.endpoint=e.endpoint
+                        WHERE e.run_id=:run
+                          AND e.error_code IN ('IntegrityError','DataError')
+                          AND e.archive_id IS NOT NULL
+                          AND s.status IN ('pending','failed')
+                          AND s.dirty_mask=0
+                          AND m.identity_status<>'conflict'
+                          AND a.processing_status IN ('pending','invalid','failed')
+                        ORDER BY s.id,e.endpoint
+                    """),
+                    {"run": int(run_id)},
+                )
+            ).mappings().all()
+
+        profile_text_capacity = await self._profile_text_repair_capacity()
+        candidates = []
+        for source in rows:
+            row = dict(source)
+            endpoint = str(row["endpoint"])
+            error_code = str(row["error_code"])
+            try:
+                bit = endpoint_bit(endpoint)
+            except ValueError:
+                continue
+            terminal_failed = (
+                int(row["failed_mask"])
+                & ~int(row["dirty_mask"])
+                & ~int(row["done_mask"])
+                & ~int(row["not_available_mask"])
+                & int(row["required_mask"])
+            )
+            if not terminal_failed & bit:
+                continue
+
+            try:
+                archive = await self.load_archive(int(row["archive_id"]))
+                payload = archive["data"]
+            except Exception:
+                continue
+
+            repair_class = None
+            try:
+                if endpoint == "financial_submissions" and error_code == "IntegrityError":
+                    collisions = submission_collision_evidence(payload)
+                    if (
+                        collisions["exact_duplicate_years"]
+                        and not collisions["conflicting_years"]
+                    ):
+                        repair_class = "financial_submission_exact_duplicate"
+                elif endpoint == "profile" and error_code == "DataError":
+                    message = str(row.get("error_message") or "").lower()
+                    value = (
+                        payload.get("setupObjNameKeyin")
+                        if isinstance(payload, dict)
+                        else None
+                    )
+                    if self._profile_overflow_repairable(
+                        message,
+                        value,
+                        profile_text_capacity,
+                    ):
+                        repair_class = "profile_setup_objective_text_overflow"
+            except Exception:
+                # Historical evidence that no longer satisfies the current
+                # source contract is never auto-repaired.
+                continue
+
+            if repair_class is None:
+                continue
+            row["endpoint_bit"] = bit
+            row["repair_class"] = repair_class
+            candidates.append(row)
+        return candidates
+
+    @staticmethod
+    def _select_next_repair_candidate(state, candidates):
+        """Select exactly one evidence-verified endpoint for one scheduler state.
+
+        Fabric can carry several terminal failed bits in one row. Reopening more
+        than one at once would let the normal transition code choose a later
+        archive by endpoint rather than by the exact failure event we verified.
+        Keep the evidence boundary strict: one state, one verified archive per
+        repair execution.
+        """
+        verified_mask = 0
+        by_endpoint = {}
+        terminal_failed = (
+            int(state["failed_mask"])
+            & ~int(state["dirty_mask"])
+            & ~int(state["done_mask"])
+            & ~int(state["not_available_mask"])
+            & int(state["required_mask"])
+        )
+        for candidate in candidates:
+            endpoint = str(candidate["endpoint"])
+            bit = int(candidate["endpoint_bit"])
+            if not terminal_failed & bit:
+                continue
+            verified_mask |= bit
+            by_endpoint[endpoint] = candidate
+
+        if not verified_mask:
+            return None
+        next_item = next_endpoint(
+            int(state["required_mask"]),
+            int(state["done_mask"]),
+            int(state["not_available_mask"]),
+            failed=int(state["failed_mask"]),
+            dirty=int(state["dirty_mask"]) | verified_mask,
+            fiscal_year=state["fiscal_year"],
+        )
+        return by_endpoint.get(next_item)
+
+    @classmethod
+    def _projection_repair_summary(cls, candidates):
+        grouped = {}
+        by_state = {}
+        states = set()
+        for row in candidates:
+            state_id = int(row["state_id"])
+            states.add(state_id)
+            by_state.setdefault(state_id, []).append(row)
+            key = (
+                str(row["endpoint"]),
+                str(row["error_code"]),
+                str(row["repair_class"]),
+            )
+            item = grouped.setdefault(
+                key,
+                {
+                    "endpoint": key[0],
+                    "error_code": key[1],
+                    "repair_class": key[2],
+                    "resources": 0,
+                    "states": set(),
+                },
+            )
+            item["resources"] += 1
+            item["states"].add(int(row["state_id"]))
+        by_error = []
+        for item in grouped.values():
+            by_error.append(
+                {
+                    "endpoint": item["endpoint"],
+                    "error_code": item["error_code"],
+                    "repair_class": item["repair_class"],
+                    "resources": int(item["resources"]),
+                    "states": len(item["states"]),
+                }
+            )
+        by_error.sort(key=lambda row: (-row["resources"], row["endpoint"], row["error_code"]))
+        planned = sum(
+            cls._select_next_repair_candidate(rows[0], rows) is not None
+            for rows in by_state.values()
+        )
+        return {
+            "candidate_resources": len(candidates),
+            "candidate_states": len(states),
+            "planned_resources_this_execution": int(planned),
+            "deferred_verified_resources": max(0, len(candidates) - int(planned)),
+            "by_endpoint_error": by_error,
+        }
+
+    async def targeted_repair(self, run_id, *, execute=False):
+        """Plan or reopen only evidence-backed project failures for archive replay.
+
+        Benchmark HTTP 404 remains deliberately non-executable until its upstream
+        business semantics are proven separately.
+        """
+        if execute:
+            async with self.engine.connect() as conn:
+                running = int(
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT COUNT(*) FROM company_collection_state "
+                                "WHERE run_id=:run AND status='running'"
+                            ),
+                            {"run": int(run_id)},
+                        )
+                    ).scalar_one()
+                    or 0
+                )
+            if running:
+                raise ValueError(
+                    "Targeted repair requires zero running durable leases; "
+                    "stop/drain the campaign first"
+                )
+
+        candidates = await self._projection_repair_candidates(run_id)
+        evidence = await self.repair_evidence(run_id, limit=500, sample_limit=20)
+        projection = self._projection_repair_summary(candidates)
+        result = {
+            "run_id": int(run_id),
+            "action": "execute" if execute else "plan_only",
+            "projection_archive_replay": projection,
+            "benchmark_404": evidence["benchmark_404"],
+            "changed_states": 0,
+            "changed_resources": 0,
+        }
+        if not execute or not candidates:
+            return result
+
+        grouped = {}
+        for item in candidates:
+            grouped.setdefault(int(item["state_id"]), []).append(item)
+
+        batch_size = max(1, int(settings.dbd_write_batch_size))
+        state_ids = sorted(grouped)
+        changed_states = 0
+        changed_resources = 0
+        for offset in range(0, len(state_ids), batch_size):
+            batch_ids = state_ids[offset : offset + batch_size]
+            async with self.engine.begin() as conn:
+                states = (
+                    await conn.execute(
+                        text("""
+                            SELECT s.*
+                            FROM company_collection_state s
+                            WHERE s.run_id=:run AND s.id IN :ids
+                            ORDER BY s.id
+                            FOR UPDATE
+                        """).bindparams(bindparam("ids", expanding=True)),
+                        {"run": int(run_id), "ids": batch_ids},
+                    )
+                ).mappings().all()
+                for source_state in states:
+                    state = dict(source_state)
+                    if (
+                        str(state["status"]) not in {"pending", "failed"}
+                        or int(state["dirty_mask"]) != 0
+                    ):
+                        continue
+
+                    verified_candidates = []
+                    for candidate in grouped.get(int(state["id"]), []):
+                        endpoint = str(candidate["endpoint"])
+                        bit = int(candidate["endpoint_bit"])
+                        terminal_failed = (
+                            int(state["failed_mask"])
+                            & ~int(state["dirty_mask"])
+                            & ~int(state["done_mask"])
+                            & ~int(state["not_available_mask"])
+                            & int(state["required_mask"])
+                        )
+                        if not terminal_failed & bit:
+                            continue
+                        archive_ok = (
+                            await conn.execute(
+                                text("""
+                                    SELECT 1
+                                    FROM response_archive
+                                    WHERE id=:archive
+                                      AND run_id=:run
+                                      AND company_id=:company
+                                      AND endpoint=:endpoint
+                                      AND processing_status IN ('pending','invalid','failed')
+                                    LIMIT 1
+                                """),
+                                {
+                                    "archive": int(candidate["archive_id"]),
+                                    "run": int(run_id),
+                                    "company": int(state["company_id"]),
+                                    "endpoint": endpoint,
+                                },
+                            )
+                        ).first()
+                        if archive_ok is not None:
+                            verified_candidates.append(candidate)
+
+                    selected = self._select_next_repair_candidate(
+                        state,
+                        verified_candidates,
+                    )
+                    if selected is None:
+                        continue
+                    next_item = str(selected["endpoint"])
+                    selected_bit = int(selected["endpoint_bit"])
+                    retry_dirty = int(state["dirty_mask"]) | selected_bit
+                    archive_id = int(selected["archive_id"])
+                    update = await conn.execute(
+                        text("""
+                            UPDATE company_collection_state
+                            SET dirty_mask=:dirty,
+                                next_endpoint=:next,
+                                stage='project',
+                                status='pending',
+                                attempts=0,
+                                project_attempts=0,
+                                available_at=UTC_TIMESTAMP(6),
+                                raw_response_id=:archive,
+                                lease_owner=NULL,
+                                lease_expires_at=NULL,
+                                last_error=NULL,
+                                finished_at=NULL,
+                                updated_at=UTC_TIMESTAMP(6)
+                            WHERE id=:state
+                              AND run_id=:run
+                              AND status IN ('pending','failed')
+                              AND dirty_mask=0
+                        """),
+                        {
+                            "dirty": retry_dirty,
+                            "next": next_item,
+                            "archive": archive_id,
+                            "state": int(state["id"]),
+                            "run": int(run_id),
+                        },
+                    )
+                    if update.rowcount == 1:
+                        changed_states += 1
+                        changed_resources += 1
+
+                if changed_states:
+                    await conn.execute(
+                        text(
+                            "UPDATE worker_runs "
+                            "SET status='ready',finished_at=NULL WHERE id=:run"
+                        ),
+                        {"run": int(run_id)},
+                    )
+
+        result["changed_states"] = changed_states
+        result["changed_resources"] = changed_resources
+        return result
 
     async def close_if_complete(self, run_id):
         async with self.engine.begin() as conn:

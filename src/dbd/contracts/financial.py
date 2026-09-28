@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 
@@ -168,17 +169,84 @@ def normalize_benchmark(data: object) -> IndustryBenchmark | None:
     )
 
 
+def submission_collision_evidence(data: object) -> dict:
+    """Describe same-year source rows without discarding any payload fields."""
+    groups: dict[str, list[str]] = {}
+    raw_rows = 0
+    rows_without_year = 0
+    for source in require_rows(data, "submitYear"):
+        raw_rows += 1
+        submit_year = source.get("submitYear")
+        if submit_year is None:
+            rows_without_year += 1
+            continue
+        fingerprint = json.dumps(
+            source,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        groups.setdefault(str(submit_year), []).append(fingerprint)
+
+    exact_duplicate_years = []
+    conflicting_years = []
+    for year, fingerprints in groups.items():
+        if len(fingerprints) < 2:
+            continue
+        if len(set(fingerprints)) == 1:
+            exact_duplicate_years.append(year)
+        else:
+            conflicting_years.append(year)
+
+    return {
+        "raw_rows": raw_rows,
+        "submit_years": len(groups),
+        "rows_without_submit_year": rows_without_year,
+        "exact_duplicate_years": sorted(exact_duplicate_years),
+        "conflicting_years": sorted(conflicting_years),
+    }
+
+
 def normalize_submissions(data: object) -> list[dict]:
-    return [
-        {
-            "submit_year": str(row.get("submitYear")),
-            "ac_date": row.get("acDate"),
-            "submit_date": to_date(row.get("submitDate")),
-            "ac_code": row.get("acCode"),
-            "au_code": row.get("auCode"),
-            "status_code": row.get("statusCode"),
-            "update_date": to_date(row.get("updateDate")),
-        }
-        for row in require_rows(data, "submitYear")
-        if row.get("submitYear") is not None
-    ]
+    """Normalize one company submission history without dropping source revisions.
+
+    Only byte-semantically identical JSON rows for one submit year are collapsed.
+    Any differing raw row for the same year remains an explicit contract failure
+    because the relational natural key is currently (jp_no, submit_year).
+    """
+    rows: list[dict] = []
+    fingerprints_by_year: dict[str, str] = {}
+    for source in require_rows(data, "submitYear"):
+        if source.get("submitYear") is None:
+            continue
+        submit_year = str(source.get("submitYear"))
+        fingerprint = json.dumps(
+            source,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        previous = fingerprints_by_year.get(submit_year)
+        if previous is not None:
+            if previous == fingerprint:
+                continue
+            raise ContractError(
+                "Conflicting financial submissions for submitYear "
+                f"{submit_year}; source revision identity is required"
+            )
+
+        fingerprints_by_year[submit_year] = fingerprint
+        rows.append(
+            {
+                "submit_year": submit_year,
+                "ac_date": source.get("acDate"),
+                "submit_date": to_date(source.get("submitDate")),
+                "ac_code": source.get("acCode"),
+                "au_code": source.get("auCode"),
+                "status_code": source.get("statusCode"),
+                "update_date": to_date(source.get("updateDate")),
+            }
+        )
+    return rows

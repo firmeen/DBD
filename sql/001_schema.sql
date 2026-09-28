@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS companies (
   share_vol DECIMAL(20,2) NULL,
   business_size_code VARCHAR(4) NULL,
   setup_obj_code VARCHAR(20) NULL,
-  setup_obj_name_keyin VARCHAR(500) NULL,
+  setup_obj_name_keyin TEXT NULL,
   total_asset DECIMAL(20,2) NULL,
   total_equity DECIMAL(20,2) NULL,
   total_income DECIMAL(20,2) NULL,

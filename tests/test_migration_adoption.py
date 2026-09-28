@@ -6,7 +6,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0011_fabric_recovery"
+HEAD = "0012_run9_data_repair"
 
 
 def test_correctness_migration_adopts_existing_objects():
@@ -288,3 +288,47 @@ def test_fabric_recovery_migration_is_adoption_safe():
             """
         )
         assert cur.fetchone()["n"] > 0
+
+
+
+def test_run9_data_repair_migration_widens_profile_objective_text():
+    with connect() as conn, conn.cursor() as cur:
+        # The integration database is session-scoped and earlier tests may have
+        # intentionally stored >500 characters. Clear only this tested field
+        # before simulating the pre-0012 VARCHAR schema so test order cannot
+        # make the narrowing setup fail before the migration is exercised.
+        cur.execute(
+            "UPDATE companies SET setup_obj_name_keyin=NULL "
+            "WHERE CHAR_LENGTH(setup_obj_name_keyin)>500"
+        )
+        cur.execute(
+            "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin "
+            "VARCHAR(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL"
+        )
+        cur.execute("UPDATE alembic_version SET version_num='0011_fabric_recovery'")
+        conn.commit()
+
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT
+              data_type,character_maximum_length,character_octet_length,
+              is_nullable,character_set_name,collation_name
+            FROM information_schema.columns
+            WHERE table_schema=DATABASE()
+              AND table_name='companies'
+              AND column_name='setup_obj_name_keyin'
+            """
+        )
+        column = cur.fetchone()
+
+    assert column["data_type"] == "text"
+    assert int(column["character_maximum_length"]) > 500
+    assert int(column["character_octet_length"]) >= int(column["character_maximum_length"])
+    assert column["is_nullable"] == "YES"
+    assert column["character_set_name"] == "utf8mb4"
+    assert column["collation_name"] == "utf8mb4_0900_ai_ci"
