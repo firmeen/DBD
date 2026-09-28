@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 
 from ..client.simple_client import SimpleAsyncDbdClient
+from ..core.settings import settings
 from ..presentation.collector_dashboard import CollectorDashboard
 from ..storage.mysql.async_engine import create_engine
 from ..storage.mysql.repositories.worker_repository import WorkerRepository
@@ -46,18 +47,20 @@ def _live_state(run_id: int, baseline: dict, runtime: dict) -> dict:
 
 async def _wait_for_prior_leases(repo, run_id: int) -> None:
     """Let leases from a crashed prior process expire before same-run resume."""
-    deadline = asyncio.get_running_loop().time() + 65.0
-    while True:
-        await repo.maintain(run_id)
-        progress = await repo.progress(run_id)
-        if int(progress.get("running", 0) or 0) == 0:
-            return
-        if asyncio.get_running_loop().time() >= deadline:
-            raise RuntimeError(
-                f"Run {run_id} still has active durable leases; "
-                "verify no previous collector process remains and retry after lease expiry"
-            )
-        await asyncio.sleep(1.0)
+    await repo.maintain(run_id)
+    progress = await repo.progress(run_id)
+    if int(progress.get("running", 0) or 0) == 0:
+        return
+
+    # Avoid repeatedly scanning a million-row run while waiting for one lease TTL.
+    await asyncio.sleep(float(settings.dbd_lease_seconds) + 1.0)
+    await repo.maintain(run_id)
+    progress = await repo.progress(run_id)
+    if int(progress.get("running", 0) or 0):
+        raise RuntimeError(
+            f"Run {run_id} still has active durable leases; "
+            "verify no previous collector process remains and retry after lease expiry"
+        )
 
 
 async def collect_run(
