@@ -26,7 +26,7 @@ class CollectorDashboard:
     def __enter__(self):
         if self.enabled and self.console.is_terminal:
             self._live = Live(
-                self._table({}),
+                Text(f"DBD COLLECTOR · RUN {self.run_id}"),
                 console=self.console,
                 refresh_per_second=4,
                 transient=False,
