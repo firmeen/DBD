@@ -1334,6 +1334,26 @@ class FabricWorkerRepository(WorkerRepository):
         Benchmark HTTP 404 remains deliberately non-executable until its upstream
         business semantics are proven separately.
         """
+        if execute:
+            async with self.engine.connect() as conn:
+                running = int(
+                    (
+                        await conn.execute(
+                            text(
+                                "SELECT COUNT(*) FROM company_collection_state "
+                                "WHERE run_id=:run AND status='running'"
+                            ),
+                            {"run": int(run_id)},
+                        )
+                    ).scalar_one()
+                    or 0
+                )
+            if running:
+                raise ValueError(
+                    "Targeted repair requires zero running durable leases; "
+                    "stop/drain the campaign first"
+                )
+
         candidates = await self._projection_repair_candidates(run_id)
         evidence = await self.repair_evidence(run_id, limit=500, sample_limit=20)
         projection = self._projection_repair_summary(candidates)

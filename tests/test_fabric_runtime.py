@@ -1163,6 +1163,9 @@ async def test_targeted_projection_repair_is_dry_run_idempotent_and_never_refetc
         "/synthetic/fin/submit/7/" + identities[0].jp_no,
         {"fiscalYear": "2568"},
     )
+    with pytest.raises(ValueError, match="zero running durable leases"):
+        await fabric.targeted_repair(run_id, execute=True)
+
     bit = endpoint_bit("financial_submissions")
 
     async with repo.engine.begin() as conn:
