@@ -468,15 +468,15 @@ async def process(
         circuit_global = "unknown"
         if client is not None:
             controller = getattr(client, "endpoint_rate", None)
-            if controller is not None:
-                try:
-                    effective_rate = float(controller.global_effective_rate())
-                except Exception:
-                    effective_rate = None
-                try:
-                    circuit_global = str(controller.circuit_state())
-                except Exception:
-                    circuit_global = "unknown"
+            rate_source = controller or client
+            try:
+                effective_rate = float(rate_source.global_effective_rate())
+            except Exception:
+                effective_rate = None
+            try:
+                circuit_global = str(rate_source.circuit_state())
+            except Exception:
+                circuit_global = "unknown"
         active = {
             "fetch": int(runtime_stats["fetch_active"]),
             "archive": int(runtime_stats["archive_active"]),

@@ -122,7 +122,9 @@ class SimpleCollectorDashboard:
         pipeline.add_column()
         pipeline.add_row(
             "HTTP",
-            f"actual {_rate(self._http_rate)} · target {_rate(snapshot.get('target_rate', self.target_rate))} · "
+            f"actual {_rate(self._http_rate)} · "
+            f"effective {_rate(snapshot.get('effective_rate', self.target_rate))} · "
+            f"target {_rate(snapshot.get('target_rate', self.target_rate))} · "
             f"requests {_int(snapshot.get('requests')):,} · retries {_int(snapshot.get('http_retries')):,} · "
             f"429/pressure {_int(snapshot.get('rate_limit_hits')):,}",
         )

@@ -102,6 +102,11 @@ class SimpleDbdClient:
             if rejected is not None and rejected == self._token:
                 self._auth.invalidate(reset_warmup=reset_warmup)
                 self._token = None
+            if self._token is None:
+                delay = self._pause_until - time.monotonic()
+                if delay > 0:
+                    self.auth_state = "waiting"
+                    await asyncio.sleep(delay)
             if self._token is None or time.time() >= self._auth._expires_at - 15:
                 self.auth_state = "refreshing"
                 try:
@@ -143,7 +148,18 @@ class SimpleDbdClient:
         return self.availability_state
 
     def global_effective_rate(self) -> float:
-        return self.target_rate
+        return float(self.rate.rate)
+
+    def _penalize_rate(self) -> float:
+        value = max(1.0, min(self.rate.rate, self.target_rate * 0.5))
+        self.rate._set_rate(value)
+        EFFECTIVE_RATE.set(value)
+        return value
+
+    def _restore_target_rate(self) -> None:
+        if self.rate.rate != self.target_rate:
+            self.rate._set_rate(self.target_rate)
+            EFFECTIVE_RATE.set(self.target_rate)
 
     @staticmethod
     def _headers(token: str, referer: str) -> dict[str, str]:
@@ -227,6 +243,7 @@ class SimpleDbdClient:
                 if rate_pressure:
                     self.rate_limit_hits += 1
                     cooldown = max(1.0, retry_after(retry_after_header))
+                    effective_rate = self._penalize_rate()
                     self.rate.cooldown(cooldown)
                     self.last_error = f"HTTP {status}"
                     log.warning(
@@ -235,6 +252,7 @@ class SimpleDbdClient:
                         path=path,
                         endpoint=rate_key,
                         cooldown_seconds=cooldown,
+                        effective_rate=effective_rate,
                         target_rate=self.target_rate,
                     )
                     if attempt < self.max_retries:
@@ -287,6 +305,7 @@ class SimpleDbdClient:
                     raise
 
                 await self._availability_ok()
+                self._restore_target_rate()
                 self.auth_state = "healthy"
                 return ApiResponse(
                     data=data,

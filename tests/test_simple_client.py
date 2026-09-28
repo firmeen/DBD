@@ -46,7 +46,7 @@ async def test_502_pauses_without_lowering_fixed_target():
     assert value.rate.rate == 60
 
 
-async def test_429_cooldown_keeps_configured_rate():
+async def test_429_penalty_is_temporary_and_success_restores_target_directly():
     value = client(retries=1)
     value._session.request.side_effect = [
         response(429, {"retry-after": "0"}),
@@ -60,6 +60,18 @@ async def test_429_cooldown_keeps_configured_rate():
     assert value.rate_limit_hits == 1
     assert value.target_rate == 60
     assert value.rate.rate == 60
+
+
+async def test_429_without_retry_budget_leaves_effective_rate_penalized():
+    value = client(retries=0)
+    value.rate.cooldown = lambda seconds: None
+    value._session.request.return_value = response(429, {"retry-after": "0"})
+
+    with pytest.raises(Exception, match="HTTP 429"):
+        await value.fetch("GET", "/profile", rate_key="profile")
+
+    assert value.target_rate == 60
+    assert value.rate.rate == 30
 
 
 async def test_auth_failure_uses_auth_budget_only_not_outer_http_retry():
