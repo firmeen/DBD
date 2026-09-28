@@ -462,6 +462,63 @@ class FabricWorkerRepository(WorkerRepository):
                     error="lease_expired_attempts_exhausted",
                 )
 
+    async def collector_lease_summary(self, run_id: int) -> dict[str, int]:
+        """Classify durable running leases before a single-process handoff."""
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text("""
+                    SELECT
+                      COUNT(*) AS running,
+                      COALESCE(SUM(lease_expires_at>UTC_TIMESTAMP(6)),0) AS live,
+                      COALESCE(SUM(
+                        lease_expires_at IS NOT NULL
+                        AND lease_expires_at<=UTC_TIMESTAMP(6)
+                      ),0) AS expired,
+                      COALESCE(SUM(lease_expires_at IS NULL),0) AS invalid
+                    FROM company_collection_state
+                    WHERE run_id=:run AND status='running'
+                    """),
+                    {"run": run_id},
+                )
+            ).mappings().one()
+        return {key: int(value or 0) for key, value in row.items()}
+
+    @transaction_retry
+    async def reclaim_expired_collector_leases(self, run_id: int) -> int:
+        """Recover expired process-loss leases without charging a data attempt.
+
+        A lease that is still live is never touched here. Expiry already fences
+        the previous owner from durable writes, so returning only expired work
+        to pending is safe and keeps process loss distinct from endpoint failure.
+        """
+        async with self.engine.begin() as conn:
+            result = await conn.execute(
+                text("""
+                UPDATE company_collection_state
+                SET status='pending',
+                    lease_owner=NULL,
+                    lease_expires_at=NULL,
+                    attempts=CASE
+                      WHEN stage='fetch' AND attempts>0 THEN attempts-1
+                      ELSE attempts
+                    END,
+                    project_attempts=CASE
+                      WHEN stage='project' AND project_attempts>0
+                      THEN project_attempts-1 ELSE project_attempts
+                    END,
+                    available_at=UTC_TIMESTAMP(6),
+                    last_error='collector_process_recovery',
+                    finished_at=NULL,
+                    updated_at=UTC_TIMESTAMP(6)
+                WHERE run_id=:run AND status='running'
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at<=UTC_TIMESTAMP(6)
+                """),
+                {"run": run_id},
+            )
+            return int(result.rowcount or 0)
+
     @transaction_retry
     async def claim_batch(self, run_id, owner, *, stage="fetch", limit=None):
         if stage not in ("fetch", "project"):
