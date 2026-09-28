@@ -36,6 +36,8 @@ async def _collect(
     force_stop_requested = asyncio.Event()
     previous_handler = signal.getsignal(signal.SIGINT)
     interrupts = 0
+    dashboard = None
+    dashboard_closed = False
 
     try:
         run = await repo.get_run(run_id)
@@ -88,6 +90,7 @@ async def _collect(
 
         exact = await scheduler_repo.progress(run_id)
         dashboard.close(exact, status=status)
+        dashboard_closed = True
         return {
             "run_id": int(run_id),
             "status": status.lower(),
@@ -95,6 +98,14 @@ async def _collect(
             "session": result,
         }
     finally:
+        if dashboard is not None and not dashboard_closed:
+            try:
+                dashboard.close(
+                    status="PAUSED" if stop_requested.is_set() else "FAILED"
+                )
+            except Exception:
+                # Terminal cleanup must never hide the collector's real failure.
+                pass
         signal.signal(signal.SIGINT, previous_handler)
         await engine.dispose()
 
