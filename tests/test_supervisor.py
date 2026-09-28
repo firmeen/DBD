@@ -11,17 +11,17 @@ from dbd.runtime.supervisor import (
     WorkerProcess,
     _campaign_terminal_snapshot,
     _drain_registered_workers,
+    _fleet_circuit_state,
     _fleet_rate_target,
     _force_kill_worker,
     _force_stop_and_reconcile,
-    _fleet_circuit_state,
-    _restore_sigint,
-    _suppress_sigint,
     _live_progress,
     _refresh_lease_with_grace,
+    _restore_sigint,
     _runtime_progress_baseline,
     _seed_rate,
     _spawn_worker,
+    _suppress_sigint,
     _terminate_workers,
     _with_retired_metrics,
     _worker_command,
@@ -606,6 +606,7 @@ def test_campaign_status_offline_exposes_exact_retry_wait_and_paused_control(
     state = supervisor.campaign_status(9)
 
     assert state["progress_exact"] is True
+    assert state["pending_includes_retry_wait"] is False
     assert state["retry_wait"] == 2100
     assert state["pending"] == 7551822
     assert state["run_status"] == "ready"

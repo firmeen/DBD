@@ -2254,6 +2254,7 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
         state = _task_progress(run_id)
         state["progress_source"] = "mysql_reconciled"
         state["progress_exact"] = True
+        state["pending_includes_retry_wait"] = False
 
     state["run_id"] = int(run_id)
     state["run_status"] = _run_status(run_id)

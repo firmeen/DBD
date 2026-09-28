@@ -518,7 +518,11 @@ async def process(
             "drain_requested": drain_requested.is_set(),
         }
 
-    async def publish_heartbeat(*, status: str | None = None) -> str | None:
+    async def publish_heartbeat(
+        *,
+        status: str | None = None,
+        release_on_drain: bool = True,
+    ) -> str | None:
         if coordinator is None or identity is None:
             return None
         try:
@@ -540,7 +544,8 @@ async def process(
         # This replaces the separate 0.5s control polling Redis round trip.
         if resolved == "draining":
             drain_requested.set()
-            release_queued_fetch.set()
+            if release_on_drain:
+                release_queued_fetch.set()
         return resolved
 
     async def mysql_heartbeat():
@@ -642,7 +647,7 @@ async def process(
             remaining = None if limit is None else max(0, limit - claimed_attempts)
             if remaining == 0:
                 drain_requested.set()
-                await publish_heartbeat(status="draining")
+                await publish_heartbeat(status="draining", release_on_drain=False)
                 continue
 
             batch_limit = settings.dbd_claim_batch_size
@@ -690,7 +695,7 @@ async def process(
                 idle_progress_at = now + _IDLE_PROGRESS_POLL_SECONDS
                 if not await repo.has_active_work(run_id):
                     drain_requested.set()
-                    await publish_heartbeat(status="draining")
+                    await publish_heartbeat(status="draining", release_on_drain=False)
                     continue
             await asyncio.sleep(0.1)
 
