@@ -72,9 +72,10 @@ def _curl_code(exc):
     return getattr(exc, "code", None) or getattr(exc, "curl_code", None)
 
 
-def _get(session, url, *, headers, stage):
+def _get(session, url, *, headers, stage, timeout=None):
+    request_timeout = settings.request_timeout if timeout is None else float(timeout)
     try:
-        return session.get(url, headers=headers, timeout=settings.request_timeout)
+        return session.get(url, headers=headers, timeout=request_timeout)
     except RequestsError as exc:
         code = _curl_code(exc)
         suffix = f" curl={code}" if code is not None else ""
@@ -86,23 +87,42 @@ def _require_ok(response, stage):
         raise DbdAuthError(f"{stage} failed: HTTP {response.status_code}")
 
 
-def warm_up(session: requests.Session) -> None:
+def warm_up(session: requests.Session, *, timeout=None) -> None:
     """Visit the home page and a real page once so the WAF can issue cookies."""
-    response = _get(session, HOME_URL, headers=_document_headers(), stage="warmup_home")
+    response = _get(
+        session,
+        HOME_URL,
+        headers=_document_headers(),
+        stage="warmup_home",
+        timeout=timeout,
+    )
 
     if response.status_code == 403 and import_chrome_cookies(session, "datawarehouse.dbd.go.th"):
-        response = _get(session, HOME_URL, headers=_document_headers(), stage="warmup_home_cookie_retry")
+        response = _get(
+            session,
+            HOME_URL,
+            headers=_document_headers(),
+            stage="warmup_home_cookie_retry",
+            timeout=timeout,
+        )
     _require_ok(response, "warmup_home")
 
     page_headers = _document_headers()
     page_headers.update({"Referer": HOME_URL, "Sec-Fetch-Site": "same-origin"})
 
-    response = _get(session, WARMUP_PAGE_URL, headers=page_headers, stage="warmup_page")
+    response = _get(
+        session,
+        WARMUP_PAGE_URL,
+        headers=page_headers,
+        stage="warmup_page",
+        timeout=timeout,
+    )
     if response.status_code == 403 and import_chrome_cookies(session, "datawarehouse.dbd.go.th"):
         response = _get(
             session,
             WARMUP_PAGE_URL,
             headers=page_headers,
             stage="warmup_page_cookie_retry",
+            timeout=timeout,
         )
     _require_ok(response, "warmup_page")
