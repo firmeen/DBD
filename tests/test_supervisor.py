@@ -735,3 +735,36 @@ def test_collector_handoff_status_fails_closed_when_redis_is_unavailable(
 
     with pytest.raises(RuntimeError, match="Cannot prove the legacy runtime is offline"):
         supervisor.collector_handoff_status(9)
+
+
+
+def test_legacy_supervisor_refuses_active_collector_before_redis_start(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(
+        supervisor,
+        "settings",
+        SimpleNamespace(dbd_redis_url="redis://test"),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "assert_manager_lock_free",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("Single-process DBD collector/API manager is already active")
+        ),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_redis_client",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("Redis must not open when the collector fence is active")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="collector/API manager is already active"):
+        supervisor.supervise_campaign(
+            9,
+            workers=1,
+            worker_concurrency=1,
+            worker_rate=1.0,
+        )
