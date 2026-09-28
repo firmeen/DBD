@@ -23,6 +23,22 @@ from ....runtime.delta import refresh_plan
 from .worker_repository import FinishResult, WorkerRepository, now, transaction_retry
 
 
+def _canonical_metadata(row):
+    """Normalize information_schema RowMapping keys across MySQL drivers."""
+    if row is None:
+        return None
+    normalized = {}
+    for key, value in row.items():
+        name = str(key).casefold()
+        if name in normalized and normalized[name] != value:
+            raise RuntimeError(
+                f"Ambiguous information_schema metadata for {name!r}; "
+                "refusing automatic repair"
+            )
+        normalized[name] = value
+    return normalized
+
+
 class FabricWorkerRepository(WorkerRepository):
     """One durable scheduler row per company/run.
 
@@ -1163,9 +1179,11 @@ class FabricWorkerRepository(WorkerRepository):
                 ),
             },
             "profile_text_schema": {
-                "column": dict(column) if column is not None else None,
-                "indexes": [dict(row) for row in indexes],
-                "generated_dependencies": [dict(row) for row in generated],
+                "column": _canonical_metadata(column),
+                "indexes": [_canonical_metadata(row) for row in indexes],
+                "generated_dependencies": [
+                    _canonical_metadata(row) for row in generated
+                ],
             },
             "projection_payload_evidence": payload_evidence,
         }
@@ -1187,6 +1205,7 @@ class FabricWorkerRepository(WorkerRepository):
                     """)
                 )
             ).mappings().first()
+        row = _canonical_metadata(row)
         if (
             row is None
             or str(row["data_type"] or "").lower()
