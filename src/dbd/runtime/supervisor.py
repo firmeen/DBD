@@ -16,6 +16,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from ..core.progress import LiveCampaignDashboard, TerminalSnapshot
 from ..core.settings import PROJECT_ROOT, settings
 from ..storage.mysql.engine import connect
+from .locking import assert_manager_lock_free
 
 _RATE_MODES = {"shared", "multiply", "adaptive"}
 _SUPERVISOR_LEASE_SECONDS = 30
@@ -1380,6 +1381,7 @@ def supervise_campaign(
     """Run one lease-protected local fleet with graceful autoscaling and durable recovery."""
     if not settings.dbd_redis_url:
         raise ValueError("Campaign supervisor requires DBD_REDIS_URL")
+    assert_manager_lock_free()
     if worker_concurrency < 1 or max_restarts < 0:
         raise ValueError("worker concurrency must be positive and max restarts non-negative")
 
