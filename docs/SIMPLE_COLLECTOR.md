@@ -28,6 +28,21 @@ The collector never creates a new run:
 dbd-data collect 9
 ```
 
+The existing Windows launcher now delegates to the same runtime, so the previous
+operator habit remains valid:
+
+```powershell
+.\Run-DBD.ps1 9 -Headless
+```
+
+`-Headless` is accepted for compatibility; the simple collector is already a
+single-process terminal runtime and still shows its live UI. Use `-NoUI` only
+when the live dashboard is intentionally not wanted.
+
+The legacy `dbd-data campaign guard 9` path remains available only as a rollback
+or distributed-compatibility path. Do not run it at the same time as the simple
+collector.
+
 Equivalent explicit defaults:
 
 ```powershell
