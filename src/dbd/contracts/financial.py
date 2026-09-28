@@ -169,16 +169,37 @@ def normalize_benchmark(data: object) -> IndustryBenchmark | None:
 
 
 def normalize_submissions(data: object) -> list[dict]:
-    return [
-        {
-            "submit_year": str(row.get("submitYear")),
-            "ac_date": row.get("acDate"),
-            "submit_date": to_date(row.get("submitDate")),
-            "ac_code": row.get("acCode"),
-            "au_code": row.get("auCode"),
-            "status_code": row.get("statusCode"),
-            "update_date": to_date(row.get("updateDate")),
+    """Normalize one company submission history without dropping source revisions.
+
+    Exact repeated rows are harmless transport duplication and can be collapsed
+    losslessly. Multiple *different* rows for the same submit year are not
+    arbitrarily resolved because the current relational natural key is
+    (jp_no, submit_year); they remain an explicit contract failure until source
+    evidence identifies a stable revision key.
+    """
+    rows: list[dict] = []
+    by_year: dict[str, dict] = {}
+    for source in require_rows(data, "submitYear"):
+        if source.get("submitYear") is None:
+            continue
+        row = {
+            "submit_year": str(source.get("submitYear")),
+            "ac_date": source.get("acDate"),
+            "submit_date": to_date(source.get("submitDate")),
+            "ac_code": source.get("acCode"),
+            "au_code": source.get("auCode"),
+            "status_code": source.get("statusCode"),
+            "update_date": to_date(source.get("updateDate")),
         }
-        for row in require_rows(data, "submitYear")
-        if row.get("submitYear") is not None
-    ]
+        previous = by_year.get(row["submit_year"])
+        if previous is None:
+            by_year[row["submit_year"]] = row
+            rows.append(row)
+            continue
+        if previous == row:
+            continue
+        raise ContractError(
+            "Conflicting financial submissions for submitYear "
+            f"{row['submit_year']}; source revision identity is required"
+        )
+    return rows

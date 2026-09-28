@@ -6,7 +6,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0011_fabric_recovery"
+HEAD = "0012_run9_data_repair"
 
 
 def test_correctness_migration_adopts_existing_objects():
@@ -288,3 +288,32 @@ def test_fabric_recovery_migration_is_adoption_safe():
             """
         )
         assert cur.fetchone()["n"] > 0
+
+
+
+def test_run9_data_repair_migration_widens_profile_objective_text():
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin VARCHAR(500) NULL"
+        )
+        cur.execute("UPDATE alembic_version SET version_num='0011_fabric_recovery'")
+        conn.commit()
+
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT data_type,character_maximum_length
+            FROM information_schema.columns
+            WHERE table_schema=DATABASE()
+              AND table_name='companies'
+              AND column_name='setup_obj_name_keyin'
+            """
+        )
+        column = cur.fetchone()
+
+    assert column["data_type"] == "text"
+    assert int(column["character_maximum_length"]) >= 65535
