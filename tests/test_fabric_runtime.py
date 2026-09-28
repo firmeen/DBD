@@ -1541,3 +1541,121 @@ async def test_targeted_profile_overflow_replays_only_after_lossless_text_migrat
             ).scalar_one()
         )
     assert stored_length == 1200
+
+
+async def test_external_stop_releases_queued_fetch_without_releasing_active_lease(repo):
+    class BlockingApi:
+        active_ready = None
+        release = None
+
+        def __init__(self, **kwargs):
+            self.requests_made = 0
+            self.retries_made = 0
+            self.rate_limit_hits = 0
+            self.redis_commands = 0
+            self.redis_admissions = 0
+            self.target_rate = 60.0
+            self.auth_state = "healthy"
+            self.availability_state = "healthy"
+            self.last_error = None
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            return None
+
+        async def fetch(self, method, path, **kwargs):
+            self.requests_made += 1
+            type(self).active_ready.set()
+            await type(self).release.wait()
+            kind, number = path.split("/")[-2:]
+            now = datetime.now(timezone.utc).replace(tzinfo=None)
+            return ApiResponse(
+                {
+                    "jpNo": number,
+                    "jpTypeCode": kind,
+                    "jpName": "Drain Synthetic",
+                    "submitFinYear": None,
+                },
+                200,
+                now,
+                now,
+            )
+
+    BlockingApi.active_ready = asyncio.Event()
+    BlockingApi.release = asyncio.Event()
+    stop_requested = asyncio.Event()
+    _, run_id, _ = await new_fabric_run(repo, ("profile",), count=4)
+
+    running = asyncio.create_task(
+        process(
+            repo,
+            run_id,
+            concurrency=1,
+            client_factory=BlockingApi,
+            stop_requested=stop_requested,
+        )
+    )
+    await asyncio.wait_for(BlockingApi.active_ready.wait(), timeout=5)
+
+    for _ in range(50):
+        async with repo.engine.connect() as conn:
+            state = (
+                await conn.execute(
+                    text(
+                        "SELECT "
+                        "SUM(status='running') running, "
+                        "SUM(status='pending') pending "
+                        "FROM company_collection_state WHERE run_id=:run"
+                    ),
+                    {"run": run_id},
+                )
+            ).mappings().one()
+        if int(state["running"] or 0) == 2:
+            break
+        await asyncio.sleep(0.02)
+
+    assert int(state["running"] or 0) == 2
+    stop_requested.set()
+
+    # One claimed-but-unstarted fetch lease must return immediately while the
+    # request already inside fetch() remains fenced as running.
+    for _ in range(100):
+        async with repo.engine.connect() as conn:
+            state = (
+                await conn.execute(
+                    text(
+                        "SELECT "
+                        "SUM(status='running') running, "
+                        "SUM(status='pending') pending, "
+                        "SUM(CASE WHEN status='pending' THEN attempts ELSE 0 END) pending_attempts "
+                        "FROM company_collection_state WHERE run_id=:run"
+                    ),
+                    {"run": run_id},
+                )
+            ).mappings().one()
+        if int(state["running"] or 0) == 1:
+            break
+        await asyncio.sleep(0.02)
+
+    assert int(state["running"] or 0) == 1
+    assert int(state["pending"] or 0) == 3
+    assert int(state["pending_attempts"] or 0) == 0
+
+    BlockingApi.release.set()
+    result = await asyncio.wait_for(running, timeout=10)
+    assert result["done"] == 1
+    assert result["pending"] == 3
+
+    async with repo.engine.connect() as conn:
+        still_running = (
+            await conn.execute(
+                text(
+                    "SELECT COUNT(*) FROM company_collection_state "
+                    "WHERE run_id=:run AND status='running'"
+                ),
+                {"run": run_id},
+            )
+        ).scalar_one()
+    assert int(still_running) == 0
