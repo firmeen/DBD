@@ -905,8 +905,11 @@ return {
         state = await self._breaker.failure(key)
         if endpoint is None:
             self._last_global_circuit_state = state
-        else:
-            self._last_endpoint_circuit_state[endpoint] = state
+            return state
+
+        self._last_endpoint_circuit_state[endpoint] = state
+        if await self._breaker.record_endpoint_availability(endpoint):
+            self._last_global_circuit_state = await self._breaker.failure("__global__")
         return state
 
     def circuit_state(self, endpoint: str | None = None) -> str:

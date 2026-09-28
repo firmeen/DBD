@@ -144,7 +144,9 @@ return state
         self.probe_seconds = max(1.0, float(probe_seconds))
         self._local: dict[str, _LocalCircuit] = {}
         self._local_pressure: dict[str, float] = {}
+        self._local_availability: dict[str, float] = {}
         self._last_global_pressure_at = 0.0
+        self._last_global_availability_at = 0.0
         self._before_script = None
         self._failure_script = None
         self._success_script = None
@@ -284,6 +286,48 @@ return state
             ],
         )
         return str(result)
+
+    async def record_endpoint_availability(self, endpoint: str) -> bool:
+        """Return True for a gated multi-endpoint availability outage signal."""
+        if self.redis is None:
+            now = time.monotonic()
+            cutoff = now - self.pressure_window_seconds
+            self._local_availability = {
+                key: observed
+                for key, observed in self._local_availability.items()
+                if observed >= cutoff
+            }
+            self._local_availability[str(endpoint)] = now
+            if len(self._local_availability) < self.pressure_endpoint_threshold:
+                return False
+            if now - self._last_global_availability_at < self._pressure_gate_seconds:
+                return False
+            self._last_global_availability_at = now
+            return True
+
+        availability_key = f"{self.namespace}:availability:endpoints"
+        gate_key = f"{self.namespace}:availability:global-circuit-gate"
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - int(self.pressure_window_seconds * 1000)
+        async with self.redis.pipeline(transaction=False) as pipe:
+            pipe.zadd(availability_key, {str(endpoint): now_ms})
+            pipe.zremrangebyscore(availability_key, 0, cutoff_ms)
+            pipe.zcard(availability_key)
+            pipe.pexpire(
+                availability_key,
+                max(1000, int(self.pressure_window_seconds * 3000)),
+            )
+            results = await pipe.execute()
+        if int(results[2] or 0) < self.pressure_endpoint_threshold:
+            return False
+        return bool(
+            await self.redis.set(
+                gate_key,
+                str(now_ms),
+                px=max(1000, int(self._pressure_gate_seconds * 1000)),
+                nx=True,
+            )
+        )
 
     async def record_endpoint_pressure(self, endpoint: str) -> bool:
         """Return True only for a gated multi-endpoint global-pressure event."""

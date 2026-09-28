@@ -15,6 +15,8 @@ from dbd.runtime.supervisor import (
     _force_kill_worker,
     _force_stop_and_reconcile,
     _fleet_circuit_state,
+    _restore_sigint,
+    _suppress_sigint,
     _live_progress,
     _refresh_lease_with_grace,
     _runtime_progress_baseline,
@@ -609,3 +611,25 @@ def test_campaign_status_offline_exposes_exact_retry_wait_and_paused_control(
     assert state["run_status"] == "ready"
     assert state["control_status"] == "paused"
     assert state["circuit_state"] == "open"
+
+
+
+def test_force_stop_sigint_shield_restores_previous_handler(monkeypatch) -> None:
+    calls = []
+    previous = object()
+
+    monkeypatch.setattr(supervisor.signal, "getsignal", lambda sig: previous)
+    monkeypatch.setattr(
+        supervisor.signal,
+        "signal",
+        lambda sig, handler: calls.append((sig, handler)),
+    )
+
+    captured = _suppress_sigint()
+    _restore_sigint(captured)
+
+    assert captured is previous
+    assert calls == [
+        (supervisor.signal.SIGINT, supervisor.signal.SIG_IGN),
+        (supervisor.signal.SIGINT, previous),
+    ]

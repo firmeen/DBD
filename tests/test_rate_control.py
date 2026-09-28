@@ -74,3 +74,23 @@ async def test_global_availability_failure_does_not_change_fleet_pacer():
 
     assert controller.circuit_state() == "open"
     assert controller.global_effective_rate() == 60
+
+
+
+async def test_distinct_endpoint_availability_can_escalate_global_without_rate_change():
+    controller = EndpointRateController(
+        60,
+        endpoint_rates={"profile": 30, "committees": 20},
+        circuit_failure_threshold=2,
+        global_pressure_endpoint_threshold=2,
+    )
+    controller._breaker._pressure_gate_seconds = 0
+
+    await controller.availability_failure("profile")
+    await controller.availability_failure("committees")
+    await controller.availability_failure("profile")
+
+    assert controller.circuit_state() == "open"
+    assert controller.global_effective_rate() == 60
+    assert controller.effective_rate("profile") == 30
+    assert controller.effective_rate("committees") == 20

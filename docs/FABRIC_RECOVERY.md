@@ -111,14 +111,28 @@ by a temporary 403/auth/network incident.
 The async client now authenticates lazily. A DBD auth outage cannot make a newly spawned
 worker die before its first heartbeat.
 
-The client retries bounded 403/auth/network/upstream errors and applies pressure to the
-existing adaptive rate/circuit layer. If that bounded HTTP-level recovery still fails,
-the worker returns the owned task to `retry_wait` through an attempt-neutral defer:
+The client retries bounded 403/auth/network/upstream errors, but availability and
+throughput pressure are now separate control signals:
+
+- auth/session failures open the global availability circuit without reducing the
+  configured fleet pacer
+- ordinary 500/502/504 and network/timeout failures open endpoint availability circuits;
+  distinct endpoint failures can escalate to the global availability circuit
+- HTTP 429 remains a throughput-pressure signal and reduces adaptive pacing
+- HTTP 503 is treated as rate pressure only when DBD supplies `Retry-After`; otherwise
+  it follows the availability path
+
+An open availability circuit stops upstream admission while preserving the configured
+pacing target. Shared workers use one bounded HALF_OPEN probe and blocked coroutines
+respect the circuit/probe window instead of polling Redis roughly once per second.
+
+If bounded HTTP-level recovery still fails, the worker returns the owned task to
+`retry_wait` through an attempt-neutral defer:
 
 ```text
 claim
   -> upstream/auth failure
-  -> bounded client retry + circuit pressure
+  -> bounded retry + availability circuit
   -> still unavailable
   -> durable defer
        status=retry_wait
@@ -144,10 +158,21 @@ New failures/deferred outcomes are appended to `collection_failure_events` with:
 This event stream complements `company_collection_state.last_error`, which remains the
 latest state-level context rather than a historical per-endpoint ledger.
 
-## Guardian boundary
+## Drain and Guardian boundary
 
-`Ctrl+C` remains an intentional pause and now displays the real durable MySQL progress
-instead of an empty 0/0 view.
+Durable fetch claiming is bounded near actual HTTP concurrency instead of the physical
+pipeline queue capacity. On graceful drain, fetchers stop consuming queued-but-unstarted
+work; active HTTP/archive/project work reaches a durable boundary and remaining queued
+fetch leases are released to MySQL without consuming an attempt.
+
+`Ctrl+C` remains an intentional pause and displays the real durable MySQL progress.
+A second Ctrl+C force-stops confirmed local process trees, shields further interrupts
+during the bounded lease-reconciliation critical section, and reclaims only leases
+belonging to confirmed-dead workers.
+
+Campaign status keeps durable and operational state separate: a durable `READY` run can
+be operationally `PAUSED`/offline, and exact status exposes `RETRY WAIT` separately
+from ordinary pending work.
 
 If local worker restart capacity is exhausted, Guardian terminates as
 `CAPACITY_EXHAUSTED` and requires operator diagnosis. It no longer churns indefinitely
