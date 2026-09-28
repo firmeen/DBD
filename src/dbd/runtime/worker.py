@@ -454,6 +454,7 @@ async def process(
             redis_pool_snapshot as _redis_pool_snapshot,
         )
         from .coordination import CampaignCoordinator, WorkerIdentity
+        from .locking import assert_manager_lock_free, runtime_handoff_lock
 
         close_async_redis = _close_async_redis
         redis_pool_snapshot = _redis_pool_snapshot
@@ -462,16 +463,21 @@ async def process(
             max_connections=settings.dbd_redis_max_connections,
         )
         try:
-            await redis_client.ping()
-            coordinator = CampaignCoordinator(
-                settings.dbd_redis_url,
-                run_id,
-                max_connections=settings.dbd_redis_max_connections,
-                client=redis_client,
-            )
-            await coordinator.open()
-            identity = WorkerIdentity(owner, int(run_id), os.getpid())
-            registration_status = await coordinator.register_worker(identity)
+            # Registration is serialized with collector handoff. Once the
+            # collector owns the long-lived manager lock, a legacy worker may
+            # not join the run later and create a second HTTP engine.
+            with runtime_handoff_lock():
+                assert_manager_lock_free()
+                await redis_client.ping()
+                coordinator = CampaignCoordinator(
+                    settings.dbd_redis_url,
+                    run_id,
+                    max_connections=settings.dbd_redis_max_connections,
+                    client=redis_client,
+                )
+                await coordinator.open()
+                identity = WorkerIdentity(owner, int(run_id), os.getpid())
+                registration_status = await coordinator.register_worker(identity)
             if registration_status == "draining":
                 drain_requested.set()
                 release_queued_fetch.set()
