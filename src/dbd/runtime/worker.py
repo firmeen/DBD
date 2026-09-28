@@ -382,6 +382,7 @@ async def process(
     distributed=False,
     runtime_callback=None,
     stop_signal=None,
+    periodic_maintenance=True,
 ):
     """Run staged claim -> fetch -> archive -> project with graceful draining.
 
@@ -400,6 +401,7 @@ async def process(
 
     projection_workers = min(settings.dbd_projection_workers, settings.db_pool_size)
     archive_workers = settings.dbd_archive_workers
+    project_claim_window = max(projection_workers, projection_workers * 2)
     fetch_claim_window = max(
         fetch_workers,
         fetch_workers * int(settings.dbd_fetch_claim_window_factor),
@@ -513,6 +515,7 @@ async def process(
             "fetch_claim_window": fetch_claim_window,
             "archive_queue": archive_queue.qsize(),
             "project_queue": project_queue.qsize(),
+            "project_claim_window": project_claim_window,
             "inflight": sum(active.values())
             + fetch_queue.qsize()
             + archive_queue.qsize()
@@ -608,7 +611,7 @@ async def process(
                 drain_requested.set()
                 release_queued_fetch.set()
             now = time.monotonic()
-            if now >= maintenance_at:
+            if periodic_maintenance and now >= maintenance_at:
                 should_maintain = True
                 if coordinator is not None and identity is not None:
                     try:
@@ -690,7 +693,8 @@ async def process(
             if remaining is not None:
                 batch_limit = min(batch_limit, remaining)
 
-            project_room = project_queue.maxsize - project_queue.qsize()
+            project_inflight = int(runtime_stats["project_active"]) + project_queue.qsize()
+            project_room = max(0, project_claim_window - project_inflight)
             project_batch = []
             if project_room > 0:
                 project_batch = await repo.claim_project_batch(
