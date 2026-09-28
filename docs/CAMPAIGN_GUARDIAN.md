@@ -1,6 +1,6 @@
 # Campaign Guardian
 
-The Campaign Guardian is the long-running operations layer for an existing durable DBD campaign. It protects the same Run ID across worker failures, supervisor failures, temporary Redis/MySQL outages, and terminal loss of the controlling shell.
+The Campaign Guardian is the legacy long-running operations layer for an existing durable DBD campaign. While the Guardian process is alive, it protects the same Run ID across worker failures, supervisor failures, and temporary Redis/MySQL outages. The former PowerShell outer-watchdog relaunch path is no longer the default runtime.
 
 The Guardian does not create a new campaign, change the run scope, issue bulk-retry, delete Redis coordination keys, or reinterpret terminal data failures.
 
@@ -49,7 +49,7 @@ Before resuming it requires Redis stability probes to pass, the previous supervi
 
 A replacement supervisor then uses the existing supervisor handoff logic to drain registered workers before it starts replacement capacity. Worker process deaths keep using the existing immediate lease reclaim logic; ordinary expired leases remain covered by scheduler maintenance.
 
-Workers spawned by the Guardian carry a host-bound per-Guardian generation token in their durable lease owner ID (for example, `local-8-ga1b2c3d4e5f60718-...`). The Windows watchdog still uses the lost Guardian PID only for local process ancestry. After a hard Guardian loss it performs a bounded, fail-closed Win32 inventory that includes both PowerShell worker wrappers and Python workers, and writes a recovery marker only after that inventory confirms zero owned descendants. The marker carries both the dead PID and its generation token. Once Redis is stable and the previous supervisor lease is absent, the replacement Guardian reconciles only MySQL leases whose owner prefix matches that confirmed-dead generation. It returns those tasks to pending and rolls back one process-loss stage attempt. There is no run-wide or PID-only reclaim: independently supervised, manually launched, multi-host, or later PID-reuse workers for the same Run ID remain outside durable reconciliation.
+Workers spawned by the Guardian carry a host-bound per-Guardian generation token in their durable lease owner ID (for example, `local-8-ga1b2c3d4e5f60718-...`). If an explicitly managed recovery marker exists from the historical watchdog path, replacement Guardian recovery remains generation-scoped: it reconciles only MySQL leases whose owner prefix matches that confirmed-dead generation. There is no run-wide or PID-only reclaim; independently supervised, manually launched, multi-host, or later PID-reuse workers remain outside durable reconciliation.
 
 The historical PowerShell watchdog containment implementation remains available
 in Git history but is no longer executed by the default launcher. Guardian
@@ -71,7 +71,7 @@ The bootstrap now treats both import and module-CLI smoke tests as required post
 
 ## Failure classes
 
-Automatic self-healing is intended for execution and infrastructure failures such as worker process exit or heartbeat loss, supervisor process failure, temporary Redis outage, temporary MySQL unavailability, stale supervisor lease fencing, and shell/interpreter loss handled by the PowerShell watchdog.
+Automatic self-healing is intended for execution and infrastructure failures such as worker process exit or heartbeat loss, supervisor process failure, temporary Redis outage, temporary MySQL unavailability, and stale supervisor lease fencing while the Guardian process remains active.
 
 The Guardian protects and waits instead of performing destructive recovery while control-plane health is uncertain.
 
