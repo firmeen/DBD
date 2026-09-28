@@ -1058,6 +1058,14 @@ def _acquire_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
         )
 
 
+def _activate_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
+    """Atomically fence legacy Supervisor activation against collector startup."""
+    with runtime_handoff_lock():
+        assert_manager_lock_free()
+        redis.ping()
+        _acquire_supervisor_lease(redis, run_id, token)
+
+
 def _refresh_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
     script = """
     if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -1531,14 +1539,8 @@ def supervise_campaign(
         return replacement
 
     try:
-        # Serialize legacy control-plane activation with collector handoff.
-        # The early manager check above is a fast failure; this second check is
-        # the atomic fence immediately before publishing the Supervisor lease.
-        with runtime_handoff_lock():
-            assert_manager_lock_free()
-            redis.ping()
-            _acquire_supervisor_lease(redis, run_id, token)
-            lease_acquired = True
+        _activate_supervisor_lease(redis, run_id, token)
+        lease_acquired = True
 
         orphaned = _drain_registered_workers(redis, run_id)
         if orphaned:
