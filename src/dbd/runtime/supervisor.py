@@ -2029,7 +2029,10 @@ def supervise_campaign(
                             row,
                             now=now,
                             active_work=bool(active_work),
-                            control_healthy=not control_plane_degraded,
+                            control_healthy=(
+                                not control_plane_degraded
+                                and not fleet_availability_degraded
+                            ),
                             draining=bool(worker.draining or graceful_stop),
                         )
                         if stalled_for is not None:
