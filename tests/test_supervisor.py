@@ -446,6 +446,29 @@ def test_resource_plan_bounds_maximum_fleet() -> None:
     assert plan.redis_connections_effective_max <= 128
 
 
+def test_run9_style_twelve_worker_envelope_stays_inside_fleet_budgets() -> None:
+    plan = build_resource_plan(
+        12,
+        db_pool_size=8,
+        archive_workers=2,
+        projection_workers=8,
+        redis_max_connections=4,
+        db_connections_max=96,
+        archive_workers_max=24,
+        projection_workers_max=48,
+        redis_connections_max=128,
+    )
+
+    assert plan.db_pool_per_worker == 3
+    assert plan.db_connections_effective_max == 80
+    assert plan.archive_workers_per_worker == 2
+    assert plan.archive_workers_effective_max == 24
+    assert plan.projection_workers_per_worker == 3
+    assert plan.projection_workers_effective_max == 36
+    assert plan.redis_connections_per_client == 4
+    assert plan.redis_connections_effective_max == 52
+
+
 def test_resource_plan_rejects_budget_that_cannot_support_workers_max() -> None:
     with pytest.raises(ValueError, match="fleet DB connection budget"):
         build_resource_plan(
