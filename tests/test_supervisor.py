@@ -9,6 +9,7 @@ import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
     AutoscaleController,
     CampaignResourcePlan,
+    RequestProgressWatchdog,
     WorkerProcess,
     _campaign_terminal_snapshot,
     _drain_registered_workers,
@@ -883,3 +884,117 @@ def test_stopped_generation_reconciliation_refuses_live_worker(monkeypatch) -> N
         )
         == 0
     )
+
+
+def test_request_progress_watchdog_trips_only_on_active_http_stall() -> None:
+    watchdog = RequestProgressWatchdog(timeout_seconds=90.0)
+
+    assert watchdog.observe(
+        now=0.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    ) is None
+    assert watchdog.observe(
+        now=60.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    ) is None
+    assert watchdog.observe(
+        now=90.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    ) == 90.0
+
+
+def test_request_progress_watchdog_resets_on_forward_progress() -> None:
+    watchdog = RequestProgressWatchdog(timeout_seconds=90.0)
+
+    watchdog.observe(
+        now=0.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    )
+    assert watchdog.observe(
+        now=80.0,
+        requests=101,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    ) is None
+    assert watchdog.observe(
+        now=150.0,
+        requests=101,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    ) is None
+
+
+def test_request_progress_watchdog_ignores_controlled_or_inactive_waits() -> None:
+    watchdog = RequestProgressWatchdog(timeout_seconds=90.0)
+
+    watchdog.observe(
+        now=0.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    )
+    assert watchdog.observe(
+        now=120.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="open",
+        draining=False,
+    ) is None
+    assert watchdog.observe(
+        now=240.0,
+        requests=100,
+        fetch_active=0,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=False,
+    ) is None
+    assert watchdog.observe(
+        now=360.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=False,
+        circuit_state="closed",
+        draining=False,
+    ) is None
+    assert watchdog.observe(
+        now=480.0,
+        requests=100,
+        fetch_active=32,
+        active_work=True,
+        control_healthy=True,
+        circuit_state="closed",
+        draining=True,
+    ) is None
