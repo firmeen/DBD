@@ -39,6 +39,8 @@ _WORKER_STARTUP_GRACE_SECONDS = 20.0
 _WORKER_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 _WORKER_DRAIN_TIMEOUT_SECONDS = 90.0
 _WORKER_KILL_WAIT_SECONDS = 5.0
+_REQUEST_STALL_TIMEOUT_SECONDS = 90.0
+_REQUEST_STALL_EXIT_CODE = 76
 _RATE_STATE_TTL_SECONDS = 600
 _DB_POOLS_PER_WORKER = 2
 _REDIS_CLIENTS_PER_WORKER = 1
@@ -58,6 +60,53 @@ class WorkerProcess:
     last_heartbeat_at: float | None = None
     registered_once: bool = False
     capacity_lost: bool = False
+
+
+@dataclass
+class RequestProgressWatchdog:
+    """Detect fleet-wide HTTP request stagnation without mistaking controlled waits for failure."""
+
+    timeout_seconds: float = _REQUEST_STALL_TIMEOUT_SECONDS
+    last_requests: int | None = None
+    stalled_since: float | None = None
+
+    def observe(
+        self,
+        *,
+        now: float,
+        requests: int,
+        fetch_active: int,
+        active_work: bool,
+        control_healthy: bool,
+        circuit_state: str,
+        draining: bool,
+    ) -> float | None:
+        requests = max(0, int(requests))
+        eligible = (
+            active_work
+            and control_healthy
+            and not draining
+            and int(fetch_active) > 0
+            and str(circuit_state or "unknown").lower() != "open"
+        )
+
+        if self.last_requests is None or requests != self.last_requests:
+            self.last_requests = requests
+            self.stalled_since = now if eligible else None
+            return None
+
+        if not eligible:
+            self.stalled_since = None
+            return None
+
+        if self.stalled_since is None:
+            self.stalled_since = now
+            return None
+
+        stalled_for = max(0.0, now - self.stalled_since)
+        if stalled_for < float(self.timeout_seconds):
+            return None
+        return stalled_for
 
 
 @dataclass(frozen=True)
@@ -1413,6 +1462,7 @@ def supervise_campaign(
     fleet_redis_connections_max: int | None = None,
     open_powershell: bool = False,
     max_restarts: int = 3,
+    request_stall_seconds: float = _REQUEST_STALL_TIMEOUT_SECONDS,
     workers_min: int | None = None,
     workers_max: int | None = None,
 ) -> int:
@@ -1422,6 +1472,9 @@ def supervise_campaign(
     assert_manager_lock_free()
     if worker_concurrency < 1 or max_restarts < 0:
         raise ValueError("worker concurrency must be positive and max restarts non-negative")
+    request_stall_seconds = float(request_stall_seconds)
+    if request_stall_seconds < 30.0:
+        raise ValueError("request stall watchdog must be at least 30 seconds")
 
     rate_key = str(redis_rate_key or settings.dbd_redis_rate_key)
     if not rate_key.strip():
@@ -1505,6 +1558,7 @@ def supervise_campaign(
     recent_rate_limit_delta = 0
     dashboard_started_at = time.monotonic()
     progress = LiveCampaignDashboard(run_id, interval=0.5)
+    request_watchdog = RequestProgressWatchdog(request_stall_seconds)
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
         nonlocal next_index
@@ -1631,6 +1685,7 @@ def supervise_campaign(
             fleet_rate_max=plan.ceiling,
             redis_rate_key=rate_key,
             max_restarts=max_restarts,
+            request_stall_seconds=request_stall_seconds,
             rate_target=initial_rate_target,
             rate_ceiling=plan.ceiling,
             db_connections_budget=resource_plan.db_connections_budget,
@@ -1794,6 +1849,32 @@ def supervise_campaign(
             active_live = [worker for worker in live if not worker.draining and not worker.capacity_lost]
             draining_live = [worker for worker in live if worker.draining]
             effective_maximum = max(0, maximum - exhausted_capacity)
+
+            circuit_state = _fleet_circuit_state(registered_states)
+            request_stalled_for = request_watchdog.observe(
+                now=now,
+                requests=int(campaign_metrics.get("requests", 0) or 0),
+                fetch_active=int(live_metrics.get("fetch_active", 0) or 0),
+                active_work=bool(active_work and active_live),
+                control_healthy=not control_plane_degraded,
+                circuit_state=circuit_state,
+                draining=graceful_stop,
+            )
+            if request_stalled_for is not None:
+                progress.event(
+                    f"HTTP request progress stalled for {request_stalled_for:.0f}s "
+                    f"with {int(live_metrics.get('fetch_active', 0) or 0)} active fetch(es); "
+                    "recycling the local fleet for Guardian recovery"
+                )
+                exit_code = _REQUEST_STALL_EXIT_CODE
+                _contain_local_fleet(
+                    redis,
+                    run_id,
+                    children,
+                    "request_progress_stalled",
+                    grace_seconds=_FAILURE_DRAIN_SECONDS,
+                )
+                break
 
             if active_work and effective_maximum < minimum:
                 progress.event(
@@ -2170,6 +2251,8 @@ def supervise_campaign(
                     runtime_status = "paused"
                 elif exit_code == 2:
                     runtime_status = "capacity_exhausted"
+                elif exit_code == _REQUEST_STALL_EXIT_CODE:
+                    runtime_status = "request_stalled"
                 elif remaining == 0 and snapshot.get("failed", 0):
                     runtime_status = "completed_with_failures"
                 elif remaining == 0:
@@ -2195,6 +2278,7 @@ def supervise_campaign(
                     fleet_rate_max=plan.ceiling,
                     redis_rate_key=rate_key,
                     max_restarts=max_restarts,
+                    request_stall_seconds=request_stall_seconds,
                     rate_target=last_rate_target,
                     rate_ceiling=plan.ceiling,
                     db_connections_budget=resource_plan.db_connections_budget,
