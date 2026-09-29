@@ -8,9 +8,15 @@ class DbdError(Exception):
 class DbdAuthError(DbdError):
     """Raised when the anonymous auth handshake with DBD fails."""
 
+    def __init__(self, message: str = "DBD authentication failed", *, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
+
 
 class DbdForbiddenError(DbdError):
-    """Raised when DBD returns 403 even after the Chrome-cookie fallback."""
+    """Raised when DBD rejects an authenticated API request with HTTP 403."""
+
+    status_code = 403
 
 
 class DbdTokenExpiredError(DbdError):

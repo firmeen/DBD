@@ -412,6 +412,12 @@ class TerminalPresenter:
         counts.add_row("DONE", f"{done:,}", "N/A", f"{na:,}")
         counts.add_row("FAILED RESOURCES", f"{failed:,}", "REMAINING", f"{remaining:,}")
         counts.add_row("RUNNING", f"{_int(state.get('running')):,}", "PENDING", f"{_int(state.get('pending')):,}")
+        retry_wait = (
+            "included in pending"
+            if state.get("pending_includes_retry_wait") and state.get("retry_wait") is None
+            else f"{_int(state.get('retry_wait')):,}"
+        )
+        counts.add_row("RETRY WAIT", retry_wait, "", "")
 
         workers = state.get("worker_states") or {}
         metrics = state.get("worker_metrics") or {}
@@ -432,12 +438,17 @@ class TerminalPresenter:
             f"restarts {_int(supervisor.get('restarts'))} · lost {_int(supervisor.get('exhausted_capacity'))}",
         )
         fleet.add_row(
+            "CONTROL",
+            f"{str(state.get('control_status') or 'unknown').upper()} · "
+            f"circuit {str(state.get('circuit_state') or 'unknown').upper()}",
+        )
+        fleet.add_row(
             "HTTP",
             f"observed {_rate(supervisor.get('http_rate_observed'))} · "
             f"effective {_rate(state.get('effective_rate'))} · "
             f"target {_rate(state.get('rate_target'))} · "
             f"retries {_int(metrics.get('http_retries')):,} · "
-            f"429/503 {_int(metrics.get('rate_limit_hits')):,}",
+            f"rate pressure {_int(metrics.get('rate_limit_hits')):,}",
         )
         fleet.add_row(
             "PIPELINE",
@@ -522,6 +533,7 @@ class TerminalPresenter:
     def failure_diagnostics(self, diagnostics: Mapping[str, Any]) -> None:
         by_endpoint = list(diagnostics.get("by_endpoint") or [])
         latest_errors = list(diagnostics.get("latest_errors") or [])
+        failure_events = list(diagnostics.get("failure_events") or [])
         if by_endpoint:
             table = Table(title="FAILED RESOURCES BY ENDPOINT", box=box.SIMPLE_HEAVY)
             table.caption = "Exact durable endpoint-bit counts"
@@ -552,6 +564,21 @@ class TerminalPresenter:
                     str(row.get("stage") or "unknown"),
                     str(row.get("status") or "unknown"),
                     f"{_int(row.get('states')):,}",
+                )
+            self.console.print(table)
+
+        if failure_events:
+            table = Table(title="DURABLE FAILURE EVENT HISTORY", box=box.SIMPLE_HEAVY)
+            for name in ("ERROR", "HTTP", "STAGE", "OUTCOME", "EVENTS", "SAMPLE"):
+                table.add_column(name)
+            for row in failure_events:
+                table.add_row(
+                    str(row.get("error_code") or "unknown"),
+                    str(row.get("http_status") or "--"),
+                    str(row.get("stage") or "unknown"),
+                    str(row.get("outcome") or "unknown"),
+                    f"{_int(row.get('events')):,}",
+                    str(row.get("sample_message") or "")[:72],
                 )
             self.console.print(table)
 

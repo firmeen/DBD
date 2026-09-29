@@ -44,6 +44,7 @@ class Settings(BaseSettings):
     dbd_materialize_batch_size: int = Field(1000, ge=100, le=5000)
     dbd_queue_size: int = Field(64, ge=1, le=10000)
     dbd_pipeline_queue_size: int = Field(512, ge=8, le=100000)
+    dbd_fetch_claim_window_factor: int = Field(2, ge=1, le=16)
     dbd_claim_batch_size: int = Field(64, ge=1, le=1000)
     dbd_archive_batch_size: int = Field(32, ge=1, le=1000)
     dbd_archive_workers: int = Field(2, ge=1, le=32)
@@ -61,6 +62,7 @@ class Settings(BaseSettings):
     dbd_lease_seconds: int = Field(300, ge=30)
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
+    dbd_upstream_defer_seconds: int = Field(30, ge=1, le=3600)
     dbd_refresh_stale_hours: dict[str, float] = Field(
         default_factory=lambda: {
             "profile": 24.0,
