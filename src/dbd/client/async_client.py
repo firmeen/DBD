@@ -35,6 +35,7 @@ from .rate_limit import TokenBucket, protective_cooldown
 from .session import WARMUP_PAGE_URL, create_session
 
 _AUTH_RECOVERY_COOLDOWN_SECONDS = 5.0
+_AUTH_REQUEST_TIMEOUT_SECONDS = min(10.0, float(settings.request_timeout))
 
 
 def _curl_code(exc) -> object:
@@ -219,7 +220,11 @@ class AsyncDbdClient:
                 continue
 
     def _blocking_token(self):
-        return self._auth.get_token(self._auth_session)
+        return self._auth.get_token(
+            self._auth_session,
+            max_attempts=1,
+            timeout_seconds=_AUTH_REQUEST_TIMEOUT_SECONDS,
+        )
 
     def _headers(self, token, referer):
         return {
