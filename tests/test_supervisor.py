@@ -665,7 +665,7 @@ def test_collector_handoff_status_skips_redis_when_not_configured(monkeypatch) -
     }
 
 
-def test_collector_handoff_status_reports_registered_legacy_worker(monkeypatch) -> None:
+def test_collector_handoff_status_reports_registered_campaign_worker(monkeypatch) -> None:
     class FakeRedis:
         def ping(self):
             return True
@@ -677,13 +677,13 @@ def test_collector_handoff_status_reports_registered_legacy_worker(monkeypatch) 
             return False
 
         def smembers(self, key):
-            return {"legacy-worker"}
+            return {"campaign-worker"}
 
         def mget(self, keys):
             return [
                 json.dumps(
                     {
-                        "worker_id": "legacy-worker",
+                        "worker_id": "campaign-worker",
                         "status": "active",
                         "heartbeat_at": time.time(),
                     }
@@ -733,12 +733,12 @@ def test_collector_handoff_status_fails_closed_when_redis_is_unavailable(
         ),
     )
 
-    with pytest.raises(RuntimeError, match="Cannot prove the legacy runtime is offline"):
+    with pytest.raises(RuntimeError, match="Cannot prove the Campaign runtime is offline"):
         supervisor.collector_handoff_status(9)
 
 
 
-def test_legacy_supervisor_refuses_active_collector_before_redis_start(
+def test_campaign_supervisor_refuses_active_collector_before_redis_start(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(

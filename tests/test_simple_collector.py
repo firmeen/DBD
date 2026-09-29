@@ -308,7 +308,7 @@ def test_postflight_invariants_fail_closed(exact, message) -> None:
 
 
 @pytest.mark.asyncio
-async def test_legacy_handoff_refuses_supervisor_or_registered_workers(monkeypatch) -> None:
+async def test_campaign_handoff_refuses_supervisor_or_registered_workers(monkeypatch) -> None:
     monkeypatch.setattr(
         collector_runtime,
         "settings",
@@ -324,15 +324,15 @@ async def test_legacy_handoff_refuses_supervisor_or_registered_workers(monkeypat
         },
     )
 
-    with pytest.raises(RuntimeError, match="legacy runtime is still active"):
-        await collector_runtime._assert_legacy_runtime_offline(9)
+    with pytest.raises(RuntimeError, match="Campaign runtime is still active"):
+        await collector_runtime._assert_campaign_runtime_offline(9)
 
 
 
 
 
 @pytest.mark.asyncio
-async def test_legacy_handoff_skips_legacy_import_when_redis_is_not_configured(
+async def test_campaign_handoff_skips_campaign_import_when_redis_is_not_configured(
     monkeypatch,
 ) -> None:
     monkeypatch.setattr(
@@ -341,7 +341,7 @@ async def test_legacy_handoff_skips_legacy_import_when_redis_is_not_configured(
         SimpleNamespace(dbd_redis_url=None),
     )
 
-    status = await collector_runtime._assert_legacy_runtime_offline(9)
+    status = await collector_runtime._assert_campaign_runtime_offline(9)
 
     assert status["redis_configured"] is False
     assert status["supervisor_active"] is False
@@ -369,7 +369,7 @@ async def test_collector_preflight_refuses_live_foreign_leases_before_reclaim(
     async def schema_ready(repo):
         return "0012_run9_data_repair"
 
-    async def legacy_offline(run_id):
+    async def campaign_offline(run_id):
         return {
             "control_status": "offline",
             "supervisor_active": False,
@@ -379,8 +379,8 @@ async def test_collector_preflight_refuses_live_foreign_leases_before_reclaim(
     monkeypatch.setattr(collector_runtime, "_assert_schema_ready", schema_ready)
     monkeypatch.setattr(
         collector_runtime,
-        "_assert_legacy_runtime_offline",
-        legacy_offline,
+        "_assert_campaign_runtime_offline",
+        campaign_offline,
     )
 
     with pytest.raises(RuntimeError, match="still has 2 live durable lease"):
@@ -414,7 +414,7 @@ async def test_collector_preflight_reclaims_only_expired_process_loss(
     async def schema_ready(repo):
         return "0012_run9_data_repair"
 
-    async def legacy_offline(run_id):
+    async def campaign_offline(run_id):
         return {
             "control_status": "offline",
             "supervisor_active": False,
@@ -424,8 +424,8 @@ async def test_collector_preflight_reclaims_only_expired_process_loss(
     monkeypatch.setattr(collector_runtime, "_assert_schema_ready", schema_ready)
     monkeypatch.setattr(
         collector_runtime,
-        "_assert_legacy_runtime_offline",
-        legacy_offline,
+        "_assert_campaign_runtime_offline",
+        campaign_offline,
     )
 
     repo = FakeRepo()

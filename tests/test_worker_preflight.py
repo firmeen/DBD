@@ -72,10 +72,10 @@ class _ManagerFenceRepo:
         self.engine = _ManagerFenceEngine(available)
 
 
-async def test_legacy_manager_fence_allows_worker_when_collector_is_absent():
+async def test_campaign_manager_fence_allows_worker_when_collector_is_absent():
     await _assert_distributed_manager_free(_ManagerFenceRepo(1))
 
 
-async def test_legacy_manager_fence_stops_worker_when_collector_is_active():
+async def test_campaign_manager_fence_stops_worker_when_collector_is_active():
     with pytest.raises(RuntimeError, match="collector/API manager became active"):
         await _assert_distributed_manager_free(_ManagerFenceRepo(0))

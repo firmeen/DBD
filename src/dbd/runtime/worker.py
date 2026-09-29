@@ -370,7 +370,7 @@ async def _release_queued_fetch_work(repo, owner: str, queue: asyncio.Queue) -> 
 
 
 async def _assert_distributed_manager_free(repo) -> None:
-    """Fail a legacy distributed worker once a single-process manager is active."""
+    """Stop a production distributed worker if the diagnostic collector owns the manager lock."""
     async with repo.engine.connect() as conn:
         available = (
             await conn.execute(
@@ -383,7 +383,7 @@ async def _assert_distributed_manager_free(repo) -> None:
     if int(available or 0) != 1:
         raise RuntimeError(
             "Single-process DBD collector/API manager became active; "
-            "legacy distributed worker is stopping"
+            "production distributed worker is stopping"
         )
 
 
@@ -404,8 +404,9 @@ async def process(
 ):
     """Run staged claim -> fetch -> archive -> project with graceful draining.
 
-    The default collector uses this pipeline in one Python process without Redis.
-    Distributed coordination remains available only for legacy compatibility.
+    The pipeline supports both production distributed Campaign workers and the
+    explicit single-process diagnostic collector. Production distributed workers
+    retain Redis coordination and shared admission/rate control.
     """
     fetch_workers = concurrency if concurrency is not None else settings.dbd_concurrency
     if not 1 <= fetch_workers <= 256 or (limit is not None and limit < 1):
@@ -482,7 +483,7 @@ async def process(
         )
         try:
             # Registration is serialized with collector handoff. Once the
-            # collector owns the long-lived manager lock, a legacy worker may
+            # collector owns the long-lived manager lock, a production worker may
             # not join the run later and create a second HTTP engine.
             with runtime_handoff_lock():
                 assert_manager_lock_free()
@@ -754,7 +755,7 @@ async def process(
             project_batch = []
             fetch_batch = []
 
-            # Legacy distributed workers serialize their manager check and
+            # Production distributed workers serialize their manager check and
             # durable claims with collector startup. The single-process
             # collector takes the no-op branch and pays no hot-path lock cost.
             claim_fence = runtime_handoff_lock() if distributed else nullcontext()

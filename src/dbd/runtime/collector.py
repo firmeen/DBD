@@ -155,9 +155,9 @@ async def _assert_schema_ready(repo) -> str:
     return expected_revision
 
 
-async def _assert_legacy_runtime_offline(run_id: int) -> dict:
-    # This is a startup-only migration fence. Keep legacy Redis imports out of
-    # collector startup entirely when no legacy control plane is configured.
+async def _assert_campaign_runtime_offline(run_id: int) -> dict:
+    # This is a startup-only diagnostic handoff fence. Keep Campaign/Redis imports
+    # out of collector startup when no production Redis control plane is configured.
     if not settings.dbd_redis_url:
         return {
             "redis_configured": False,
@@ -173,7 +173,7 @@ async def _assert_legacy_runtime_offline(run_id: int) -> dict:
     workers = int(status.get("workers", 0) or 0)
     if supervisor_active or workers:
         raise RuntimeError(
-            "Collector handoff refused: legacy runtime is still active "
+            "Collector handoff refused: Campaign runtime is still active "
             f"(supervisor_active={supervisor_active}, workers={workers}, "
             f"control_status={status.get('control_status', 'unknown')!r})"
         )
@@ -188,10 +188,10 @@ async def _collector_preflight(repo, run_id: int, *, health=None) -> dict:
     # Constructing the backend validates archive configuration before any claim.
     _ = repo.archive_backend
 
-    # Serialize this migration gate against legacy distributed-worker startup.
+    # Serialize this diagnostic handoff against production distributed-worker startup.
     # The CLI already holds the long-lived manager lock for the collector.
     with runtime_handoff_lock():
-        legacy = await _assert_legacy_runtime_offline(run_id)
+        legacy = await _assert_campaign_runtime_offline(run_id)
 
         leases = await repo.collector_lease_summary(run_id)
         if int(leases.get("invalid", 0) or 0):
@@ -220,8 +220,8 @@ async def _collector_preflight(repo, run_id: int, *, health=None) -> dict:
     return {
         "schema_revision": schema_revision,
         "archive_backend": settings.dbd_archive_backend,
-        "legacy_control": str(legacy.get("control_status") or "offline"),
-        "legacy_workers": int(legacy.get("workers", 0) or 0),
+        "campaign_control": str(legacy.get("control_status") or "offline"),
+        "campaign_workers": int(legacy.get("workers", 0) or 0),
         "reclaimed_leases": int(reclaimed),
     }
 

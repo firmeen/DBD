@@ -1059,7 +1059,7 @@ def _acquire_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
 
 
 def _activate_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
-    """Atomically fence legacy Supervisor activation against collector startup."""
+    """Fence production Supervisor activation against explicit collector startup."""
     with runtime_handoff_lock():
         assert_manager_lock_free()
         redis.ping()
@@ -2344,11 +2344,11 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
 
 
 def collector_handoff_status(run_id: int) -> dict:
-    """Fail-closed startup view used when switching from the legacy fleet.
+    """Fail-closed startup view for the explicit diagnostic collector handoff.
 
-    Redis is intentionally not part of the collector HTTP hot path. When a
-    legacy Redis control plane is configured, however, startup must prove that
-    no Supervisor or registered distributed worker can race the new collector.
+    Campaign is the production runtime. Before a diagnostic collector starts,
+    Redis must prove that no production Supervisor or registered distributed
+    worker can overlap the single-process diagnostic path.
     """
     if not settings.dbd_redis_url:
         return {
@@ -2380,7 +2380,7 @@ def collector_handoff_status(run_id: int) -> dict:
         }
     except Exception as exc:
         raise RuntimeError(
-            "Cannot prove the legacy runtime is offline because its Redis "
+            "Cannot prove the Campaign runtime is offline because its Redis "
             "control plane is unavailable"
         ) from exc
     finally:

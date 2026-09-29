@@ -22,7 +22,7 @@ def assert_manager_lock(conn) -> None:
 def assert_manager_lock_free() -> None:
     """Fail if the single-process API manager lock is currently owned.
 
-    Legacy distributed workers call this once before registration/claiming so a
+    Production distributed workers call this before registration/claiming so a
     collector that already owns the manager lock cannot be joined later by the
     old runtime.
     """
@@ -38,10 +38,10 @@ def assert_manager_lock_free() -> None:
 
 @contextmanager
 def runtime_handoff_lock(timeout_seconds: int = 5):
-    """Serialize legacy-worker registration against collector handoff.
+    """Serialize production-worker registration against diagnostic collector handoff.
 
     The collector keeps the normal API manager lock for its full lifetime. This
-    short lock only closes the startup race between that collector and legacy
+    short lock only closes the startup race between that collector and production
     distributed workers registering themselves.
     """
     timeout = max(0, int(timeout_seconds))
