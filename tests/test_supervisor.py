@@ -1124,6 +1124,52 @@ def test_worker_progress_watchdog_does_not_treat_admission_only_as_http_progress
     ) == 90.0
 
 
+def test_worker_progress_watchdog_respects_full_shared_admission_wait() -> None:
+    watchdog = WorkerProgressWatchdog(timeout_seconds=90.0)
+    state = {
+        "fetch_active": 8,
+        "requests": 90,
+        "responses": 90,
+        "shared_admission_waiting": True,
+        "shared_admission_waiters": 8,
+    }
+    watchdog.observe(
+        "worker-a",
+        state,
+        now=0.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    )
+    assert watchdog.observe(
+        "worker-a",
+        state,
+        now=120.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    ) is None
+
+    state["shared_admission_waiting"] = False
+    state["shared_admission_waiters"] = 0
+    assert watchdog.observe(
+        "worker-a",
+        state,
+        now=209.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    ) is None
+    assert watchdog.observe(
+        "worker-a",
+        state,
+        now=210.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    ) == 90.0
+
+
 def test_worker_progress_watchdog_does_not_ignore_local_open_circuit_forever() -> None:
     watchdog = WorkerProgressWatchdog(timeout_seconds=90.0)
     state = {
