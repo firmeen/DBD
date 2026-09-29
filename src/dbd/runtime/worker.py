@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import os
 import time
-from contextlib import nullcontext
 from pathlib import Path
 from uuid import uuid4
 
@@ -376,8 +375,9 @@ async def _assert_distributed_manager_free(repo) -> None:
             await conn.execute(
                 text(
                     "SELECT IS_FREE_LOCK("
-                    "CONCAT(DATABASE(), ':dbd-api-manager'))"
-                )
+                    "CONCAT(DATABASE(), :manager_lock_suffix))"
+                ),
+                {"manager_lock_suffix": ":dbd-api-manager"},
             )
         ).scalar_one()
     if int(available or 0) != 1:
@@ -755,36 +755,36 @@ async def process(
             project_batch = []
             fetch_batch = []
 
-            # Production distributed workers serialize their manager check and
-            # durable claims with collector startup. The single-process
-            # collector takes the no-op branch and pays no hot-path lock cost.
-            claim_fence = runtime_handoff_lock() if distributed else nullcontext()
-            with claim_fence:
-                if distributed:
-                    await _assert_distributed_manager_free(repo)
+            # Registration/startup is serialized by runtime_handoff_lock().
+            # The hot claim path must never serialize independent production
+            # workers on one global named lock. A cheap manager-lock visibility
+            # check is sufficient here: if the explicit diagnostic collector
+            # owns the manager lock, stop before claiming more durable work.
+            if distributed:
+                await _assert_distributed_manager_free(repo)
 
-                if project_room > 0:
-                    project_batch = await repo.claim_project_batch(
-                        run_id, owner, min(batch_limit, project_room)
-                    )
-                    claimed_attempts += len(project_batch)
-
-                remaining = (
-                    None if limit is None else max(0, limit - claimed_attempts)
+            if project_room > 0:
+                project_batch = await repo.claim_project_batch(
+                    run_id, owner, min(batch_limit, project_room)
                 )
-                if remaining is None or remaining > 0:
-                    if fetch_room > 0:
-                        take = min(settings.dbd_claim_batch_size, fetch_room)
-                        if remaining is not None:
-                            take = min(take, remaining)
-                        if take > 0:
-                            fetch_batch = await repo.claim_batch(
-                                run_id,
-                                owner,
-                                stage="fetch",
-                                limit=take,
-                            )
-                            claimed_attempts += len(fetch_batch)
+                claimed_attempts += len(project_batch)
+
+            remaining = (
+                None if limit is None else max(0, limit - claimed_attempts)
+            )
+            if remaining is None or remaining > 0:
+                if fetch_room > 0:
+                    take = min(settings.dbd_claim_batch_size, fetch_room)
+                    if remaining is not None:
+                        take = min(take, remaining)
+                    if take > 0:
+                        fetch_batch = await repo.claim_batch(
+                            run_id,
+                            owner,
+                            stage="fetch",
+                            limit=take,
+                        )
+                        claimed_attempts += len(fetch_batch)
 
             for task in project_batch:
                 if task.get("status") == "retry_wait":
