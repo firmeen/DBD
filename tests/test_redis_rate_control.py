@@ -173,3 +173,42 @@ async def test_one_workers_local_global_circuit_does_not_block_peer():
             await endpoint.clear_state()
         await first.close()
         await second.close()
+
+async def test_hard_fleet_admission_ignores_stale_global_penalty_and_cooldown():
+    key = "dbd:test-hard-cap:" + uuid4().hex
+    controller = EndpointRateController(
+        1000,
+        redis_url=REDIS_URL,
+        redis_key=key,
+        shared_rate_ceiling=100,
+    )
+    await controller.open()
+    try:
+        redis = controller._redis
+        assert redis is not None
+        await redis.set(f"{key}:target-rate", "100", px=60_000)
+        await redis.set(f"{key}:effective-rate", "0.5", px=60_000)
+        await redis.set(
+            f"{key}:cooldown-until-ms",
+            str(int(time.time() * 1000) + 60_000),
+            px=60_000,
+        )
+        await redis.set(key, str(int(time.time() * 1000)), px=60_000)
+
+        started = time.perf_counter()
+        admission = await controller.acquire("profile")
+        elapsed = time.perf_counter() - started
+
+        assert admission.shared is True
+        assert elapsed < 0.5
+        assert controller._global_shared is not None
+        assert controller._global_shared.rate == pytest.approx(100)
+        assert float(await redis.get(f"{key}:effective-rate")) == pytest.approx(100)
+    finally:
+        if controller._global_shared is not None:
+            await controller._global_shared.clear_state()
+        endpoint = controller._shared_endpoint("profile")
+        if endpoint is not None:
+            await endpoint.clear_state()
+        await controller.close()
+
