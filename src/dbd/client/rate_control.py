@@ -608,64 +608,42 @@ return {
         )
         keys = self._shared_keys(endpoint)
 
-        while True:
-            probe_token = None
-            started = time.perf_counter()
-            try:
-                result = await self._admission_script(
-                    keys=keys,
-                    args=[
-                        "1" if endpoint is not None else "0",
-                        self.shared_rate_ceiling,
-                        endpoint_ceiling,
-                        self._global_shared._state_ttl_ms,
-                    ],
-                )
-            finally:
-                self._observe_redis_command("admission", started)
-
-            wait_ms = max(0.0, float(result[0]))
-            mode = str(result[3])
-            global_state = str(result[4])
-            endpoint_state = str(result[5]) if endpoint is not None else None
-            if mode == "circuit":
-                # Respect the durable circuit window instead of waking every
-                # coroutine roughly once per second. Cap the sleep so callers
-                # notice a successful HALF_OPEN probe promptly.
-                wait_seconds = max(wait_ms / 1000.0, 0.05)
-                wait_cap = max(1.0, min(5.0, self._breaker.open_seconds / 2.0))
-                await self._sleep_shared_admission(
-                    min(wait_seconds, wait_cap),
-                    "shared_circuit",
-                )
-                continue
-
-            global_rate = float(result[1])
-            global_target = float(result[6])
-            self._global_shared.rate = global_rate
-            self._global_recovery_target = global_target
-            self._global_recovery_needed = global_rate < global_target
-            if shared_endpoint is not None and result[2] != "":
-                endpoint_rate = float(result[2])
-                endpoint_target = float(result[7])
-                shared_endpoint.rate = endpoint_rate
-                self._endpoint_recovery_targets[endpoint] = endpoint_target
-                if endpoint_rate < endpoint_target:
-                    self._endpoint_recovery_needed.add(endpoint)
-                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
-            EFFECTIVE_RATE.set(global_rate)
-            self.redis_admissions += 1
-            if wait_ms > 0:
-                await self._sleep_shared_admission(
-                    wait_ms / 1000.0,
-                    "shared_pacing",
-                )
-            return AdmissionState(
-                global_state=global_state,
-                endpoint_state=endpoint_state,
-                probe_token=probe_token,
-                shared=True,
+        started = time.perf_counter()
+        try:
+            result = await self._admission_script(
+                keys=keys,
+                args=[
+                    "1" if endpoint is not None else "0",
+                    self.shared_rate_ceiling,
+                    endpoint_ceiling,
+                    self._global_shared._state_ttl_ms,
+                ],
             )
+        finally:
+            self._observe_redis_command("admission", started)
+
+        wait_ms = max(0.0, float(result[0]))
+        global_rate = float(result[1])
+        global_target = float(result[6])
+        self._global_shared.rate = global_rate
+        self._global_recovery_target = global_target
+        self._global_recovery_needed = False
+        if shared_endpoint is not None and result[2] != "":
+            endpoint_rate = float(result[2])
+            endpoint_target = float(result[7])
+            shared_endpoint.rate = endpoint_rate
+            self._endpoint_recovery_targets[endpoint] = endpoint_target
+            if endpoint_rate < endpoint_target:
+                self._endpoint_recovery_needed.add(endpoint)
+            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
+        EFFECTIVE_RATE.set(global_rate)
+        self.redis_admissions += 1
+        if wait_ms > 0:
+            await self._sleep_shared_admission(
+                wait_ms / 1000.0,
+                "shared_pacing",
+            )
+        return AdmissionState(shared=True)
 
     async def _shared_success_recovery(
         self,
@@ -674,20 +652,16 @@ return {
     ) -> tuple[float | None, float | None]:
         if self._redis is None:
             return None, None
-        # Circuit transitions are worker-local. Shared Redis recovery handles
-        # only endpoint pacing state, never circuit ownership.
-        half_open = False
+        # Shared recovery exists only for endpoint rate-pressure state. The
+        # fleet-global lane is a fixed hard ceiling and availability circuits
+        # are worker-local.
         endpoint_needs_recovery = (
             endpoint is not None and endpoint in self._endpoint_recovery_needed
         )
         now = time.monotonic()
-        if (
-            not half_open
-            and not self._global_recovery_needed
-            and not endpoint_needs_recovery
-        ):
+        if not endpoint_needs_recovery:
             return None, None
-        if not half_open and now < self._next_shared_recovery_at:
+        if now < self._next_shared_recovery_at:
             return None, None
 
         if self._success_script is None:
@@ -790,14 +764,12 @@ return {
         await self._global_local.acquire()
 
         # Redis admission is only the shared fleet/endpoint pacing fence.
-        # The Lua circuit slots use a versioned namespace that this local
-        # breaker never writes, so stale shared circuit state cannot gate calls.
+        # No availability circuit state is read from or written to Redis here.
         shared = await self._shared_admit(endpoint)
         return AdmissionState(
             global_state=global_state,
             endpoint_state=endpoint_state,
-            probe_token=shared.probe_token,
-            shared=True,
+            shared=shared.shared,
         )
 
     async def availability_failure(self, endpoint: str | None = None) -> str:
