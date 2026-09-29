@@ -154,10 +154,14 @@ class AsyncDbdClient:
             self.auth_failures += 1
             self.last_auth_error_at = time.time()
             self._remember_error(exc)
-            self._auth_backoff_until = (
-                time.monotonic() + _AUTH_RECOVERY_COOLDOWN_SECONDS
-            )
-            await self.endpoint_rate.availability_failure()
+            availability_state = await self.endpoint_rate.availability_failure()
+            cooldown = _AUTH_RECOVERY_COOLDOWN_SECONDS
+            if availability_state == "open":
+                cooldown = max(
+                    cooldown,
+                    float(settings.dbd_circuit_open_seconds),
+                )
+            self._auth_backoff_until = time.monotonic() + cooldown
             raise
         self._token = token
         self._auth_backoff_until = 0.0
