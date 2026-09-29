@@ -601,6 +601,9 @@ return {
         self._last_endpoint_circuit_state: dict[str, str] = {}
         self.redis_commands = 0
         self.redis_admissions = 0
+        self.shared_admission_waiters = 0
+        self.shared_admission_wait_until = 0.0
+        self.shared_admission_wait_reason: str | None = None
         # Availability/circuit state is deliberately worker-local. Redis remains
         # responsible for fleet pacing and endpoint-specific upstream pressure,
         # but one worker's auth/session/transport outage must never stop peers.
@@ -713,6 +716,28 @@ return {
             for state in ("in_use", "available", "created", "max"):
                 REDIS_POOL_CONNECTIONS.labels(state).set(snapshot[state])
 
+    async def _sleep_shared_admission(self, seconds: float, reason: str) -> None:
+        """Expose intentional Redis pacing waits so worker health does not misclassify them."""
+        seconds = max(0.0, float(seconds))
+        if seconds <= 0:
+            return
+        self.shared_admission_waiters += 1
+        self.shared_admission_wait_until = max(
+            self.shared_admission_wait_until,
+            time.time() + seconds,
+        )
+        self.shared_admission_wait_reason = str(reason)
+        try:
+            await asyncio.sleep(seconds)
+        finally:
+            self.shared_admission_waiters = max(
+                0,
+                self.shared_admission_waiters - 1,
+            )
+            if self.shared_admission_waiters == 0:
+                self.shared_admission_wait_until = 0.0
+                self.shared_admission_wait_reason = None
+
     async def _shared_admit(self, endpoint: str | None) -> AdmissionState:
         if self._redis is None:
             raise RuntimeError("Shared Redis admission is not configured")
@@ -758,7 +783,10 @@ return {
                 # notice a successful HALF_OPEN probe promptly.
                 wait_seconds = max(wait_ms / 1000.0, 0.05)
                 wait_cap = max(1.0, min(5.0, self._breaker.open_seconds / 2.0))
-                await asyncio.sleep(min(wait_seconds, wait_cap))
+                await self._sleep_shared_admission(
+                    min(wait_seconds, wait_cap),
+                    "shared_circuit",
+                )
                 continue
 
             global_rate = float(result[1])
@@ -777,7 +805,10 @@ return {
             EFFECTIVE_RATE.set(global_rate)
             self.redis_admissions += 1
             if wait_ms > 0:
-                await asyncio.sleep(wait_ms / 1000.0)
+                await self._sleep_shared_admission(
+                    wait_ms / 1000.0,
+                    "shared_pacing",
+                )
             return AdmissionState(
                 global_state=global_state,
                 endpoint_state=endpoint_state,
