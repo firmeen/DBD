@@ -314,19 +314,39 @@ local function pacing_state(
   local base_ms = math.max(now_ms, cooldown_until)
   local next_ms = tonumber(redis.call('GET', next_key) or base_ms)
   if next_ms < base_ms then next_ms = base_ms end
-  return rate, next_ms, target
+  return rate, next_ms, target, cooldown_until
 end
 
-local global_rate, global_next, global_target = pacing_state(
+local global_rate, global_next, global_target, global_cooldown = pacing_state(
   KEYS[1], KEYS[2], KEYS[3], KEYS[5], global_ceiling, false
 )
 local endpoint_rate = 0
 local endpoint_next = now_ms
 local endpoint_target = endpoint_ceiling
+local endpoint_cooldown = 0
 if has_endpoint then
-  endpoint_rate, endpoint_next, endpoint_target = pacing_state(
+  endpoint_rate, endpoint_next, endpoint_target, endpoint_cooldown = pacing_state(
     KEYS[6], KEYS[7], KEYS[8], KEYS[10], endpoint_ceiling, true
   )
+
+  -- Endpoint-specific pacing must never reserve the global fleet cursor far
+  -- into the future. Otherwise one endpoint Retry-After/penalty would stall
+  -- unrelated endpoints even though the global fleet hard cap is healthy.
+  local endpoint_constrained = endpoint_cooldown > now_ms
+    or endpoint_rate < endpoint_target
+    or endpoint_target < global_target
+  if endpoint_constrained and endpoint_next > now_ms then
+    return {
+      tostring(endpoint_next - now_ms),
+      tostring(global_rate),
+      tostring(endpoint_rate),
+      'endpoint_wait',
+      'closed',
+      'closed',
+      tostring(global_target),
+      tostring(endpoint_target)
+    }
+  end
 end
 
 local admit_ms = math.max(now_ms, global_next, endpoint_next)
@@ -603,39 +623,53 @@ return {
         )
         keys = self._shared_keys(endpoint)
 
-        started = time.perf_counter()
-        try:
-            result = await self._admission_script(
-                keys=keys,
-                args=[
-                    "1" if endpoint is not None else "0",
-                    self.shared_rate_ceiling,
-                    endpoint_ceiling,
-                    self._global_shared._state_ttl_ms,
-                ],
-            )
-        finally:
-            self._observe_redis_command("admission", started)
+        while True:
+            started = time.perf_counter()
+            try:
+                result = await self._admission_script(
+                    keys=keys,
+                    args=[
+                        "1" if endpoint is not None else "0",
+                        self.shared_rate_ceiling,
+                        endpoint_ceiling,
+                        self._global_shared._state_ttl_ms,
+                    ],
+                )
+            finally:
+                self._observe_redis_command("admission", started)
 
-        wait_ms = max(0.0, float(result[0]))
-        global_rate = float(result[1])
-        global_target = float(result[6])
-        self._global_shared.rate = global_rate
-        if shared_endpoint is not None and result[2] != "":
-            endpoint_rate = float(result[2])
-            endpoint_target = float(result[7])
-            shared_endpoint.rate = endpoint_rate
-            if endpoint_rate < endpoint_target:
-                self._endpoint_recovery_needed.add(endpoint)
-            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
-        EFFECTIVE_RATE.set(global_rate)
-        self.redis_admissions += 1
-        if wait_ms > 0:
-            await self._sleep_shared_admission(
-                wait_ms / 1000.0,
-                "shared_pacing",
-            )
-        return AdmissionState(shared=True)
+            wait_ms = max(0.0, float(result[0]))
+            mode = str(result[3])
+            global_rate = float(result[1])
+            global_target = float(result[6])
+            self._global_shared.rate = global_rate
+            if shared_endpoint is not None and result[2] != "":
+                endpoint_rate = float(result[2])
+                endpoint_target = float(result[7])
+                shared_endpoint.rate = endpoint_rate
+                if endpoint_rate < endpoint_target:
+                    self._endpoint_recovery_needed.add(endpoint)
+                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
+            EFFECTIVE_RATE.set(global_rate)
+
+            if mode == "endpoint_wait":
+                # The endpoint lane has not reserved a global slot. Sleep until
+                # that endpoint can compete again, then retry the atomic fleet
+                # reservation so unrelated endpoints keep using the hard cap.
+                if wait_ms > 0:
+                    await self._sleep_shared_admission(
+                        wait_ms / 1000.0,
+                        "endpoint_pacing",
+                    )
+                continue
+
+            self.redis_admissions += 1
+            if wait_ms > 0:
+                await self._sleep_shared_admission(
+                    wait_ms / 1000.0,
+                    "shared_pacing",
+                )
+            return AdmissionState(shared=True)
 
     async def _shared_success_recovery(
         self,
@@ -721,34 +755,35 @@ return {
         EFFECTIVE_RATE.set(self._global_effective())
         return self.target_rate
 
-    async def acquire(self, endpoint: str | None) -> AdmissionState:
-        if self._redis is None:
-            global_state = await self._breaker.before("__global__")
-            self._last_global_circuit_state = global_state
-            endpoint_state = None
-            if endpoint is not None:
-                endpoint_state = await self._breaker.before(endpoint)
-                self._last_endpoint_circuit_state[endpoint] = endpoint_state
-                await self._bucket(endpoint).acquire()
-                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(
-                    self._endpoint_effective(endpoint)
-                )
-            await self._global_local.acquire()
-            EFFECTIVE_RATE.set(self._global_effective())
-            return AdmissionState(
-                global_state=global_state,
-                endpoint_state=endpoint_state,
-                shared=False,
-            )
+    async def wait_available(self, endpoint: str | None = None) -> AdmissionState:
+        """Wait only on this worker's availability circuit; do not consume pacing."""
 
-        # Availability circuits are worker-local. A broken auth/session or
-        # transport path in one process therefore cannot block healthy peers.
         global_state = await self._breaker.before("__global__")
         self._last_global_circuit_state = global_state
         endpoint_state = None
         if endpoint is not None:
             endpoint_state = await self._breaker.before(endpoint)
             self._last_endpoint_circuit_state[endpoint] = endpoint_state
+        return AdmissionState(
+            global_state=global_state,
+            endpoint_state=endpoint_state,
+            shared=False,
+        )
+
+    async def acquire(self, endpoint: str | None) -> AdmissionState:
+        availability = await self.wait_available(endpoint)
+
+        if self._redis is None:
+            if endpoint is not None:
+                await self._bucket(endpoint).acquire()
+                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(
+                    self._endpoint_effective(endpoint)
+                )
+            await self._global_local.acquire()
+            EFFECTIVE_RATE.set(self._global_effective())
+            return availability
+
+        if endpoint is not None:
             await self._bucket(endpoint).acquire()
         await self._global_local.acquire()
 
@@ -756,8 +791,8 @@ return {
         # No availability circuit state is read from or written to Redis here.
         shared = await self._shared_admit(endpoint)
         return AdmissionState(
-            global_state=global_state,
-            endpoint_state=endpoint_state,
+            global_state=availability.global_state,
+            endpoint_state=availability.endpoint_state,
             shared=shared.shared,
         )
 
