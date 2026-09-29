@@ -248,6 +248,64 @@ async def _prepare_campaign(args) -> int:
         await engine.dispose()
 
 
+async def _recover_campaign(args) -> dict:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        source = await repo.get_run(args.source_run_id)
+        scheduler_repo = repo.for_run(source)
+        if scheduler_repo.scheduler_mode != "fabric_v2":
+            raise ValueError("campaign recover requires a fabric_v2 source run")
+        if not args.execute:
+            plan = await scheduler_repo.recovery_plan(args.source_run_id)
+            return {
+                **plan,
+                "action": "plan_only",
+                "next_command": (
+                    f"dbd-data campaign recover {int(args.source_run_id)} --execute"
+                ),
+            }
+        return await scheduler_repo.create_recovery_run(
+            args.source_run_id,
+            recovery_run_id=args.recovery_run_id,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _campaign_evidence(args) -> dict:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        run = await repo.get_run(args.run_id)
+        scheduler_repo = repo.for_run(run)
+        if scheduler_repo.scheduler_mode != "fabric_v2":
+            raise ValueError("campaign evidence requires a fabric_v2 run")
+        return await scheduler_repo.repair_evidence(
+            args.run_id,
+            limit=args.limit,
+            sample_limit=args.samples,
+        )
+    finally:
+        await engine.dispose()
+
+
+async def _campaign_repair(args) -> dict:
+    engine = create_engine()
+    repo = WorkerRepository(engine)
+    try:
+        run = await repo.get_run(args.run_id)
+        scheduler_repo = repo.for_run(run)
+        if scheduler_repo.scheduler_mode != "fabric_v2":
+            raise ValueError("campaign repair requires a fabric_v2 run")
+        return await scheduler_repo.targeted_repair(
+            args.run_id,
+            execute=bool(args.execute),
+        )
+    finally:
+        await engine.dispose()
+
+
 async def _validate_campaign_run(run_id: int) -> None:
     engine = create_engine()
     repo = WorkerRepository(engine)
@@ -379,6 +437,19 @@ def _add_campaign_guard_options(parser):
     parser.set_defaults(open_powershell=None)
 
 
+async def _collect_command(args, health=None) -> dict:
+    from ..runtime.collector import collect_run
+
+    return await collect_run(
+        args.run_id,
+        concurrency=args.concurrency,
+        rate=args.rate,
+        limit=args.limit,
+        dashboard_enabled=not bool(getattr(args, "json", False)),
+        health=health,
+    )
+
+
 def _campaign_command(args, presenter: TerminalPresenter) -> None:
     from ..runtime.supervisor import campaign_status, request_campaign_stop, supervise_campaign
 
@@ -393,6 +464,52 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
             "DBD · CAMPAIGN CONTROL",
             {"run_id": int(args.run_id), "action": "graceful_stop_requested"},
         )
+        return
+    if args.campaign_command == "evidence":
+        payload = asyncio.run(_campaign_evidence(args))
+        presenter.command_result("DBD · CAMPAIGN REPAIR EVIDENCE", payload)
+        return
+    if args.campaign_command == "repair":
+        if args.execute:
+            state = campaign_status(args.run_id)
+            if (
+                state.get("supervisor_active")
+                or int(state.get("workers", 0) or 0)
+                or int(state.get("running", 0) or 0)
+            ):
+                raise ValueError(
+                    "Campaign is still active; pause/stop it before targeted repair"
+                )
+            with manager_lock() as conn:
+                payload = asyncio.run(_campaign_repair(args))
+                assert_manager_lock(conn)
+        else:
+            payload = asyncio.run(_campaign_repair(args))
+        presenter.command_result("DBD · TARGETED REPAIR", payload)
+        return
+    if args.campaign_command == "recover":
+        source_state = campaign_status(args.source_run_id)
+        if (
+            source_state.get("supervisor_active")
+            or int(source_state.get("workers", 0) or 0)
+            or int(source_state.get("running", 0) or 0)
+        ):
+            raise ValueError(
+                "Source campaign is still active; pause/stop it before creating a recovery run"
+            )
+        if args.recovery_run_id is not None and not args.execute:
+            raise ValueError("--recovery-run-id requires --execute")
+        if args.execute:
+            with manager_lock() as conn:
+                payload = asyncio.run(_recover_campaign(args))
+                assert_manager_lock(conn)
+        else:
+            payload = asyncio.run(_recover_campaign(args))
+        if args.execute:
+            payload["next_command"] = (
+                f".\\Run-DBD.ps1 {int(payload['recovery_run_id'])} -Headless"
+            )
+        presenter.command_result("DBD · FABRIC RECOVERY", payload)
         return
     if args.campaign_command == "guard":
         from ..runtime.guardian import guard_campaign_run
@@ -464,7 +581,36 @@ def main():
     )
     replay.add_argument("archive_id", type=positive)
 
-    campaign = sub.add_parser("campaign", help="Supervise a coordinated local worker fleet")
+    collect = _add_output_options(
+        sub.add_parser(
+            "collect",
+            help="Resume one durable fabric run in a single Python process",
+        )
+    )
+    collect.add_argument("run_id", type=positive)
+    collect.add_argument(
+        "--concurrency",
+        type=positive,
+        default=48,
+        help="Concurrent HTTP fetch tasks in this process (default: 48)",
+    )
+    collect.add_argument(
+        "--rate",
+        type=positive_rate,
+        default=50.0,
+        help="Process-wide HTTP request ceiling per second (default: 50)",
+    )
+    collect.add_argument(
+        "--limit",
+        type=positive,
+        help="Optional maximum claims for a bounded validation run",
+    )
+    collect.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+
+    campaign = sub.add_parser(
+        "campaign",
+        help="Legacy coordinated worker-fleet commands; prefer dbd-data collect",
+    )
     campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
     campaign_start = campaign_sub.add_parser("start", help="Create a run and launch coordinated workers")
     source = campaign_start.add_mutually_exclusive_group(required=True)
@@ -494,10 +640,58 @@ def main():
     )
     campaign_guard.add_argument("run_id", type=positive)
     _add_campaign_guard_options(campaign_guard)
+    campaign_recover = _add_output_options(
+        campaign_sub.add_parser(
+            "recover",
+            help="Plan or materialize a clean fabric_v2 recovery run from an existing run",
+        )
+    )
+    campaign_recover.add_argument("source_run_id", type=positive)
+    campaign_recover.add_argument(
+        "--execute",
+        action="store_true",
+        help="Create the recovery run; without this flag the command is read-only",
+    )
+    campaign_recover.add_argument(
+        "--recovery-run-id",
+        type=positive,
+        help="Resume one interrupted building recovery run",
+    )
     campaign_status_parser = _add_output_options(
         campaign_sub.add_parser("status", help="Show fleet and durable queue status")
     )
     campaign_status_parser.add_argument("run_id", type=positive)
+    campaign_evidence = _add_output_options(
+        campaign_sub.add_parser(
+            "evidence",
+            help="Read exact endpoint/error evidence before targeted repair",
+        )
+    )
+    campaign_evidence.add_argument("run_id", type=positive)
+    campaign_evidence.add_argument(
+        "--limit",
+        type=positive,
+        default=50,
+        help="Maximum grouped endpoint/error rows",
+    )
+    campaign_evidence.add_argument(
+        "--samples",
+        type=positive,
+        default=20,
+        help="Maximum latest failure-event samples with company/archive context",
+    )
+    campaign_repair = _add_output_options(
+        campaign_sub.add_parser(
+            "repair",
+            help="Plan or execute evidence-backed same-run archive repairs",
+        )
+    )
+    campaign_repair.add_argument("run_id", type=positive)
+    campaign_repair.add_argument(
+        "--execute",
+        action="store_true",
+        help="Reopen only verified project failures; default is read-only dry-run",
+    )
     campaign_stop = _add_output_options(
         campaign_sub.add_parser("stop", help="Request graceful draining of all workers")
     )
@@ -605,8 +799,32 @@ def main():
             presenter.master_status({key: int(value or 0) for key, value in row.items()})
         elif args.command == "campaign":
             _campaign_command(args, presenter)
+        elif args.command == "collect":
+            configure(args.metrics_port)
+            with manager_lock() as conn:
+                result = asyncio.run(
+                    _collect_command(
+                        args,
+                        health=lambda: assert_manager_lock(conn),
+                    )
+                )
+                assert_manager_lock(conn)
+            presenter.command_result("DBD · COLLECTOR RESULT", result)
+            if result.get("paused"):
+                raise SystemExit(130)
         elif args.command in ("bulk-status", "bulk-retry"):
             if args.command == "bulk-retry":
+                from ..runtime.supervisor import campaign_status
+
+                state = campaign_status(args.run_id)
+                if (
+                    state.get("supervisor_active")
+                    or int(state.get("workers", 0) or 0)
+                    or int(state.get("running", 0) or 0)
+                ):
+                    raise ValueError(
+                        "Pause/stop the campaign before reopening failed resources"
+                    )
                 with manager_lock():
                     asyncio.run(worker_command(args, presenter=presenter))
             else:
