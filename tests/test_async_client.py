@@ -51,37 +51,35 @@ async def test_expired_token_and_concurrent_rejections_refresh_once():
     assert len(calls) == 1
 
 
-async def test_auth_refresh_failure_is_single_flight_per_worker():
+async def test_auth_refresh_failure_is_single_flight_per_worker(monkeypatch):
     c = client()
     c._token = None
     c._auth._expires_at = 0
+    c.endpoint_rate.availability_failure = AsyncMock(return_value="closed")
+    c.endpoint_rate.recover_global = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        async_client_module,
+        "_AUTH_RECOVERY_COOLDOWN_SECONDS",
+        0.02,
+    )
     calls = []
 
-    def fail_refresh():
-        calls.append("fail")
-        time.sleep(0.05)
-        raise DbdAuthError("synthetic auth outage")
-
-    c._blocking_token = fail_refresh
-    results = await asyncio.gather(
-        *(c._ensure_token() for _ in range(10)),
-        return_exceptions=True,
-    )
-
-    assert len(calls) == 1
-    assert all(isinstance(item, DbdAuthError) for item in results)
-    assert c.auth_failures == 1
-    assert c.auth_state == "cooldown"
-
-    def recover_refresh():
-        calls.append("recover")
+    def refresh():
+        calls.append(1)
+        time.sleep(0.03)
+        if len(calls) == 1:
+            raise DbdAuthError("synthetic auth outage")
         c._auth._expires_at = time.time() + 100
         return "recovered"
 
-    c._blocking_token = recover_refresh
-    c._auth_backoff_until = time.monotonic() - 1
-    assert await c._ensure_token() == "recovered"
-    assert calls == ["fail", "recover"]
+    c._blocking_token = refresh
+    results = await asyncio.gather(*(c._ensure_token() for _ in range(10)))
+
+    assert results == ["recovered"] * 10
+    assert len(calls) == 2
+    assert c.auth_failures == 1
+    assert c.endpoint_rate.availability_failure.await_count == 1
+    assert c.endpoint_rate.recover_global.await_count == 1
     assert c.auth_state == "ready"
 
 
