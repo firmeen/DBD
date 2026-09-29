@@ -79,7 +79,7 @@ dbd-data bulk `
   --metrics-port 9108
 ```
 
-These numbers are examples only. A 429/503 penalizes the affected endpoint and global adaptive safety layer. In distributed mode Redis carries the shared aggregate schedule, effective rate, cooldown and last-penalty timestamp, so a rejection observed by one process slows the worker fleet using the same namespace. Healthy decoded responses recover conservatively toward the configured ceilings.
+These numbers are examples only. In distributed production, worker auth/session and ordinary availability failures remain local to that worker. HTTP 429 and 503 with `Retry-After` are rate-pressure evidence and may slow the shared pacer for the affected endpoint. The Redis fleet pacer remains the configured aggregate hard ceiling; one worker cannot adaptively collapse that fleet ceiling.
 
 ## Mixed seven-endpoint capacity probe
 
@@ -116,7 +116,7 @@ dbd-data bulk `
   --metrics-port 0
 ```
 
-`--distributed` joins an existing run only. MySQL `FOR UPDATE SKIP LOCKED` plus lease/version fencing provides durable work ownership. Redis supplies aggregate pacing and shared adaptive backoff/recovery. Do not use independent rate-limit namespaces, proxy rotation, session rotation or IP rotation to evade upstream throttling.
+`--distributed` joins an existing run only. MySQL `FOR UPDATE SKIP LOCKED` plus lease/version fencing provides durable work ownership. Redis supplies the aggregate hard fleet pace, endpoint-specific shared pressure state, worker heartbeat and fleet control. Do not use independent rate-limit namespaces, proxy rotation, session rotation or IP rotation to evade upstream throttling.
 
 ## Archive storage modes
 
@@ -208,13 +208,13 @@ Failure at any step is an archive/project failure and never silently falls back 
 | `DBD_ARCHIVE_ENCRYPTION_KEY_ID` | `v1` | active key id stored in new rows |
 | `DBD_ARCHIVE_DECRYPTION_KEYS` | `{}` | JSON map of retained old key ids to secret keys |
 | `DBD_REDIS_URL` | unset | enables distributed shared pacing |
-| `DBD_REDIS_RATE_KEY` | `dbd:global-rate` | shared adaptive-rate namespace |
+| `DBD_REDIS_RATE_KEY` | `dbd:global-rate` | shared fleet pacing / endpoint-pressure namespace |
 
 ## Observability
 
 Prometheus includes HTTP attempts/retries/latency, global and endpoint effective rate, fetch/archive/project outcomes, queue depth, batch-size histograms, archive original/stored bytes and terminal task outcomes.
 
-A rising archive/project queue with an empty fetch queue indicates local persistence/projection pressure. A falling effective rate with 429/503 indicates upstream admission pressure; adding workers will not fix that.
+A rising archive/project queue with an empty fetch queue indicates local persistence/projection pressure. Endpoint effective-rate reductions with 429 or 503 + `Retry-After` indicate endpoint admission pressure; adding workers does not raise the hard fleet ceiling.
 
 ## 48-hour capacity arithmetic
 
@@ -246,4 +246,4 @@ Real admission must account for retries, auth, discovery, DB work, object-store 
 
 ## Production acceptance boundary
 
-Code/CI can prove queue ownership, migration repeatability, raw-first recovery, shared Redis adaptive pacing, encryption/integrity/key-rotation behavior and projection freshness. It cannot prove that DBD sustainably accepts the required live mixed-endpoint rate or that a complete campaign finishes within 48 hours. Those remain live gates: mixed HTTP probe, persisted canary, immutable all-status campaign, retry overhead, database/archive growth, external-storage behavior at production scale, backup/restore drill and final wall-clock evidence.
+Code/CI can prove queue ownership, migration repeatability, raw-first recovery, Redis hard fleet pacing, worker-local failure isolation, endpoint-pressure sharing, encryption/integrity/key-rotation behavior and projection freshness. It cannot prove that DBD sustainably accepts the required live mixed-endpoint rate or that a complete campaign finishes within 48 hours. Those remain live gates: mixed HTTP probe, persisted canary, immutable all-status campaign, retry overhead, database/archive growth, external-storage behavior at production scale, backup/restore drill and final wall-clock evidence.

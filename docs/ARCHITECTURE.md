@@ -3,7 +3,7 @@
 ## Ownership and dependencies
 
 - `cli/`: arguments, commands, exit policy and manager-lock boundaries.
-- `client/`: browser-like session/auth, crypto, retries and adaptive admission.
+- `client/`: browser-like session/auth, crypto, retries, worker-local availability isolation and shared pacing.
 - `contracts/`: identity/root-shape validation and pure normalization.
 - `runtime/`: endpoint definitions, staged bulk orchestration and replay.
 - `pipelines/`: discovery orchestration and compatibility pipelines.
@@ -107,28 +107,34 @@ through row leases/version fencing. Redis coordinates aggregate admission.
 
 ## HTTP/auth/rate path
 
-The V2 bulk request path is:
+The production distributed request path is:
 
 ```text
-concurrency semaphore
-  -> endpoint local adaptive gate
-  -> optional shared endpoint Redis gate
-  -> global local adaptive gate
-  -> optional shared global Redis gate
-  -> token ensure/refresh
+worker-local availability circuit
+  -> worker-local endpoint/global rate caps
+  -> Redis aggregate fleet hard-cap admission
+  -> optional Redis shared endpoint pacing
+  -> token ensure/refresh for this worker session
   -> curl_cffi request
-  -> status penalty/cooldown
-  -> decrypt/wrapper decode
-  -> healthy recovery
+  -> response classification
+  -> archive/project pipeline
 ```
 
-401/token expiry refreshes through one auth lock. 403 is terminal. 429/503 penalizes
-the endpoint and global safety layer.
+Each worker owns its own session, auth lifecycle and availability circuits.
+Authentication failure, transport failure, ordinary 500/502/504, and 503 without
+`Retry-After` therefore remain worker/endpoint-local availability signals and do
+not lower the Redis fleet ceiling or block healthy peer workers.
 
-In distributed mode Redis stores the aggregate schedule plus effective-rate,
-cooldown and last-penalty state. A 429/503 seen by one process therefore constrains
-other workers using the same namespace rather than only the process that received
-it. Healthy decoded responses recover gradually toward the configured target.
+Explicit upstream rate pressure remains respected. HTTP 429 and 503 with
+`Retry-After` can reduce the shared pacer for the affected endpoint, while the
+fleet-wide Redis pacer remains the configured aggregate hard ceiling. Adding worker
+processes increases fault tolerance and available concurrency; it does not multiply
+that ceiling.
+
+The Supervisor observes progress per worker. A single worker whose admission,
+request, response and completion counters stop advancing while fetches remain active
+is recycled independently. Multiple worker-local availability failures freeze
+autoscale growth rather than creating a replacement storm.
 
 Redis is a coordination/safety mechanism, not a rate-limit bypass.
 
