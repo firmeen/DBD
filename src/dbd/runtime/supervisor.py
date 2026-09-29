@@ -2095,7 +2095,6 @@ def supervise_campaign(
             draining_live = [worker for worker in live if worker.draining]
             effective_maximum = max(0, maximum - exhausted_capacity)
 
-            circuit_state = _fleet_circuit_state(registered_states)
             if active_work and effective_maximum < minimum:
                 progress.event(
                     f"available fleet capacity {effective_maximum} fell below minimum {minimum}"
