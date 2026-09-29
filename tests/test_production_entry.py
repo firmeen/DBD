@@ -34,6 +34,8 @@ def test_cli_keeps_campaign_as_production_runtime_and_collector_explicit() -> No
 def test_readme_keeps_campaign_as_operator_path() -> None:
     readme = (PROJECT_ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "Campaign เป็นวิธีที่ง่ายที่สุดในการเปิด worker fleet ที่ coordinated ผ่าน Redis" in readme
+    assert "## Campaign" in readme
+    assert "dbd-data campaign start" in readme
     assert "dbd-data campaign resume" in readme
+    assert "DBD_REDIS_RATE_KEY" in readme
     assert "Collector (recommended)" not in readme
