@@ -13,6 +13,7 @@ from dbd.runtime.supervisor import (
     WorkerProgressWatchdog,
     _campaign_terminal_snapshot,
     _drain_registered_workers,
+    _fleet_availability_summary,
     _fleet_circuit_state,
     _fleet_rate_target,
     _force_kill_worker,
@@ -675,6 +676,71 @@ def test_campaign_terminal_snapshot_uses_existing_loop_values_only() -> None:
     assert snap.http_rate == 11.8
     assert snap.control_healthy is True
 
+
+
+def test_fleet_availability_requires_multiple_independent_workers() -> None:
+    ids, unhealthy, degraded = _fleet_availability_summary(
+        [
+            {
+                "worker_id": "worker-a",
+                "status": "active",
+                "circuit_global": "open",
+                "auth_state": "cooldown",
+            },
+            {
+                "worker_id": "worker-b",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "ready",
+            },
+            {
+                "worker_id": "worker-c",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "ready",
+            },
+            {
+                "worker_id": "worker-d",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "ready",
+            },
+        ]
+    )
+    assert ids == {"worker-a", "worker-b", "worker-c", "worker-d"}
+    assert unhealthy == 1
+    assert degraded is False
+
+    _, unhealthy, degraded = _fleet_availability_summary(
+        [
+            {
+                "worker_id": "worker-a",
+                "status": "active",
+                "circuit_global": "open",
+                "auth_state": "cooldown",
+            },
+            {
+                "worker_id": "worker-b",
+                "status": "active",
+                "circuit_global": "open",
+                "auth_state": "cooldown",
+            },
+            {
+                "worker_id": "worker-c",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "ready",
+            },
+            {
+                "worker_id": "worker-d",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "ready",
+            },
+        ]
+    )
+    assert unhealthy == 2
+    assert degraded is True
 
 
 def test_fleet_circuit_state_prefers_most_restrictive_worker_state() -> None:
