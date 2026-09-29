@@ -99,6 +99,15 @@ def test_profile_persists_operational_values_but_current_env_owns_rate_namespace
     assert restored.redis_rate_key == "dbd:production:global-rate"
 
 
+def test_unprofiled_guardian_does_not_multiply_uncapped_worker_rate() -> None:
+    config = guardian.GuardianConfig(run_id=9)
+
+    assert config.workers == 4
+    assert config.workers_min == 4
+    assert config.workers_max == 4
+    assert config.fleet_rate_max is None
+
+
 def test_legacy_fixed_four_profile_migrates_to_bounded_twelve(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
