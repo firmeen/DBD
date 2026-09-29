@@ -271,13 +271,13 @@ class AdmissionState:
 
 
 class EndpointRateController:
-    """Hierarchical per-worker + shared fleet/endpoint adaptive admission.
+    """Worker-local availability isolation plus shared hard fleet pacing.
 
-    Each worker has a hard local global cap (`global_rate`). Distributed workers
-    additionally share a fleet pacer whose hard ceiling can be larger. Endpoint
-    pacers are created lazily for every endpoint so a 429 observed by one process
-    constrains that endpoint across the fleet without automatically halving the
-    global fleet rate.
+    Each worker has its own local rate cap and availability circuits. Distributed
+    workers additionally share a Redis fleet pacer whose global rate is a hard
+    aggregate ceiling. Endpoint pacers are shared lazily so explicit endpoint
+    pressure such as 429/Retry-After can constrain that endpoint without turning
+    one worker's auth/session/transport failure into a fleet-wide stop.
     """
 
     _ADMISSION_SCRIPT = """

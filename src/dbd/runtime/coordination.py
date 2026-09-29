@@ -25,7 +25,7 @@ class CampaignCoordinator:
 
     MySQL remains the source of truth for work and leases. Redis carries only
     fleet-wide control state: graceful-stop requests, targeted drains, worker
-    heartbeats, maintenance leadership and shared adaptive rate state.
+    heartbeats, maintenance leadership and shared pacing state.
     """
 
     _PUBLISH_WORKER_SCRIPT = """

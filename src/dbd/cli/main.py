@@ -351,7 +351,10 @@ def _add_campaign_worker_options(parser):
     parser.add_argument(
         "--fleet-rate-initial",
         type=positive_rate,
-        help="Initial shared fleet rate; enables worker-independent fleet admission",
+        help=(
+            "Compatibility startup hint for explicit fleet admission; "
+            "--fleet-rate-max is the authoritative hard aggregate ceiling"
+        ),
     )
     parser.add_argument(
         "--fleet-rate-max",

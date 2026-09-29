@@ -176,8 +176,8 @@ class AsyncDbdClient:
 
     async def _mark_auth_unavailable(self) -> None:
         # Authentication/session availability is not evidence that the caller is
-        # exceeding upstream capacity. Open the global availability circuit
-        # without ratcheting the configured pacer down.
+        # exceeding upstream capacity. Open only this worker's global
+        # availability circuit without ratcheting the fleet pacer down.
         await self.endpoint_rate.availability_failure()
 
     async def _mark_upstream_unavailable(self, rate_key: str | None) -> None:
