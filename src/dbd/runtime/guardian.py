@@ -23,7 +23,7 @@ from .supervisor import (
     supervise_campaign,
 )
 
-_GUARDIAN_PROFILE_VERSION = 1
+_GUARDIAN_PROFILE_VERSION = 2
 _GUARDIAN_STATE_VERSION = 1
 _EXIT_CONFIG = 64
 _EXIT_ALREADY_MANAGED = 75
@@ -248,14 +248,33 @@ def resolve_guardian_config(
     """Resolve defaults -> runtime/profile -> current Redis namespace -> explicit CLI values."""
     allowed = {item.name for item in fields(GuardianConfig)} - {"supervisor_generation"}
     values = asdict(GuardianConfig(run_id=int(run_id)))
+    stored_profile = _read_json(guardian_profile_path(run_id))
 
     for source in (
         _runtime_profile(run_id),
-        _read_json(guardian_profile_path(run_id)),
+        stored_profile,
     ):
         for key, value in source.items():
             if key in allowed and key != "run_id" and value is not None:
                 values[key] = value
+
+    # Profile v1 predates bounded hard-cap autoscaling and persisted Run 9 as a
+    # fixed 4/4/4 fleet. Upgrade only that exact legacy shape. Any explicit
+    # operator override remains authoritative and non-default fleet shapes are
+    # preserved exactly.
+    try:
+        stored_version = int(stored_profile.get("profile_version", 0) or 0)
+    except (TypeError, ValueError):
+        stored_version = 0
+    explicit = dict(overrides or {})
+    if (
+        stored_version < 2
+        and explicit.get("workers_max") is None
+        and int(values.get("workers", 0) or 0) == 4
+        and int(values.get("workers_min", 0) or 0) == 4
+        and int(values.get("workers_max", 0) or 0) == 4
+    ):
+        values["workers_max"] = 12
 
     # Redis namespace is deployment configuration, not durable run data.
     # A current .env change must not be silently shadowed by an old persisted
