@@ -26,6 +26,15 @@ def client():
     return c
 
 
+def test_production_client_exposes_worker_local_health_telemetry():
+    c = client()
+    assert c.auth_state == "ready"
+    assert c.upstream_state == "closed"
+    assert c.responses_received == 0
+    assert c.last_request_at is None
+    assert c.last_response_at is None
+
+
 async def test_expired_token_and_concurrent_rejections_refresh_once():
     c = client()
     calls = []

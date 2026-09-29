@@ -89,6 +89,32 @@ class AsyncDbdClient:
         self._penalty_streaks: dict[str, int] = {}
         self._last_penalty_at: dict[str, float] = {}
         self.requests_made = self.retries_made = self.rate_limit_hits = 0
+        self.responses_received = 0
+        self.auth_failures = 0
+        self.last_request_at: float | None = None
+        self.last_response_at: float | None = None
+        self.last_auth_success_at: float | None = None
+        self.last_auth_error_at: float | None = None
+        self.last_error: str | None = None
+        self.last_error_at: float | None = None
+
+    @property
+    def auth_state(self) -> str:
+        if self._auth_lock.locked():
+            return "refreshing"
+        if self._token is not None and time.time() < self._auth._expires_at - 15:
+            return "ready"
+        if self.endpoint_rate.circuit_state() == "open":
+            return "cooldown"
+        return "needed"
+
+    @property
+    def upstream_state(self) -> str:
+        return self.endpoint_rate.circuit_state()
+
+    def _remember_error(self, exc: BaseException) -> None:
+        self.last_error = f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"
+        self.last_error_at = time.time()
 
     def _next_penalty_streak(self, key: str) -> int:
         now = time.monotonic()
@@ -121,7 +147,14 @@ class AsyncDbdClient:
                 self._auth.invalidate(reset_warmup=reset_warmup)
                 self._token = None
             if self._token is None or time.time() >= self._auth._expires_at - 15:
-                self._token = await asyncio.to_thread(self._blocking_token)
+                try:
+                    self._token = await asyncio.to_thread(self._blocking_token)
+                except DbdAuthError as exc:
+                    self.auth_failures += 1
+                    self.last_auth_error_at = time.time()
+                    self._remember_error(exc)
+                    raise
+                self.last_auth_success_at = time.time()
                 if self._session is not None and self._auth_session is not None:
                     self._session.cookies.update(self._auth_session.cookies)
             return self._token
@@ -198,6 +231,7 @@ class AsyncDbdClient:
                         raise
                     requested = datetime.now(timezone.utc).replace(tzinfo=None)
                     self.requests_made += 1
+                    self.last_request_at = time.time()
                     with LATENCY.time():
                         try:
                             response = await self._session.request(
@@ -210,6 +244,7 @@ class AsyncDbdClient:
                             )
                         except (RequestsError, TimeoutError) as exc:
                             REQUESTS.labels("network_error").inc()
+                            self._remember_error(exc)
                             await self._mark_upstream_unavailable(rate_key)
                             log.warning(
                                 "http_transport_error",
@@ -220,6 +255,8 @@ class AsyncDbdClient:
                                 curl_code=_curl_code(exc),
                             )
                             raise
+                    self.responses_received += 1
+                    self.last_response_at = time.time()
                     status = response.status_code
                     REQUESTS.labels(str(status)).inc()
                     retry_after_header = response.headers.get("retry-after")
@@ -287,6 +324,8 @@ class AsyncDbdClient:
                         await self._ensure_token(rejected=token, reset_warmup=True)
                         raise DbdForbiddenError("HTTP 403")
                     if status in (500, 502, 504) or (status == 503 and not rate_pressure):
+                        transient = TransientHttpError(f"HTTP {status}", status_code=status)
+                        self._remember_error(transient)
                         await self._mark_upstream_unavailable(rate_key)
                     if status in (429, 500, 502, 503, 504):
                         raise TransientHttpError(f"HTTP {status}", status_code=status)

@@ -429,6 +429,7 @@ async def process(
     stop = asyncio.Event()
     drain_requested = asyncio.Event()
     release_queued_fetch = asyncio.Event()
+    drain_started_at: float | None = None
     fetch_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     archive_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
     project_queue: asyncio.Queue = asyncio.Queue(maxsize=settings.dbd_pipeline_queue_size)
@@ -462,6 +463,14 @@ async def process(
         "last_error_at": None,
     }
 
+    def request_drain(*, release_queued: bool) -> None:
+        nonlocal drain_started_at
+        if not drain_requested.is_set():
+            drain_started_at = time.monotonic()
+        drain_requested.set()
+        if release_queued:
+            release_queued_fetch.set()
+
     def remember_runtime_error(exc: BaseException) -> None:
         runtime_stats["last_error"] = (
             f"{type(exc).__name__}: {str(exc) or type(exc).__name__}"
@@ -493,13 +502,13 @@ async def process(
                     run_id,
                     max_connections=settings.dbd_redis_max_connections,
                     client=redis_client,
+                    require_supervisor_lease=True,
                 )
                 await coordinator.open()
                 identity = WorkerIdentity(owner, int(run_id), os.getpid())
                 registration_status = await coordinator.register_worker(identity)
             if registration_status == "draining":
-                drain_requested.set()
-                release_queued_fetch.set()
+                request_drain(release_queued=True)
         except BaseException:
             await close_async_redis(redis_client)
             raise
@@ -574,6 +583,12 @@ async def process(
             + archive_queue.qsize()
             + project_queue.qsize(),
             "requests": int(getattr(client, "requests_made", 0) or 0),
+            "responses": int(getattr(client, "responses_received", 0) or 0),
+            "last_request_at": getattr(client, "last_request_at", None),
+            "last_response_at": getattr(client, "last_response_at", None),
+            "last_auth_success_at": getattr(client, "last_auth_success_at", None),
+            "last_auth_error_at": getattr(client, "last_auth_error_at", None),
+            "auth_failures": int(getattr(client, "auth_failures", 0) or 0),
             "http_retries": int(getattr(client, "retries_made", 0) or 0),
             "rate_limit_hits": int(getattr(client, "rate_limit_hits", 0) or 0),
             "effective_rate": effective_rate,
@@ -618,9 +633,7 @@ async def process(
         # The heartbeat Lua transition evaluates stop + targeted drain atomically.
         # This replaces the separate 0.5s control polling Redis round trip.
         if resolved == "draining":
-            drain_requested.set()
-            if release_on_drain:
-                release_queued_fetch.set()
+            request_drain(release_queued=release_on_drain)
         return resolved
 
     async def mysql_heartbeat():
@@ -663,8 +676,7 @@ async def process(
         nonlocal claimed_attempts, maintenance_at, drain_db_check_at, idle_progress_at
         while not stop.is_set():
             if stop_signal is not None and stop_signal.is_set() and not drain_requested.is_set():
-                drain_requested.set()
-                release_queued_fetch.set()
+                request_drain(release_queued=True)
             now = time.monotonic()
             if periodic_maintenance and now >= maintenance_at:
                 should_maintain = True
@@ -686,6 +698,14 @@ async def process(
                 maintenance_at = now + _MAINTENANCE_INTERVAL_SECONDS
 
             if drain_requested.is_set():
+                if (
+                    drain_started_at is not None
+                    and time.monotonic() - drain_started_at > 90.0
+                ):
+                    raise RuntimeError(
+                        f"Worker {owner} drain exceeded 90s; forcing task cancellation "
+                        "so durable leases can be released"
+                    )
                 if release_queued_fetch.is_set():
                     # External/Guardian drain: fetchers stop dequeuing immediately.
                     # Finish only work already inside active HTTP/archive/project,
@@ -740,7 +760,7 @@ async def process(
 
             remaining = None if limit is None else max(0, limit - claimed_attempts)
             if remaining == 0:
-                drain_requested.set()
+                request_drain(release_queued=False)
                 await publish_heartbeat(status="draining", release_on_drain=False)
                 continue
 
@@ -810,7 +830,7 @@ async def process(
             if now >= idle_progress_at:
                 idle_progress_at = now + _IDLE_PROGRESS_POLL_SECONDS
                 if not await repo.has_active_work(run_id):
-                    drain_requested.set()
+                    request_drain(release_queued=False)
                     await publish_heartbeat(status="draining", release_on_drain=False)
                     continue
             await asyncio.sleep(0.1)

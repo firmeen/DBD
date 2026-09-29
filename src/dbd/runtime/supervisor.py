@@ -63,47 +63,51 @@ class WorkerProcess:
 
 
 @dataclass
-class RequestProgressWatchdog:
-    """Detect fleet-wide HTTP request stagnation without mistaking controlled waits for failure."""
+class WorkerProgressWatchdog:
+    """Detect request-path stagnation per worker without freezing healthy peers."""
 
     timeout_seconds: float = _REQUEST_STALL_TIMEOUT_SECONDS
-    last_requests: int | None = None
-    stalled_since: float | None = None
+    samples: dict[str, tuple[tuple[int, int, int, int], float]] = field(
+        default_factory=dict
+    )
+
+    def forget(self, worker_id: str) -> None:
+        self.samples.pop(str(worker_id), None)
 
     def observe(
         self,
+        worker_id: str,
+        state: dict | None,
         *,
         now: float,
-        requests: int,
-        fetch_active: int,
         active_work: bool,
         control_healthy: bool,
-        circuit_state: str,
         draining: bool,
     ) -> float | None:
-        requests = max(0, int(requests))
+        worker_id = str(worker_id)
+        if not state:
+            self.forget(worker_id)
+            return None
         eligible = (
             active_work
             and control_healthy
             and not draining
-            and int(fetch_active) > 0
-            and str(circuit_state or "unknown").lower() != "open"
+            and int(state.get("fetch_active", 0) or 0) > 0
         )
-
-        if self.last_requests is None or requests != self.last_requests:
-            self.last_requests = requests
-            self.stalled_since = now if eligible else None
-            return None
-
+        marker = (
+            int(state.get("redis_admissions", 0) or 0),
+            int(state.get("requests", 0) or 0),
+            int(state.get("responses", 0) or 0),
+            int(state.get("completed", 0) or 0),
+        )
+        previous = self.samples.get(worker_id)
         if not eligible:
-            self.stalled_since = None
+            self.samples[worker_id] = (marker, now)
             return None
-
-        if self.stalled_since is None:
-            self.stalled_since = now
+        if previous is None or previous[0] != marker:
+            self.samples[worker_id] = (marker, now)
             return None
-
-        stalled_for = max(0.0, now - self.stalled_since)
+        stalled_for = max(0.0, now - previous[1])
         if stalled_for < float(self.timeout_seconds):
             return None
         return stalled_for
@@ -170,10 +174,13 @@ class AutoscaleController:
         effective_maximum: int,
         now: float,
         fetch_queue: int = 0,
+        fetch_active: int = 0,
         archive_queue: int = 0,
         project_queue: int = 0,
         observed_http_rate: float | None = None,
         rate_target: float | None = None,
+        worker_rate: float | None = None,
+        hard_fleet_cap: bool = False,
         rate_limit_delta: int = 0,
     ) -> int:
         """Scale only when the pipeline needs capacity and downstream is healthy."""
@@ -181,6 +188,7 @@ class AutoscaleController:
         pending = max(0, int(pending))
         running = max(0, int(running))
         fetch_queue = max(0, int(fetch_queue))
+        fetch_active = max(0, int(fetch_active))
         archive_queue = max(0, int(archive_queue))
         project_queue = max(0, int(project_queue))
         effective_maximum = max(0, min(int(effective_maximum), self.maximum))
@@ -206,11 +214,30 @@ class AutoscaleController:
         high_pending = pending > max(capacity, current * capacity * 4)
         queue_starved = fetch_queue <= max(capacity, current * capacity)
         under_rate = (
-            observed_http_rate is None
-            or rate_target is None
-            or observed_http_rate < (float(rate_target) * 0.90)
+            observed_http_rate is not None
+            and rate_target is not None
+            and observed_http_rate < (float(rate_target) * 0.90)
         )
-        if current < effective_maximum and high_pending and (queue_starved or under_rate):
+        if hard_fleet_cap:
+            local_capacity = (
+                float(worker_rate) * current
+                if worker_rate is not None and float(worker_rate) > 0
+                else 0.0
+            )
+            capacity_shortfall = (
+                rate_target is not None
+                and local_capacity > 0
+                and local_capacity < float(rate_target) * 0.98
+            )
+            saturated_fetchers = fetch_active >= max(
+                1, int(current * capacity * 0.75)
+            )
+            scale_pressure = capacity_shortfall or (
+                saturated_fetchers and under_rate
+            )
+        else:
+            scale_pressure = queue_starved or under_rate
+        if current < effective_maximum and high_pending and scale_pressure:
             self.low_pressure_observations = 0
             self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
             return current + 1
@@ -933,6 +960,7 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
         "project_queue",
         "inflight",
         "requests",
+        "responses",
         "http_retries",
         "rate_limit_hits",
         "redis_commands",
@@ -1613,7 +1641,7 @@ def supervise_campaign(
     recent_rate_limit_delta = 0
     dashboard_started_at = time.monotonic()
     progress = LiveCampaignDashboard(run_id, interval=0.5)
-    request_watchdog = RequestProgressWatchdog(request_stall_seconds)
+    worker_watchdog = WorkerProgressWatchdog(request_stall_seconds)
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
         nonlocal next_index
@@ -1862,6 +1890,17 @@ def supervise_campaign(
                             now_mono=now,
                         )
                     )
+                    if reason is None and row is not None:
+                        stalled_for = worker_watchdog.observe(
+                            worker.worker_id,
+                            row,
+                            now=now,
+                            active_work=bool(active_work),
+                            control_healthy=not control_plane_degraded,
+                            draining=bool(worker.draining or graceful_stop),
+                        )
+                        if stalled_for is not None:
+                            reason = f"request_progress_stall_{stalled_for:.0f}s"
                     if reason is None:
                         survivors.append(worker)
                         continue
@@ -1881,6 +1920,7 @@ def supervise_campaign(
                         continue
                     code = worker.process.poll()
                     retire_metrics(row)
+                    worker_watchdog.forget(worker.worker_id)
                     reclaimed = _release_dead_worker_leases(run_id, worker.worker_id)
                     _close_worker_handle(worker)
                     _cleanup_worker_control(redis, run_id, worker.worker_id)
@@ -1896,6 +1936,7 @@ def supervise_campaign(
                     continue
 
                 retire_metrics(row)
+                worker_watchdog.forget(worker.worker_id)
                 _release_dead_worker_leases(run_id, worker.worker_id)
                 _close_worker_handle(worker)
                 _cleanup_worker_control(redis, run_id, worker.worker_id)
@@ -1912,31 +1953,6 @@ def supervise_campaign(
             effective_maximum = max(0, maximum - exhausted_capacity)
 
             circuit_state = _fleet_circuit_state(registered_states)
-            request_stalled_for = request_watchdog.observe(
-                now=now,
-                requests=int(campaign_metrics.get("requests", 0) or 0),
-                fetch_active=int(live_metrics.get("fetch_active", 0) or 0),
-                active_work=bool(active_work and active_live),
-                control_healthy=not control_plane_degraded,
-                circuit_state=circuit_state,
-                draining=graceful_stop,
-            )
-            if request_stalled_for is not None:
-                progress.event(
-                    f"HTTP request progress stalled for {request_stalled_for:.0f}s "
-                    f"with {int(live_metrics.get('fetch_active', 0) or 0)} active fetch(es); "
-                    "recycling the local fleet for Guardian recovery"
-                )
-                exit_code = _REQUEST_STALL_EXIT_CODE
-                _contain_local_fleet(
-                    redis,
-                    run_id,
-                    children,
-                    "request_progress_stalled",
-                    grace_seconds=_FAILURE_DRAIN_SECONDS,
-                )
-                break
-
             if active_work and effective_maximum < minimum:
                 progress.event(
                     f"available fleet capacity {effective_maximum} fell below minimum {minimum}"
@@ -1965,10 +1981,13 @@ def supervise_campaign(
                     effective_maximum=effective_maximum,
                     now=now,
                     fetch_queue=live_metrics.get("fetch_queue", 0),
+                    fetch_active=live_metrics.get("fetch_active", 0),
                     archive_queue=live_metrics.get("archive_queue", 0),
                     project_queue=live_metrics.get("project_queue", 0),
                     observed_http_rate=observed_http_rate if plan.independent else None,
                     rate_target=current_effective_rate if plan.independent else None,
+                    worker_rate=plan.worker_rate,
+                    hard_fleet_cap=plan.independent,
                     rate_limit_delta=recent_rate_limit_delta,
                 )
                 if target > len(active_live) and len(live) < effective_maximum:

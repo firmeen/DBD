@@ -9,7 +9,7 @@ import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
     AutoscaleController,
     CampaignResourcePlan,
-    RequestProgressWatchdog,
+    WorkerProgressWatchdog,
     WorkerProcess,
     _campaign_terminal_snapshot,
     _drain_registered_workers,
@@ -474,6 +474,46 @@ def test_autoscale_freezes_on_downstream_backlog() -> None:
     ) == 4
 
 
+def test_hard_cap_autoscale_adds_capacity_only_when_fetchers_are_saturated() -> None:
+    controller = AutoscaleController(4, 12, 8)
+    assert controller.target(
+        pending=5000,
+        running=32,
+        current=4,
+        effective_maximum=12,
+        now=10.0,
+        fetch_queue=32,
+        fetch_active=32,
+        archive_queue=0,
+        project_queue=0,
+        observed_http_rate=40.0,
+        rate_target=60.0,
+        worker_rate=15.0,
+        hard_fleet_cap=True,
+        rate_limit_delta=0,
+    ) == 5
+
+
+def test_hard_cap_autoscale_holds_when_workers_are_not_saturated() -> None:
+    controller = AutoscaleController(4, 12, 8)
+    assert controller.target(
+        pending=5000,
+        running=16,
+        current=4,
+        effective_maximum=12,
+        now=10.0,
+        fetch_queue=32,
+        fetch_active=8,
+        archive_queue=0,
+        project_queue=0,
+        observed_http_rate=40.0,
+        rate_target=60.0,
+        worker_rate=15.0,
+        hard_fleet_cap=True,
+        rate_limit_delta=0,
+    ) == 4
+
+
 
 def test_campaign_terminal_snapshot_uses_existing_loop_values_only() -> None:
     snap = _campaign_terminal_snapshot(
@@ -920,115 +960,127 @@ def test_stopped_generation_reconciliation_refuses_live_worker(monkeypatch) -> N
     )
 
 
-def test_request_progress_watchdog_trips_only_on_active_http_stall() -> None:
-    watchdog = RequestProgressWatchdog(timeout_seconds=90.0)
+def test_worker_progress_watchdog_trips_only_the_stalled_worker() -> None:
+    watchdog = WorkerProgressWatchdog(timeout_seconds=90.0)
+    stalled = {
+        "fetch_active": 8,
+        "redis_admissions": 100,
+        "requests": 90,
+        "responses": 90,
+        "completed": 80,
+    }
+    healthy = dict(stalled)
 
     assert watchdog.observe(
+        "worker-a",
+        stalled,
         now=0.0,
-        requests=100,
-        fetch_active=32,
         active_work=True,
         control_healthy=True,
-        circuit_state="closed",
         draining=False,
     ) is None
     assert watchdog.observe(
-        now=60.0,
-        requests=100,
-        fetch_active=32,
+        "worker-b",
+        healthy,
+        now=0.0,
         active_work=True,
         control_healthy=True,
-        circuit_state="closed",
+        draining=False,
+    ) is None
+
+    healthy["requests"] = 91
+    assert watchdog.observe(
+        "worker-b",
+        healthy,
+        now=80.0,
+        active_work=True,
+        control_healthy=True,
         draining=False,
     ) is None
     assert watchdog.observe(
+        "worker-a",
+        stalled,
         now=90.0,
-        requests=100,
-        fetch_active=32,
         active_work=True,
         control_healthy=True,
-        circuit_state="closed",
+        draining=False,
+    ) == 90.0
+    assert watchdog.observe(
+        "worker-b",
+        healthy,
+        now=90.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    ) is None
+
+
+def test_worker_progress_watchdog_does_not_ignore_local_open_circuit_forever() -> None:
+    watchdog = WorkerProgressWatchdog(timeout_seconds=90.0)
+    state = {
+        "fetch_active": 8,
+        "redis_admissions": 100,
+        "requests": 90,
+        "responses": 90,
+        "completed": 80,
+        "circuit_global": "open",
+    }
+    watchdog.observe(
+        "worker-a",
+        state,
+        now=0.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    )
+    assert watchdog.observe(
+        "worker-a",
+        state,
+        now=90.0,
+        active_work=True,
+        control_healthy=True,
         draining=False,
     ) == 90.0
 
 
-def test_request_progress_watchdog_resets_on_forward_progress() -> None:
-    watchdog = RequestProgressWatchdog(timeout_seconds=90.0)
-
+def test_worker_progress_watchdog_ignores_inactive_or_control_degraded_worker() -> None:
+    watchdog = WorkerProgressWatchdog(timeout_seconds=90.0)
+    state = {
+        "fetch_active": 8,
+        "redis_admissions": 100,
+        "requests": 90,
+        "responses": 90,
+        "completed": 80,
+    }
     watchdog.observe(
+        "worker-a",
+        state,
         now=0.0,
-        requests=100,
-        fetch_active=32,
         active_work=True,
         control_healthy=True,
-        circuit_state="closed",
         draining=False,
     )
     assert watchdog.observe(
-        now=80.0,
-        requests=101,
-        fetch_active=32,
-        active_work=True,
-        control_healthy=True,
-        circuit_state="closed",
-        draining=False,
-    ) is None
-    assert watchdog.observe(
-        now=150.0,
-        requests=101,
-        fetch_active=32,
-        active_work=True,
-        control_healthy=True,
-        circuit_state="closed",
-        draining=False,
-    ) is None
-
-
-def test_request_progress_watchdog_ignores_controlled_or_inactive_waits() -> None:
-    watchdog = RequestProgressWatchdog(timeout_seconds=90.0)
-
-    watchdog.observe(
-        now=0.0,
-        requests=100,
-        fetch_active=32,
-        active_work=True,
-        control_healthy=True,
-        circuit_state="closed",
-        draining=False,
-    )
-    assert watchdog.observe(
+        "worker-a",
+        {**state, "fetch_active": 0},
         now=120.0,
-        requests=100,
-        fetch_active=32,
         active_work=True,
         control_healthy=True,
-        circuit_state="open",
         draining=False,
     ) is None
     assert watchdog.observe(
+        "worker-a",
+        state,
         now=240.0,
-        requests=100,
-        fetch_active=0,
-        active_work=True,
-        control_healthy=True,
-        circuit_state="closed",
-        draining=False,
-    ) is None
-    assert watchdog.observe(
-        now=360.0,
-        requests=100,
-        fetch_active=32,
         active_work=True,
         control_healthy=False,
-        circuit_state="closed",
         draining=False,
     ) is None
     assert watchdog.observe(
-        now=480.0,
-        requests=100,
-        fetch_active=32,
+        "worker-a",
+        state,
+        now=360.0,
         active_work=True,
         control_healthy=True,
-        circuit_state="closed",
         draining=True,
     ) is None

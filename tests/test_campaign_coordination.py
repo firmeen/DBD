@@ -51,6 +51,29 @@ async def test_campaign_stop_and_worker_heartbeat_are_shared():
         await second.close()
 
 
+async def test_worker_self_fences_when_required_supervisor_lease_disappears():
+    run_id = int(uuid4().hex[:8], 16)
+    namespace = "dbd:test-supervisor-fence:" + uuid4().hex
+    coordinator = CampaignCoordinator(
+        REDIS_URL,
+        run_id,
+        namespace=namespace,
+        require_supervisor_lease=True,
+    )
+    await coordinator.open()
+    try:
+        await coordinator._client().set(coordinator.supervisor_lease_key, "owner", ex=5)
+        worker = WorkerIdentity("worker-a", run_id, 111)
+        assert await coordinator.register_worker(worker, ttl_seconds=5) == "active"
+
+        await coordinator._client().delete(coordinator.supervisor_lease_key)
+        assert await coordinator.heartbeat_worker(worker, ttl_seconds=5) == "draining"
+        workers = await coordinator.workers()
+        assert workers[0]["status"] == "draining"
+    finally:
+        await coordinator.close()
+
+
 async def test_preexisting_targeted_drain_survives_register_and_active_heartbeat():
     run_id = int(uuid4().hex[:8], 16)
     namespace = "dbd:test-pre-register-drain:" + uuid4().hex

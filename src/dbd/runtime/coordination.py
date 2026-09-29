@@ -54,7 +54,8 @@ class CampaignCoordinator:
     if requested_status == 'draining'
       or previous_status == 'draining'
       or redis.call('EXISTS', KEYS[3]) == 1
-      or redis.call('EXISTS', KEYS[4]) == 1 then
+      or redis.call('EXISTS', KEYS[4]) == 1
+      or (ARGV[6] == '1' and redis.call('EXISTS', KEYS[5]) == 0) then
       payload['status'] = 'draining'
     else
       payload['status'] = 'active'
@@ -74,6 +75,7 @@ class CampaignCoordinator:
         namespace: str = "dbd:campaign",
         max_connections: int | None = None,
         client: Redis | None = None,
+        require_supervisor_lease: bool = False,
     ) -> None:
         self.url = url
         self.run_id = int(run_id)
@@ -81,6 +83,7 @@ class CampaignCoordinator:
         self.max_connections = max_connections
         self._redis: Redis | None = client
         self._owns_redis = client is None
+        self.require_supervisor_lease = bool(require_supervisor_lease)
         self._publish_worker_script = None
 
     @property
@@ -98,6 +101,10 @@ class CampaignCoordinator:
     @property
     def maintenance_key(self) -> str:
         return f"{self.base_key}:maintenance"
+
+    @property
+    def supervisor_lease_key(self) -> str:
+        return f"{self.base_key}:supervisor:lease"
 
     def worker_key(self, worker_id: str) -> str:
         return f"{self.base_key}:worker:{worker_id}"
@@ -209,6 +216,7 @@ class CampaignCoordinator:
                     self.workers_key,
                     self.stop_key,
                     self.worker_drain_key(identity.worker_id),
+                    self.supervisor_lease_key,
                 ],
                 args=[
                     json.dumps(body, default=str),
@@ -216,6 +224,7 @@ class CampaignCoordinator:
                     time.time(),
                     max(1, int(ttl_seconds)),
                     identity.worker_id,
+                    "1" if self.require_supervisor_lease else "0",
                 ],
             )
         finally:
