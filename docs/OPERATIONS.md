@@ -21,7 +21,7 @@ Core controls:
 | `DBD_REDIS_SOCKET_TIMEOUT_SECONDS` | Redis command/read timeout |
 | `DBD_REDIS_CONNECT_TIMEOUT_SECONDS` | Redis connect timeout |
 | `DBD_REDIS_HEALTH_CHECK_INTERVAL_SECONDS` | Redis connection health-check interval |
-| `DBD_REDIS_RECOVERY_INTERVAL_SECONDS` | Minimum interval between shared adaptive recovery writes |
+| `DBD_REDIS_RECOVERY_INTERVAL_SECONDS` | Minimum interval between shared endpoint-pacing recovery writes |
 | `DBD_FLEET_REDIS_CONNECTIONS_MAX` / `--fleet-redis-connections-max` | Redis connection budget for the long-lived campaign fleet; default `128` |
 | `DBD_PIPELINE_QUEUE_SIZE` | Bounded fetch/archive/project backpressure |
 | `DBD_CLAIM_BATCH_SIZE` | Queue claims per transaction |
@@ -38,10 +38,13 @@ Concurrency and admission rate are different controls. More concurrency helps on
 until enough in-flight work exists to sustain the accepted upstream rate.
 
 Campaign can explicitly decouple worker capacity from upstream admission with
-`--fleet-rate-initial` and `--fleet-rate-max`. When those flags are present,
-changing `workers` / `workers-max` does not change the shared HTTP ceiling.
-When they are omitted, the legacy `shared`, `multiply`, and `adaptive`
-worker-rate derivation remains compatible.
+`--fleet-rate-max`. In that mode `--worker-rate` remains the local hard cap for
+each process while Redis enforces `--fleet-rate-max` as the aggregate hard ceiling;
+changing `workers` / `workers-max` does not multiply it. `--fleet-rate-initial`
+is retained as a compatibility profile field, while the maximum is authoritative
+for hard-cap production operation. When explicit fleet-rate flags are omitted, the
+legacy `shared`, `multiply`, and `adaptive` worker-rate derivation remains
+compatible.
 
 Fleet resource limits are calculated before workers start. Defaults are global
 fleet caps rather than per-worker multipliers: 96 MySQL connections, 24 archive
@@ -94,27 +97,27 @@ python scripts/benchmark_terminal_dashboard.py `
 
 ## Rate control and distributed workers
 
-Single-process V2 uses endpoint-local adaptive buckets plus a global safety bucket.
-429/503 backs off the affected endpoint and global safety rate; healthy decoded
-responses recover conservatively toward the configured ceiling.
+Single-process V2 keeps its local limiter behavior. Production distributed workers
+use a stricter failure-domain split: each process owns its session, auth lifecycle,
+availability circuits and local rate cap, while Redis owns aggregate pacing and
+endpoint-specific shared rate pressure.
 
-Distributed mode additionally requires one shared Redis URL/key. Redis stores the
-aggregate pacing schedule, effective rate, cooldown and last-penalty state. A
-rejection observed by one process therefore constrains all workers using that same
-namespace.
+With an explicit fleet ceiling, the global Redis pace is a hard aggregate ceiling,
+not adaptive failure state. Authentication/session failures, transport failures,
+ordinary 500/502/504, and 503 without `Retry-After` do not reduce that ceiling or
+open a circuit for peer workers. HTTP 429 and 503 with `Retry-After` remain rate
+pressure and can reduce the shared pacer for the affected endpoint.
 
-Each worker owns exactly one bounded async Redis pool. Campaign heartbeat/control,
-endpoint/global pacing and circuit protection share that pool for the worker
-lifetime. Healthy endpoint admission uses one registered Lua script (EVALSHA) to
-evaluate global + endpoint circuits and reserve both pacing schedules for the same
-future timestamp. This replaces the previous four healthy-path Redis round trips
-(global circuit, endpoint circuit, endpoint pacer, global pacer) with one logical
-round trip.
+Each worker owns one bounded async Redis pool shared by campaign heartbeat/control
+and pacing. Healthy endpoint admission remains one registered Lua execution for
+global + endpoint reservations. Availability circuits are worker-local, so one
+broken process cannot gate healthy peers through Redis.
 
-A successful healthy request does not write Redis recovery state on every response.
-Local recovery remains immediate; shared recovery is gated and batched, except a
-HALF_OPEN probe success which closes its owned probe promptly. A 429/503 penalty is
-still published immediately so other workers observe the reduced shared rate.
+A successful healthy request does not write shared recovery state on every response.
+Endpoint pacing recovers conservatively after its quiet period. The Supervisor also
+tracks per-worker admission/request/response/completion progress and recycles only a
+stalled worker; multi-worker availability evidence freezes autoscale growth instead
+of spawning a replacement storm.
 
 Prometheus exposes Redis RTT, logical command pressure, pool connection counts and
 estimated Redis commands per HTTP attempt. The worker heartbeat also carries
@@ -282,8 +285,7 @@ ceiling or 48-hour ETA.
 ## Queue and storage growth
 
 Watch stage backlog rather than HTTP RPS alone. Rising archive/project queues with
-an empty fetch queue indicate local persistence/projection pressure. Falling shared
-effective rate with 429/503 indicates upstream pressure.
+an empty fetch queue indicate local persistence/projection pressure. Falling endpoint effective rate with 429 or 503 + `Retry-After` indicates endpoint pressure.
 
 `response_archive` remains the durable archive metadata boundary. `raw_responses`
 continues to exist because historical projection foreign keys still depend on it.

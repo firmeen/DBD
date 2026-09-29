@@ -150,9 +150,10 @@ dbd-data bulk --run-id N --distributed --concurrency 32 --rate <MEASURED_RATE>
 
 All workers must share MySQL, run ID, Redis URL and rate key. MySQL leases plus
 `FOR UPDATE SKIP LOCKED` provide durable work ownership. Redis carries the aggregate
-schedule, effective rate, cooldown and last-penalty state; a 429/503 seen by one
-worker therefore slows the fleet using that namespace. Endpoint targets remain
-optional measured ceilings.
+fleet schedule and endpoint-specific rate-pressure state. Worker auth/session and
+ordinary availability failures remain local. A 429 or 503 with `Retry-After` may
+slow the affected endpoint across the fleet, but does not adaptively collapse the
+global hard ceiling. Endpoint targets remain optional measured ceilings.
 
 Do not create independent rate keys or rotate proxies/sessions/IPs to evade upstream
 throttling.

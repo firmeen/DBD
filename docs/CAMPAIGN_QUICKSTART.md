@@ -96,17 +96,18 @@ $env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
 dbd-data campaign start `
   --master `
   --all-statuses `
-  --workers 6 `
-  --workers-min 3 `
-  --workers-max 6 `
-  --worker-concurrency 12 `
-  --worker-rate 2 `
+  --workers 4 `
+  --workers-min 4 `
+  --workers-max 12 `
+  --worker-concurrency 8 `
+  --worker-rate 15 `
+  --fleet-rate-max 60 `
   --rate-mode adaptive `
   --max-restarts 3 `
   --headless
 ```
 
-ค่าด้านบนเป็น operational example ไม่ใช่ rate guarantee ของ upstream service ถ้า 429/503 เพิ่มขึ้น ให้ลด rate หรือกลับไปใช้ค่าที่ผ่าน canary
+ค่าด้านบนเป็น operational example ไม่ใช่ rate guarantee ของ upstream service. `worker-rate=15` เป็น local cap ต่อ worker และ `fleet-rate-max=60` เป็น aggregate hard ceiling ของ Redis. ถ้า 429 หรือ 503 + Retry-After เพิ่มขึ้น ให้ลดค่าที่วัดจาก canary; การเพิ่ม worker ไม่ได้เพิ่ม hard fleet ceiling.
 
 สำหรับ campaign ใหม่สามารถแยกจำนวน worker ออกจาก HTTP budget ได้โดย explicit fleet rate:
 
@@ -114,23 +115,23 @@ dbd-data campaign start `
 dbd-data campaign start `
   --master `
   --all-statuses `
-  --workers 6 `
+  --workers 4 `
   --workers-min 4 `
-  --workers-max 20 `
-  --worker-concurrency 12 `
-  --fleet-rate-initial 12 `
-  --fleet-rate-max 20 `
+  --workers-max 12 `
+  --worker-concurrency 8 `
+  --worker-rate 15 `
+  --fleet-rate-max 60 `
   --fleet-db-connections-max 96 `
-  --fleet-archive-workers-max 20 `
-  --fleet-projection-workers-max 40 `
+  --fleet-archive-workers-max 24 `
+  --fleet-projection-workers-max 48 `
   --fleet-redis-connections-max 128 `
   --rate-mode adaptive `
   --max-restarts 3 `
   --headless
 ```
 
-ในโหมดนี้ `workers-max=20` ไม่ได้หมายถึง 40 req/s หรือ `worker-rate × workers` อีกต่อไป
-`--fleet-rate-max` เป็น hard shared ceiling ส่วน worker count ใช้เพิ่ม local pipeline capacity เท่านั้น
+ในโหมดนี้ `workers-max=12` ไม่ได้หมายถึง 180 req/s หรือ `worker-rate × workers`
+`--fleet-rate-max=60` เป็น hard shared ceiling ส่วน worker count ใช้เพิ่ม local pipeline capacity / resilience เท่านั้น
 resource budget จะถูกแบ่งเป็น per-worker caps ตั้งแต่เริ่ม supervisor และ configuration ที่เล็กจนรองรับ `workers-max` ไม่ได้จะถูก reject ก่อน spawn worker
 
 ระหว่าง `campaign start --master` ระบบต้อง materialize durable scheduler state ก่อนเปิด worker
@@ -181,11 +182,12 @@ dbd-data campaign stop N
 $env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
 
 dbd-data campaign resume N `
-  --workers 6 `
-  --workers-min 3 `
-  --workers-max 6 `
-  --worker-concurrency 12 `
-  --worker-rate 2 `
+  --workers 4 `
+  --workers-min 4 `
+  --workers-max 12 `
+  --worker-concurrency 8 `
+  --worker-rate 15 `
+  --fleet-rate-max 60 `
   --rate-mode adaptive `
   --max-restarts 3 `
   --headless

@@ -50,10 +50,11 @@ The current suite covers, among other cases:
 - JSON/zstd archive encoding and replay compatibility;
 - mixed-capacity probe workload construction, endpoint parsing and deadline/drain
   behavior;
-- local endpoint penalty plus global safety backoff;
+- worker-local availability/circuit isolation for auth/session/transport failures;
 - Redis pacers share one aggregate request schedule;
-- Redis adaptive effective-rate/cooldown/recovery state propagates across independent
-  workers using the same key;
+- explicit hard fleet ceilings remain independent of worker count;
+- endpoint rate-pressure state propagates across workers using the same key without
+  turning one worker's availability failure into a global fleet circuit;
 - external S3-compatible archives are encrypted client-side with AES-256-GCM;
 - external JSON and zstd payloads round-trip through encryption/decryption;
 - ciphertext tamper and canonical serialized-payload checksum mismatch are rejected;
@@ -109,10 +110,12 @@ archive boundary. Lease recovery uses the counter for the task's current stage, 
 ## Distributed rate semantics
 
 Distributed workers coordinate durable work through MySQL leases and admission
-through one Redis namespace. The Redis state is more than a fixed ceiling: it also
-contains the shared effective rate, cooldown and last-penalty timestamp. Therefore a
-429/503 observed by one worker constrains other workers using the same namespace.
-Recovery advances conservatively toward the configured ceiling after a quiet period.
+through one Redis namespace. With explicit fleet configuration, Redis enforces a
+hard aggregate fleet ceiling while worker-local caps remain independent. Worker
+auth/session and availability circuits are not shared. HTTP 429 and 503 with
+`Retry-After` remain explicit rate-pressure evidence and can constrain the shared
+pacer for the affected endpoint. Adding workers does not multiply the hard fleet
+ceiling.
 
 This is a safety/cooperation mechanism, not a way to increase or bypass an upstream
 rate limit.
