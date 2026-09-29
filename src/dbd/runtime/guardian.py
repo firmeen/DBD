@@ -270,6 +270,7 @@ def resolve_guardian_config(
     if (
         stored_version < 2
         and explicit.get("workers_max") is None
+        and values.get("fleet_rate_max") is not None
         and int(values.get("workers", 0) or 0) == 4
         and int(values.get("workers_min", 0) or 0) == 4
         and int(values.get("workers_max", 0) or 0) == 4
