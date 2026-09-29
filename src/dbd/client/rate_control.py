@@ -287,86 +287,6 @@ local has_endpoint = ARGV[1] == '1'
 local global_ceiling = tonumber(ARGV[2])
 local endpoint_ceiling = tonumber(ARGV[3])
 local ttl_ms = tonumber(ARGV[4])
-local probe_token = ARGV[5]
-local probe_ttl_ms = tonumber(ARGV[6])
-local circuit_ttl_ms = tonumber(ARGV[7])
-
-local function circuit_status(state_key, opened_key, probe_key)
-  local state = redis.call('GET', state_key) or 'closed'
-  local opened_until = tonumber(redis.call('GET', opened_key) or 0)
-  if state == 'open' then
-    if opened_until > now_ms then
-      return opened_until - now_ms, 'open', false
-    end
-    if redis.call('EXISTS', probe_key) == 1 then
-      local probe_wait = redis.call('PTTL', probe_key)
-      if probe_wait > 0 then return probe_wait, 'open', false end
-      return 250, 'open', false
-    end
-    return 0, 'half_open', true
-  end
-  if state == 'half_open' then
-    if redis.call('EXISTS', probe_key) == 1 then
-      local probe_wait = redis.call('PTTL', probe_key)
-      if probe_wait > 0 then return probe_wait, 'half_open', false end
-      return 250, 'half_open', false
-    end
-    return 0, 'half_open', true
-  end
-  return 0, 'closed', false
-end
-
-local gwait, gstate, gprobe = circuit_status(KEYS[11], KEYS[12], KEYS[15])
-local ewait = 0
-local estate = 'closed'
-local eprobe = false
-if has_endpoint then
-  ewait, estate, eprobe = circuit_status(KEYS[16], KEYS[17], KEYS[20])
-end
-if gwait > 0 or ewait > 0 then
-  return {
-    tostring(math.max(gwait, ewait)),
-    '',
-    '',
-    'circuit',
-    gstate,
-    estate
-  }
-end
-
-local global_claimed = false
-if gprobe then
-  local claimed = redis.call(
-    'SET', KEYS[15], probe_token, 'PX', probe_ttl_ms, 'NX'
-  )
-  if not claimed then
-    return {'250', '', '', 'circuit', gstate, estate}
-  end
-  global_claimed = true
-end
-
-local endpoint_claimed = false
-if has_endpoint and eprobe then
-  local claimed = redis.call(
-    'SET', KEYS[20], probe_token, 'PX', probe_ttl_ms, 'NX'
-  )
-  if not claimed then
-    if global_claimed and redis.call('GET', KEYS[15]) == probe_token then
-      redis.call('DEL', KEYS[15])
-    end
-    return {'250', '', '', 'circuit', gstate, estate}
-  end
-  endpoint_claimed = true
-end
-
-if global_claimed then
-  redis.call('PSETEX', KEYS[11], circuit_ttl_ms, 'half_open')
-  gstate = 'half_open'
-end
-if endpoint_claimed then
-  redis.call('PSETEX', KEYS[16], circuit_ttl_ms, 'half_open')
-  estate = 'half_open'
-end
 
 local function pacing_state(
   next_key,
@@ -383,14 +303,12 @@ local function pacing_state(
   local target = math.min(ceiling, runtime_target)
   local rate = tonumber(redis.call('GET', rate_key) or target)
   if not adaptive then
-    -- The global Redis lane is a hard aggregate ceiling. Ignore legacy
-    -- adaptive effective-rate/cooldown state so one old penalty cannot silently
-    -- collapse a newly isolated fleet below its configured hard cap.
     rate = target
   elseif rate == nil or rate <= 0 then
     rate = target
   end
   if rate > target then rate = target end
+
   local cooldown_until = tonumber(redis.call('GET', cooldown_key) or 0)
   if not adaptive then cooldown_until = 0 end
   local base_ms = math.max(now_ms, cooldown_until)
@@ -413,41 +331,19 @@ end
 
 local admit_ms = math.max(now_ms, global_next, endpoint_next)
 local global_interval = math.max(1, 1000 / global_rate)
-redis.call(
-  'PSETEX',
-  KEYS[1],
-  ttl_ms,
-  tostring(admit_ms + global_interval)
-)
+redis.call('PSETEX', KEYS[1], ttl_ms, tostring(admit_ms + global_interval))
 redis.call('PSETEX', KEYS[2], ttl_ms, tostring(global_rate))
-if redis.call('EXISTS', KEYS[3]) == 1 then
-  redis.call('PEXPIRE', KEYS[3], ttl_ms)
-end
-if redis.call('EXISTS', KEYS[4]) == 1 then
-  redis.call('PEXPIRE', KEYS[4], ttl_ms)
-end
-if redis.call('EXISTS', KEYS[5]) == 1 then
-  redis.call('PEXPIRE', KEYS[5], ttl_ms)
-end
+if redis.call('EXISTS', KEYS[3]) == 1 then redis.call('PEXPIRE', KEYS[3], ttl_ms) end
+if redis.call('EXISTS', KEYS[4]) == 1 then redis.call('PEXPIRE', KEYS[4], ttl_ms) end
+if redis.call('EXISTS', KEYS[5]) == 1 then redis.call('PEXPIRE', KEYS[5], ttl_ms) end
 
 if has_endpoint then
   local endpoint_interval = math.max(1, 1000 / endpoint_rate)
-  redis.call(
-    'PSETEX',
-    KEYS[6],
-    ttl_ms,
-    tostring(admit_ms + endpoint_interval)
-  )
+  redis.call('PSETEX', KEYS[6], ttl_ms, tostring(admit_ms + endpoint_interval))
   redis.call('PSETEX', KEYS[7], ttl_ms, tostring(endpoint_rate))
-  if redis.call('EXISTS', KEYS[8]) == 1 then
-    redis.call('PEXPIRE', KEYS[8], ttl_ms)
-  end
-  if redis.call('EXISTS', KEYS[9]) == 1 then
-    redis.call('PEXPIRE', KEYS[9], ttl_ms)
-  end
-  if redis.call('EXISTS', KEYS[10]) == 1 then
-    redis.call('PEXPIRE', KEYS[10], ttl_ms)
-  end
+  if redis.call('EXISTS', KEYS[8]) == 1 then redis.call('PEXPIRE', KEYS[8], ttl_ms) end
+  if redis.call('EXISTS', KEYS[9]) == 1 then redis.call('PEXPIRE', KEYS[9], ttl_ms) end
+  if redis.call('EXISTS', KEYS[10]) == 1 then redis.call('PEXPIRE', KEYS[10], ttl_ms) end
 end
 
 return {
@@ -455,8 +351,8 @@ return {
   tostring(global_rate),
   has_endpoint and tostring(endpoint_rate) or '',
   'paced',
-  gstate,
-  estate,
+  'closed',
+  has_endpoint and 'closed' or '',
   tostring(global_target),
   has_endpoint and tostring(endpoint_target) or ''
 }
@@ -472,74 +368,39 @@ local ttl_ms = tonumber(ARGV[4])
 local quiet_ms = tonumber(ARGV[5])
 local factor = tonumber(ARGV[6])
 local step = tonumber(ARGV[7])
-local global_admission_state = ARGV[8]
-local endpoint_admission_state = ARGV[9]
-local probe_token = ARGV[10]
 
-local function close_half_open(
-  state_key,
-  opened_key,
-  failures_key,
-  window_key,
-  probe_key
-)
-  local state = redis.call('GET', state_key) or 'closed'
-  local owner = redis.call('GET', probe_key)
-  if state == 'half_open' and owner == probe_token then
-    redis.call('PSETEX', state_key, ttl_ms, 'closed')
-    redis.call('DEL', opened_key, failures_key, window_key, probe_key)
-  end
-end
+local global_target = tonumber(redis.call('GET', KEYS[5]) or global_ceiling)
+if global_target == nil or global_target <= 0 then global_target = global_ceiling end
+global_target = math.min(global_ceiling, global_target)
+redis.call('PSETEX', KEYS[2], ttl_ms, tostring(global_target))
 
-if global_admission_state == 'half_open' then
-  close_half_open(KEYS[11], KEYS[12], KEYS[13], KEYS[14], KEYS[15])
-end
-if has_endpoint and endpoint_admission_state == 'half_open' then
-  close_half_open(KEYS[16], KEYS[17], KEYS[18], KEYS[19], KEYS[20])
-end
-
-local function recover_rate(rate_key, cooldown_key, penalty_key, target_key, ceiling, adaptive)
-  local runtime_target = tonumber(redis.call('GET', target_key) or ceiling)
-  if runtime_target == nil or runtime_target <= 0 then
-    runtime_target = ceiling
-  end
-  local target = math.min(ceiling, runtime_target)
-  if not adaptive then
-    redis.call('PSETEX', rate_key, ttl_ms, tostring(target))
-    return target, target
-  end
-  local rate = tonumber(redis.call('GET', rate_key) or target)
-  if rate == nil or rate <= 0 then rate = target end
-  if rate > target then rate = target end
-  local cooldown_until = tonumber(redis.call('GET', cooldown_key) or 0)
-  local last_penalty = tonumber(redis.call('GET', penalty_key) or 0)
-  if rate >= target
-    or now_ms < cooldown_until
-    or (now_ms - last_penalty) < quiet_ms then
-    redis.call('PSETEX', rate_key, ttl_ms, tostring(rate))
-    return rate, target
-  end
-  local recovered = math.min(target, math.max(rate + step, rate * factor))
-  if recovered > rate then
-    rate = recovered
-    redis.call('PSETEX', rate_key, ttl_ms, tostring(rate))
-    redis.call('PSETEX', penalty_key, ttl_ms, tostring(now_ms))
-  end
-  return rate, target
-end
-
-local global_rate, global_target = recover_rate(
-  KEYS[2], KEYS[3], KEYS[4], KEYS[5], global_ceiling, false
-)
 local endpoint_rate = 0
 local endpoint_target = endpoint_ceiling
 if has_endpoint then
-  endpoint_rate, endpoint_target = recover_rate(
-    KEYS[7], KEYS[8], KEYS[9], KEYS[10], endpoint_ceiling, true
-  )
+  local runtime_target = tonumber(redis.call('GET', KEYS[10]) or endpoint_ceiling)
+  if runtime_target == nil or runtime_target <= 0 then runtime_target = endpoint_ceiling end
+  endpoint_target = math.min(endpoint_ceiling, runtime_target)
+
+  endpoint_rate = tonumber(redis.call('GET', KEYS[7]) or endpoint_target)
+  if endpoint_rate == nil or endpoint_rate <= 0 then endpoint_rate = endpoint_target end
+  if endpoint_rate > endpoint_target then endpoint_rate = endpoint_target end
+
+  local cooldown_until = tonumber(redis.call('GET', KEYS[8]) or 0)
+  local last_penalty = tonumber(redis.call('GET', KEYS[9]) or 0)
+  if endpoint_rate < endpoint_target
+    and now_ms >= cooldown_until
+    and (now_ms - last_penalty) >= quiet_ms then
+    endpoint_rate = math.min(
+      endpoint_target,
+      math.max(endpoint_rate + step, endpoint_rate * factor)
+    )
+    redis.call('PSETEX', KEYS[9], ttl_ms, tostring(now_ms))
+  end
+  redis.call('PSETEX', KEYS[7], ttl_ms, tostring(endpoint_rate))
 end
+
 return {
-  tostring(global_rate),
+  tostring(global_target),
   has_endpoint and tostring(endpoint_rate) or '',
   tostring(global_target),
   has_endpoint and tostring(endpoint_target) or ''
@@ -687,25 +548,18 @@ return {
         return min(local, shared.rate) if shared is not None else local
 
     def _shared_keys(self, endpoint: str | None) -> list[str]:
+        """Return pacing keys only; availability circuits are worker-local."""
         if self._global_shared is None:
             raise RuntimeError("Shared Redis admission is not configured")
         global_pacer = list(self._global_shared._keys)
-        global_circuit = list(self._breaker._keys("__global__"))
         if endpoint is None:
             endpoint_pacer = global_pacer
-            endpoint_circuit = global_circuit
         else:
             shared_endpoint = self._shared_endpoint(endpoint)
             if shared_endpoint is None:
                 raise RuntimeError("Shared endpoint admission is not configured")
             endpoint_pacer = list(shared_endpoint._keys)
-            endpoint_circuit = list(self._breaker._keys(endpoint))
-        return [
-            *global_pacer,
-            *endpoint_pacer,
-            *global_circuit,
-            *endpoint_circuit,
-        ]
+        return [*global_pacer, *endpoint_pacer]
 
     def _observe_redis_command(self, operation: str, started: float) -> None:
         REDIS_RTT.labels(operation).observe(time.perf_counter() - started)
@@ -755,7 +609,7 @@ return {
         keys = self._shared_keys(endpoint)
 
         while True:
-            probe_token = uuid4().hex
+            probe_token = None
             started = time.perf_counter()
             try:
                 result = await self._admission_script(
@@ -765,9 +619,6 @@ return {
                         self.shared_rate_ceiling,
                         endpoint_ceiling,
                         self._global_shared._state_ttl_ms,
-                        probe_token,
-                        int(self._breaker.probe_seconds * 1000),
-                        self._breaker._state_ttl_ms,
                     ],
                 )
             finally:
@@ -860,9 +711,6 @@ return {
                     30_000,
                     1.25,
                     0.5,
-                    "closed",
-                    "closed",
-                    admission.probe_token or "",
                 ],
             )
         finally:
