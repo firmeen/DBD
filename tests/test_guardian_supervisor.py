@@ -32,6 +32,8 @@ def test_guardian_rate_key_is_forwarded_to_worker_environment(monkeypatch) -> No
     assert worker.process.pid == 4242
     assert captured["env"]["DBD_REDIS_RATE_KEY"] == "dbd:production:global-rate"
     assert captured["env"]["DBD_FLEET_RATE_CEILING"] == "20.0"
+    assert captured["env"]["PYTHONIOENCODING"] == "utf-8"
+    assert captured["env"]["PYTHONUTF8"] == "1"
     command_text = " ".join(captured["command"])
     assert "--run-id 8" in command_text
 
