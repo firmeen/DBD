@@ -105,6 +105,7 @@ function Get-GuardianState {
         return $null
     }
 }
+
 function Get-WorkerRegistry {
     if (-not (Test-Path -LiteralPath $WorkerRegistryPath)) {
         return $null
@@ -211,10 +212,7 @@ function Get-GuardianOwnedWorkers {
                 }
 
                 $matches = @(
-                    Get-CimInstance Win32_Process `
-                        -Filter ("ProcessId = {0}" -f $pidValue) `
-                        -OperationTimeoutSec 5 `
-                        -ErrorAction Stop
+                    Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $pidValue) -OperationTimeoutSec 5 -ErrorAction Stop
                 )
                 if ($matches.Count -eq 0) {
                     continue
@@ -232,7 +230,7 @@ function Get-GuardianOwnedWorkers {
 
                 $runPattern = [regex]::Escape([string]$RunId)
                 if (
-                    $name -match '^(python(w)?(\.exe)?|powershell(\.exe)?|pwsh(\.exe)?)
+                    $name -notmatch '^(python(w)?(\.exe)?|powershell(\.exe)?|pwsh(\.exe)?)
     $processByPid = @{}
     foreach ($process in $processes) {
         $processByPid[[int]$process.ProcessId] = $process
@@ -280,9 +278,7 @@ function Stop-GuardianOwnedWorkers {
     )
 
     $workers = @(
-        Get-GuardianOwnedWorkers `
-            -GuardianPid $GuardianPid `
-            -SupervisorGeneration $SupervisorGeneration
+        Get-GuardianOwnedWorkers -GuardianPid $GuardianPid -SupervisorGeneration $SupervisorGeneration
     )
     if ($workers.Count -eq 0) {
         return 0
@@ -413,11 +409,7 @@ while ($true) {
         $ownedWorkers = @()
 
         try {
-            $ownedWorkers = @(
-                Get-GuardianOwnedWorkers `
-                    -GuardianPid $lostGuardianPid `
-                    -SupervisorGeneration $lostSupervisorGeneration
-            )
+            $ownedWorkers = @(Get-GuardianOwnedWorkers -GuardianPid $lostGuardianPid -SupervisorGeneration $lostSupervisorGeneration)
             $ownershipVerified = $true
         }
         catch {
@@ -438,11 +430,7 @@ while ($true) {
             )
             Start-Sleep -Seconds $OrphanGraceSeconds
             try {
-                [void](
-                    Stop-GuardianOwnedWorkers `
-                        -GuardianPid $lostGuardianPid `
-                        -SupervisorGeneration $lostSupervisorGeneration
-                )
+                [void](Stop-GuardianOwnedWorkers -GuardianPid $lostGuardianPid -SupervisorGeneration $lostSupervisorGeneration)
             }
             catch {
                 Write-Warning (
@@ -456,11 +444,7 @@ while ($true) {
 
         if ($ownershipVerified) {
             try {
-                $remainingOwned = @(
-                    Get-GuardianOwnedWorkers `
-                        -GuardianPid $lostGuardianPid `
-                        -SupervisorGeneration $lostSupervisorGeneration
-                )
+                $remainingOwned = @(Get-GuardianOwnedWorkers -GuardianPid $lostGuardianPid -SupervisorGeneration $lostSupervisorGeneration)
                 if ($remainingOwned.Count -eq 0 -and $lostSupervisorGeneration) {
                     try {
                         Write-RecoveryMarker `
@@ -510,18 +494,16 @@ while ($true) {
     Write-GuardianHeader "RECOVERING" ("relaunch in {0}s | same Run ID" -f $effectiveDelay)
     Start-Sleep -Seconds ([int]$effectiveDelay)
 }
- -and
-                    $commandLine -match '\-m\s+dbd\s+bulk' -and
-                    $commandLine -match ("\-\-run-id\s+" + $runPattern + "(\s|$)")
+ -or
+                    $commandLine -notmatch '\-m\s+dbd\s+bulk' -or
+                    $commandLine -notmatch ("\-\-run-id\s+" + $runPattern + "(\s|$)")
                 ) {
-                    $registered += $process
-                }
-                else {
                     throw (
                         "Process registry PID {0} no longer matches Run {1}; " +
                         "recovery ownership cannot be proven." -f $pidValue, $RunId
                     )
                 }
+                $registered += $process
             }
             return @($registered)
         }
