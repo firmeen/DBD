@@ -113,6 +113,39 @@ async def test_auth_recovery_wave_reenters_worker_local_availability_gate(monkey
     assert c.endpoint_rate.recover_global.await_count == 1
 
 
+async def test_fetch_authenticates_before_reserving_rate_capacity():
+    c = client()
+    order = []
+
+    async def ensure_token(*args, **kwargs):
+        order.append("auth")
+        return "token"
+
+    async def acquire(endpoint):
+        order.append("admission")
+        return SimpleNamespace(shared=False)
+
+    c._ensure_token = ensure_token
+    c.endpoint_rate.acquire = acquire
+
+    result = await c.fetch("GET", "/profile", rate_key="profile")
+
+    assert result.status == 200
+    assert order[:2] == ["auth", "admission"]
+
+
+async def test_auth_failure_does_not_consume_rate_admission():
+    c = client()
+    c._ensure_token = AsyncMock(side_effect=DbdAuthError("auth unavailable"))
+    c._mark_auth_unavailable = AsyncMock()
+    c.endpoint_rate.acquire = AsyncMock()
+
+    with pytest.raises(DbdAuthError):
+        await c.fetch("GET", "/profile", rate_key="profile")
+
+    c.endpoint_rate.acquire.assert_not_awaited()
+
+
 async def test_expiry_during_decryption_retries():
     c = client()
     c._ensure_token = AsyncMock(return_value="new")
