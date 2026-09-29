@@ -1951,6 +1951,11 @@ def supervise_campaign(
                 for row in registered_states
                 if str(row.get("status") or "").lower() == "active"
             ]
+            active_health_ids = {
+                str(row.get("worker_id"))
+                for row in active_health_rows
+                if row.get("worker_id")
+            }
             unhealthy_workers = sum(
                 str(row.get("circuit_global") or "").lower() == "open"
                 or str(row.get("auth_state") or "").lower() == "cooldown"
@@ -2072,7 +2077,9 @@ def supervise_campaign(
 
             target = len(active_live)
             current_effective_rate = None
-            fleet_visibility_complete = len(active_health_rows) == len(active_live)
+            fleet_visibility_complete = active_health_ids == {
+                worker.worker_id for worker in active_live
+            }
             if (
                 autoscale
                 and not graceful_stop
