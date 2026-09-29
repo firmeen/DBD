@@ -1028,6 +1028,7 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
         "inflight",
         "requests",
         "responses",
+        "auth_failures",
         "http_retries",
         "rate_limit_hits",
         "redis_commands",
@@ -1064,6 +1065,7 @@ def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict
         "not_available",
         "requests",
         "responses",
+        "auth_failures",
         "http_retries",
         "rate_limit_hits",
         "redis_commands",
@@ -1119,6 +1121,8 @@ def _campaign_terminal_snapshot(
     control_healthy: bool,
     heartbeat_age_seconds: float | None,
     elapsed_seconds: float,
+    workers_unhealthy: int = 0,
+    fleet_availability_degraded: bool = False,
 ) -> TerminalSnapshot:
     """Build presentation state from values already present in the supervisor loop."""
     return TerminalSnapshot(
@@ -1144,6 +1148,7 @@ def _campaign_terminal_snapshot(
         workers_active=workers_active,
         workers_draining=workers_draining,
         workers_stale=workers_stale,
+        workers_unhealthy=workers_unhealthy,
         workers_min=workers_min,
         workers_max=workers_max,
         restarts=restarts,
@@ -1153,6 +1158,8 @@ def _campaign_terminal_snapshot(
         rate_target=target_rate,
         rate_ceiling=rate_ceiling,
         requests=int(campaign_metrics.get("requests", 0)),
+        responses=int(campaign_metrics.get("responses", 0)),
+        auth_failures=int(campaign_metrics.get("auth_failures", 0)),
         http_retries=int(campaign_metrics.get("http_retries", 0)),
         rate_limit_hits=int(campaign_metrics.get("rate_limit_hits", 0)),
         redis_pool_in_use=int(live_metrics.get("redis_pool_in_use", 0)),
@@ -1160,6 +1167,7 @@ def _campaign_terminal_snapshot(
         redis_commands=int(campaign_metrics.get("redis_commands", 0)),
         redis_admissions=int(campaign_metrics.get("redis_admissions", 0)),
         control_healthy=control_healthy,
+        fleet_availability_degraded=fleet_availability_degraded,
         heartbeat_age_seconds=heartbeat_age_seconds,
         elapsed_seconds=elapsed_seconds,
     )
@@ -1757,6 +1765,7 @@ def supervise_campaign(
             "not_available",
             "requests",
             "responses",
+            "auth_failures",
             "http_retries",
             "rate_limit_hits",
             "redis_commands",
@@ -2208,7 +2217,7 @@ def supervise_campaign(
                         "draining"
                         if graceful_stop
                         else "degraded"
-                        if control_plane_degraded
+                        if control_plane_degraded or fleet_availability_degraded
                         else "running"
                     ),
                     live_progress=live_progress,
@@ -2230,6 +2239,8 @@ def supervise_campaign(
                     control_healthy=not control_plane_degraded,
                     heartbeat_age_seconds=heartbeat_age,
                     elapsed_seconds=max(0.0, now - dashboard_started_at),
+                    workers_unhealthy=unhealthy_workers,
+                    fleet_availability_degraded=fleet_availability_degraded,
                 )
             )
 
@@ -2240,7 +2251,13 @@ def supervise_campaign(
                         run_id,
                         supervisor_pid=os.getpid(),
             supervisor_generation=generation or None,
-                        status="draining" if graceful_stop else "running",
+                        status=(
+                            "draining"
+                            if graceful_stop
+                            else "degraded"
+                            if fleet_availability_degraded
+                            else "running"
+                        ),
                         autoscale=autoscale,
                         workers_initial=initial_workers,
                         workers_min=minimum,
@@ -2250,6 +2267,8 @@ def supervise_campaign(
                         workers_draining=len(draining_live),
                         workers_registered=registered,
                         workers_stale=stale_registered,
+                        workers_unhealthy=unhealthy_workers,
+                        fleet_availability_degraded=fleet_availability_degraded,
                         exhausted_capacity=exhausted_capacity,
                         effective_worker_max=effective_maximum,
                         worker_concurrency=worker_concurrency,

@@ -68,6 +68,7 @@ class TerminalSnapshot:
     workers_active: int = 0
     workers_draining: int = 0
     workers_stale: int = 0
+    workers_unhealthy: int = 0
     workers_min: int = 0
     workers_max: int = 0
     restarts: int = 0
@@ -78,6 +79,8 @@ class TerminalSnapshot:
     rate_target: float = 0.0
     rate_ceiling: float = 0.0
     requests: int = 0
+    responses: int = 0
+    auth_failures: int = 0
     http_retries: int = 0
     rate_limit_hits: int = 0
 
@@ -86,6 +89,7 @@ class TerminalSnapshot:
     redis_commands: int = 0
     redis_admissions: int = 0
     control_healthy: bool = True
+    fleet_availability_degraded: bool = False
     heartbeat_age_seconds: float | None = None
 
     elapsed_seconds: float = 0.0
@@ -354,6 +358,9 @@ class LiveCampaignDashboard:
             snapshot.redis_commands / snapshot.requests if snapshot.requests > 0 else 0.0
         )
         control = "HEALTHY" if snapshot.control_healthy else "DEGRADED"
+        availability = (
+            "DEGRADED" if snapshot.fleet_availability_degraded else "ISOLATED"
+        )
         heartbeat = (
             "--"
             if snapshot.heartbeat_age_seconds is None
@@ -381,18 +388,19 @@ class LiveCampaignDashboard:
         fleet = (
             f" FLEET     workers {snapshot.workers_registered}/{snapshot.workers_target or snapshot.workers_max}   "
             f"active {snapshot.workers_active}   draining {snapshot.workers_draining}   "
-            f"stale {snapshot.workers_stale}   restarts {snapshot.restarts}   "
+            f"stale {snapshot.workers_stale}   unhealthy {snapshot.workers_unhealthy}   "
+            f"availability {availability}   restarts {snapshot.restarts}   "
             f"lost-cap {snapshot.exhausted_capacity}"
         )
         http = (
             f" HTTP      actual {self._rate_text(snapshot.http_rate):>9}   "
             f"effective {snapshot.rate_effective:.2f}/s   target {snapshot.rate_target:.2f}/s   "
             f"ceiling {snapshot.rate_ceiling:.2f}/s   retries {snapshot.http_retries:,}   "
-            f"429/503 {snapshot.rate_limit_hits:,}"
+            f"auth-fail {snapshot.auth_failures:,}   429/503 {snapshot.rate_limit_hits:,}"
         )
         http_bar = (
             f"           load {render_bar(int(http_load * 1000), int(max(snapshot.rate_ceiling, 0.001) * 1000), 30)} "
-            f"requests {snapshot.requests:,}"
+            f"requests/responses {snapshot.requests:,}/{snapshot.responses:,}"
         )
         redis = (
             f" REDIS     pool {snapshot.redis_pool_in_use}/{snapshot.redis_pool_max or '-'}   "
@@ -442,6 +450,7 @@ class LiveCampaignDashboard:
         percent = self._percent(snapshot.current, snapshot.total)
         status = snapshot.status.upper()
         control = "OK" if snapshot.control_healthy else "DEGRADED"
+        availability = "DEGRADED" if snapshot.fleet_availability_degraded else "ISO"
         lines = [
             f"DBD CAMPAIGN {snapshot.run_id} · {status}",
             f"{render_bar(snapshot.current, snapshot.total, max(12, min(24, width - 24)))} "
@@ -451,8 +460,10 @@ class LiveCampaignDashboard:
             f"q fetch/archive/project {snapshot.fetch_queue}/{snapshot.archive_queue}/{snapshot.project_queue}",
             f"active fetch/archive/project {snapshot.fetch_active}/{snapshot.archive_active}/{snapshot.project_active}",
             f"workers {snapshot.workers_active}/{snapshot.workers_target or snapshot.workers_max} "
-            f"drain {snapshot.workers_draining} stale {snapshot.workers_stale}",
+            f"drain {snapshot.workers_draining} unhealthy {snapshot.workers_unhealthy} "
+            f"avail {availability}",
             f"HTTP {self._rate_text(snapshot.http_rate)} target {snapshot.rate_target:.2f}/s "
+            f"req/resp {snapshot.requests:,}/{snapshot.responses:,} auth {snapshot.auth_failures:,} "
             f"429/503 {snapshot.rate_limit_hits:,}",
             f"Redis {control} pool {snapshot.redis_pool_in_use}/{snapshot.redis_pool_max or '-'}",
             f"Event {self._event_text(self._latest_event, max(16, width - 6))}",
