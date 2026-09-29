@@ -268,7 +268,7 @@ def resolve_guardian_config(
         stored_version = 0
     explicit = dict(overrides or {})
     if (
-        stored_version < 2
+        stored_version == 1
         and explicit.get("workers_max") is None
         and values.get("fleet_rate_max") is not None
         and int(values.get("workers", 0) or 0) == 4
