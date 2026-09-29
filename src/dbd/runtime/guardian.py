@@ -238,7 +238,7 @@ def resolve_guardian_config(
     overrides: Mapping[str, Any] | None = None,
     persist: bool = True,
 ) -> GuardianConfig:
-    """Resolve defaults -> previous runtime -> persisted profile -> explicit CLI values."""
+    """Resolve defaults -> runtime/profile -> current Redis namespace -> explicit CLI values."""
     allowed = {item.name for item in fields(GuardianConfig)} - {"supervisor_generation"}
     values = asdict(GuardianConfig(run_id=int(run_id)))
 
