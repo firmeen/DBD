@@ -1,18 +1,14 @@
-# Single-process DBD Collector
+# Single-process DBD Collector (Diagnostic / Canary)
 
-The preferred ingestion runtime is the single-process collector:
+This command is an explicit single-process diagnostic/canary path for an existing `fabric_v2` run. It is **not** the production runtime. Production operation remains `Run-DBD.ps1 -> campaign guard -> Guardian -> Supervisor -> autoscaled distributed workers -> Redis shared admission/rate control`.
+
+Use the collector only when intentionally validating the durable pipeline in one process:
 
 ~~~powershell
 dbd-data collect RUN_ID
 ~~~
 
-On Windows the existing launcher remains available:
-
-~~~powershell
-.\Run-DBD.ps1 RUN_ID -Headless
-~~~
-
-The launcher is intentionally thin. It resolves the project Python environment and invokes dbd-data collect in the same process. It does not start Guardian, Supervisor, worker child processes, autoscaling, or Redis admission.
+Do **not** use `Run-DBD.ps1` to invoke this diagnostic path. `Run-DBD.ps1` is the production Guardian/ Campaign watchdog and launches `dbd-data campaign guard RUN_ID`.
 
 ## Runtime model
 
@@ -38,7 +34,7 @@ MySQL normalized data
 
 MySQL remains the durable source of truth. The collector reuses the existing Fabric scheduler state and does not rematerialize the run.
 
-## Default operator profile
+## Diagnostic defaults
 
 ~~~text
 concurrency = 48
@@ -248,18 +244,23 @@ Only one API manager can run against the same database at a time. Redis is not r
 
 If the lock connection is lost, the health check fails closed rather than allowing two independent collectors.
 
-## Legacy runtime
+## Production runtime boundary
 
-Legacy Campaign, Guardian, Supervisor, distributed workers and Redis coordination remain in the repository temporarily for compatibility and diagnostics.
+Campaign, Guardian, Supervisor, distributed workers, autoscaling and Redis coordination are the production runtime. The collector does not replace them.
 
-They are not invoked by:
+Production entry:
 
 ~~~powershell
-dbd-data collect RUN_ID
 .\Run-DBD.ps1 RUN_ID -Headless
 ~~~
 
-They can be removed later after the single-process collector has completed production soak validation.
+Direct Guardian entry is also available:
+
+~~~powershell
+dbd-data campaign guard RUN_ID --headless
+~~~
+
+Distributed workers use Redis for shared request admission, global/endpoint pacing, circuit state, worker heartbeat and fleet control while MySQL remains the durable source of truth.
 
 ## Validation
 
@@ -277,7 +278,7 @@ Focused compatibility validation:
 python -m pytest -q tests/test_async_client.py tests/test_rate_control.py tests/test_supervisor.py tests/test_guardian_supervisor.py tests/test_worker_preflight.py
 ~~~
 
-Redis admission tests are legacy-path tests only:
+Redis admission tests validate the production distributed path:
 
 ~~~powershell
 python -m pytest -q tests/test_redis_rate_control.py
@@ -296,7 +297,7 @@ dbd-data campaign status RUN_ID --verbose
 for visibility, but `dbd-data collect RUN_ID` refuses its first claim if the
 legacy Supervisor/workers or live durable leases are still present.
 
-After local validation, start with the same Run ID and a bounded canary:
+For an explicit single-process diagnostic only, use a bounded canary:
 
 ~~~powershell
 dbd-data collect RUN_ID --concurrency 16 --rate 20 --limit 200

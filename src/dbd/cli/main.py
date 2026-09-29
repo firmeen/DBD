@@ -584,7 +584,7 @@ def main():
     collect = _add_output_options(
         sub.add_parser(
             "collect",
-            help="Resume one durable fabric run in a single Python process",
+            help="Explicit single-process diagnostic/canary runner for an existing durable fabric run",
         )
     )
     collect.add_argument("run_id", type=positive)
@@ -609,7 +609,7 @@ def main():
 
     campaign = sub.add_parser(
         "campaign",
-        help="Legacy coordinated worker-fleet commands; prefer dbd-data collect",
+        help="Supervise the production coordinated worker fleet",
     )
     campaign_sub = campaign.add_subparsers(dest="campaign_command", required=True)
     campaign_start = campaign_sub.add_parser("start", help="Create a run and launch coordinated workers")

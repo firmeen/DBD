@@ -1,6 +1,6 @@
 # DBD Data Platform
 
-ระบบสำหรับเก็บและจัดการข้อมูลจาก DBD DataWarehouse แบบทำงานต่อเนื่องได้ แม้ process หยุดหรือเครื่อง restart โดยใช้ **MySQL เป็นข้อมูลหลักที่เชื่อถือได้** และใช้ durable queue/task state สำหรับ resume งาน ตัว collector หลักทำงานแบบ single-process async และไม่ใช้ Redis ใน HTTP hot path; Redis เหลือสำหรับ legacy distributed workflows เท่านั้น
+ระบบสำหรับเก็บและจัดการข้อมูลจาก DBD DataWarehouse แบบทำงานต่อเนื่องได้ แม้ process หยุดหรือเครื่อง restart โดยใช้ **MySQL เป็นข้อมูลหลักที่เชื่อถือได้**, ใช้ queue/task state สำหรับ resume งาน และสามารถใช้ **Redis** เพื่อควบคุม Campaign/worker หลาย process ร่วมกัน
 
 ถ้าคุณเพิ่งเข้ามาในโปรเจกต์นี้ ไม่จำเป็นต้องอ่าน architecture ทั้งหมดก่อน ให้เริ่มจากหัวข้อ **เริ่มใช้งานแบบสั้นที่สุด** ด้านล่าง
 
@@ -111,21 +111,9 @@ dbd-data master-status
 dbd-data discover-status
 ```
 
-จากจุดนี้ collector หลักใช้งานได้แล้ว:
+จากจุดนี้ single-process workflow ใช้งานได้แล้ว
 
-```powershell
-dbd-data collect RUN_ID --concurrency 48 --rate 50
-```
-
-บน Windows ใช้ wrapper เดิมได้:
-
-```powershell
-.\Run-DBD.ps1 RUN_ID -Headless
-```
-
-ทั้งสองคำสั่ง resume **Run ID เดิม** จาก MySQL โดยไม่ materialize งานใหม่
-
-ถ้าจำเป็นต้องใช้ legacy Campaign / distributed workers จึงค่อยตั้ง Redis เพิ่มตาม [Redis setup](docs/setup/REDIS.md)
+ถ้าจะใช้ **Campaign / distributed workers** ให้ตั้ง Redis เพิ่มตาม [Redis setup](docs/setup/REDIS.md)
 
 ---
 
@@ -195,42 +183,9 @@ Financial endpoints ต้องพึ่งข้อมูลจาก profile 
 
 ---
 
-## Collector
+## Campaign
 
-Collector คือ runtime หลักที่แนะนำสำหรับ run แบบ `fabric_v2`
-
-```powershell
-dbd-data collect RUN_ID
-```
-
-default:
-
-```text
-concurrency = 48
-global HTTP ceiling = 50 requests/s
-```
-
-ปรับเองได้:
-
-```powershell
-dbd-data collect RUN_ID --concurrency 64 --rate 50
-```
-
-Collector ใช้ process Python เดียว, async HTTP pool, MySQL durable leases และ pipeline `fetch -> archive -> project` เดิม จึง resume Run เดิมได้โดยไม่ยิง resource ที่ DONE/N/A ซ้ำ Redis, Guardian, Supervisor, autoscaling และ worker fleet ไม่อยู่ใน request hot path
-
-ก่อน claim แรก collector จะตรวจ schema revision/required columns, archive configuration, legacy Supervisor/worker handoff และ durable leases แบบ fail-closed โดยอัตโนมัติ ถ้ามี live lease หรือ legacy runtime ยังทำงานอยู่ collector จะไม่เริ่มยิง HTTP
-
-ถ้า process ถูก kill หรือเครื่องดับ lease ที่หมดอายุจะถูก reclaim แบบ attempt-neutral; งาน stage `project` ที่มี archive แล้วจะกลับมา replay archive เดิมโดยไม่ refetch DBD
-
-Ctrl+C ครั้งแรกหยุด claim งานใหม่และ drain งานที่กำลังทำอย่างปลอดภัย งาน queued ที่ยังไม่เริ่มจะคืน lease กลับ MySQL แบบ attempt-neutral หลัง drain จะมี exact postflight check ว่า total ไม่เปลี่ยน, DONE/N/A/FAILED ไม่ย้อน และ RUNNING กลับ 0
-
-ดูรายละเอียดที่ [Single-process collector](docs/COLLECTOR.md)
-
----
-
-## Legacy Campaign
-
-Campaign เดิมยังเก็บไว้ชั่วคราวเพื่อ compatibility และ distributed diagnostics แต่ไม่ใช่ runtime หลักสำหรับ single-machine ingestion
+Campaign เป็นวิธีที่ง่ายที่สุดในการเปิด worker fleet ที่ coordinated ผ่าน Redis
 
 ก่อน production ให้รัน canary ก่อน ดูขั้นตอนเต็มใน [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md)
 
@@ -407,13 +362,11 @@ dbd-data discover
 dbd-data discover-status
 dbd-data master-status
 
-# Collector (recommended)
-dbd-data collect RUN_ID
-dbd-data collect RUN_ID --concurrency 48 --rate 50
-.\Run-DBD.ps1 RUN_ID -Headless
-
-# Legacy Campaign
+# Campaign
+dbd-data campaign start --help
 dbd-data campaign status RUN_ID
+dbd-data campaign stop RUN_ID
+dbd-data campaign resume RUN_ID
 
 # Bulk queue
 dbd-data bulk-status RUN_ID
