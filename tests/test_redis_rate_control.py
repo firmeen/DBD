@@ -116,6 +116,54 @@ async def test_two_controllers_share_one_hard_fleet_schedule():
         await second.close()
 
 
+async def test_endpoint_cooldown_does_not_reserve_global_fleet_cursor():
+    key = "dbd:test-endpoint-isolation:" + uuid4().hex
+    controller = EndpointRateController(
+        1000,
+        redis_url=REDIS_URL,
+        redis_key=key,
+        shared_rate_ceiling=1000,
+    )
+    blocked = None
+    await controller.open()
+    try:
+        if controller._global_shared is not None:
+            await controller._global_shared.clear_state()
+        profile = controller._shared_endpoint("profile")
+        committees = controller._shared_endpoint("committees")
+        assert profile is not None
+        assert committees is not None
+        await profile.clear_state()
+        await committees.clear_state()
+
+        await controller.penalize("profile", 0.30)
+        blocked = asyncio.create_task(controller.acquire("profile"))
+        await asyncio.sleep(0.03)
+
+        redis = controller._redis
+        assert redis is not None
+        # A blocked endpoint must not push the aggregate fleet cursor forward.
+        assert await redis.get(key) is None
+
+        started = time.perf_counter()
+        healthy = await controller.acquire("committees")
+        assert healthy.shared is True
+        assert time.perf_counter() - started < 0.20
+
+        assert (await asyncio.wait_for(blocked, 1.0)).shared is True
+    finally:
+        if blocked is not None and not blocked.done():
+            blocked.cancel()
+            await asyncio.gather(blocked, return_exceptions=True)
+        if controller._global_shared is not None:
+            await controller._global_shared.clear_state()
+        for endpoint_name in ("profile", "committees"):
+            endpoint = controller._shared_endpoint(endpoint_name)
+            if endpoint is not None:
+                await endpoint.clear_state()
+        await controller.close()
+
+
 async def test_healthy_shared_admission_is_one_redis_round_trip():
     key = "dbd:test-fast-admission:" + uuid4().hex
     controller = EndpointRateController(
