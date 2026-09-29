@@ -555,6 +555,9 @@ def test_powershell_watchdog_contract() -> None:
     assert "run-id" in script
     assert "taskkill.exe" in script
     assert "Get-GuardianOwnedWorkers" in script
+    assert "$WorkerRegistryPath" in script
+    assert "Get-WorkerRegistry" in script
+    assert '-Filter ("ProcessId = {0}" -f $pidValue)' in script
     assert "Test-GuardianDescendant" in script
     assert "ParentProcessId" in script
     assert "$state.pid" in script
@@ -564,6 +567,7 @@ def test_powershell_watchdog_contract() -> None:
     assert "supervisor_pid" in script
     assert "$remainingOwned.Count -eq 0" in script
     assert "Get-CimInstance Win32_Process -OperationTimeoutSec 5 -ErrorAction Stop" in script
+    assert "-SupervisorGeneration $lostSupervisorGeneration" in script
     assert "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue" not in script
     assert "powershell(\\.exe)?|pwsh" in script
     assert "IsNullOrWhiteSpace" in script
