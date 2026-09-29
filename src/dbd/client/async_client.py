@@ -83,6 +83,8 @@ class AsyncDbdClient:
         self._semaphore = asyncio.Semaphore(self.concurrency)
         self._auth = DbdAuth()
         self._auth_lock = asyncio.Lock()
+        self._auth_refresh_task: asyncio.Task | None = None
+        self._auth_backoff_until = 0.0
         self._token = None
         self._session = None
         self._auth_session = None
@@ -100,7 +102,9 @@ class AsyncDbdClient:
 
     @property
     def auth_state(self) -> str:
-        if self._auth_lock.locked():
+        if time.monotonic() < self._auth_backoff_until:
+            return "cooldown"
+        if self._auth_refresh_task is not None and not self._auth_refresh_task.done():
             return "refreshing"
         if self._token is not None and time.time() < self._auth._expires_at - 15:
             return "ready"
@@ -141,23 +145,61 @@ class AsyncDbdClient:
             self._auth_session = None
         await self.endpoint_rate.close()
 
+    async def _refresh_token_once(self) -> str:
+        try:
+            token = await asyncio.to_thread(self._blocking_token)
+        except DbdAuthError as exc:
+            self.auth_failures += 1
+            self.last_auth_error_at = time.time()
+            self._remember_error(exc)
+            self._auth_backoff_until = time.monotonic() + 5.0
+            raise
+        self._token = token
+        self._auth_backoff_until = 0.0
+        self.last_auth_success_at = time.time()
+        if self._session is not None and self._auth_session is not None:
+            self._session.cookies.update(self._auth_session.cookies)
+        return token
+
     async def _ensure_token(self, *, rejected=None, force=False, reset_warmup=False):
-        async with self._auth_lock:
-            if force or (rejected is not None and rejected == self._token):
-                self._auth.invalidate(reset_warmup=reset_warmup)
-                self._token = None
-            if self._token is None or time.time() >= self._auth._expires_at - 15:
-                try:
-                    self._token = await asyncio.to_thread(self._blocking_token)
-                except DbdAuthError as exc:
-                    self.auth_failures += 1
-                    self.last_auth_error_at = time.time()
-                    self._remember_error(exc)
-                    raise
-                self.last_auth_success_at = time.time()
-                if self._session is not None and self._auth_session is not None:
-                    self._session.cookies.update(self._auth_session.cookies)
-            return self._token
+        if force or (rejected is not None and rejected == self._token):
+            async with self._auth_lock:
+                if force or (rejected is not None and rejected == self._token):
+                    self._auth.invalidate(reset_warmup=reset_warmup)
+                    self._token = None
+                    self._auth_refresh_task = None
+                    self._auth_backoff_until = 0.0
+
+        while True:
+            if self._token is not None and time.time() < self._auth._expires_at - 15:
+                return self._token
+
+            task = None
+            wait_seconds = 0.0
+            async with self._auth_lock:
+                if self._token is not None and time.time() < self._auth._expires_at - 15:
+                    return self._token
+
+                wait_seconds = max(
+                    0.0,
+                    self._auth_backoff_until - time.monotonic(),
+                )
+                if wait_seconds <= 0:
+                    if (
+                        self._auth_refresh_task is None
+                        or self._auth_refresh_task.done()
+                    ):
+                        self._auth_refresh_task = asyncio.create_task(
+                            self._refresh_token_once()
+                        )
+                    task = self._auth_refresh_task
+
+            if wait_seconds > 0:
+                await asyncio.sleep(wait_seconds)
+                continue
+
+            assert task is not None
+            return await task
 
     def _blocking_token(self):
         return self._auth.get_token(self._auth_session)
