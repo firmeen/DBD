@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import dbd.runtime.guardian as guardian
 from dbd.presentation.guardian import GuardianDashboard
 
@@ -44,8 +46,16 @@ def probe():
     )
 
 
-def test_profile_persists_explicit_operational_values(monkeypatch, tmp_path) -> None:
+def test_profile_persists_operational_values_but_current_env_owns_rate_namespace(
+    monkeypatch,
+    tmp_path,
+) -> None:
     monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        guardian,
+        "settings",
+        SimpleNamespace(dbd_redis_rate_key="dbd:production:global-rate"),
+    )
     monkeypatch.setattr(
         guardian,
         "_runtime_profile",
@@ -54,6 +64,7 @@ def test_profile_persists_explicit_operational_values(monkeypatch, tmp_path) -> 
             "workers_min": 4,
             "workers_max": 10,
             "fleet_rate_initial": 16.0,
+            "redis_rate_key": "dbd:dev:global-rate",
         },
     )
 
@@ -61,7 +72,7 @@ def test_profile_persists_explicit_operational_values(monkeypatch, tmp_path) -> 
         8,
         overrides={
             "fleet_rate_max": 20.0,
-            "redis_rate_key": "dbd:production:global-rate",
+            "redis_rate_key": "dbd:explicit:global-rate",
             "open_powershell": False,
         },
     )
@@ -71,9 +82,16 @@ def test_profile_persists_explicit_operational_values(monkeypatch, tmp_path) -> 
     assert config.workers_max == 10
     assert config.fleet_rate_initial == 16.0
     assert config.fleet_rate_max == 20.0
-    assert config.redis_rate_key == "dbd:production:global-rate"
+    assert config.redis_rate_key == "dbd:explicit:global-rate"
 
-    monkeypatch.setattr(guardian, "_runtime_profile", lambda run_id: {"workers": 2})
+    monkeypatch.setattr(
+        guardian,
+        "_runtime_profile",
+        lambda run_id: {
+            "workers": 2,
+            "redis_rate_key": "dbd:dev:global-rate",
+        },
+    )
     restored = guardian.resolve_guardian_config(8)
 
     assert restored.workers == 6
