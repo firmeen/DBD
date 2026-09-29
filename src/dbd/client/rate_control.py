@@ -373,7 +373,8 @@ local function pacing_state(
   rate_key,
   cooldown_key,
   target_key,
-  ceiling
+  ceiling,
+  adaptive
 )
   local runtime_target = tonumber(redis.call('GET', target_key) or ceiling)
   if runtime_target == nil or runtime_target <= 0 then
@@ -381,7 +382,14 @@ local function pacing_state(
   end
   local target = math.min(ceiling, runtime_target)
   local rate = tonumber(redis.call('GET', rate_key) or target)
-  if rate == nil or rate <= 0 then rate = target end
+  if not adaptive then
+    -- The global Redis lane is a hard aggregate ceiling. Ignore legacy
+    -- adaptive effective-rate/cooldown state so one old penalty cannot silently
+    -- collapse a newly isolated fleet below its configured hard cap.
+    rate = target
+  elseif rate == nil or rate <= 0 then
+    rate = target
+  end
   if rate > target then rate = target end
   local cooldown_until = tonumber(redis.call('GET', cooldown_key) or 0)
   local base_ms = math.max(now_ms, cooldown_until)
@@ -391,14 +399,14 @@ local function pacing_state(
 end
 
 local global_rate, global_next, global_target = pacing_state(
-  KEYS[1], KEYS[2], KEYS[3], KEYS[5], global_ceiling
+  KEYS[1], KEYS[2], KEYS[3], KEYS[5], global_ceiling, false
 )
 local endpoint_rate = 0
 local endpoint_next = now_ms
 local endpoint_target = endpoint_ceiling
 if has_endpoint then
   endpoint_rate, endpoint_next, endpoint_target = pacing_state(
-    KEYS[6], KEYS[7], KEYS[8], KEYS[10], endpoint_ceiling
+    KEYS[6], KEYS[7], KEYS[8], KEYS[10], endpoint_ceiling, true
   )
 end
 
@@ -489,12 +497,16 @@ if has_endpoint and endpoint_admission_state == 'half_open' then
   close_half_open(KEYS[16], KEYS[17], KEYS[18], KEYS[19], KEYS[20])
 end
 
-local function recover_rate(rate_key, cooldown_key, penalty_key, target_key, ceiling)
+local function recover_rate(rate_key, cooldown_key, penalty_key, target_key, ceiling, adaptive)
   local runtime_target = tonumber(redis.call('GET', target_key) or ceiling)
   if runtime_target == nil or runtime_target <= 0 then
     runtime_target = ceiling
   end
   local target = math.min(ceiling, runtime_target)
+  if not adaptive then
+    redis.call('PSETEX', rate_key, ttl_ms, tostring(target))
+    return target, target
+  end
   local rate = tonumber(redis.call('GET', rate_key) or target)
   if rate == nil or rate <= 0 then rate = target end
   if rate > target then rate = target end
@@ -516,13 +528,13 @@ local function recover_rate(rate_key, cooldown_key, penalty_key, target_key, cei
 end
 
 local global_rate, global_target = recover_rate(
-  KEYS[2], KEYS[3], KEYS[4], KEYS[5], global_ceiling
+  KEYS[2], KEYS[3], KEYS[4], KEYS[5], global_ceiling, false
 )
 local endpoint_rate = 0
 local endpoint_target = endpoint_ceiling
 if has_endpoint then
   endpoint_rate, endpoint_target = recover_rate(
-    KEYS[7], KEYS[8], KEYS[9], KEYS[10], endpoint_ceiling
+    KEYS[7], KEYS[8], KEYS[9], KEYS[10], endpoint_ceiling, true
   )
 end
 return {
