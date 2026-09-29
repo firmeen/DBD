@@ -1279,6 +1279,30 @@ def reclaim_guardian_process_leases(run_id: int, supervisor_generation: str) -> 
         raise_errors=True,
     )
 
+
+def _reconcile_stopped_generation_leases(
+    run_id: int,
+    supervisor_generation: str | None,
+    workers: list[WorkerProcess],
+) -> int:
+    """Second-chance attempt-neutral cleanup after all local processes stop.
+
+    Workers normally release their durable leases during normal worker cleanup.
+    Windows interruption or a shutdown-time database error can prevent that.
+    Once every process from this Supervisor generation is confirmed stopped,
+    the generation prefix is an exact ownership fence for safe reclamation.
+    """
+    generation = _normalize_supervisor_generation(supervisor_generation)
+    if not generation:
+        return 0
+    if any(worker.process.poll() is None for worker in workers):
+        return 0
+    return _reclaim_running_leases(
+        run_id,
+        worker_prefix=f"local-{int(run_id)}-g{generation}-",
+        reason="supervisor_shutdown_recovery",
+    )
+
 def _request_local_drain(
     redis: Redis,
     run_id: int,
@@ -2119,6 +2143,17 @@ def supervise_campaign(
             if worker.process.poll() is not None:
                 _release_dead_worker_leases(run_id, worker.worker_id)
                 _cleanup_worker_control(redis, run_id, worker.worker_id)
+
+        generation_reclaimed = _reconcile_stopped_generation_leases(
+            run_id,
+            generation or None,
+            children,
+        )
+        if generation_reclaimed:
+            progress.event(
+                f"shutdown reconciliation reclaimed {generation_reclaimed} "
+                "generation-owned durable lease(s)"
+            )
 
         if lease_acquired:
             try:
