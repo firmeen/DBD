@@ -74,6 +74,48 @@ async def test_redis_pacer_applies_connection_pool_cap():
 
 
 
+async def test_two_controllers_share_one_hard_fleet_schedule():
+    key = "dbd:test-hard-fleet-schedule:" + uuid4().hex
+    first = EndpointRateController(
+        1000,
+        redis_url=REDIS_URL,
+        redis_key=key,
+        shared_rate_ceiling=10,
+    )
+    second = EndpointRateController(
+        1000,
+        redis_url=REDIS_URL,
+        redis_key=key,
+        shared_rate_ceiling=10,
+    )
+    await first.open()
+    await second.open()
+    try:
+        if first._global_shared is not None:
+            await first._global_shared.clear_state()
+        started = time.perf_counter()
+        await asyncio.gather(
+            first.acquire("profile"),
+            second.acquire("profile"),
+        )
+        elapsed = time.perf_counter() - started
+
+        assert elapsed >= 0.06
+        assert first._global_shared is not None
+        assert second._global_shared is not None
+        assert first._global_shared.rate == pytest.approx(10)
+        assert second._global_shared.rate == pytest.approx(10)
+    finally:
+        for controller in (first, second):
+            if controller._global_shared is not None:
+                await controller._global_shared.clear_state()
+            endpoint = controller._shared_endpoint("profile")
+            if endpoint is not None:
+                await endpoint.clear_state()
+        await first.close()
+        await second.close()
+
+
 async def test_healthy_shared_admission_is_one_redis_round_trip():
     key = "dbd:test-fast-admission:" + uuid4().hex
     controller = EndpointRateController(
@@ -122,6 +164,8 @@ async def test_endpoint_penalty_is_immediately_visible_to_another_controller():
         observed = await second.acquire("profile")
         assert observed.shared is True
         assert second.effective_rate("profile") == pytest.approx(50)
+        assert first.global_effective_rate() == pytest.approx(100)
+        assert second.global_effective_rate() == pytest.approx(100)
     finally:
         for controller in (first, second):
             if controller._global_shared is not None:
