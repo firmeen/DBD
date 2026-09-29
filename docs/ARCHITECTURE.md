@@ -131,10 +131,14 @@ fleet-wide Redis pacer remains the configured aggregate hard ceiling. Adding wor
 processes increases fault tolerance and available concurrency; it does not multiply
 that ceiling.
 
-The Supervisor observes progress per worker. A single worker whose admission,
-request, response and completion counters stop advancing while fetches remain active
-is recycled independently. Multiple worker-local availability failures freeze
-autoscale growth rather than creating a replacement storm.
+The Supervisor observes progress per worker. Actual HTTP request/response
+movement is the watchdog marker; queued work or Redis-admission counters cannot hide
+a dead HTTP path. Intentional shared pacing/cooldown is reported separately by the
+worker and suspends that worker's stall timer while every active fetch is deliberately
+parked behind Redis admission, so an explicit Retry-After is respected rather than
+misclassified as a dead process. Outside that controlled wait, a stalled worker is
+recycled independently. Multiple worker-local availability failures freeze autoscale
+growth rather than creating a replacement storm.
 
 Redis is a coordination/safety mechanism, not a rate-limit bypass.
 
