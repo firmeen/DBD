@@ -468,11 +468,9 @@ async def process(
         runtime_stats["last_error_at"] = time.time()
 
     if distributed:
-        from ..core.redis import (
-            close_async_redis as _close_async_redis,
-            create_async_redis,
-            redis_pool_snapshot as _redis_pool_snapshot,
-        )
+        from ..core.redis import close_async_redis as _close_async_redis
+        from ..core.redis import create_async_redis
+        from ..core.redis import redis_pool_snapshot as _redis_pool_snapshot
         from .coordination import CampaignCoordinator, WorkerIdentity
         from .locking import assert_manager_lock_free, runtime_handoff_lock
 
