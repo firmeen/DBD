@@ -404,6 +404,7 @@ def _campaign_guard_overrides(args) -> dict:
         "fleet_projection_workers_max",
         "fleet_redis_connections_max",
         "max_restarts",
+        "request_stall_seconds",
         "open_powershell",
         "redis_rate_key",
         "recovery_interval",
@@ -425,6 +426,11 @@ def _add_campaign_guard_options(parser):
     parser.add_argument("--fleet-projection-workers-max", type=positive)
     parser.add_argument("--fleet-redis-connections-max", type=positive)
     parser.add_argument("--max-restarts", type=non_negative)
+    parser.add_argument(
+        "--request-stall-seconds",
+        type=positive_rate,
+        help="Recycle a healthy-heartbeating fleet when HTTP request count stops advancing for this many seconds (minimum 30)",
+    )
     parser.add_argument("--redis-rate-key")
     parser.add_argument(
         "--recovery-interval",
