@@ -193,8 +193,14 @@ function Get-GuardianOwnedWorkers {
     # Win32_Process scan on hosts where CIM enumeration can time out.
     if (-not [string]::IsNullOrWhiteSpace($SupervisorGeneration)) {
         $registry = Get-WorkerRegistry
+        $stableProperty = $null
+        if ($null -ne $registry) {
+            $stableProperty = $registry.PSObject.Properties["stable"]
+        }
         if (
             $null -ne $registry -and
+            $null -ne $stableProperty -and
+            [bool]$stableProperty.Value -and
             [int]$registry.run_id -eq $RunId -and
             [string]$registry.supervisor_generation -eq $SupervisorGeneration
         ) {
@@ -215,10 +221,9 @@ function Get-GuardianOwnedWorkers {
                     Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $pidValue) -OperationTimeoutSec 5 -ErrorAction Stop
                 )
                 if ($matches.Count -eq 0) {
-                    throw (
-                        "Process registry PID {0} is missing; exact worker exit cannot be " +
-                        "proven without risking a surviving child process." -f $pidValue
-                    )
+                    # A stable registry is a complete snapshot for this generation.
+                    # A listed PID that no longer exists is therefore confirmed dead.
+                    continue
                 }
 
                 $process = $matches[0]
@@ -241,12 +246,7 @@ function Get-GuardianOwnedWorkers {
                 }
                 $workerPattern = [regex]::Escape($workerId)
                 if (
-                    $name -notmatch '^(python(w)?(\.exe)?|powershell(\.exe)?|pwsh(\.exe)?)                $registered += $process
-            }
-            return @($registered)
-        }
-    }
-
+                    $name -notmatch '^(python(w)?(\.exe)?|powershell(\.exe)?|pwsh(\.exe)?)
     # Fallback for older/missing registries: bounded full inventory + ancestry proof.
     $processes = @(
         Get-CimInstance Win32_Process -OperationTimeoutSec 5 -ErrorAction Stop
