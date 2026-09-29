@@ -14,6 +14,14 @@ def test_windows_launcher_keeps_campaign_guard_as_production_entry() -> None:
     assert "RestartDelaySeconds" in launcher
 
 
+def test_windows_hard_loss_checks_exact_worker_identity() -> None:
+    launcher = (PROJECT_ROOT / "Run-DBD.ps1").read_text(encoding="utf-8")
+
+    assert "run-$RunId.workers.json" in launcher
+    assert "--worker-instance" in launcher
+    assert "$workerPattern = [regex]::Escape($workerId)" in launcher
+
+
 def test_collector_documentation_is_explicitly_non_production() -> None:
     collector_doc = (PROJECT_ROOT / "docs" / "COLLECTOR.md").read_text(encoding="utf-8")
 
