@@ -1059,6 +1059,27 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
     }
 
 
+def _fleet_availability_summary(states: list[dict]) -> tuple[set[str], int, bool]:
+    """Summarize independent worker health; endpoint count is never outage evidence."""
+    active = [
+        row
+        for row in states
+        if str(row.get("status") or "").lower() == "active"
+    ]
+    active_ids = {
+        str(row.get("worker_id"))
+        for row in active
+        if row.get("worker_id")
+    }
+    unhealthy = sum(
+        str(row.get("circuit_global") or "").lower() == "open"
+        or str(row.get("auth_state") or "").lower() == "cooldown"
+        for row in active
+    )
+    threshold = max(2, (max(1, len(active)) + 1) // 2)
+    return active_ids, unhealthy, unhealthy >= threshold
+
+
 def _fleet_circuit_state(states: list[dict]) -> str:
     """Return the most restrictive global availability state visible in the fleet."""
     priority = {"unknown": 0, "closed": 1, "half_open": 2, "open": 3}
@@ -1971,28 +1992,14 @@ def supervise_campaign(
                 for row in registered_states
                 if row.get("worker_id")
             }
-            active_health_rows = [
-                row
-                for row in registered_states
-                if str(row.get("status") or "").lower() == "active"
-            ]
-            active_health_ids = {
-                str(row.get("worker_id"))
-                for row in active_health_rows
-                if row.get("worker_id")
-            }
-            unhealthy_workers = sum(
-                str(row.get("circuit_global") or "").lower() == "open"
-                or str(row.get("auth_state") or "").lower() == "cooldown"
-                for row in active_health_rows
-            )
-            healthy_workers = max(0, len(active_health_rows) - unhealthy_workers)
-            fleet_unhealthy_threshold = max(
-                2,
-                (max(1, len(active_health_rows)) + 1) // 2,
-            )
-            fleet_availability_degraded = (
-                unhealthy_workers >= fleet_unhealthy_threshold
+            (
+                active_health_ids,
+                unhealthy_workers,
+                fleet_availability_degraded,
+            ) = _fleet_availability_summary(registered_states)
+            healthy_workers = max(
+                0,
+                len(active_health_ids) - unhealthy_workers,
             )
 
             stop_requested = False
