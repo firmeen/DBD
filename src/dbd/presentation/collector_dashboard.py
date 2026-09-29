@@ -27,7 +27,7 @@ class CollectorDashboard:
     def __enter__(self):
         if self.enabled and self.console.is_terminal:
             self._live = Live(
-                Text(f"DBD COLLECTOR · RUN {self.run_id}"),
+                Text(f"DBD DIAGNOSTIC COLLECTOR · RUN {self.run_id}"),
                 console=self.console,
                 refresh_per_second=4,
                 transient=False,
@@ -80,7 +80,7 @@ class CollectorDashboard:
         eta = remaining / flow if flow and flow > 0 else None
 
         table = Table(
-            title=f"DBD COLLECTOR · RUN {self.run_id}",
+            title=f"DBD DIAGNOSTIC COLLECTOR · RUN {self.run_id}",
             show_header=False,
             box=None,
             pad_edge=False,
