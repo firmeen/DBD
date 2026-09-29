@@ -100,6 +100,14 @@ def safe_error(exc: BaseException) -> str:
 
 
 async def worker_command(args, health=None, presenter=None):
+    worker_instance = getattr(args, "worker_instance", None)
+    if worker_instance is not None:
+        environment_worker = os.environ.get("DBD_WORKER_ID")
+        if environment_worker != worker_instance:
+            raise RuntimeError(
+                "Distributed worker identity mismatch between command line and environment"
+            )
+
     presenter = presenter or TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
         verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
@@ -756,6 +764,10 @@ def main():
                 "--distributed",
                 action="store_true",
                 help="Join an existing run from multiple processes using the Redis shared rate cap",
+            )
+            p.add_argument(
+                "--worker-instance",
+                help=argparse.SUPPRESS,
             )
             p.add_argument(
                 "--all-statuses",
