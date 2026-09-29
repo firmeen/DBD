@@ -195,19 +195,46 @@ class AsyncDbdClient:
                     0.0,
                     self._auth_backoff_until - time.monotonic(),
                 )
-                if wait_seconds <= 0:
-                    if (
-                        self._auth_refresh_task is None
-                        or self._auth_refresh_task.done()
-                    ):
-                        self._auth_refresh_task = asyncio.create_task(
-                            self._refresh_token_once()
-                        )
+                if (
+                    wait_seconds <= 0
+                    and self._auth_refresh_task is not None
+                    and not self._auth_refresh_task.done()
+                ):
                     task = self._auth_refresh_task
 
             if wait_seconds > 0:
                 await asyncio.sleep(wait_seconds)
                 continue
+
+            if task is None:
+                # A completed failed refresh wave may have opened this worker's
+                # local availability circuit. Re-enter that gate before creating
+                # the next refresh wave. This does not consume another Redis
+                # fleet pacing slot and keeps every peer worker independent.
+                await self.endpoint_rate.wait_available()
+                async with self._auth_lock:
+                    if (
+                        self._token is not None
+                        and time.time() < self._auth._expires_at - 15
+                    ):
+                        return self._token
+
+                    wait_seconds = max(
+                        0.0,
+                        self._auth_backoff_until - time.monotonic(),
+                    )
+                    if wait_seconds <= 0:
+                        if (
+                            self._auth_refresh_task is None
+                            or self._auth_refresh_task.done()
+                        ):
+                            self._auth_refresh_task = asyncio.create_task(
+                                self._refresh_token_once()
+                            )
+                        task = self._auth_refresh_task
+
+                if wait_seconds > 0:
+                    continue
 
             assert task is not None
             try:
