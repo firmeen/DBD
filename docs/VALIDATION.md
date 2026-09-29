@@ -53,8 +53,17 @@ The current suite covers, among other cases:
 - worker-local availability/circuit isolation for auth/session/transport failures;
 - Redis pacers share one aggregate request schedule;
 - explicit hard fleet ceilings remain independent of worker count;
+- hard-cap admission ignores stale legacy global effective-rate/cooldown state, and
+  fenced Supervisor activation resets the old reservation cursor without deleting
+  Redis coordination keys;
 - endpoint rate-pressure state propagates across workers using the same key without
   turning one worker's availability failure into a global fleet circuit;
+- the per-worker request watchdog does not recycle a worker while every active fetch
+  is intentionally waiting behind shared Redis pacing/cooldown, preserving explicit
+  Retry-After behavior;
+- legacy Guardian profile v1 fixed `4/4/4` fleets migrate to bounded `4..12` only
+  when an explicit fleet hard cap already exists, while explicit operator overrides
+  and uncapped legacy profiles remain unchanged;
 - external S3-compatible archives are encrypted client-side with AES-256-GCM;
 - external JSON and zstd payloads round-trip through encryption/decryption;
 - ciphertext tamper and canonical serialized-payload checksum mismatch are rejected;
