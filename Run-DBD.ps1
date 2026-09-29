@@ -367,7 +367,16 @@ Write-GuardianHeader "BOOT" ("Python: {0}" -f $Python)
 Write-Host ("DBD source: {0}" -f $DbdModulePath)
 
 while ($true) {
-    $commandArgs = @("-m", "dbd", "campaign", "guard", [string]$RunId)
+    # Run-DBD is the production outer watchdog. Refuse an accidental dev
+    # pacing namespace before Supervisor ownership or worker spawn.
+    $commandArgs = @(
+        "-m",
+        "dbd",
+        "campaign",
+        "guard",
+        [string]$RunId,
+        "--require-production-namespace"
+    )
     if ($Headless) {
         $commandArgs += "--headless"
     }
