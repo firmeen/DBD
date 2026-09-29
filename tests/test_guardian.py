@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 import dbd.runtime.guardian as guardian
 from dbd.presentation.guardian import GuardianDashboard
 
@@ -97,6 +99,41 @@ def test_profile_persists_operational_values_but_current_env_owns_rate_namespace
     assert restored.workers == 6
     assert restored.fleet_rate_max == 20.0
     assert restored.redis_rate_key == "dbd:production:global-rate"
+
+
+def test_production_namespace_fence_rejects_dev_rate_key() -> None:
+    with pytest.raises(ValueError, match="dbd:production:"):
+        guardian._validate_config(
+            guardian.GuardianConfig(
+                run_id=9,
+                redis_rate_key="dbd:dev:global-rate",
+                require_production_namespace=True,
+            )
+        )
+
+    validated = guardian._validate_config(
+        guardian.GuardianConfig(
+            run_id=9,
+            redis_rate_key="dbd:production:global-rate",
+            require_production_namespace=True,
+        )
+    )
+    assert validated.redis_rate_key == "dbd:production:global-rate"
+
+
+def test_production_namespace_policy_is_not_persisted(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
+    config = guardian.GuardianConfig(
+        run_id=9,
+        redis_rate_key="dbd:production:global-rate",
+        require_production_namespace=True,
+    )
+
+    guardian._persist_guardian_config(config)
+
+    saved = guardian._read_json(guardian.guardian_profile_path(9))
+    assert saved["redis_rate_key"] == "dbd:production:global-rate"
+    assert "require_production_namespace" not in saved
 
 
 def test_unprofiled_guardian_does_not_multiply_uncapped_worker_rate() -> None:
