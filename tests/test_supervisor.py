@@ -55,9 +55,17 @@ def test_adaptive_rate_starts_low_with_scaled_ceiling() -> None:
 
 
 def test_child_workers_disable_prometheus_listener_collision() -> None:
-    command = _worker_command(42, concurrency=8, rate=15)
+    command = _worker_command(
+        42,
+        concurrency=8,
+        rate=15,
+        worker_id="local-42-g0123456789abcdef-1-deadbeef",
+    )
     assert "--distributed" in command
     assert command[command.index("--metrics-port") + 1] == "0"
+    assert command[command.index("--worker-instance") + 1] == (
+        "local-42-g0123456789abcdef-1-deadbeef"
+    )
 
 
 def test_worker_registry_tracks_exact_live_child_pids(monkeypatch, tmp_path) -> None:
