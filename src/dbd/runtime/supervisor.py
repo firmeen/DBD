@@ -86,11 +86,12 @@ class WorkerProgressWatchdog:
         if not state:
             self.forget(worker_id)
             return None
+        fetch_active = int(state.get("fetch_active", 0) or 0)
         eligible = (
             active_work
             and control_healthy
             and not draining
-            and int(state.get("fetch_active", 0) or 0) > 0
+            and fetch_active > 0
         )
         # Admission and downstream completion are diagnostic signals, but they
         # must not mask a dead HTTP path. Only actual request/response movement
@@ -100,7 +101,14 @@ class WorkerProgressWatchdog:
             int(state.get("responses", 0) or 0),
         )
         previous = self.samples.get(worker_id)
-        if not eligible:
+        deliberate_shared_wait = (
+            bool(state.get("shared_admission_waiting"))
+            and int(state.get("shared_admission_waiters", 0) or 0) >= fetch_active
+        )
+        if not eligible or deliberate_shared_wait:
+            # Explicit Redis pacing/cooldown is not a dead request path. Reset
+            # the worker-local timer while every active fetch is intentionally
+            # parked behind shared admission so Retry-After remains authoritative.
             self.samples[worker_id] = (marker, now)
             return None
         if previous is None or previous[0] != marker:
