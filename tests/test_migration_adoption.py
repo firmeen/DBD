@@ -1,3 +1,5 @@
+from uuid import uuid4
+
 import pytest
 
 from dbd.storage.mysql.engine import connect
@@ -6,7 +8,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0010_incremental_refresh"
+HEAD = "0012_run9_data_repair"
 
 
 def test_correctness_migration_adopts_existing_objects():
@@ -134,7 +136,9 @@ def test_project_attempt_migration_adopts_existing_column():
 
 
 def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data():
-    marker = "lease-adoption-marker"
+    # The disposable integration database is intentionally reusable across
+    # sessions, so this preservation marker must not collide with a prior run.
+    marker = "lease-adoption-" + uuid4().hex
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             "INSERT INTO discovery_buckets(bucket_key,keyword,search_type,created_at,updated_at) "
@@ -183,6 +187,14 @@ def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data()
         assert cur.fetchone()["n"] == 1
         cur.execute(
             """
+            SELECT COUNT(*) AS n FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='collection_failure_events'
+              AND column_name='error_message'
+            """
+        )
+        assert cur.fetchone()["n"] == 1
+        cur.execute(
+            """
             SELECT COUNT(*) AS n FROM information_schema.statistics
             WHERE table_schema=DATABASE() AND table_name='company_collection_state'
               AND index_name='idx_collection_active'
@@ -191,6 +203,10 @@ def test_campaign_runtime_migration_is_repeat_safe_and_preserves_existing_data()
         assert cur.fetchone()["n"] > 0
         cur.execute("SELECT bucket_key FROM discovery_buckets WHERE id=%s", (bucket_id,))
         assert cur.fetchone()["bucket_key"] == marker
+        # Keep the reusable disposable DB tidy after proving the migration
+        # preserved pre-existing data.
+        cur.execute("DELETE FROM discovery_buckets WHERE id=%s", (bucket_id,))
+        conn.commit()
 
 
 def test_incremental_refresh_migration_is_adoption_safe():
@@ -241,3 +257,92 @@ def test_incremental_refresh_migration_is_adoption_safe():
             """
         )
         assert [row["name"] for row in cur.fetchall()] == ["force_refresh_mask"]
+
+
+def test_fabric_recovery_migration_is_adoption_safe():
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("UPDATE alembic_version SET version_num='0010_incremental_refresh'")
+        conn.commit()
+
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT column_name AS name FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='worker_runs'
+              AND column_name IN ('parent_run_id','recovery_kind')
+            ORDER BY column_name
+            """
+        )
+        assert [row["name"] for row in cur.fetchall()] == [
+            "parent_run_id",
+            "recovery_kind",
+        ]
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM information_schema.tables
+            WHERE table_schema=DATABASE() AND table_name='collection_failure_events'
+            """
+        )
+        assert cur.fetchone()["n"] == 1
+        cur.execute(
+            """
+            SELECT COUNT(*) AS n FROM information_schema.statistics
+            WHERE table_schema=DATABASE() AND table_name='worker_runs'
+              AND index_name='idx_worker_runs_parent'
+            """
+        )
+        assert cur.fetchone()["n"] > 0
+
+
+
+def test_run9_data_repair_migration_widens_profile_objective_text():
+    with connect() as conn, conn.cursor() as cur:
+        # The integration database is session-scoped and earlier tests may have
+        # intentionally stored >500 characters. Clear only this tested field
+        # before simulating the pre-0012 VARCHAR schema so test order cannot
+        # make the narrowing setup fail before the migration is exercised.
+        cur.execute(
+            "UPDATE companies SET setup_obj_name_keyin=NULL "
+            "WHERE CHAR_LENGTH(setup_obj_name_keyin)>500"
+        )
+        cur.execute(
+            "ALTER TABLE companies MODIFY COLUMN setup_obj_name_keyin "
+            "VARCHAR(500) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci NULL"
+        )
+        cur.execute("UPDATE alembic_version SET version_num='0011_fabric_recovery'")
+        conn.commit()
+
+    migrate()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == HEAD
+        cur.execute(
+            """
+            SELECT
+              data_type AS actual_data_type,
+              character_maximum_length AS actual_character_maximum_length,
+              character_octet_length AS actual_character_octet_length,
+              is_nullable AS actual_is_nullable,
+              character_set_name AS actual_character_set_name,
+              collation_name AS actual_collation_name
+            FROM information_schema.columns
+            WHERE table_schema=DATABASE()
+              AND table_name='companies'
+              AND column_name='setup_obj_name_keyin'
+            """
+        )
+        column = cur.fetchone()
+
+    assert str(column["actual_data_type"]).lower() == "text"
+    assert int(column["actual_character_maximum_length"]) > 500
+    assert int(column["actual_character_octet_length"]) >= int(
+        column["actual_character_maximum_length"]
+    )
+    assert str(column["actual_is_nullable"]).upper() == "YES"
+    assert str(column["actual_character_set_name"]).lower() == "utf8mb4"
+    assert str(column["actual_collation_name"]).lower() == "utf8mb4_0900_ai_ci"

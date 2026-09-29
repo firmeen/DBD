@@ -194,3 +194,36 @@ def test_failed_dirty_bit_is_retryable_and_success_clears_failure() -> None:
     assert transition.dirty_mask == 0
     assert transition.status == "done"
     assert transition.next_endpoint is None
+
+
+def test_profile_failure_preserves_existing_financial_done_and_na_bits() -> None:
+    required = mask_for_endpoints(
+        (
+            "profile",
+            "financial_submissions",
+            "financial_statements",
+            "industry_benchmark",
+        )
+    )
+    submission = endpoint_bit("financial_submissions")
+    statement = endpoint_bit("financial_statements")
+    benchmark = endpoint_bit("industry_benchmark")
+
+    transition = advance_state(
+        endpoint="profile",
+        outcome="failed",
+        required_mask=required,
+        done_mask=submission,
+        not_available_mask=benchmark,
+        failed_mask=0,
+        dirty_mask=required & ~submission & ~benchmark,
+    )
+
+    assert transition.done_mask & submission
+    assert transition.not_available_mask & benchmark
+    assert not (transition.failed_mask & submission)
+    assert not (transition.failed_mask & benchmark)
+    assert transition.failed_mask & endpoint_bit("profile")
+    assert transition.failed_mask & statement
+    assert transition.done_mask & transition.failed_mask == 0
+    assert transition.not_available_mask & transition.failed_mask == 0

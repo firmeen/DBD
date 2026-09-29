@@ -9,6 +9,7 @@ from dbd.contracts.company import (
     normalize_nation_history,
     normalize_nations,
 )
+from dbd.contracts.financial import normalize_submissions, submission_collision_evidence
 from dbd.contracts.identity import parse_code
 from dbd.contracts.strict import normalize_collection, normalize_industry_benchmark
 from dbd.core.exceptions import ContractError
@@ -136,3 +137,58 @@ def test_default_parts_cover_tabs_one_and_two_only():
     assert dropped.isdisjoint(default)
     assert set(endpoints(["nationality", "history"])) == dropped
     assert dropped <= set(endpoints(list(PARTS)))
+
+
+
+def test_financial_submission_exact_duplicates_are_deduplicated_losslessly():
+    payload = [
+        {
+            "submitYear": "2566",
+            "acDate": "3112",
+            "submitDate": [2024, 5, 31],
+            "acCode": "A",
+            "auCode": "U",
+            "statusCode": "1",
+            "updateDate": [2024, 6, 1],
+        },
+        {
+            "submitYear": "2566",
+            "acDate": "3112",
+            "submitDate": [2024, 5, 31],
+            "acCode": "A",
+            "auCode": "U",
+            "statusCode": "1",
+            "updateDate": [2024, 6, 1],
+        },
+    ]
+
+    rows = normalize_submissions(payload)
+
+    assert len(rows) == 1
+    assert rows[0]["submit_year"] == "2566"
+    assert rows[0]["status_code"] == "1"
+
+
+def test_financial_submission_conflicting_same_year_requires_revision_identity():
+    payload = [
+        {"submitYear": "2566", "statusCode": "1"},
+        {"submitYear": "2566", "statusCode": "2"},
+    ]
+
+    with pytest.raises(ContractError, match="source revision identity is required"):
+        normalize_submissions(payload)
+
+
+
+def test_financial_submission_different_raw_rows_are_not_collapsed():
+    payload = [
+        {"submitYear": "2566", "statusCode": "1", "sourceRevision": "A"},
+        {"submitYear": "2566", "statusCode": "1", "sourceRevision": "B"},
+    ]
+
+    evidence = submission_collision_evidence(payload)
+    assert evidence["exact_duplicate_years"] == []
+    assert evidence["conflicting_years"] == ["2566"]
+
+    with pytest.raises(ContractError, match="source revision identity is required"):
+        normalize_submissions(payload)
