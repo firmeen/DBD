@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -15,6 +16,7 @@ from redis.exceptions import TimeoutError as RedisTimeoutError
 from ..core.progress import LiveCampaignDashboard, TerminalSnapshot
 from ..core.settings import PROJECT_ROOT, settings
 from ..storage.mysql.engine import connect
+from .locking import assert_manager_lock_free, runtime_handoff_lock
 
 _RATE_MODES = {"shared", "multiply", "adaptive"}
 _SUPERVISOR_LEASE_SECONDS = 30
@@ -492,9 +494,25 @@ def _failure_diagnostics(run_id: int, limit: int = 8) -> dict:
             )
             latest_errors = [dict(row) for row in cur.fetchall()]
             scope = "task_error_exact"
+
+        cur.execute(
+            """
+            SELECT error_code,http_status,stage,outcome,COUNT(*) AS events,
+                   MAX(error_message) AS sample_message
+            FROM collection_failure_events
+            WHERE run_id=%s
+            GROUP BY error_code,http_status,stage,outcome
+            ORDER BY events DESC,error_code
+            LIMIT %s
+            """,
+            (run_id, max(1, int(limit))),
+        )
+        failure_events = [dict(row) for row in cur.fetchall()]
+
     return {
         "by_endpoint": by_endpoint,
         "latest_errors": latest_errors,
+        "failure_events": failure_events,
         "error_scope": scope,
     }
 
@@ -800,6 +818,7 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
         "archive_active",
         "project_active",
         "fetch_queue",
+        "fetch_claim_window",
         "archive_queue",
         "project_queue",
         "inflight",
@@ -816,6 +835,17 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
         key: sum(int(row.get(key, 0) or 0) for row in states)
         for key in summed
     }
+
+
+def _fleet_circuit_state(states: list[dict]) -> str:
+    """Return the most restrictive global availability state visible in the fleet."""
+    priority = {"unknown": 0, "closed": 1, "half_open": 2, "open": 3}
+    resolved = "unknown"
+    for row in states:
+        state = str(row.get("circuit_global") or "unknown").lower()
+        if priority.get(state, 0) > priority.get(resolved, 0):
+            resolved = state
+    return resolved
 
 
 def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict[str, int]:
@@ -1028,6 +1058,14 @@ def _acquire_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
         )
 
 
+def _activate_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
+    """Atomically fence legacy Supervisor activation against collector startup."""
+    with runtime_handoff_lock():
+        assert_manager_lock_free()
+        redis.ping()
+        _acquire_supervisor_lease(redis, run_id, token)
+
+
 def _refresh_supervisor_lease(redis: Redis, run_id: int, token: str) -> None:
     script = """
     if redis.call('GET', KEYS[1]) == ARGV[1] then
@@ -1107,6 +1145,25 @@ def _wait_worker_exit(worker: WorkerProcess, timeout: float = _WORKER_KILL_WAIT_
     return True
 
 
+def _suppress_sigint():
+    """Ignore further Ctrl+C only while bounded force-stop reconciliation runs."""
+    try:
+        previous = signal.getsignal(signal.SIGINT)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+        return previous
+    except (AttributeError, OSError, ValueError):
+        return None
+
+
+def _restore_sigint(previous) -> None:
+    if previous is None:
+        return
+    try:
+        signal.signal(signal.SIGINT, previous)
+    except (AttributeError, OSError, ValueError):
+        pass
+
+
 def _terminate_workers(workers: list[WorkerProcess]) -> None:
     if os.name == "nt":
         for worker in workers:
@@ -1127,6 +1184,23 @@ def _terminate_workers(workers: list[WorkerProcess]) -> None:
             _force_kill_worker(worker)
             _wait_worker_exit(worker)
         _close_worker_handle(worker)
+
+
+def _force_stop_and_reconcile(
+    redis: Redis,
+    run_id: int,
+    workers: list[WorkerProcess],
+) -> int:
+    """Force local process trees, then reclaim only leases of confirmed-dead workers."""
+    _terminate_workers(workers)
+    reclaimed = 0
+    for worker in workers:
+        if worker.process.poll() is None:
+            continue
+        reclaimed += _release_dead_worker_leases(run_id, worker.worker_id)
+        _cleanup_worker_control(redis, run_id, worker.worker_id)
+        _close_worker_handle(worker)
+    return reclaimed
 
 
 def _reclaim_running_leases(
@@ -1315,6 +1389,7 @@ def supervise_campaign(
     """Run one lease-protected local fleet with graceful autoscaling and durable recovery."""
     if not settings.dbd_redis_url:
         raise ValueError("Campaign supervisor requires DBD_REDIS_URL")
+    assert_manager_lock_free()
     if worker_concurrency < 1 or max_restarts < 0:
         raise ValueError("worker concurrency must be positive and max restarts non-negative")
 
@@ -1376,6 +1451,7 @@ def supervise_campaign(
     restart_events = 0
     graceful_stop = False
     exit_code = 0
+    interrupt_handler = None
     lease_acquired = False
     supervisor_error = False
     next_lease_refresh = 0.0
@@ -1463,8 +1539,7 @@ def supervise_campaign(
         return replacement
 
     try:
-        redis.ping()
-        _acquire_supervisor_lease(redis, run_id, token)
+        _activate_supervisor_lease(redis, run_id, token)
         lease_acquired = True
 
         orphaned = _drain_registered_workers(redis, run_id)
@@ -1892,6 +1967,9 @@ def supervise_campaign(
                         progress_source="redis_worker_heartbeat",
                         reconciled_at=reconciled_at,
                         pending=pending,
+                        retry_wait=None,
+                        pending_includes_retry_wait=True,
+                        circuit_state=_fleet_circuit_state(registered_states),
                         running=running,
                         done=done,
                         done_only=live_progress["done_only"],
@@ -1995,12 +2073,16 @@ def supervise_campaign(
                     )
                     time.sleep(0.75)
             except KeyboardInterrupt:
-                progress.event("Second Ctrl+C received: forcing worker termination")
-                _terminate_workers(children)
-                for worker in children:
-                    if worker.process.poll() is not None:
-                        _release_dead_worker_leases(run_id, worker.worker_id)
-                        _cleanup_worker_control(redis, run_id, worker.worker_id)
+                progress.event(
+                    "Second Ctrl+C received: forcing worker termination; "
+                    "further interrupts are shielded until lease reconciliation completes"
+                )
+                interrupt_handler = _suppress_sigint()
+                reclaimed = _force_stop_and_reconcile(redis, run_id, children)
+                if reclaimed:
+                    progress.event(
+                        f"force-stop reclaimed {reclaimed} confirmed-dead worker lease(s)"
+                    )
         finally:
             exit_code = 130
 
@@ -2089,7 +2171,10 @@ def supervise_campaign(
                     ),
                     progress_source="mysql_reconciled",
                     reconciled_at=time.time(),
-                    pending=snapshot.get("pending", 0) + snapshot.get("retry_wait", 0),
+                    pending=snapshot.get("pending", 0),
+                    retry_wait=snapshot.get("retry_wait", 0),
+                    pending_includes_retry_wait=False,
+                    circuit_state=_fleet_circuit_state(registered_states),
                     running=snapshot.get("running", 0),
                     done=snapshot.get("done", 0) + snapshot.get("not_available", 0),
                     done_only=snapshot.get("done", 0),
@@ -2108,6 +2193,7 @@ def supervise_campaign(
             redis.close()
         except Exception:
             pass
+        _restore_sigint(interrupt_handler)
 
     state = final_snapshot or _task_progress(run_id)
     failed = state.get("failed", 0)
@@ -2148,7 +2234,11 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
                 state = {
                     "total": int(runtime.get("total", 0) or 0),
                     "pending": int(runtime.get("pending", 0) or 0),
-                    "retry_wait": 0,
+                    "retry_wait": (
+                        None
+                        if runtime.get("retry_wait") is None
+                        else int(runtime.get("retry_wait", 0) or 0)
+                    ),
                     "running": int(runtime.get("running", 0) or 0),
                     "failed": int(runtime.get("failed", 0) or 0),
                     "done": int(runtime.get("done_only", runtime.get("done", 0)) or 0),
@@ -2157,7 +2247,9 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
                         "progress_source", "redis_worker_heartbeat"
                     ),
                     "progress_exact": False,
-                    "pending_includes_retry_wait": True,
+                    "pending_includes_retry_wait": bool(
+                        runtime.get("pending_includes_retry_wait", True)
+                    ),
                 }
         except Exception:
             if redis is not None:
@@ -2171,9 +2263,31 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
         state = _task_progress(run_id)
         state["progress_source"] = "mysql_reconciled"
         state["progress_exact"] = True
+        state["pending_includes_retry_wait"] = False
 
     state["run_id"] = int(run_id)
     state["run_status"] = _run_status(run_id)
+    runtime_status = str((runtime or {}).get("status") or "").lower()
+    if supervisor_active:
+        state["control_status"] = runtime_status or "active"
+    elif workers:
+        state["control_status"] = "workers_without_supervisor"
+    elif runtime_status in {
+        "paused",
+        "capacity_exhausted",
+        "completed",
+        "completed_with_failures",
+        "supervisor_error",
+        "stopped",
+    }:
+        state["control_status"] = runtime_status
+    else:
+        state["control_status"] = "offline"
+    state["circuit_state"] = str(
+        (runtime or {}).get("circuit_state")
+        or _fleet_circuit_state(workers)
+        or "unknown"
+    )
     if diagnostics:
         state["failure_diagnostics"] = _failure_diagnostics(run_id)
 
@@ -2227,6 +2341,54 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
         finally:
             redis.close()
     return state
+
+
+def collector_handoff_status(run_id: int) -> dict:
+    """Fail-closed startup view used when switching from the legacy fleet.
+
+    Redis is intentionally not part of the collector HTTP hot path. When a
+    legacy Redis control plane is configured, however, startup must prove that
+    no Supervisor or registered distributed worker can race the new collector.
+    """
+    if not settings.dbd_redis_url:
+        return {
+            "redis_configured": False,
+            "control_status": "not_configured",
+            "supervisor_active": False,
+            "workers": 0,
+        }
+
+    redis = None
+    try:
+        redis = _redis_client(settings.dbd_redis_max_connections)
+        redis.ping()
+        runtime = _read_runtime_state(redis, run_id)
+        workers = _registered_worker_states(redis, run_id)
+        supervisor_active = bool(redis.exists(_supervisor_lease_key(run_id)))
+        runtime_status = str((runtime or {}).get("status") or "").lower()
+        if supervisor_active:
+            control_status = runtime_status or "active"
+        elif workers:
+            control_status = "workers_without_supervisor"
+        else:
+            control_status = runtime_status or "offline"
+        return {
+            "redis_configured": True,
+            "control_status": control_status,
+            "supervisor_active": supervisor_active,
+            "workers": len(workers),
+        }
+    except Exception as exc:
+        raise RuntimeError(
+            "Cannot prove the legacy runtime is offline because its Redis "
+            "control plane is unavailable"
+        ) from exc
+    finally:
+        if redis is not None:
+            try:
+                redis.close()
+            except Exception:
+                pass
 
 
 def request_campaign_stop(run_id: int) -> None:

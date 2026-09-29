@@ -3,10 +3,8 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from email.utils import parsedate_to_datetime
 from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
@@ -19,7 +17,7 @@ from tenacity import (
     wait_random_exponential,
 )
 
-from ..core.exceptions import DbdForbiddenError, DbdTokenExpiredError
+from ..core.exceptions import DbdAuthError, DbdForbiddenError, DbdTokenExpiredError
 from ..core.settings import settings
 from ..core.telemetry import (
     EFFECTIVE_RATE,
@@ -31,37 +29,10 @@ from ..core.telemetry import (
 )
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
+from .http import ApiResponse, PermanentHttpError, TransientHttpError, retry_after
 from .rate_control import EndpointRateController
 from .rate_limit import TokenBucket, protective_cooldown
 from .session import WARMUP_PAGE_URL, create_session
-
-
-class TransientHttpError(RuntimeError):
-    pass
-
-
-class PermanentHttpError(ValueError):
-    pass
-
-
-@dataclass
-class ApiResponse:
-    data: object
-    status: int
-    requested_at: datetime
-    received_at: datetime
-
-
-def retry_after(value: str | None) -> float:
-    if not value:
-        return 1.0
-    try:
-        return max(0.0, float(value))
-    except ValueError:
-        try:
-            return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
-        except (ValueError, TypeError, OverflowError):
-            return 1.0
 
 
 def _curl_code(exc) -> object:
@@ -131,11 +102,8 @@ class AsyncDbdClient:
         await self.endpoint_rate.open()
         self._session = AsyncSession(impersonate="chrome", max_clients=self.concurrency)
         self._auth_session = create_session()
-        try:
-            await self._ensure_token()
-        except BaseException:
-            await self.__aexit__()
-            raise
+        # Authenticate lazily on the first admitted request. A temporary DBD or
+        # network outage must not crash every worker before it can heartbeat.
         return self
 
     async def __aexit__(self, *args):
@@ -147,10 +115,10 @@ class AsyncDbdClient:
             self._auth_session = None
         await self.endpoint_rate.close()
 
-    async def _ensure_token(self, *, rejected=None, force=False):
+    async def _ensure_token(self, *, rejected=None, force=False, reset_warmup=False):
         async with self._auth_lock:
             if force or (rejected is not None and rejected == self._token):
-                self._auth.invalidate()
+                self._auth.invalidate(reset_warmup=reset_warmup)
                 self._token = None
             if self._token is None or time.time() >= self._auth._expires_at - 15:
                 self._token = await asyncio.to_thread(self._blocking_token)
@@ -173,6 +141,17 @@ class AsyncDbdClient:
             "Sec-Fetch-Site": "same-origin",
         }
 
+    async def _mark_auth_unavailable(self) -> None:
+        # Authentication/session availability is not evidence that the caller is
+        # exceeding upstream capacity. Open the global availability circuit
+        # without ratcheting the configured pacer down.
+        await self.endpoint_rate.availability_failure()
+
+    async def _mark_upstream_unavailable(self, rate_key: str | None) -> None:
+        # Transport and ordinary upstream 5xx failures are endpoint-scoped when
+        # possible. They gate admission but do not alter throughput pacing.
+        await self.endpoint_rate.availability_failure(rate_key)
+
     async def fetch(
         self,
         method,
@@ -190,7 +169,14 @@ class AsyncDbdClient:
             stop=stop_after_attempt(self.max_retries + 1),
             wait=wait_random_exponential(multiplier=1, max=30),
             retry=retry_if_exception_type(
-                (TransientHttpError, DbdTokenExpiredError, RequestsError, TimeoutError)
+                (
+                    TransientHttpError,
+                    DbdTokenExpiredError,
+                    DbdForbiddenError,
+                    DbdAuthError,
+                    RequestsError,
+                    TimeoutError,
+                )
             ),
             reraise=True,
         )
@@ -205,7 +191,11 @@ class AsyncDbdClient:
                         admission = await self.endpoint_rate.acquire(rate_key)
                     else:
                         await self.rate.acquire()
-                    token = await self._ensure_token()
+                    try:
+                        token = await self._ensure_token()
+                    except DbdAuthError:
+                        await self._mark_auth_unavailable()
+                        raise
                     requested = datetime.now(timezone.utc).replace(tzinfo=None)
                     self.requests_made += 1
                     with LATENCY.time():
@@ -220,6 +210,7 @@ class AsyncDbdClient:
                             )
                         except (RequestsError, TimeoutError) as exc:
                             REQUESTS.labels("network_error").inc()
+                            await self._mark_upstream_unavailable(rate_key)
                             log.warning(
                                 "http_transport_error",
                                 stage="request",
@@ -231,9 +222,15 @@ class AsyncDbdClient:
                             raise
                     status = response.status_code
                     REQUESTS.labels(str(status)).inc()
-                    if status in (429, 503):
+                    retry_after_header = response.headers.get("retry-after")
+                    rate_pressure = status == 429 or (
+                        status == 503
+                        and retry_after_header is not None
+                        and str(retry_after_header).strip() != ""
+                    )
+                    if rate_pressure:
                         self.rate_limit_hits += 1
-                        server_cooldown = retry_after(response.headers.get("retry-after"))
+                        server_cooldown = retry_after(retry_after_header)
                         penalty_key = rate_key or "__global__"
                         streak = self._next_penalty_streak(penalty_key)
                         global_escalated = rate_key is None
@@ -284,13 +281,17 @@ class AsyncDbdClient:
                         )
                     if status == 401:
                         await self._ensure_token(rejected=token)
-                        raise TransientHttpError("HTTP 401")
+                        raise TransientHttpError("HTTP 401", status_code=401)
                     if status == 403:
+                        await self._mark_auth_unavailable()
+                        await self._ensure_token(rejected=token, reset_warmup=True)
                         raise DbdForbiddenError("HTTP 403")
+                    if status in (500, 502, 504) or (status == 503 and not rate_pressure):
+                        await self._mark_upstream_unavailable(rate_key)
                     if status in (429, 500, 502, 503, 504):
-                        raise TransientHttpError(f"HTTP {status}")
+                        raise TransientHttpError(f"HTTP {status}", status_code=status)
                     if status >= 400:
-                        raise PermanentHttpError(f"HTTP {status}")
+                        raise PermanentHttpError(f"HTTP {status}", status_code=status)
                     try:
                         data = self._decode(response, path, token)
                     except DbdTokenExpiredError:

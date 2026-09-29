@@ -22,18 +22,49 @@ class DbdAuth:
         self._expires_at: float = 0.0
         self._warmed_up = False
 
-    def get_token(self, session: requests.Session) -> str:
+    def get_token(
+        self,
+        session: requests.Session,
+        *,
+        max_attempts: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
         if self._token and time.time() < self._expires_at - _EXPIRY_SAFETY_MARGIN_SECONDS:
             return self._token
-        return self._refresh(session)
+        return self._refresh(
+            session,
+            max_attempts=max_attempts,
+            timeout_seconds=timeout_seconds,
+        )
 
-    def invalidate(self) -> None:
+    def invalidate(self, *, reset_warmup: bool = False) -> None:
         self._token = None
         self._expires_at = 0.0
+        if reset_warmup:
+            self._warmed_up = False
 
-    def _refresh(self, session: requests.Session) -> str:
+    def _refresh(
+        self,
+        session: requests.Session,
+        *,
+        max_attempts: int | None = None,
+        timeout_seconds: float | None = None,
+    ) -> str:
+        attempts = (
+            settings.dbd_max_auth_attempts
+            if max_attempts is None
+            else max(1, int(max_attempts))
+        )
+        request_timeout = (
+            settings.request_timeout
+            if timeout_seconds is None
+            else max(0.1, float(timeout_seconds))
+        )
         if not self._warmed_up:
-            warm_up(session)
+            if timeout_seconds is None:
+                warm_up(session)
+            else:
+                warm_up(session, timeout=request_timeout)
             self._warmed_up = True
 
         headers = {
@@ -45,16 +76,23 @@ class DbdAuth:
             "Sec-Fetch-Site": "same-origin",
         }
 
-        for attempt in range(1, settings.dbd_max_auth_attempts + 1):
+        last_error = None
+        last_status = None
+        for attempt in range(1, attempts + 1):
             try:
-                response = session.post(REFRESH_URL, headers=headers, timeout=settings.request_timeout)
+                response = session.post(REFRESH_URL, headers=headers, timeout=request_timeout)
             except RequestsError as exc:
                 code = getattr(exc, "code", None) or getattr(exc, "curl_code", None)
                 suffix = f" curl={code}" if code is not None else ""
-                raise DbdAuthError(
+                last_error = (
                     f"auth_refresh transport {type(exc).__name__}{suffix} path=/api/refresh"
-                ) from None
+                )
+                if attempt < attempts:
+                    time.sleep(min(5, attempt))
+                    continue
+                raise DbdAuthError(last_error) from None
 
+            last_status = int(response.status_code)
             if response.status_code == 403:
                 import_chrome_cookies(session, "datawarehouse.dbd.go.th")
                 time.sleep(1)
@@ -81,12 +119,21 @@ class DbdAuth:
                 time.sleep(1)
                 continue
 
-            raise DbdAuthError(
+            last_error = (
                 f"auth_refresh failed: HTTP {response.status_code} path=/api/refresh"
             )
+            if attempt < attempts:
+                time.sleep(min(5, attempt))
+                continue
+            raise DbdAuthError(last_error, status_code=last_status)
 
         raise DbdAuthError(
-            f"auth_refresh exhausted after {settings.dbd_max_auth_attempts} attempts path=/api/refresh"
+            last_error
+            or (
+                f"auth_refresh exhausted after {attempts} "
+                "attempts path=/api/refresh"
+            ),
+            status_code=last_status,
         )
 
 

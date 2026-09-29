@@ -19,6 +19,52 @@ def assert_manager_lock(conn) -> None:
             raise RuntimeError("DBD API manager lock was lost")
 
 
+def assert_manager_lock_free() -> None:
+    """Fail if the single-process API manager lock is currently owned.
+
+    Legacy distributed workers call this once before registration/claiming so a
+    collector that already owns the manager lock cannot be joined later by the
+    old runtime.
+    """
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT IS_FREE_LOCK(CONCAT(DATABASE(), ':dbd-api-manager')) AS free"
+        )
+        if cur.fetchone()["free"] != 1:
+            raise RuntimeError(
+                "Single-process DBD collector/API manager is already active"
+            )
+
+
+@contextmanager
+def runtime_handoff_lock(timeout_seconds: int = 5):
+    """Serialize legacy-worker registration against collector handoff.
+
+    The collector keeps the normal API manager lock for its full lifetime. This
+    short lock only closes the startup race between that collector and legacy
+    distributed workers registering themselves.
+    """
+    timeout = max(0, int(timeout_seconds))
+    with connect() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT GET_LOCK(CONCAT(DATABASE(), ':dbd-runtime-handoff'), %s) AS acquired",
+                (timeout,),
+            )
+            if cur.fetchone()["acquired"] != 1:
+                raise RuntimeError("DBD runtime handoff is busy; retry shortly")
+        try:
+            yield
+        finally:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT RELEASE_LOCK(CONCAT(DATABASE(), ':dbd-runtime-handoff'))"
+                    )
+            except Exception:
+                pass
+
+
 @contextmanager
 def manager_lock():
     """One API manager per database: an in-memory rate limit has one owner."""
