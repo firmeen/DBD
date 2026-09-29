@@ -249,7 +249,7 @@ function Get-GuardianOwnedWorkers {
                     $name -notmatch '^(python(w)?(\.exe)?|powershell(\.exe)?|pwsh(\.exe)?)$' -or
                     $commandLine -notmatch '\-m\s+dbd\s+bulk' -or
                     $commandLine -notmatch ("\-\-run-id\s+" + $runPattern + "(\s|$)") -or
-                    $commandLine -notmatch ("\-\-worker-instance\s+" + $workerPattern + "(\s|$)")
+                    $commandLine -notmatch ("--worker-instance\s+" + $workerPattern + "(\s|$)")
                 ) {
                     throw (
                         "Process registry PID {0} no longer matches Run {1} worker {2}; " +
