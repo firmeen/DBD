@@ -22,7 +22,7 @@ def _int(value: Any) -> int:
 def _phase_style(phase: str) -> str:
     if phase in {"COMPLETED", "RUNNING"}:
         return "bold green"
-    if phase in {"WAIT_REDIS", "WAIT_MYSQL", "FENCED", "RECONCILING", "RECOVERING", "RECOVERING_STALL", "PAUSED"}:
+    if phase in {"WAIT_REDIS", "WAIT_MYSQL", "FENCED", "RECONCILING", "RECOVERING", "PAUSED"}:
         return "bold yellow"
     if phase in {"FATAL", "COMPLETED_WITH_FAILURES"}:
         return "bold red"
@@ -111,8 +111,8 @@ class GuardianDashboard:
         )
         control.add_row("RATE KEY", str(profile.get("redis_rate_key") or "--"))
         control.add_row(
-            "STALL WATCH",
-            f"HTTP request progress {float(profile.get('request_stall_seconds') or 0):.0f}s",
+            "WORKER STALL",
+            f"per-worker HTTP progress {float(profile.get('request_stall_seconds') or 0):.0f}s",
         )
 
         recovery = Table.grid(padding=(0, 2))
