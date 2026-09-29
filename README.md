@@ -33,7 +33,7 @@ Campaign / Bulk collection
 
 MySQL เก็บ durable state ของงานทั้งหมด เช่น master company, run, task, lease และ archive metadata
 
-Redis ไม่ใช่ฐานข้อมูลหลัก ใช้สำหรับ coordination เช่น shared rate, worker heartbeat, cooldown และ campaign control
+Redis ไม่ใช่ฐานข้อมูลหลัก ใช้สำหรับ coordination เช่น hard fleet rate ceiling, endpoint pressure, worker heartbeat, fencing และ campaign control
 
 ---
 
@@ -197,17 +197,24 @@ $env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
 dbd-data campaign start `
   --master `
   --all-statuses `
-  --workers 6 `
-  --workers-min 3 `
-  --workers-max 6 `
-  --worker-concurrency 12 `
-  --worker-rate 2 `
+  --workers 4 `
+  --workers-min 4 `
+  --workers-max 12 `
+  --worker-concurrency 8 `
+  --worker-rate 15 `
+  --fleet-rate-max 60 `
   --rate-mode adaptive `
   --max-restarts 3 `
   --headless
 ```
 
 ค่าด้านบนเป็น operational example ไม่ใช่การรับประกันว่า upstream จะรับ rate นี้ได้เสมอ ต้องดู canary, 429/503 และ throughput จริง
+
+เมื่อกำหนด `--fleet-rate-max` ค่า `--worker-rate` เป็น local hard cap ต่อ worker
+และ Redis บังคับ aggregate fleet hard cap แยกต่างหาก ดังนั้นการ autoscale จาก 4
+ไปมากกว่านั้นเพิ่ม concurrency/resilience แต่ไม่คูณเพดาน 60 req/s. Auth/session
+และ availability circuit เป็น worker-local; 429 หรือ 503 + Retry-After ยังสามารถ
+กด shared endpoint pacing ได้.
 
 เมื่อได้ run ID เช่น:
 
@@ -234,11 +241,12 @@ resume run เดิม:
 
 ```powershell
 dbd-data campaign resume 12 `
-  --workers 6 `
-  --workers-min 3 `
-  --workers-max 6 `
-  --worker-concurrency 12 `
-  --worker-rate 2 `
+  --workers 4 `
+  --workers-min 4 `
+  --workers-max 12 `
+  --worker-concurrency 8 `
+  --worker-rate 15 `
+  --fleet-rate-max 60 `
   --rate-mode adaptive `
   --max-restarts 3 `
   --headless
@@ -282,7 +290,7 @@ Redis จำเป็นสำหรับ:
 - Campaign supervisor
 - distributed bulk workers
 - distributed discovery
-- shared adaptive rate/cooldown
+- hard aggregate fleet pacing + shared endpoint pressure
 - worker heartbeat/control
 
 ตัวแปร:

@@ -403,6 +403,22 @@ def test_explicit_fleet_rate_is_independent_of_worker_count() -> None:
     assert _fleet_rate_target(plan, 20) == 20
 
 
+def test_run9_style_hard_fleet_cap_keeps_worker_rate_local() -> None:
+    plan = build_rate_plan(
+        "adaptive",
+        15,
+        12,
+        initial_workers=4,
+        fleet_rate_initial=15,
+        fleet_rate_max=60,
+    )
+    assert plan.worker_rate == 15
+    assert plan.ceiling == 60
+    assert plan.initial == 60
+    assert _fleet_rate_target(plan, 4) == 60
+    assert _fleet_rate_target(plan, 12) == 60
+
+
 def test_explicit_fleet_rate_rejects_initial_above_ceiling() -> None:
     with pytest.raises(ValueError, match="0 < initial <= max"):
         build_rate_plan("adaptive", 2, 20, fleet_rate_initial=21, fleet_rate_max=20)
