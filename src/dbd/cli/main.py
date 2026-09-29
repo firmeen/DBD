@@ -418,6 +418,7 @@ def _campaign_guard_overrides(args) -> dict:
         "request_stall_seconds",
         "open_powershell",
         "redis_rate_key",
+        "require_production_namespace",
         "recovery_interval",
     )
     return {name: getattr(args, name, None) for name in names}
@@ -457,6 +458,15 @@ def _add_campaign_guard_options(parser):
         ),
     )
     parser.add_argument("--redis-rate-key")
+    parser.add_argument(
+        "--require-production-namespace",
+        action="store_true",
+        default=None,
+        help=(
+            "Fail before Supervisor startup unless the resolved Redis rate key "
+            "uses the dbd:production: namespace"
+        ),
+    )
     parser.add_argument(
         "--recovery-interval",
         type=positive_rate,
