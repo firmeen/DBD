@@ -41,7 +41,11 @@ class GuardianConfig:
     supervisor_generation: str = ""
     workers: int = 4
     workers_min: int = 4
-    workers_max: int = 12
+    # New/unprofiled campaigns stay at the historical fixed-four envelope.
+    # The versioned Run 9 migration below enables 4..12 only when an explicit
+    # hard fleet ceiling already exists, so process scaling cannot multiply an
+    # uncapped upstream budget.
+    workers_max: int = 4
     worker_concurrency: int = 8
     worker_rate: float = settings.dbd_rate_per_second
     rate_mode: str = "adaptive"
