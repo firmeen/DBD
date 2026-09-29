@@ -392,6 +392,7 @@ local function pacing_state(
   end
   if rate > target then rate = target end
   local cooldown_until = tonumber(redis.call('GET', cooldown_key) or 0)
+  if not adaptive then cooldown_until = 0 end
   local base_ms = math.max(now_ms, cooldown_until)
   local next_ms = tonumber(redis.call('GET', next_key) or base_ms)
   if next_ms < base_ms then next_ms = base_ms end
