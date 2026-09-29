@@ -116,6 +116,52 @@ async def test_two_controllers_share_one_hard_fleet_schedule():
         await second.close()
 
 
+async def test_four_workers_share_run9_style_sixty_rps_hard_ceiling():
+    key = "dbd:test-run9-hard-fleet:" + uuid4().hex
+    controllers = [
+        EndpointRateController(
+            15,
+            redis_url=REDIS_URL,
+            redis_key=key,
+            shared_rate_ceiling=60,
+        )
+        for _ in range(4)
+    ]
+    for controller in controllers:
+        await controller.open()
+    try:
+        first = controllers[0]
+        if first._global_shared is not None:
+            await first._global_shared.clear_state()
+
+        started = time.perf_counter()
+        admissions = await asyncio.gather(
+            *(controller.acquire("profile") for controller in controllers)
+        )
+        elapsed = time.perf_counter() - started
+
+        assert all(admission.shared for admission in admissions)
+        assert elapsed >= 0.03
+        assert all(
+            controller.global_effective_rate() == pytest.approx(15)
+            for controller in controllers
+        )
+        assert all(
+            controller._global_shared is not None
+            and controller._global_shared.rate == pytest.approx(60)
+            for controller in controllers
+        )
+    finally:
+        for controller in controllers:
+            if controller._global_shared is not None:
+                await controller._global_shared.clear_state()
+            endpoint = controller._shared_endpoint("profile")
+            if endpoint is not None:
+                await endpoint.clear_state()
+        for controller in controllers:
+            await controller.close()
+
+
 async def test_endpoint_cooldown_does_not_reserve_global_fleet_cursor():
     key = "dbd:test-endpoint-isolation:" + uuid4().hex
     controller = EndpointRateController(
