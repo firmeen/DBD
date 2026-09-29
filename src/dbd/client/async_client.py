@@ -310,16 +310,21 @@ class AsyncDbdClient:
                     self.retries_made += 1
                     HTTP_RETRIES.inc()
                 async with self._semaphore:
-                    admission = None
-                    if rate_key is not None or self._shared_admission:
-                        admission = await self.endpoint_rate.acquire(rate_key)
-                    else:
-                        await self.rate.acquire()
+                    # Authentication/session recovery is worker-local. Do not
+                    # reserve a fleet pacing slot until this worker has a usable
+                    # token, otherwise one broken worker can consume shared
+                    # capacity while producing no DBD API request.
                     try:
                         token = await self._ensure_token()
                     except DbdAuthError:
                         await self._mark_auth_unavailable()
                         raise
+
+                    admission = None
+                    if rate_key is not None or self._shared_admission:
+                        admission = await self.endpoint_rate.acquire(rate_key)
+                    else:
+                        await self.rate.acquire()
                     requested = datetime.now(timezone.utc).replace(tzinfo=None)
                     self.requests_made += 1
                     self.last_request_at = time.time()
