@@ -422,8 +422,19 @@ def _add_campaign_guard_options(parser):
     parser.add_argument("--worker-concurrency", type=positive)
     parser.add_argument("--worker-rate", type=positive_rate)
     parser.add_argument("--rate-mode", choices=("shared", "multiply", "adaptive"))
-    parser.add_argument("--fleet-rate-initial", type=positive_rate)
-    parser.add_argument("--fleet-rate-max", type=positive_rate)
+    parser.add_argument(
+        "--fleet-rate-initial",
+        type=positive_rate,
+        help=(
+            "Compatibility startup hint; with explicit fleet-rate configuration "
+            "--fleet-rate-max is the hard aggregate ceiling"
+        ),
+    )
+    parser.add_argument(
+        "--fleet-rate-max",
+        type=positive_rate,
+        help="Hard shared fleet rate ceiling, independent of workers-max",
+    )
     parser.add_argument("--fleet-db-connections-max", type=positive)
     parser.add_argument("--fleet-archive-workers-max", type=positive)
     parser.add_argument("--fleet-projection-workers-max", type=positive)
@@ -432,7 +443,10 @@ def _add_campaign_guard_options(parser):
     parser.add_argument(
         "--request-stall-seconds",
         type=positive_rate,
-        help="Recycle a healthy-heartbeating fleet when HTTP request count stops advancing for this many seconds (minimum 30)",
+        help=(
+            "Recycle only an individual worker whose HTTP request/response path "
+            "stops advancing for this many seconds (minimum 30)"
+        ),
     )
     parser.add_argument("--redis-rate-key")
     parser.add_argument(
