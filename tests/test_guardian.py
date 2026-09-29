@@ -99,6 +99,78 @@ def test_profile_persists_operational_values_but_current_env_owns_rate_namespace
     assert restored.redis_rate_key == "dbd:production:global-rate"
 
 
+def test_legacy_fixed_four_profile_migrates_to_bounded_twelve(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        guardian,
+        "settings",
+        SimpleNamespace(dbd_redis_rate_key="dbd:production:global-rate"),
+    )
+    monkeypatch.setattr(
+        guardian,
+        "_runtime_profile",
+        lambda run_id: {
+            "workers": 4,
+            "workers_min": 4,
+            "workers_max": 4,
+            "worker_rate": 15.0,
+            "fleet_rate_max": 60.0,
+        },
+    )
+    guardian._write_json_atomic(
+        guardian.guardian_profile_path(9),
+        {
+            "profile_version": 1,
+            "run_id": 9,
+            "workers": 4,
+            "workers_min": 4,
+            "workers_max": 4,
+            "worker_rate": 15.0,
+            "fleet_rate_max": 60.0,
+        },
+    )
+
+    config = guardian.resolve_guardian_config(9, persist=False)
+
+    assert config.workers == 4
+    assert config.workers_min == 4
+    assert config.workers_max == 12
+    assert config.worker_rate == 15.0
+    assert config.fleet_rate_max == 60.0
+
+
+def test_profile_migration_never_overrides_explicit_workers_max(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        guardian,
+        "settings",
+        SimpleNamespace(dbd_redis_rate_key="dbd:production:global-rate"),
+    )
+    monkeypatch.setattr(
+        guardian,
+        "_runtime_profile",
+        lambda run_id: {"workers": 4, "workers_min": 4, "workers_max": 4},
+    )
+    guardian._write_json_atomic(
+        guardian.guardian_profile_path(9),
+        {
+            "profile_version": 1,
+            "run_id": 9,
+            "workers": 4,
+            "workers_min": 4,
+            "workers_max": 4,
+        },
+    )
+
+    config = guardian.resolve_guardian_config(
+        9,
+        overrides={"workers_max": 6},
+        persist=False,
+    )
+
+    assert config.workers_max == 6
+
+
 def test_supervisor_lease_is_clear_only_when_key_is_absent() -> None:
     assert guardian.RedisRecoveryProbe(True, 5, 5, lease_ttl=-2).lease_clear is True
     assert guardian.RedisRecoveryProbe(True, 5, 5, lease_ttl=-1).lease_clear is False
