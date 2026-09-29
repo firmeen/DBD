@@ -191,7 +191,7 @@ async def _collector_preflight(repo, run_id: int, *, health=None) -> dict:
     # Serialize this diagnostic handoff against production distributed-worker startup.
     # The CLI already holds the long-lived manager lock for the collector.
     with runtime_handoff_lock():
-        legacy = await _assert_campaign_runtime_offline(run_id)
+        campaign = await _assert_campaign_runtime_offline(run_id)
 
         leases = await repo.collector_lease_summary(run_id)
         if int(leases.get("invalid", 0) or 0):
@@ -220,8 +220,8 @@ async def _collector_preflight(repo, run_id: int, *, health=None) -> dict:
     return {
         "schema_revision": schema_revision,
         "archive_backend": settings.dbd_archive_backend,
-        "campaign_control": str(legacy.get("control_status") or "offline"),
-        "campaign_workers": int(legacy.get("workers", 0) or 0),
+        "campaign_control": str(campaign.get("control_status") or "offline"),
+        "campaign_workers": int(campaign.get("workers", 0) or 0),
         "reclaimed_leases": int(reclaimed),
     }
 

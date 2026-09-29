@@ -94,7 +94,7 @@ class CollectorDashboard:
                 "PREFLIGHT",
                 (
                     f"schema {preflight.get('schema_revision', 'unknown')}   "
-                    f"legacy {preflight.get('legacy_control', 'unknown')}   "
+                    f"campaign {preflight.get('campaign_control', 'unknown')}   "
                     f"leases clear   recovered {int(preflight.get('reclaimed_leases', 0))}"
                 ),
             )
