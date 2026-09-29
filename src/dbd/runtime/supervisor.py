@@ -40,7 +40,6 @@ _WORKER_HEARTBEAT_TIMEOUT_SECONDS = 15.0
 _WORKER_DRAIN_TIMEOUT_SECONDS = 90.0
 _WORKER_KILL_WAIT_SECONDS = 5.0
 _REQUEST_STALL_TIMEOUT_SECONDS = 90.0
-_REQUEST_STALL_EXIT_CODE = 76
 _RATE_STATE_TTL_SECONDS = 600
 _DB_POOLS_PER_WORKER = 2
 _REDIS_CLIENTS_PER_WORKER = 1
@@ -2557,8 +2556,6 @@ def supervise_campaign(
                     runtime_status = "paused"
                 elif exit_code == 2:
                     runtime_status = "capacity_exhausted"
-                elif exit_code == _REQUEST_STALL_EXIT_CODE:
-                    runtime_status = "request_stalled"
                 elif remaining == 0 and snapshot.get("failed", 0):
                     runtime_status = "completed_with_failures"
                 elif remaining == 0:
