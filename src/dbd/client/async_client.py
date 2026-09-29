@@ -34,6 +34,8 @@ from .rate_control import EndpointRateController
 from .rate_limit import TokenBucket, protective_cooldown
 from .session import WARMUP_PAGE_URL, create_session
 
+_AUTH_RECOVERY_COOLDOWN_SECONDS = 5.0
+
 
 def _curl_code(exc) -> object:
     code = getattr(exc, "code", None)
@@ -152,11 +154,15 @@ class AsyncDbdClient:
             self.auth_failures += 1
             self.last_auth_error_at = time.time()
             self._remember_error(exc)
-            self._auth_backoff_until = time.monotonic() + 5.0
+            self._auth_backoff_until = (
+                time.monotonic() + _AUTH_RECOVERY_COOLDOWN_SECONDS
+            )
+            await self.endpoint_rate.availability_failure()
             raise
         self._token = token
         self._auth_backoff_until = 0.0
         self.last_auth_success_at = time.time()
+        await self.endpoint_rate.recover_global()
         if self._session is not None and self._auth_session is not None:
             self._session.cookies.update(self._auth_session.cookies)
         return token
@@ -199,7 +205,14 @@ class AsyncDbdClient:
                 continue
 
             assert task is not None
-            return await task
+            try:
+                return await task
+            except DbdAuthError:
+                # One failed refresh wave is shared by every waiting coroutine.
+                # Keep the durable fetch tasks parked behind the worker-local
+                # recovery gate instead of charging each task with duplicate
+                # HTTP retries / retry_wait transitions.
+                continue
 
     def _blocking_token(self):
         return self._auth.get_token(self._auth_session)
