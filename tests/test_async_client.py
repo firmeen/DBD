@@ -83,6 +83,36 @@ async def test_auth_refresh_failure_is_single_flight_per_worker(monkeypatch):
     assert c.auth_state == "ready"
 
 
+async def test_auth_recovery_wave_reenters_worker_local_availability_gate(monkeypatch):
+    c = client()
+    c._token = None
+    c._auth._expires_at = 0
+    c.endpoint_rate.wait_available = AsyncMock()
+    c.endpoint_rate.availability_failure = AsyncMock(return_value="closed")
+    c.endpoint_rate.recover_global = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        async_client_module,
+        "_AUTH_RECOVERY_COOLDOWN_SECONDS",
+        0.0,
+    )
+    calls = []
+
+    def refresh():
+        calls.append(1)
+        if len(calls) == 1:
+            raise DbdAuthError("synthetic auth outage")
+        c._auth._expires_at = time.time() + 100
+        return "recovered"
+
+    c._blocking_token = refresh
+
+    assert await asyncio.wait_for(c._ensure_token(), 1.0) == "recovered"
+    assert calls == [1, 1]
+    assert c.endpoint_rate.wait_available.await_count == 2
+    assert c.endpoint_rate.availability_failure.await_count == 1
+    assert c.endpoint_rate.recover_global.await_count == 1
+
+
 async def test_expiry_during_decryption_retries():
     c = client()
     c._ensure_token = AsyncMock(return_value="new")
