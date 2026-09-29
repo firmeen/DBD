@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 from contextlib import contextmanager
+from types import SimpleNamespace
 
 import pytest
 
@@ -77,3 +78,13 @@ def test_collect_cli_returns_130_after_graceful_pause(monkeypatch) -> None:
         cli_main.main()
 
     assert exc.value.code == 130
+
+async def test_distributed_worker_identity_mismatch_fails_before_db(monkeypatch) -> None:
+    monkeypatch.setenv("DBD_WORKER_ID", "local-9-g1111111111111111-1-a")
+    args = SimpleNamespace(
+        worker_instance="local-9-g2222222222222222-1-b",
+    )
+
+    with pytest.raises(RuntimeError, match="worker identity mismatch"):
+        await cli_main.worker_command(args)
+
