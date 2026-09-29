@@ -41,7 +41,7 @@ class GuardianConfig:
     supervisor_generation: str = ""
     workers: int = 4
     workers_min: int = 4
-    workers_max: int = 4
+    workers_max: int = 12
     worker_concurrency: int = 8
     worker_rate: float = settings.dbd_rate_per_second
     rate_mode: str = "adaptive"

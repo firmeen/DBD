@@ -633,6 +633,55 @@ def _run_status(run_id: int) -> str:
         return str(row["status"])
 
 
+def _worker_registry_path(run_id: int):
+    return PROJECT_ROOT / "data" / "guardian" / f"run-{int(run_id)}.workers.json"
+
+
+def _write_worker_registry(
+    run_id: int,
+    supervisor_generation: str | None,
+    workers: list[WorkerProcess],
+) -> None:
+    """Persist exact local child PIDs for bounded hard-loss recovery.
+
+    This registry is operational metadata only. Redis remains the live control
+    plane and MySQL remains durable work truth. A hard-killed Supervisor leaves
+    the last registry behind so the outer watchdog can inspect exact PIDs before
+    falling back to a full Win32 process inventory.
+    """
+    path = _worker_registry_path(run_id)
+    live = [
+        {
+            "worker_id": worker.worker_id,
+            "index": int(worker.index),
+            "pid": int(worker.process.pid),
+            "started_at": float(worker.started_at),
+        }
+        for worker in workers
+        if worker.process.poll() is None
+    ]
+    payload = {
+        "run_id": int(run_id),
+        "supervisor_pid": os.getpid(),
+        "supervisor_generation": _normalize_supervisor_generation(
+            supervisor_generation
+        )
+        or None,
+        "updated_at": time.time(),
+        "workers": live,
+    }
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
+        temp.write_text(
+            json.dumps(payload, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        os.replace(temp, path)
+    except OSError:
+        return
+
+
 def _worker_command(run_id: int, *, concurrency: int, rate: float) -> list[str]:
     return [
         sys.executable,
@@ -1642,6 +1691,21 @@ def supervise_campaign(
     dashboard_started_at = time.monotonic()
     progress = LiveCampaignDashboard(run_id, interval=0.5)
     worker_watchdog = WorkerProgressWatchdog(request_stall_seconds)
+    registry_signature: tuple[tuple[str, int], ...] | None = None
+
+    def sync_worker_registry() -> None:
+        nonlocal registry_signature
+        signature = tuple(
+            sorted(
+                (worker.worker_id, int(worker.process.pid))
+                for worker in children
+                if worker.process.poll() is None
+            )
+        )
+        if signature == registry_signature:
+            return
+        _write_worker_registry(run_id, generation or None, children)
+        registry_signature = signature
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
         nonlocal next_index
@@ -1751,6 +1815,7 @@ def supervise_campaign(
         if has_work:
             for _ in range(initial_workers):
                 children.append(spawn_worker())
+        sync_worker_registry()
 
         _write_runtime_state(
             redis,
@@ -2042,6 +2107,8 @@ def supervise_campaign(
                     f"({len(active_live)}/{required_floor})"
                 )
 
+            sync_worker_registry()
+
             # Draining workers can still finish already-owned HTTP work, so they
             # remain part of the upstream budget until their process exits.
             rate_workers = len([worker for worker in live if not worker.capacity_lost])
@@ -2313,6 +2380,7 @@ def supervise_campaign(
             generation or None,
             children,
         )
+        _write_worker_registry(run_id, generation or None, [])
         if generation_reclaimed:
             progress.event(
                 f"shutdown reconciliation reclaimed {generation_reclaimed} "

@@ -28,6 +28,8 @@ from dbd.runtime.supervisor import (
     _terminate_workers,
     _with_retired_metrics,
     _worker_command,
+    _worker_registry_path,
+    _write_worker_registry,
     build_rate_plan,
     build_resource_plan,
 )
@@ -55,6 +57,34 @@ def test_child_workers_disable_prometheus_listener_collision() -> None:
     command = _worker_command(42, concurrency=8, rate=15)
     assert "--distributed" in command
     assert command[command.index("--metrics-port") + 1] == "0"
+
+
+def test_worker_registry_tracks_exact_live_child_pids(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(supervisor, "PROJECT_ROOT", tmp_path)
+
+    class Process:
+        def __init__(self, pid, code=None):
+            self.pid = pid
+            self.code = code
+
+        def poll(self):
+            return self.code
+
+    live = WorkerProcess(1, "worker-live", Process(111))
+    dead = WorkerProcess(2, "worker-dead", Process(222, 1))
+    _write_worker_registry(9, "8f0675d7ace3f411", [live, dead])
+
+    payload = json.loads(_worker_registry_path(9).read_text(encoding="utf-8"))
+    assert payload["run_id"] == 9
+    assert payload["supervisor_generation"] == "8f0675d7ace3f411"
+    assert payload["workers"] == [
+        {
+            "index": 1,
+            "pid": 111,
+            "started_at": live.started_at,
+            "worker_id": "worker-live",
+        }
+    ]
 
 
 def test_seed_rate_legacy_mode_does_not_clear_existing_shared_penalty_state() -> None:
