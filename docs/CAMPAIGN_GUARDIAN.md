@@ -13,7 +13,7 @@ $env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
 dbd-data campaign guard 8 --workers 4 --workers-min 4 --workers-max 12 --worker-concurrency 8 --worker-rate 15 --fleet-rate-max 60 --fleet-db-connections-max 96 --fleet-archive-workers-max 24 --fleet-projection-workers-max 48 --fleet-redis-connections-max 128 --rate-mode adaptive --max-restarts 3 --headless
 ~~~
 
-The resolved profile is persisted under data/guardian/run-8.json. It contains operational settings only; credentials and Redis URLs are not copied into the profile. Existing persisted profiles remain authoritative on resume, so changing a code default such as `workers_max` does not silently rewrite an existing campaign.
+The resolved profile is persisted under data/guardian/run-8.json. It contains operational settings only; credentials and Redis URLs are not copied into the profile. Existing persisted profiles remain authoritative on resume except for one versioned safety migration: a v1 fixed `4/4/4` profile is promoted to `workers_max=12` only when it already carries an explicit `fleet_rate_max`, so added process capacity cannot multiply the upstream ceiling. Explicit CLI `--workers-max` always wins, and uncapped or non-default legacy fleet shapes are preserved.
 
 After that, the normal operator command is only:
 
