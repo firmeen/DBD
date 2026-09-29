@@ -1093,6 +1093,35 @@ def test_worker_progress_watchdog_trips_only_the_stalled_worker() -> None:
     ) is None
 
 
+def test_worker_progress_watchdog_does_not_treat_admission_only_as_http_progress() -> None:
+    watchdog = WorkerProgressWatchdog(timeout_seconds=90.0)
+    state = {
+        "fetch_active": 8,
+        "redis_admissions": 100,
+        "requests": 0,
+        "responses": 0,
+        "completed": 0,
+    }
+    watchdog.observe(
+        "worker-a",
+        state,
+        now=0.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    )
+    state["redis_admissions"] = 120
+    state["completed"] = 5
+    assert watchdog.observe(
+        "worker-a",
+        state,
+        now=90.0,
+        active_work=True,
+        control_healthy=True,
+        draining=False,
+    ) == 90.0
+
+
 def test_worker_progress_watchdog_does_not_ignore_local_open_circuit_forever() -> None:
     watchdog = WorkerProgressWatchdog(timeout_seconds=90.0)
     state = {

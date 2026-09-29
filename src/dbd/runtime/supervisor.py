@@ -67,9 +67,7 @@ class WorkerProgressWatchdog:
     """Detect request-path stagnation per worker without freezing healthy peers."""
 
     timeout_seconds: float = _REQUEST_STALL_TIMEOUT_SECONDS
-    samples: dict[str, tuple[tuple[int, int, int, int], float]] = field(
-        default_factory=dict
-    )
+    samples: dict[str, tuple[tuple[int, int], float]] = field(default_factory=dict)
 
     def forget(self, worker_id: str) -> None:
         self.samples.pop(str(worker_id), None)
@@ -94,11 +92,12 @@ class WorkerProgressWatchdog:
             and not draining
             and int(state.get("fetch_active", 0) or 0) > 0
         )
+        # Admission and downstream completion are diagnostic signals, but they
+        # must not mask a dead HTTP path. Only actual request/response movement
+        # resets this worker's request-progress timeout.
         marker = (
-            int(state.get("redis_admissions", 0) or 0),
             int(state.get("requests", 0) or 0),
             int(state.get("responses", 0) or 0),
-            int(state.get("completed", 0) or 0),
         )
         previous = self.samples.get(worker_id)
         if not eligible:
@@ -1064,6 +1063,7 @@ def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict
         "retry_wait",
         "not_available",
         "requests",
+        "responses",
         "http_retries",
         "rate_limit_hits",
         "redis_commands",
@@ -1756,6 +1756,7 @@ def supervise_campaign(
             "retry_wait",
             "not_available",
             "requests",
+            "responses",
             "http_retries",
             "rate_limit_hits",
             "redis_commands",
@@ -2071,7 +2072,13 @@ def supervise_campaign(
 
             target = len(active_live)
             current_effective_rate = None
-            if autoscale and not graceful_stop and not control_plane_degraded:
+            fleet_visibility_complete = len(active_health_rows) == len(active_live)
+            if (
+                autoscale
+                and not graceful_stop
+                and not control_plane_degraded
+                and fleet_visibility_complete
+            ):
                 if plan.independent:
                     current_effective_rate = _effective_rate(
                         redis, rate_key, plan.initial

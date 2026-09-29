@@ -37,6 +37,7 @@ _MAINTENANCE_INTERVAL_SECONDS = 5.0
 _MAINTENANCE_LEASE_SECONDS = 8
 _DRAIN_DB_POLL_SECONDS = 0.5
 _IDLE_PROGRESS_POLL_SECONDS = 1.0
+_SELF_DRAIN_TIMEOUT_SECONDS = 90.0
 
 
 def code_batches(path: str, size: int):
@@ -700,7 +701,7 @@ async def process(
             if drain_requested.is_set():
                 if (
                     drain_started_at is not None
-                    and time.monotonic() - drain_started_at > 90.0
+                    and time.monotonic() - drain_started_at > _SELF_DRAIN_TIMEOUT_SECONDS
                 ):
                     raise RuntimeError(
                         f"Worker {owner} drain exceeded 90s; forcing task cancellation "
