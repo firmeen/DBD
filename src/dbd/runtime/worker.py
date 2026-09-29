@@ -552,11 +552,29 @@ async def process(
                 break
         redis_commands = 0
         redis_admissions = 0
+        shared_admission_waiters = 0
+        shared_admission_waiting = False
+        shared_admission_wait_reason = None
         if client is not None:
             controller = getattr(client, "endpoint_rate", None)
             if controller is not None:
                 redis_commands = int(getattr(controller, "redis_commands", 0) or 0)
                 redis_admissions = int(getattr(controller, "redis_admissions", 0) or 0)
+                shared_admission_waiters = int(
+                    getattr(controller, "shared_admission_waiters", 0) or 0
+                )
+                shared_admission_wait_until = float(
+                    getattr(controller, "shared_admission_wait_until", 0.0) or 0.0
+                )
+                shared_admission_waiting = (
+                    shared_admission_waiters > 0
+                    and shared_admission_wait_until > time.time()
+                )
+                shared_admission_wait_reason = getattr(
+                    controller,
+                    "shared_admission_wait_reason",
+                    None,
+                )
         pool = (
             redis_pool_snapshot(redis_client)
             if redis_client is not None and redis_pool_snapshot is not None
@@ -603,6 +621,9 @@ async def process(
             or getattr(client, "last_error_at", None),
             "redis_commands": redis_commands,
             "redis_admissions": redis_admissions,
+            "shared_admission_waiters": shared_admission_waiters,
+            "shared_admission_waiting": shared_admission_waiting,
+            "shared_admission_wait_reason": shared_admission_wait_reason,
             "redis_pool_in_use": int(pool.get("in_use", 0)),
             "redis_pool_created": int(pool.get("created", 0)),
             "redis_pool_max": int(pool.get("max", 0)),
