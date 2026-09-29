@@ -58,6 +58,9 @@ class GuardianConfig:
     request_stall_seconds: float = 90.0
     open_powershell: bool = False
     redis_rate_key: str = settings.dbd_redis_rate_key
+    # Launcher policy, not durable run configuration. Run-DBD.ps1 enables this
+    # so a production resume cannot silently share a development pacing lane.
+    require_production_namespace: bool = False
     recovery_interval: float = settings.dbd_redis_recovery_interval_seconds
     redis_stability_samples: int = 5
     redis_sample_delay: float = 1.0
@@ -237,8 +240,17 @@ def _validate_config(config: GuardianConfig) -> GuardianConfig:
             char not in "0123456789abcdef" for char in generation
         ):
             raise ValueError("supervisor generation must be a 16-character lowercase hex token")
-    if not str(config.redis_rate_key).strip():
+    rate_key = str(config.redis_rate_key).strip()
+    if not rate_key:
         raise ValueError("Redis rate key must not be empty")
+    if (
+        config.require_production_namespace
+        and not rate_key.lower().startswith("dbd:production:")
+    ):
+        raise ValueError(
+            "production Guardian requires DBD_REDIS_RATE_KEY in the "
+            "'dbd:production:' namespace"
+        )
     return config
 
 
@@ -301,6 +313,8 @@ def resolve_guardian_config(
 def _persist_guardian_config(config: GuardianConfig) -> None:
     payload = asdict(config)
     payload.pop("supervisor_generation", None)
+    # This is an entrypoint safety policy, not a property of the durable run.
+    payload.pop("require_production_namespace", None)
     _write_json_atomic(
         guardian_profile_path(config.run_id),
         {
