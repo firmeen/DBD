@@ -9,8 +9,8 @@ import dbd.runtime.supervisor as supervisor
 from dbd.runtime.supervisor import (
     AutoscaleController,
     CampaignResourcePlan,
-    WorkerProgressWatchdog,
     WorkerProcess,
+    WorkerProgressWatchdog,
     _campaign_terminal_snapshot,
     _drain_registered_workers,
     _fleet_circuit_state,
@@ -541,6 +541,38 @@ def test_hard_cap_autoscale_holds_when_workers_are_not_saturated() -> None:
         worker_rate=15.0,
         hard_fleet_cap=True,
         rate_limit_delta=0,
+    ) == 4
+
+
+def test_hard_cap_autoscale_replaces_one_unhealthy_worker_capacity() -> None:
+    controller = AutoscaleController(4, 12, 8)
+    assert controller.target(
+        pending=5000,
+        running=24,
+        current=4,
+        effective_maximum=12,
+        now=10.0,
+        healthy_workers=3,
+        fleet_availability_degraded=False,
+        hard_fleet_cap=True,
+    ) == 5
+
+
+def test_hard_cap_autoscale_freezes_on_multi_worker_availability_incident() -> None:
+    controller = AutoscaleController(4, 12, 8)
+    assert controller.target(
+        pending=5000,
+        running=16,
+        current=4,
+        effective_maximum=12,
+        now=10.0,
+        fetch_active=32,
+        observed_http_rate=0.0,
+        rate_target=60.0,
+        worker_rate=15.0,
+        healthy_workers=2,
+        fleet_availability_degraded=True,
+        hard_fleet_cap=True,
     ) == 4
 
 

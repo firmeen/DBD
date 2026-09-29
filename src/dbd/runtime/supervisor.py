@@ -181,6 +181,8 @@ class AutoscaleController:
         rate_target: float | None = None,
         worker_rate: float | None = None,
         hard_fleet_cap: bool = False,
+        healthy_workers: int | None = None,
+        fleet_availability_degraded: bool = False,
         rate_limit_delta: int = 0,
     ) -> int:
         """Scale only when the pipeline needs capacity and downstream is healthy."""
@@ -201,6 +203,23 @@ class AutoscaleController:
             return min(current + 1, minimum)
         if now < self.next_decision_at:
             return current
+
+        # Multiple independent worker availability failures are evidence of a
+        # fleet/upstream incident, not missing local capacity. Freeze autoscale
+        # rather than creating a replacement storm. A single unhealthy worker
+        # may receive one spare process so minimum healthy capacity is preserved.
+        if fleet_availability_degraded:
+            self.low_pressure_observations = 0
+            self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
+            return current
+        if (
+            healthy_workers is not None
+            and int(healthy_workers) < minimum
+            and current < effective_maximum
+        ):
+            self.low_pressure_observations = 0
+            self.next_decision_at = now + _AUTOSCALE_UP_COOLDOWN_SECONDS
+            return current + 1
 
         downstream_limit = max(capacity * 2, current * capacity * 2)
         downstream_backlog = (
@@ -1926,6 +1945,24 @@ def supervise_campaign(
                 for row in registered_states
                 if row.get("worker_id")
             }
+            active_health_rows = [
+                row
+                for row in registered_states
+                if str(row.get("status") or "").lower() == "active"
+            ]
+            unhealthy_workers = sum(
+                str(row.get("circuit_global") or "").lower() == "open"
+                or str(row.get("auth_state") or "").lower() == "cooldown"
+                for row in active_health_rows
+            )
+            healthy_workers = max(0, len(active_health_rows) - unhealthy_workers)
+            fleet_unhealthy_threshold = max(
+                2,
+                (max(1, len(active_health_rows)) + 1) // 2,
+            )
+            fleet_availability_degraded = (
+                unhealthy_workers >= fleet_unhealthy_threshold
+            )
 
             stop_requested = False
             if not control_plane_degraded:
@@ -2053,6 +2090,8 @@ def supervise_campaign(
                     rate_target=current_effective_rate if plan.independent else None,
                     worker_rate=plan.worker_rate,
                     hard_fleet_cap=plan.independent,
+                    healthy_workers=healthy_workers,
+                    fleet_availability_degraded=fleet_availability_degraded,
                     rate_limit_delta=recent_rate_limit_delta,
                 )
                 if target > len(active_live) and len(live) < effective_maximum:

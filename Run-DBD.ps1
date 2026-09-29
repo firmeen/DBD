@@ -215,7 +215,10 @@ function Get-GuardianOwnedWorkers {
                     Get-CimInstance Win32_Process -Filter ("ProcessId = {0}" -f $pidValue) -OperationTimeoutSec 5 -ErrorAction Stop
                 )
                 if ($matches.Count -eq 0) {
-                    continue
+                    throw (
+                        "Process registry PID {0} is missing; exact worker exit cannot be " +
+                        "proven without risking a surviving child process." -f $pidValue
+                    )
                 }
 
                 $process = $matches[0]

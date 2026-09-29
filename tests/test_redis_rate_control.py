@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import pytest
 
-from dbd.client.rate_control import AdmissionState, EndpointRateController, RedisPacer
+from dbd.client.rate_control import EndpointRateController, RedisPacer
 
 REDIS_URL = os.getenv("DBD_REDIS_TEST_URL")
 pytestmark = pytest.mark.skipif(not REDIS_URL, reason="DBD_REDIS_TEST_URL is not configured")
