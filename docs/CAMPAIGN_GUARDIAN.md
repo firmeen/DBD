@@ -29,6 +29,8 @@ For a Windows outer watchdog that can also relaunch the Python Guardian after an
 
 Use `-OpenPowerShell` instead when separate worker consoles are intentionally required. The two display switches are mutually exclusive.
 
+Because `Run-DBD.ps1` is the production outer watchdog, it also enables a fail-fast namespace fence: the resolved `DBD_REDIS_RATE_KEY` must start with `dbd:production:`. A stale `dbd:dev:...` value is rejected before Supervisor ownership or worker spawn. The policy is launcher-only and is not persisted into the durable Guardian profile, so direct development/test Guardian invocations can still use isolated non-production namespaces intentionally.
+
 `Run-DBD.ps1` is intentionally ASCII-only so the same checked-out file parses safely in both Windows PowerShell 5.1 and PowerShell 7 without depending on BOM/code-page behavior. The watchdog also prepends the repository `src` directory to its process-local `PYTHONPATH` and verifies `import dbd` before launch. This lets the watchdog execute the checked-out source even if an old editable-install entry point in `.venv` has become stale; it does not change the permanent user environment.
 
 ## Recovery contract
