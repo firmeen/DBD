@@ -870,6 +870,14 @@ def _seed_rate(
     target = float(initial_rate if target_rate is None else target_rate)
     pipe = redis.pipeline(transaction=False)
     if hard_fleet_cap:
+        # Supervisor activation is fenced from the previous fleet, so reset the
+        # shared reservation cursor as well as adaptive state. This prevents an
+        # old low-rate/cooldown schedule from delaying a new hard-cap fleet.
+        pipe.set(
+            rate_key,
+            str(int(time.time() * 1000)),
+            ex=_RATE_STATE_TTL_SECONDS,
+        )
         pipe.set(
             f"{rate_key}:effective-rate",
             str(target),
