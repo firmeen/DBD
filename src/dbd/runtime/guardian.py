@@ -28,7 +28,6 @@ _GUARDIAN_STATE_VERSION = 1
 _EXIT_CONFIG = 64
 _EXIT_ALREADY_MANAGED = 75
 _EXIT_PAUSED = 130
-_EXIT_REQUEST_STALLED = 76
 
 
 class GuardianAlreadyRunning(RuntimeError):
@@ -916,39 +915,6 @@ def _guard_loop(config: GuardianConfig, dashboard: GuardianDashboard) -> int:
         )
         if terminal is not None:
             return terminal
-
-        if code == _EXIT_REQUEST_STALLED:
-            recovery_count += 1
-            consecutive_failures += 1
-            last_failure = "request_progress_stalled"
-            delay = min(
-                60.0,
-                config.recovery_interval * (2 ** min(max(0, consecutive_failures - 1), 4)),
-            )
-            message = (
-                "HTTP request progress stalled while durable work remained; "
-                f"the local fleet was contained and the same run will recover in {delay:.0f}s."
-            )
-            dashboard.render(
-                _view(
-                    config,
-                    phase="RECOVERING_STALL",
-                    recovery_count=recovery_count,
-                    message=message,
-                    state=after,
-                    package_health=package_health,
-                    last_failure=last_failure,
-                )
-            )
-            _write_guardian_state(
-                config,
-                phase="RECOVERING_STALL",
-                terminal=False,
-                recovery_count=recovery_count,
-                message=message,
-            )
-            time.sleep(delay)
-            continue
 
         if code == 2:
             message = (
