@@ -1,6 +1,10 @@
 import pytest
 
-from dbd.runtime.worker import _assert_distributed_manager_free, process
+from dbd.runtime.worker import (
+    _assert_distributed_manager_free,
+    _redis_control_grace_exceeded,
+    process,
+)
 
 
 class BrokenArchiveRepo:
@@ -90,3 +94,8 @@ async def test_campaign_manager_fence_allows_worker_when_collector_is_absent():
 async def test_campaign_manager_fence_stops_worker_when_collector_is_active():
     with pytest.raises(RuntimeError, match="collector/API manager became active"):
         await _assert_distributed_manager_free(_ManagerFenceRepo(0))
+
+def test_redis_control_grace_fails_closed_before_supervisor_lease_expiry():
+    assert _redis_control_grace_exceeded(100.0, now=119.999) is False
+    assert _redis_control_grace_exceeded(100.0, now=120.0) is True
+
