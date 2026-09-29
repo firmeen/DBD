@@ -245,11 +245,21 @@ def resolve_guardian_config(
     for source in (
         _runtime_profile(run_id),
         _read_json(guardian_profile_path(run_id)),
-        dict(overrides or {}),
     ):
         for key, value in source.items():
             if key in allowed and key != "run_id" and value is not None:
                 values[key] = value
+
+    # Redis namespace is deployment configuration, not durable run data.
+    # A current .env change must not be silently shadowed by an old persisted
+    # Guardian profile. Explicit CLI --redis-rate-key remains highest precedence.
+    environment_rate_key = str(settings.dbd_redis_rate_key or "").strip()
+    if environment_rate_key:
+        values["redis_rate_key"] = environment_rate_key
+
+    for key, value in dict(overrides or {}).items():
+        if key in allowed and key != "run_id" and value is not None:
+            values[key] = value
 
     values["run_id"] = int(run_id)
     config = _validate_config(GuardianConfig(**{key: values[key] for key in allowed}))
