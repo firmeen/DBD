@@ -369,14 +369,7 @@ Write-Host ("DBD source: {0}" -f $DbdModulePath)
 while ($true) {
     # Run-DBD is the production outer watchdog. Refuse an accidental dev
     # pacing namespace before Supervisor ownership or worker spawn.
-    $commandArgs = @(
-        "-m",
-        "dbd",
-        "campaign",
-        "guard",
-        [string]$RunId,
-        "--require-production-namespace"
-    )
+    $commandArgs = @("-m", "dbd", "campaign", "guard", [string]$RunId, "--require-production-namespace")
     if ($Headless) {
         $commandArgs += "--headless"
     }
