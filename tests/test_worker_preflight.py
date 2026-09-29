@@ -43,8 +43,12 @@ class _ScalarResult:
 class _ManagerFenceConnection:
     def __init__(self, available):
         self.available = available
+        self.statement = None
+        self.params = None
 
-    async def execute(self, statement):
+    async def execute(self, statement, params=None):
+        self.statement = str(statement)
+        self.params = params
         return _ScalarResult(self.available)
 
 
@@ -73,7 +77,14 @@ class _ManagerFenceRepo:
 
 
 async def test_campaign_manager_fence_allows_worker_when_collector_is_absent():
-    await _assert_distributed_manager_free(_ManagerFenceRepo(1))
+    repo = _ManagerFenceRepo(1)
+
+    await _assert_distributed_manager_free(repo)
+
+    assert ":manager_lock_suffix" in repo.engine.connection.statement
+    assert repo.engine.connection.params == {
+        "manager_lock_suffix": ":dbd-api-manager"
+    }
 
 
 async def test_campaign_manager_fence_stops_worker_when_collector_is_active():
