@@ -90,7 +90,7 @@ async def test_endpoint_429_penalizes_endpoint_without_global_collapse():
     assert c.endpoint_rate.global_effective_rate() == 1000
 
 
-async def test_distinct_endpoint_pressure_escalates_global_safety_layer():
+async def test_distinct_endpoint_pressure_does_not_collapse_worker_global_rate():
     c = client()
     c.endpoint_rate.acquire = AsyncMock()
     c._session.request.side_effect = [
@@ -106,7 +106,7 @@ async def test_distinct_endpoint_pressure_escalates_global_safety_layer():
     await c.fetch("GET", "/committees", rate_key="committees")
     assert c.endpoint_rate.effective_rate("profile") == 500
     assert c.endpoint_rate.effective_rate("committees") == 500
-    assert c.endpoint_rate.global_effective_rate() == 500
+    assert c.endpoint_rate.global_effective_rate() == 1000
 
 
 def test_protective_cooldown_respects_server_and_repeated_window_pressure():
