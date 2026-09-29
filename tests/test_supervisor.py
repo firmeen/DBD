@@ -766,6 +766,87 @@ def test_fleet_availability_requires_multiple_independent_workers() -> None:
     assert degraded is True
 
 
+def test_fleet_availability_clears_after_simultaneous_auth_recovery() -> None:
+    recovering = [
+        {
+            "worker_id": "worker-a",
+            "status": "active",
+            "circuit_global": "open",
+            "auth_state": "cooldown",
+        },
+        {
+            "worker_id": "worker-b",
+            "status": "active",
+            "circuit_global": "open",
+            "auth_state": "cooldown",
+        },
+        {
+            "worker_id": "worker-c",
+            "status": "active",
+            "circuit_global": "closed",
+            "auth_state": "ready",
+        },
+        {
+            "worker_id": "worker-d",
+            "status": "active",
+            "circuit_global": "closed",
+            "auth_state": "ready",
+        },
+    ]
+
+    _, unhealthy, degraded = _fleet_availability_summary(recovering)
+    assert unhealthy == 2
+    assert degraded is True
+
+    # The fleet signal is derived from current independent worker state; it is
+    # not a latched outage. As auth refresh succeeds, normal worker supervision
+    # and autoscale decisions become eligible again immediately.
+    recovering[0]["circuit_global"] = "closed"
+    recovering[0]["auth_state"] = "ready"
+    _, unhealthy, degraded = _fleet_availability_summary(recovering)
+    assert unhealthy == 1
+    assert degraded is False
+
+    recovering[1]["circuit_global"] = "closed"
+    recovering[1]["auth_state"] = "ready"
+    _, unhealthy, degraded = _fleet_availability_summary(recovering)
+    assert unhealthy == 0
+    assert degraded is False
+
+
+def test_auth_refreshing_or_needed_is_not_counted_as_fleet_outage() -> None:
+    _, unhealthy, degraded = _fleet_availability_summary(
+        [
+            {
+                "worker_id": "worker-a",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "refreshing",
+            },
+            {
+                "worker_id": "worker-b",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "needed",
+            },
+            {
+                "worker_id": "worker-c",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "ready",
+            },
+            {
+                "worker_id": "worker-d",
+                "status": "active",
+                "circuit_global": "closed",
+                "auth_state": "ready",
+            },
+        ]
+    )
+    assert unhealthy == 0
+    assert degraded is False
+
+
 def test_fleet_circuit_state_prefers_most_restrictive_worker_state() -> None:
     assert _fleet_circuit_state([]) == "unknown"
     assert _fleet_circuit_state(
