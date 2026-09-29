@@ -51,8 +51,13 @@ The current suite covers, among other cases:
 - mixed-capacity probe workload construction, endpoint parsing and deadline/drain
   behavior;
 - worker-local availability/circuit isolation for auth/session/transport failures;
-- Redis pacers share one aggregate request schedule;
+- Redis pacers share one aggregate request schedule, including the Run 9-style
+  four-worker `15 req/s` local-cap / `60 req/s` aggregate hard-cap shape;
 - explicit hard fleet ceilings remain independent of worker count;
+- simultaneous worker-local auth cooldowns can mark the fleet degraded, but the
+  signal is derived from current heartbeat state and clears as workers recover;
+- the Windows production watchdog refuses a non-`dbd:production:` Redis pacing
+  namespace before Supervisor ownership or worker spawn;
 - hard-cap admission ignores stale legacy global effective-rate/cooldown state, and
   fenced Supervisor activation resets the old reservation cursor without deleting
   Redis coordination keys;
