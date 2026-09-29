@@ -12,6 +12,7 @@ def test_windows_launcher_keeps_campaign_guard_as_production_entry() -> None:
     assert "GuardianArgs" in launcher
     assert "OrphanGraceSeconds" in launcher
     assert "RestartDelaySeconds" in launcher
+    assert "--require-production-namespace" in launcher
 
 
 def test_windows_hard_loss_checks_exact_worker_identity() -> None:
