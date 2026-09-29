@@ -18,6 +18,7 @@ from dbd.runtime.supervisor import (
     _force_stop_and_reconcile,
     _live_progress,
     _refresh_lease_with_grace,
+    _reconcile_stopped_generation_leases,
     _restore_sigint,
     _runtime_progress_baseline,
     _seed_rate,
@@ -808,3 +809,77 @@ def test_atomic_supervisor_activation_orders_handoff_before_lease(monkeypatch) -
         ("lease", 9, "token-9"),
         "handoff_exit",
     ]
+
+
+def test_stopped_generation_reconciliation_is_attempt_neutral_and_generation_scoped(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    class DeadProcess:
+        def poll(self):
+            return 0
+
+    workers = [
+        WorkerProcess(1, "local-9-g8f0675d7ace3f411-1-a", DeadProcess()),
+        WorkerProcess(2, "local-9-g8f0675d7ace3f411-2-b", DeadProcess()),
+    ]
+
+    def reclaim(run_id, *, worker_id=None, worker_prefix=None, reason, raise_errors=False):
+        calls.append(
+            {
+                "run_id": run_id,
+                "worker_id": worker_id,
+                "worker_prefix": worker_prefix,
+                "reason": reason,
+                "raise_errors": raise_errors,
+            }
+        )
+        return 63
+
+    monkeypatch.setattr(supervisor, "_reclaim_running_leases", reclaim)
+
+    reclaimed = _reconcile_stopped_generation_leases(
+        9,
+        "8f0675d7ace3f411",
+        workers,
+    )
+
+    assert reclaimed == 63
+    assert calls == [
+        {
+            "run_id": 9,
+            "worker_id": None,
+            "worker_prefix": "local-9-g8f0675d7ace3f411-",
+            "reason": "supervisor_shutdown_recovery",
+            "raise_errors": False,
+        }
+    ]
+
+
+def test_stopped_generation_reconciliation_refuses_live_worker(monkeypatch) -> None:
+    class LiveProcess:
+        def poll(self):
+            return None
+
+    worker = WorkerProcess(
+        1,
+        "local-9-g8f0675d7ace3f411-1-a",
+        LiveProcess(),
+    )
+    monkeypatch.setattr(
+        supervisor,
+        "_reclaim_running_leases",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("live generation must never be reclaimed")
+        ),
+    )
+
+    assert (
+        _reconcile_stopped_generation_leases(
+            9,
+            "8f0675d7ace3f411",
+            [worker],
+        )
+        == 0
+    )
