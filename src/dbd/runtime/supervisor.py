@@ -667,13 +667,15 @@ def _write_worker_registry(
     run_id: int,
     supervisor_generation: str | None,
     workers: list[WorkerProcess],
-) -> None:
-    """Persist exact local child PIDs for bounded hard-loss recovery.
+    *,
+    stable: bool = True,
+) -> bool:
+    """Persist an atomic child-process snapshot for bounded hard-loss recovery.
 
-    This registry is operational metadata only. Redis remains the live control
-    plane and MySQL remains durable work truth. A hard-killed Supervisor leaves
-    the last registry behind so the outer watchdog can inspect exact PIDs before
-    falling back to a full Win32 process inventory.
+    An unstable snapshot is a write-ahead fence used before Popen. The outer
+    Windows watchdog trusts exact PID containment only for a stable registry;
+    if the Supervisor dies while the fleet is mutating, it falls back to
+    ancestry discovery instead of trusting an incomplete snapshot.
     """
     path = _worker_registry_path(run_id)
     live = [
@@ -693,6 +695,7 @@ def _write_worker_registry(
             supervisor_generation
         )
         or None,
+        "stable": bool(stable),
         "updated_at": time.time(),
         "workers": live,
     }
@@ -704,8 +707,9 @@ def _write_worker_registry(
             encoding="utf-8",
         )
         os.replace(temp, path)
+        return True
     except OSError:
-        return
+        return False
 
 
 def _worker_command(
@@ -1769,36 +1773,76 @@ def supervise_campaign(
     dashboard_started_at = time.monotonic()
     progress = LiveCampaignDashboard(run_id, interval=0.5)
     worker_watchdog = WorkerProgressWatchdog(request_stall_seconds)
-    registry_signature: tuple[tuple[str, int], ...] | None = None
+    registry_signature: tuple[bool, tuple[tuple[str, int], ...]] | None = None
 
-    def sync_worker_registry() -> None:
+    def sync_worker_registry(
+        *,
+        stable: bool = True,
+        extra_worker: WorkerProcess | None = None,
+        force: bool = False,
+        required: bool = False,
+    ) -> bool:
         nonlocal registry_signature
-        signature = tuple(
+        registry_workers = children if extra_worker is None else [*children, extra_worker]
+        live_signature = tuple(
             sorted(
                 (worker.worker_id, int(worker.process.pid))
-                for worker in children
+                for worker in registry_workers
                 if worker.process.poll() is None
             )
         )
-        if signature == registry_signature:
-            return
-        _write_worker_registry(run_id, generation or None, children)
-        registry_signature = signature
+        signature = (bool(stable), live_signature)
+        if not force and signature == registry_signature:
+            return True
+        written = _write_worker_registry(
+            run_id,
+            generation or None,
+            registry_workers,
+            stable=stable,
+        )
+        if written:
+            registry_signature = signature
+            return True
+        if required:
+            raise OSError(
+                "Cannot persist the worker-registry mutation fence before spawning capacity"
+            )
+        return False
 
     def spawn_worker(*, restart_index: int | None = None, restarts: int = 0) -> WorkerProcess:
         nonlocal next_index
         index = next_index if restart_index is None else restart_index
-        worker = _spawn_worker(
-            run_id,
-            index,
-            concurrency=worker_concurrency,
-            rate=plan.worker_rate,
-            fleet_rate_ceiling=plan.ceiling,
-            open_powershell=open_powershell,
-            resource_plan=resource_plan,
-            restart_count=restarts,
-            redis_rate_key=rate_key,
-            supervisor_generation=generation or None,
+
+        # Write-ahead fence: a hard Supervisor loss between Popen and the next
+        # complete registry snapshot must never make an older stable snapshot
+        # authoritative.
+        sync_worker_registry(stable=False, force=True, required=True)
+        try:
+            worker = _spawn_worker(
+                run_id,
+                index,
+                concurrency=worker_concurrency,
+                rate=plan.worker_rate,
+                fleet_rate_ceiling=plan.ceiling,
+                open_powershell=open_powershell,
+                resource_plan=resource_plan,
+                restart_count=restarts,
+                redis_rate_key=rate_key,
+                supervisor_generation=generation or None,
+            )
+        except BaseException:
+            # Best effort: restore a complete snapshot of the pre-spawn fleet.
+            # If this write also fails, the persisted unstable fence is safer.
+            sync_worker_registry(stable=True, force=True)
+            raise
+
+        # Include the new PID before returning it to the caller. If this write
+        # fails, the previously persisted unstable fence remains in place and
+        # the outer watchdog will refuse exact-registry containment.
+        sync_worker_registry(
+            stable=True,
+            extra_worker=worker,
+            force=True,
         )
         if restart_index is None:
             next_index += 1
