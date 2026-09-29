@@ -588,9 +588,14 @@ return {
         self._last_endpoint_circuit_state: dict[str, str] = {}
         self.redis_commands = 0
         self.redis_admissions = 0
+        # Availability/circuit state is deliberately worker-local. Redis remains
+        # responsible for fleet pacing and endpoint-specific upstream pressure,
+        # but one worker's auth/session/transport outage must never stop peers.
+        # A versioned local-only namespace also prevents stale shared circuit
+        # keys from older deployments from participating in admission.
         self._breaker = AdaptiveCircuitBreaker(
-            redis=self._redis,
-            namespace=f"{redis_key}:circuit",
+            redis=None,
+            namespace=f"{redis_key}:worker-local-circuit",
             failure_threshold=circuit_failure_threshold,
             window_seconds=circuit_window_seconds,
             open_seconds=circuit_open_seconds,
@@ -656,12 +661,14 @@ return {
         return pacer
 
     def _endpoint_effective(self, endpoint: str) -> float:
+        local = self._bucket(endpoint).rate
         shared = self._shared_endpoints.get(endpoint)
-        return shared.rate if shared is not None else self._bucket(endpoint).rate
+        return min(local, shared.rate) if shared is not None else local
 
     def _global_effective(self) -> float:
+        local = self._global_local.rate
         shared = self._global_shared
-        return shared.rate if shared is not None else self._global_local.rate
+        return min(local, shared.rate) if shared is not None else local
 
     def _shared_keys(self, endpoint: str | None) -> list[str]:
         if self._global_shared is None:
@@ -886,13 +893,27 @@ return {
                 shared=False,
             )
 
-        # Local buckets protect one process. The Redis script then atomically
-        # evaluates both circuits and reserves endpoint/global fleet pacing for
-        # the same admission timestamp, avoiding four healthy-path Redis RTTs.
+        # Availability circuits are worker-local. A broken auth/session or
+        # transport path in one process therefore cannot block healthy peers.
+        global_state = await self._breaker.before("__global__")
+        self._last_global_circuit_state = global_state
+        endpoint_state = None
         if endpoint is not None:
+            endpoint_state = await self._breaker.before(endpoint)
+            self._last_endpoint_circuit_state[endpoint] = endpoint_state
             await self._bucket(endpoint).acquire()
         await self._global_local.acquire()
-        return await self._shared_admit(endpoint)
+
+        # Redis admission is only the shared fleet/endpoint pacing fence.
+        # The Lua circuit slots use a versioned namespace that this local
+        # breaker never writes, so stale shared circuit state cannot gate calls.
+        shared = await self._shared_admit(endpoint)
+        return AdmissionState(
+            global_state=global_state,
+            endpoint_state=endpoint_state,
+            probe_token=shared.probe_token,
+            shared=True,
+        )
 
     async def availability_failure(self, endpoint: str | None = None) -> str:
         """Record upstream availability failure without changing pacing rate.
@@ -908,8 +929,9 @@ return {
             return state
 
         self._last_endpoint_circuit_state[endpoint] = state
-        if await self._breaker.record_endpoint_availability(endpoint):
-            self._last_global_circuit_state = await self._breaker.failure("__global__")
+        # Endpoint availability is intentionally isolated to this worker.
+        # Multi-endpoint failures inside one process are not sufficient evidence
+        # of a fleet-wide outage.
         return state
 
     def circuit_state(self, endpoint: str | None = None) -> str:
@@ -937,31 +959,24 @@ return {
         new_endpoint = self._endpoint_effective(endpoint)
         ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(new_endpoint)
 
+        # Explicit endpoint pressure is shared only for that endpoint. It must
+        # not ratchet the fleet-wide hard ceiling down or open a global circuit.
         old_global = self._global_effective()
-        global_escalated = await self._breaker.record_endpoint_pressure(endpoint)
-        if global_escalated:
-            self._global_recovery_needed = True
-            self._last_global_circuit_state = await self._breaker.failure("__global__")
-            self._global_local.slow_down()
-            self._global_local.cooldown(cooldown_seconds)
-            if self._global_shared is not None:
-                await self._global_shared.penalize(cooldown_seconds)
-                if self._global_shared.rate < self._global_local.rate:
-                    self._global_local._set_rate(self._global_shared.rate)
-        new_global = self._global_effective()
+        new_global = old_global
         EFFECTIVE_RATE.set(new_global)
-        return old_endpoint, new_endpoint, old_global, new_global, global_escalated
+        return old_endpoint, new_endpoint, old_global, new_global, False
 
     async def penalize_global(self, cooldown_seconds: float) -> tuple[float, float]:
-        self._global_recovery_needed = True
+        """Apply an unscoped rejection only to this worker.
+
+        The Redis global pacer is a hard fleet ceiling, not adaptive failure
+        state. A response that cannot be attributed to an endpoint therefore
+        slows this process locally while peers remain eligible to continue.
+        """
         self._last_global_circuit_state = await self._breaker.failure("__global__")
         old_global = self._global_effective()
         self._global_local.slow_down()
         self._global_local.cooldown(cooldown_seconds)
-        if self._global_shared is not None:
-            await self._global_shared.penalize(cooldown_seconds)
-            if self._global_shared.rate < self._global_local.rate:
-                self._global_local._set_rate(self._global_shared.rate)
         new_global = self._global_effective()
         EFFECTIVE_RATE.set(new_global)
         return old_global, new_global
@@ -974,12 +989,12 @@ return {
         endpoint_bucket = self._bucket(endpoint)
         local_endpoint_recovered = endpoint_bucket.recover()
         local_global_recovered = self._global_local.recover()
+        endpoint_state = await self._breaker.success(endpoint)
+        global_state = await self._breaker.success("__global__")
+        self._last_endpoint_circuit_state[endpoint] = endpoint_state
+        self._last_global_circuit_state = global_state
 
         if self._redis is None:
-            endpoint_state = await self._breaker.success(endpoint)
-            global_state = await self._breaker.success("__global__")
-            self._last_endpoint_circuit_state[endpoint] = endpoint_state
-            self._last_global_circuit_state = global_state
             endpoint_effective = self._endpoint_effective(endpoint)
             global_effective = self._global_effective()
             ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_effective)
@@ -1015,8 +1030,8 @@ return {
         admission: AdmissionState | None = None,
     ) -> float | None:
         local_recovered = self._global_local.recover()
+        self._last_global_circuit_state = await self._breaker.success("__global__")
         if self._redis is None:
-            self._last_global_circuit_state = await self._breaker.success("__global__")
             effective = self._global_effective()
             EFFECTIVE_RATE.set(effective)
             return effective if local_recovered is not None else None

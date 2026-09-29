@@ -248,12 +248,16 @@ def build_rate_plan(
     independent = fleet_rate_initial is not None or fleet_rate_max is not None
     if independent:
         ceiling = float(fleet_rate_max if fleet_rate_max is not None else fleet_rate_initial)
-        initial = float(
-            fleet_rate_initial if fleet_rate_initial is not None else min(worker_rate, ceiling)
+        requested_initial = float(
+            fleet_rate_initial if fleet_rate_initial is not None else ceiling
         )
-        if initial <= 0 or ceiling <= 0 or initial > ceiling:
+        if requested_initial <= 0 or ceiling <= 0 or requested_initial > ceiling:
             raise ValueError("fleet rate must satisfy 0 < initial <= max")
-        return CampaignRatePlan(mode, ceiling, workers, ceiling, initial, True)
+        # Explicit fleet configuration means each worker keeps its own local
+        # hard cap while Redis enforces one aggregate hard cap. The old
+        # implementation accidentally replaced worker_rate with the fleet
+        # ceiling and treated initial as adaptive fleet state.
+        return CampaignRatePlan(mode, worker_rate, workers, ceiling, ceiling, True)
 
     if mode == "shared":
         ceiling = initial = worker_rate
@@ -759,23 +763,74 @@ def _seed_rate(
     rate_key: str,
     initial_rate: float,
     target_rate: float | None = None,
+    *,
+    hard_fleet_cap: bool = False,
 ) -> None:
-    """Seed shared safety state without erasing an active penalty/cooldown."""
+    """Seed shared pacing state.
+
+    Legacy derived-rate modes preserve an active adaptive penalty. Explicit
+    fleet-rate mode is different: Redis is the aggregate hard ceiling, so stale
+    global penalty/cooldown state from the previous architecture is normalized
+    in place without deleting coordination keys.
+    """
     target = float(initial_rate if target_rate is None else target_rate)
     pipe = redis.pipeline(transaction=False)
-    pipe.set(f"{rate_key}:effective-rate", str(initial_rate), ex=_RATE_STATE_TTL_SECONDS, nx=True)
-    pipe.set(
-        f"{rate_key}:last-penalty-ms",
-        str(int(time.time() * 1000) - 120_000),
-        ex=_RATE_STATE_TTL_SECONDS,
-        nx=True,
-    )
+    if hard_fleet_cap:
+        pipe.set(
+            f"{rate_key}:effective-rate",
+            str(target),
+            ex=_RATE_STATE_TTL_SECONDS,
+        )
+        pipe.set(
+            f"{rate_key}:cooldown-until-ms",
+            "0",
+            ex=_RATE_STATE_TTL_SECONDS,
+        )
+        pipe.set(
+            f"{rate_key}:last-penalty-ms",
+            str(int(time.time() * 1000) - 120_000),
+            ex=_RATE_STATE_TTL_SECONDS,
+        )
+    else:
+        pipe.set(
+            f"{rate_key}:effective-rate",
+            str(initial_rate),
+            ex=_RATE_STATE_TTL_SECONDS,
+            nx=True,
+        )
+        pipe.set(
+            f"{rate_key}:last-penalty-ms",
+            str(int(time.time() * 1000) - 120_000),
+            ex=_RATE_STATE_TTL_SECONDS,
+            nx=True,
+        )
     pipe.set(_rate_target_key(rate_key), str(target), ex=_RATE_STATE_TTL_SECONDS)
     pipe.execute()
 
 
-def _set_rate_target(redis: Redis, rate_key: str, target_rate: float) -> float:
-    """Retarget the fleet atomically; scale-down clamps immediately, scale-up recovers gradually."""
+def _set_rate_target(
+    redis: Redis,
+    rate_key: str,
+    target_rate: float,
+    *,
+    hard_fleet_cap: bool = False,
+) -> float:
+    """Retarget shared fleet pacing without coupling worker failures."""
+    if hard_fleet_cap:
+        pipe = redis.pipeline(transaction=False)
+        pipe.set(
+            f"{rate_key}:effective-rate",
+            str(float(target_rate)),
+            ex=_RATE_STATE_TTL_SECONDS,
+        )
+        pipe.set(
+            _rate_target_key(rate_key),
+            str(float(target_rate)),
+            ex=_RATE_STATE_TTL_SECONDS,
+        )
+        pipe.execute()
+        return float(target_rate)
+
     script = """
     local target = tonumber(ARGV[1])
     local ttl = tonumber(ARGV[2])
@@ -1656,7 +1711,13 @@ def supervise_campaign(
         next_worker_refresh = now
         _clear_stop(redis, run_id)
         initial_rate_target = _fleet_rate_target(plan, initial_workers)
-        _seed_rate(redis, rate_key, plan.initial, initial_rate_target)
+        _seed_rate(
+            redis,
+            rate_key,
+            plan.initial,
+            initial_rate_target,
+            hard_fleet_cap=plan.independent,
+        )
         last_rate_target = initial_rate_target
 
         if has_work:
@@ -1974,6 +2035,7 @@ def supervise_campaign(
                             redis,
                             rate_key,
                             rate_target,
+                            hard_fleet_cap=plan.independent,
                         )
                         last_rate_target = rate_target
                     else:

@@ -57,7 +57,7 @@ def test_child_workers_disable_prometheus_listener_collision() -> None:
     assert command[command.index("--metrics-port") + 1] == "0"
 
 
-def test_seed_rate_does_not_clear_existing_shared_penalty_state() -> None:
+def test_seed_rate_legacy_mode_does_not_clear_existing_shared_penalty_state() -> None:
     class FakePipeline:
         def __init__(self, calls):
             self.calls = calls
@@ -93,6 +93,40 @@ def test_seed_rate_does_not_clear_existing_shared_penalty_state() -> None:
     assert redis.set_calls[2][2].get("nx") is None
     assert all(call[2].get("ex") == 600 for call in redis.set_calls)
     assert float(redis.set_calls[2][1]) == 15.0
+
+
+def test_seed_rate_hard_fleet_cap_normalizes_stale_global_penalty() -> None:
+    class FakePipeline:
+        def __init__(self, calls):
+            self.calls = calls
+
+        def set(self, key, value, **kwargs):
+            self.calls.append((key, value, kwargs))
+            return self
+
+        def execute(self):
+            return [True] * len(self.calls)
+
+    class FakeRedis:
+        def __init__(self):
+            self.set_calls = []
+
+        def pipeline(self, *, transaction=False):
+            assert transaction is False
+            return FakePipeline(self.set_calls)
+
+    redis = FakeRedis()
+    _seed_rate(redis, "dbd:rate", 60, 60, hard_fleet_cap=True)
+
+    assert [call[0] for call in redis.set_calls] == [
+        "dbd:rate:effective-rate",
+        "dbd:rate:cooldown-until-ms",
+        "dbd:rate:last-penalty-ms",
+        "dbd:rate:target-rate",
+    ]
+    assert float(redis.set_calls[0][1]) == 60.0
+    assert redis.set_calls[1][1] == "0"
+    assert all(call[2].get("nx") is None for call in redis.set_calls)
 
 
 def test_windows_force_stop_kills_entire_worker_tree(monkeypatch) -> None:
@@ -332,9 +366,9 @@ def test_retired_terminal_metrics_preserve_done_progress() -> None:
 def test_explicit_fleet_rate_is_independent_of_worker_count() -> None:
     plan = build_rate_plan("adaptive", 2, 20, initial_workers=4, fleet_rate_initial=12, fleet_rate_max=20)
     assert plan.independent is True
-    assert plan.initial == 12
+    assert plan.initial == 20
     assert plan.ceiling == 20
-    assert plan.worker_rate == 20
+    assert plan.worker_rate == 2
     assert _fleet_rate_target(plan, 4) == 20
     assert _fleet_rate_target(plan, 20) == 20
 

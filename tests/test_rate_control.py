@@ -3,7 +3,7 @@ import pytest
 from dbd.client.rate_control import EndpointRateController, RedisPacer
 
 
-async def test_endpoint_penalty_stays_local_until_distinct_pressure_escalates_global():
+async def test_endpoint_penalty_never_escalates_one_workers_pressure_to_global():
     controller = EndpointRateController(
         60,
         endpoint_rates={"profile": 30, "industry_benchmark": 10},
@@ -27,8 +27,8 @@ async def test_endpoint_penalty_stays_local_until_distinct_pressure_escalates_gl
         "profile", 0
     )
     assert (old_endpoint, new_endpoint) == (30, 15)
-    assert (old_global, new_global, escalated) == (60, 30, True)
-    assert controller.global_effective_rate() == 30
+    assert (old_global, new_global, escalated) == (60, 60, False)
+    assert controller.global_effective_rate() == 60
 
     controller.set_target_rate(20)
     assert controller.effective_rate("profile") == 20
@@ -72,12 +72,12 @@ async def test_global_availability_failure_does_not_change_fleet_pacer():
     await controller.availability_failure()
     assert await controller.availability_failure() == "open"
 
-    assert controller.circuit_state() == "open"
+    assert controller.circuit_state() == "closed"
     assert controller.global_effective_rate() == 60
 
 
 
-async def test_distinct_endpoint_availability_can_escalate_global_without_rate_change():
+async def test_distinct_endpoint_availability_stays_worker_endpoint_local():
     controller = EndpointRateController(
         60,
         endpoint_rates={"profile": 30, "committees": 20},
