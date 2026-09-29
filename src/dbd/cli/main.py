@@ -770,10 +770,6 @@ def main():
                 help=argparse.SUPPRESS,
             )
             p.add_argument(
-                "--worker-instance",
-                help=argparse.SUPPRESS,
-            )
-            p.add_argument(
                 "--all-statuses",
                 action="store_true",
                 help="Include struck-off, liquidated and dissolved companies (default: operating only)",
@@ -875,12 +871,6 @@ def main():
                     raise ValueError("--distributed requires an existing --run-id and cannot build a run")
                 if not settings.dbd_redis_url:
                     raise ValueError("--distributed requires DBD_REDIS_URL")
-                if args.worker_instance is not None:
-                    expected_worker = str(os.environ.get("DBD_WORKER_ID") or "")
-                    if not expected_worker or args.worker_instance != expected_worker:
-                        raise ValueError(
-                            "--worker-instance is Supervisor-owned and must match DBD_WORKER_ID"
-                        )
                 asyncio.run(worker_command(args, presenter=presenter))
             else:
                 with manager_lock() as conn:
