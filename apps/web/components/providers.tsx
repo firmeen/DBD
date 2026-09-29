@@ -22,7 +22,7 @@ export function AppProviders({ children }: { children: React.ReactNode }) {
   return (
     <QueryClientProvider client={queryClient}>
       <NuqsAdapter>
-        <ThemeProvider defaultTheme="dark" enableSystem={false}>
+        <ThemeProvider defaultTheme="system" enableSystem>
           {children}
         </ThemeProvider>
       </NuqsAdapter>

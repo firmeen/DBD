@@ -4,6 +4,7 @@ import * as React from "react"
 import type { EChartsOption } from "echarts"
 import ReactECharts from "echarts-for-react"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import type {
   AnalyticsBucket,
   AnalyticsDistribution,
@@ -25,12 +26,12 @@ export function AnalyticsDistributions({
 }) {
   if (distributions.length === 0) {
     return (
-      <div className="grid min-h-[360px] place-items-center rounded-[26px] border border-white/8 bg-white/[0.018] text-center">
+      <div className="grid min-h-[360px] place-items-center rounded-[26px] border border-tipx-line/8 bg-tipx-ink/[0.018] text-center">
         <div>
-          <p className="text-sm font-medium text-white/43">
+          <p className="text-sm font-medium text-tipx-ink/43">
             No coordinated distributions
           </p>
-          <p className="mt-2 text-[10px] text-white/24">
+          <p className="mt-2 text-[10px] text-tipx-ink/24">
             The serving contract has not supplied analytical buckets for this population.
           </p>
         </div>
@@ -64,6 +65,7 @@ function DistributionField({
   onFilter: (filter: AnalyticsFilter) => void
   onPopulation: (population: PopulationRef) => void
 }) {
+  const { palette } = useTipxTheme()
   const buckets = React.useMemo(
     () =>
       [...distribution.buckets]
@@ -86,14 +88,14 @@ function DistributionField({
       },
       tooltip: {
         trigger: "item",
-        backgroundColor: "rgba(8,16,22,.97)",
-        borderColor: "rgba(255,255,255,.1)",
-        textStyle: { color: "rgba(255,255,255,.76)", fontSize: 10 },
+        backgroundColor: palette.chart.tooltipBackground,
+        borderColor: palette.chart.tooltipBorder,
+        textStyle: { color: palette.chart.tooltipText, fontSize: 10 },
       },
       xAxis: {
         type: "value",
-        splitLine: { lineStyle: { color: "rgba(255,255,255,.045)" } },
-        axisLabel: { color: "rgba(255,255,255,.22)", fontSize: 8 },
+        splitLine: { lineStyle: { color: palette.chart.grid } },
+        axisLabel: { color: palette.chart.muted, fontSize: 8 },
       },
       yAxis: {
         type: "category",
@@ -102,7 +104,7 @@ function DistributionField({
         axisTick: { show: false },
         axisLine: { show: false },
         axisLabel: {
-          color: "rgba(255,255,255,.38)",
+          color: palette.chart.label,
           fontSize: 9,
           width: 116,
           overflow: "truncate",
@@ -116,15 +118,15 @@ function DistributionField({
             value: bucket.count,
             itemStyle: {
               color: bucketIsActive(bucket, filters)
-                ? "rgba(255,255,255,.92)"
-                : "rgba(139,202,220,.48)",
+                ? palette.chart.selected
+                : palette.chart.secondary,
               borderRadius: [0, 6, 6, 0],
             },
           })),
         },
       ],
     }),
-    [buckets, filters]
+    [buckets, filters, palette]
   )
 
   const onEvents = React.useMemo(
@@ -148,17 +150,17 @@ function DistributionField({
   )
 
   return (
-    <section className="overflow-hidden rounded-[24px] border border-white/8 bg-[#0a1015]/70 p-4 backdrop-blur-xl">
+    <section className="overflow-hidden rounded-[24px] border border-tipx-line/8 bg-tipx-surface/70 p-4 backdrop-blur-xl">
       <div className="mb-3 flex items-center justify-between gap-3">
         <div>
-          <p className="text-[9px] font-semibold uppercase tracking-[0.18em] text-white/28">
+          <p className="text-[9px] font-semibold uppercase tracking-[0.18em] text-tipx-ink/28">
             {distribution.label}
           </p>
-          <p className="mt-1 text-[9px] text-white/18">
+          <p className="mt-1 text-[9px] text-tipx-ink/18">
             Click a semantic bucket to coordinate the analytical population
           </p>
         </div>
-        <span className="font-mono text-[8px] text-white/18">
+        <span className="font-mono text-[8px] text-tipx-ink/18">
           {distribution.buckets.length} buckets
         </span>
       </div>

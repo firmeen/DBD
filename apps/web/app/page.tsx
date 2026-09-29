@@ -1,11 +1,24 @@
 import { Suspense } from "react"
 
 import { IntelligenceShell } from "@/components/intelligence/intelligence-shell"
+import { parseTipxIntegrationSearchParams } from "@/lib/integration/launch-url"
 
-export default function Page() {
+type PageSearchParams = Promise<
+  Record<string, string | string[] | undefined>
+>
+
+export default async function Page({
+  searchParams,
+}: {
+  searchParams: PageSearchParams
+}) {
+  const integrationContext = parseTipxIntegrationSearchParams(
+    await searchParams
+  )
+
   return (
     <Suspense fallback={<IntelligenceShellFallback />}>
-      <IntelligenceShell />
+      <IntelligenceShell integrationContext={integrationContext} />
     </Suspense>
   )
 }

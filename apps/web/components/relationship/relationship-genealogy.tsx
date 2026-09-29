@@ -4,6 +4,7 @@ import * as React from "react"
 import { graphlib, layout } from "@dagrejs/dagre"
 import { GitMerge } from "lucide-react"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import type { GenealogySnapshot } from "@/lib/relationship/types"
 import type { EntityRef } from "@/lib/intelligence/types"
 
@@ -17,17 +18,18 @@ export function RelationshipGenealogy({
   snapshot: GenealogySnapshot
   onFocusCompany: (entity: EntityRef) => void
 }) {
+  const { palette } = useTipxTheme()
   const drawing = React.useMemo(() => buildGenealogy(snapshot), [snapshot])
 
   if (snapshot.nodes.length === 0) {
     return (
       <div className="absolute inset-0 grid place-items-center px-8 text-center">
         <div>
-          <GitMerge className="mx-auto size-6 text-white/18" />
-          <p className="mt-4 text-sm font-medium text-white/49">
+          <GitMerge className="mx-auto size-6 text-tipx-ink/18" />
+          <p className="mt-4 text-sm font-medium text-tipx-ink/49">
             Genealogy unavailable
           </p>
-          <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+          <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-tipx-ink/25">
             {snapshot.message ||
               "Focus a company with transformation or merger history to open directed genealogy."}
           </p>
@@ -63,7 +65,7 @@ export function RelationshipGenealogy({
               markerHeight="6"
               orient="auto-start-reverse"
             >
-              <path d="M 0 0 L 10 5 L 0 10 z" fill="#71828f" />
+              <path d="M 0 0 L 10 5 L 0 10 z" fill={palette.graph.edge} />
             </marker>
           </defs>
 
@@ -73,7 +75,7 @@ export function RelationshipGenealogy({
                 d={polylinePath(edge.points)}
                 fill="none"
                 stroke={
-                  edge.kind === "merger" ? "#8fe8c9" : "#71828f"
+                  edge.kind === "merger" ? palette.graph.path : palette.graph.edge
                 }
                 strokeOpacity={edge.kind === "merger" ? 0.7 : 0.5}
                 strokeWidth={edge.kind === "merger" ? 2.1 : 1.4}
@@ -85,7 +87,7 @@ export function RelationshipGenealogy({
                   y={edge.labelY - 7}
                   textAnchor="middle"
                   fontSize="9"
-                  fill="#82909a"
+                  fill={palette.chart.muted}
                 >
                   {edge.label}
                 </text>
@@ -118,8 +120,8 @@ export function RelationshipGenealogy({
                 width={NODE_WIDTH}
                 height={NODE_HEIGHT}
                 rx="15"
-                fill="#0b1319"
-                stroke="#738591"
+                fill={palette.graph.canvas}
+                stroke={palette.graph.edge}
                 strokeOpacity="0.28"
               />
               <text
@@ -127,11 +129,11 @@ export function RelationshipGenealogy({
                 y="27"
                 fontSize="10"
                 fontWeight="600"
-                fill="#d5dde2"
+                fill={palette.graph.label}
               >
                 {truncate(node.company.label, 28)}
               </text>
-              <text x="14" y="46" fontSize="8" fill="#62717c">
+              <text x="14" y="46" fontSize="8" fill={palette.chart.muted}>
                 {truncate(node.company.secondary || node.company.id, 35)}
               </text>
             </g>
@@ -139,7 +141,7 @@ export function RelationshipGenealogy({
         </svg>
       </div>
 
-      <div className="pointer-events-none fixed bottom-20 left-7 rounded-full border border-white/7 bg-[#071017]/78 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-white/24 backdrop-blur-xl">
+      <div className="pointer-events-none fixed bottom-20 left-7 rounded-full border border-tipx-line/7 bg-tipx-floating/78 px-3 py-1.5 text-[8px] uppercase tracking-[0.14em] text-tipx-ink/24 backdrop-blur-xl">
         Dagre · directed transform / merger genealogy
       </div>
     </div>

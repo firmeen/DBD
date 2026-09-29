@@ -5,6 +5,7 @@ import type { EChartsOption } from "echarts"
 import ReactECharts from "echarts-for-react"
 import { Activity } from "lucide-react"
 
+import { useTipxTheme } from "@/hooks/use-tipx-theme"
 import { formatAnalyticsMetric } from "@/lib/analytics/format"
 import type {
   AnalyticsMetricFormat,
@@ -29,13 +30,13 @@ export function AnalyticsTrajectory({
   if (groups.length === 0) return null
 
   return (
-    <section className="rounded-[26px] border border-white/8 bg-[#0a1015]/70 p-4 backdrop-blur-xl sm:p-5">
+    <section className="rounded-[26px] border border-tipx-line/8 bg-tipx-surface/70 p-4 backdrop-blur-xl sm:p-5">
       <div className="mb-4">
-        <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.19em] text-white/28">
+        <p className="flex items-center gap-2 text-[9px] font-semibold uppercase tracking-[0.19em] text-tipx-ink/28">
           <Activity className="size-3.5" />
           Population trajectory
         </p>
-        <p className="mt-1 text-[9px] text-white/20">
+        <p className="mt-1 text-[9px] text-tipx-ink/20">
           Metric families stay on separate units; no mixed currency/percentage axis.
         </p>
       </div>
@@ -59,39 +60,46 @@ function TrajectoryGroup({
   format: AnalyticsMetricFormat
   series: AnalyticsSeries[]
 }) {
+  const { palette } = useTipxTheme()
+
   const option = React.useMemo<EChartsOption>(() => {
     const periods = Array.from(
       new Set(series.flatMap((item) => item.points.map((point) => point.period)))
     ).sort()
 
     return {
+      color: [
+        palette.chart.primary,
+        palette.chart.secondary,
+        palette.chart.accent,
+      ],
       animationDuration: 360,
       grid: { left: 8, right: 14, top: 42, bottom: 16, containLabel: true },
       legend: {
         top: 0,
         left: 0,
         type: "scroll",
-        textStyle: { color: "rgba(255,255,255,.38)", fontSize: 8 },
+        textStyle: { color: palette.chart.label, fontSize: 8 },
       },
       tooltip: {
         trigger: "axis",
-        backgroundColor: "rgba(8,16,22,.97)",
-        borderColor: "rgba(255,255,255,.1)",
-        textStyle: { color: "rgba(255,255,255,.76)", fontSize: 10 },
+        backgroundColor: palette.chart.tooltipBackground,
+        borderColor: palette.chart.tooltipBorder,
+        textStyle: { color: palette.chart.tooltipText, fontSize: 10 },
       },
       xAxis: {
         type: "category",
         data: periods,
         boundaryGap: false,
         axisTick: { show: false },
-        axisLine: { lineStyle: { color: "rgba(255,255,255,.07)" } },
-        axisLabel: { color: "rgba(255,255,255,.22)", fontSize: 8 },
+        axisLine: { lineStyle: { color: palette.chart.axis } },
+        axisLabel: { color: palette.chart.muted, fontSize: 8 },
       },
       yAxis: {
         type: "value",
-        splitLine: { lineStyle: { color: "rgba(255,255,255,.045)" } },
+        splitLine: { lineStyle: { color: palette.chart.grid } },
         axisLabel: {
-          color: "rgba(255,255,255,.22)",
+          color: palette.chart.muted,
           fontSize: 8,
           formatter: (value: number | string) =>
             formatAnalyticsMetric(Number(value), format, true),
@@ -112,11 +120,11 @@ function TrajectoryGroup({
         ),
       })),
     }
-  }, [format, series])
+  }, [format, palette, series])
 
   return (
-    <div className="rounded-2xl border border-white/7 bg-black/10 p-3">
-      <p className="mb-2 font-mono text-[8px] uppercase tracking-[0.14em] text-white/18">
+    <div className="rounded-2xl border border-tipx-line/7 bg-tipx-ink/[0.025] p-3">
+      <p className="mb-2 font-mono text-[8px] uppercase tracking-[0.14em] text-tipx-ink/18">
         {format}
       </p>
       <ReactECharts

@@ -40,6 +40,10 @@ interface WorkspaceState {
   setPopulation: (population: PopulationRef | null) => void
   setCommandOpen: (open: boolean) => void
   setLensOpen: (open: boolean) => void
+  hydrateExternalContext: (context: {
+    activeSurface: SurfaceId
+    focus: EntityRef | null
+  }) => void
   saveSurfaceSnapshot: (
     surface: SurfaceId,
     payload: Record<string, unknown>
@@ -209,6 +213,20 @@ export const useWorkspaceStore = create<WorkspaceState>((set, get) => ({
           ? { lensOpen: false }
           : state
     ),
+
+  hydrateExternalContext: ({ activeSurface, focus }) =>
+    set({
+      activeSurface,
+      focus,
+      selection: [],
+      compare: [],
+      population: null,
+      commandOpen: false,
+      lensOpen: false,
+      surfaceSnapshots: {},
+      historyPast: [],
+      historyFuture: [],
+    }),
 
   saveSurfaceSnapshot: (surface, payload) =>
     set((state) => ({

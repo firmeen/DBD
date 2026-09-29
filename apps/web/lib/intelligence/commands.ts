@@ -1,7 +1,7 @@
 import { SURFACES } from "./surfaces"
 import type { IntelligenceCommandId, SurfaceId } from "./types"
 
-export type CommandCategory = "Navigate" | "Lens" | "Workspace"
+export type CommandCategory = "Navigate" | "Lens" | "Workspace" | "Appearance"
 
 export interface IntelligenceCommand {
   id: IntelligenceCommandId
@@ -47,6 +47,24 @@ export const INTELLIGENCE_COMMANDS: readonly IntelligenceCommand[] = [
     label: "Clear analytical selection",
     description: "Clear the active population while preserving focus and compare.",
     category: "Workspace",
+  },
+  {
+    id: "theme.system",
+    label: "Appearance · System",
+    description: "Follow the operating-system light or dark appearance.",
+    category: "Appearance",
+  },
+  {
+    id: "theme.light",
+    label: "Appearance · Light",
+    description: "Use the TIP INSURE-inspired light intelligence theme.",
+    category: "Appearance",
+  },
+  {
+    id: "theme.dark",
+    label: "Appearance · Dark",
+    description: "Use the deep-navy TIPX intelligence theme.",
+    category: "Appearance",
   },
   {
     id: "command.open",

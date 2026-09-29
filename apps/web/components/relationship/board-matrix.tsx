@@ -165,8 +165,8 @@ export function BoardMatrix({
           className={cn(
             "rounded-xl border px-3 py-2 text-[9px] transition",
             sortByDegree
-              ? "border-white/18 bg-white text-black"
-              : "border-white/8 bg-[#081016]/82 text-white/36 hover:bg-white/[0.06]"
+              ? "border-tipx-line/18 bg-tipx-brand text-tipx-on-brand"
+              : "border-tipx-line/8 bg-tipx-floating/82 text-tipx-ink/36 hover:bg-tipx-ink/[0.06]"
           )}
         >
           Degree order
@@ -174,14 +174,14 @@ export function BoardMatrix({
         <button
           type="button"
           onClick={onOpenNetwork}
-          className="ml-auto inline-flex items-center gap-2 rounded-xl border border-white/8 bg-[#081016]/82 px-3 py-2 text-[9px] text-white/40 hover:bg-white/[0.06] hover:text-white"
+          className="ml-auto inline-flex items-center gap-2 rounded-xl border border-tipx-line/8 bg-tipx-floating/82 px-3 py-2 text-[9px] text-tipx-ink/40 hover:bg-tipx-ink/[0.06] hover:text-tipx-ink"
         >
           Network
           <ArrowRight className="size-3" />
         </button>
       </div>
 
-      <div className="mx-4 mb-2 flex items-center justify-between text-[8px] uppercase tracking-[0.13em] text-white/22 sm:mx-7">
+      <div className="mx-4 mb-2 flex items-center justify-between text-[8px] uppercase tracking-[0.13em] text-tipx-ink/22 sm:mx-7">
         <span>
           {companies.length.toLocaleString()} companies ×{" "}
           {people.length.toLocaleString()} people ·{" "}
@@ -192,16 +192,16 @@ export function BoardMatrix({
 
       <div
         ref={scrollRef}
-        className="pointer-events-auto mx-4 mb-20 min-h-0 flex-1 overflow-auto rounded-2xl border border-white/8 bg-[#081016]/88 shadow-[0_24px_80px_rgba(0,0,0,.32)] backdrop-blur-xl sm:mx-7"
+        className="pointer-events-auto mx-4 mb-20 min-h-0 flex-1 overflow-auto rounded-2xl border border-tipx-line/8 bg-tipx-floating/88 shadow-[0_24px_80px_rgba(0,0,0,.32)] backdrop-blur-xl sm:mx-7"
       >
         {!synchronized ? (
           <div className="grid h-full min-h-[420px] place-items-center px-8 text-center">
             <div>
               <LoaderMatrixState />
-              <p className="mt-3 text-sm font-medium text-white/48">
+              <p className="mt-3 text-sm font-medium text-tipx-ink/48">
                 Preparing updated Matrix query
               </p>
-              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-tipx-ink/25">
                 Previous membership cells are intentionally hidden until both visible axis searches match the debounced serving query.
               </p>
             </div>
@@ -210,10 +210,10 @@ export function BoardMatrix({
           <div className="grid h-full min-h-[420px] place-items-center px-8 text-center">
             <div>
               <LoaderMatrixState />
-              <p className="mt-3 text-sm font-medium text-white/48">
+              <p className="mt-3 text-sm font-medium text-tipx-ink/48">
                 Loading Board Matrix
               </p>
-              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-tipx-ink/25">
                 The axis controls remain interactive while the synchronized Matrix population is requested.
               </p>
             </div>
@@ -224,7 +224,7 @@ export function BoardMatrix({
               <p className="text-sm font-medium text-rose-100/55">
                 Board Matrix request failed
               </p>
-              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-tipx-ink/25">
                 {errorMessage}
               </p>
             </div>
@@ -232,10 +232,10 @@ export function BoardMatrix({
         ) : companies.length === 0 || people.length === 0 ? (
           <div className="grid h-full min-h-[420px] place-items-center px-8 text-center">
             <div>
-              <p className="text-sm font-medium text-white/48">
+              <p className="text-sm font-medium text-tipx-ink/48">
                 Board Matrix unavailable
               </p>
-              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-white/25">
+              <p className="mx-auto mt-2 max-w-lg text-[10px] leading-5 text-tipx-ink/25">
                 {snapshot.message ||
                   "The serving model returned no Company × Person axes for the current Lens and search."}
               </p>
@@ -250,18 +250,18 @@ export function BoardMatrix({
             }}
           >
             <div
-              className="sticky top-0 z-30 h-[76px] border-b border-white/8 bg-[#0a1117]/98"
+              className="sticky top-0 z-30 h-[76px] border-b border-tipx-line/8 bg-tipx-floating/98"
               style={{ width: totalWidth }}
             >
               <div
-                className="sticky left-0 z-40 grid h-full place-items-center border-r border-white/8 bg-[#0b1218] px-4 text-left"
+                className="sticky left-0 z-40 grid h-full place-items-center border-r border-tipx-line/8 bg-tipx-surface px-4 text-left"
                 style={{ width: ROW_HEADER_WIDTH }}
               >
                 <div className="w-full">
-                  <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-white/31">
+                  <p className="font-mono text-[9px] uppercase tracking-[0.16em] text-tipx-ink/31">
                     Company × Director
                   </p>
-                  <p className="mt-1 text-[8px] text-white/20">
+                  <p className="mt-1 text-[8px] text-tipx-ink/20">
                     Frozen entity axes · virtual body
                   </p>
                 </div>
@@ -275,16 +275,16 @@ export function BoardMatrix({
                     type="button"
                     onClick={() => onFocusPerson(matrixPersonToEntity(person))}
                     title={person.name}
-                    className="absolute top-0 flex h-full flex-col justify-end border-r border-white/6 px-2 pb-2 text-left transition hover:bg-white/[0.045]"
+                    className="absolute top-0 flex h-full flex-col justify-end border-r border-tipx-line/6 px-2 pb-2 text-left transition hover:bg-tipx-ink/[0.045]"
                     style={{
                       left: ROW_HEADER_WIDTH + virtualColumn.start,
                       width: virtualColumn.size,
                     }}
                   >
-                    <span className="line-clamp-2 text-[9px] font-medium leading-3 text-white/47">
+                    <span className="line-clamp-2 text-[9px] font-medium leading-3 text-tipx-ink/47">
                       {person.name}
                     </span>
-                    <span className="mt-1 font-mono text-[7px] text-white/19">
+                    <span className="mt-1 font-mono text-[7px] text-tipx-ink/19">
                       d{person.degree}
                     </span>
                   </button>
@@ -302,7 +302,7 @@ export function BoardMatrix({
                 return (
                   <div
                     key={company.id}
-                    className="absolute left-0 top-0 border-b border-white/5"
+                    className="absolute left-0 top-0 border-b border-tipx-line/5"
                     style={{
                       width: totalWidth,
                       height: virtualRow.size,
@@ -315,17 +315,17 @@ export function BoardMatrix({
                         onFocusCompany(matrixCompanyToEntity(company))
                       }
                       title={company.name}
-                      className="sticky left-0 z-20 flex h-full items-center gap-2 border-r border-white/8 bg-[#0b1218]/98 px-3 text-left transition hover:bg-[#121b22]"
+                      className="sticky left-0 z-20 flex h-full items-center gap-2 border-r border-tipx-line/8 bg-tipx-surface/98 px-3 text-left transition hover:bg-tipx-elevated"
                       style={{ width: ROW_HEADER_WIDTH }}
                     >
-                      <span className="grid size-7 shrink-0 place-items-center rounded-lg border border-white/7 bg-white/[0.025] text-[9px] font-semibold text-white/36">
+                      <span className="grid size-7 shrink-0 place-items-center rounded-lg border border-tipx-line/7 bg-tipx-ink/[0.025] text-[9px] font-semibold text-tipx-ink/36">
                         {company.name.trim().charAt(0).toUpperCase() || "?"}
                       </span>
                       <span className="min-w-0 flex-1">
-                        <span className="block truncate text-[9px] font-medium text-white/49">
+                        <span className="block truncate text-[9px] font-medium text-tipx-ink/49">
                           {company.name}
                         </span>
-                        <span className="mt-0.5 block font-mono text-[7px] text-white/18">
+                        <span className="mt-0.5 block font-mono text-[7px] text-tipx-ink/18">
                           d{company.degree}
                         </span>
                       </span>
@@ -357,7 +357,7 @@ export function BoardMatrix({
                               : "No membership"
                           }
                           className={cn(
-                            "absolute top-0 grid h-full place-items-center border-r border-white/5 transition hover:bg-white/[0.045]",
+                            "absolute top-0 grid h-full place-items-center border-r border-tipx-line/5 transition hover:bg-tipx-ink/[0.045]",
                             isAnchor && "bg-emerald-200/[0.075]"
                           )}
                           style={{
@@ -373,11 +373,11 @@ export function BoardMatrix({
                                   ? "border-cyan-100/35 bg-cyan-200/55"
                                   : company.tipStatus === "expired"
                                     ? "border-rose-100/28 bg-rose-200/45"
-                                    : "border-white/30 bg-white/42"
+                                    : "border-tipx-line/30 bg-tipx-ink/42"
                               )}
                             />
                           ) : (
-                            <span className="size-1 rounded-full bg-white/[0.045]" />
+                            <span className="size-1 rounded-full bg-tipx-ink/[0.045]" />
                           )}
                         </button>
                       )
@@ -406,13 +406,13 @@ function MatrixSearch({
 }) {
   return (
     <label className="relative block min-w-[180px] flex-1 sm:max-w-xs">
-      <Icon className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-white/24" />
+      <Icon className="pointer-events-none absolute left-3 top-1/2 size-3.5 -translate-y-1/2 text-tipx-ink/24" />
       <input
         value={value}
         onChange={(event) => onChange(event.target.value)}
         placeholder={placeholder}
         data-keyboard-input
-        className="h-9 w-full rounded-xl border border-white/8 bg-[#081016]/82 pl-9 pr-3 text-[10px] text-white outline-none placeholder:text-white/20 focus:border-white/15 focus:bg-[#0b141b]"
+        className="h-9 w-full rounded-xl border border-tipx-line/8 bg-tipx-floating/82 pl-9 pr-3 text-[10px] text-tipx-ink outline-none placeholder:text-tipx-ink/20 focus:border-tipx-line/15 focus:bg-tipx-elevated"
       />
     </label>
   )
@@ -421,6 +421,6 @@ function MatrixSearch({
 
 function LoaderMatrixState() {
   return (
-    <span className="mx-auto block size-5 animate-pulse rounded-full border border-white/15 bg-white/[0.04]" />
+    <span className="mx-auto block size-5 animate-pulse rounded-full border border-tipx-line/15 bg-tipx-ink/[0.04]" />
   )
 }
