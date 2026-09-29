@@ -780,46 +780,15 @@ def test_dashboard_can_render_recovery_snapshot_without_terminal() -> None:
     assert "DISABLED" in rendered
 
 
-def test_request_stall_reenters_same_run_recovery(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
-    monkeypatch.setattr(
-        guardian,
-        "package_environment_snapshot",
-        lambda: {"health": "healthy"},
-    )
+def test_request_stall_recovery_stays_inside_supervisor_worker_boundary() -> None:
+    guardian_source = (
+        guardian.PROJECT_ROOT / "src" / "dbd" / "runtime" / "guardian.py"
+    ).read_text(encoding="utf-8")
+    supervisor_source = (
+        guardian.PROJECT_ROOT / "src" / "dbd" / "runtime" / "supervisor.py"
+    ).read_text(encoding="utf-8")
 
-    gates = {"count": 0}
-
-    def recovery_gate(*args, **kwargs):
-        gates["count"] += 1
-        if gates["count"] > 1:
-            raise KeyboardInterrupt
-        return state(remaining=10), probe()
-
-    monkeypatch.setattr(guardian, "_wait_for_recovery_gate", recovery_gate)
-    monkeypatch.setattr(
-        guardian,
-        "supervise_campaign",
-        lambda run_id, **kwargs: guardian._EXIT_REQUEST_STALLED,
-    )
-    monkeypatch.setattr(
-        guardian,
-        "campaign_status",
-        lambda run_id: state(remaining=10),
-    )
-    monkeypatch.setattr(guardian.time, "sleep", lambda seconds: None)
-
-    dashboard = QuietDashboard()
-    try:
-        guardian._guard_loop(
-            guardian.GuardianConfig(run_id=9, recovery_interval=1.0),
-            dashboard,
-        )
-    except KeyboardInterrupt:
-        pass
-
-    assert "RECOVERING_STALL" in dashboard.phases
-    saved = guardian._read_json(guardian.guardian_state_path(9))
-    assert saved["phase"] == "RECOVERING_STALL"
-    assert saved["terminal"] is False
-    assert "same run" in saved["message"].lower()
+    assert "WorkerProgressWatchdog" in supervisor_source
+    assert "_EXIT_REQUEST_STALLED" not in guardian_source
+    assert "RECOVERING_STALL" not in guardian_source
+    assert "_REQUEST_STALL_EXIT_CODE" not in supervisor_source
