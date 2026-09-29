@@ -149,13 +149,15 @@ def test_seed_rate_hard_fleet_cap_normalizes_stale_global_penalty() -> None:
     _seed_rate(redis, "dbd:rate", 60, 60, hard_fleet_cap=True)
 
     assert [call[0] for call in redis.set_calls] == [
+        "dbd:rate",
         "dbd:rate:effective-rate",
         "dbd:rate:cooldown-until-ms",
         "dbd:rate:last-penalty-ms",
         "dbd:rate:target-rate",
     ]
-    assert float(redis.set_calls[0][1]) == 60.0
-    assert redis.set_calls[1][1] == "0"
+    assert float(redis.set_calls[0][1]) > 0
+    assert float(redis.set_calls[1][1]) == 60.0
+    assert redis.set_calls[2][1] == "0"
     assert all(call[2].get("nx") is None for call in redis.set_calls)
 
 
