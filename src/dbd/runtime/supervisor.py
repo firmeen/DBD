@@ -604,6 +604,12 @@ def _spawn_worker(
     )
     env = os.environ.copy()
     env["DBD_WORKER_ID"] = worker_id
+    # Headless workers write Rich/plain output into UTF-8 log files. On Thai
+    # Windows the inherited console code page may otherwise be cp874, which
+    # cannot encode presentation glyphs and can turn a successful worker exit
+    # into UnicodeEncodeError/exit 1.
+    env["PYTHONIOENCODING"] = "utf-8"
+    env["PYTHONUTF8"] = "1"
     if fleet_rate_ceiling is not None:
         env["DBD_FLEET_RATE_CEILING"] = str(float(fleet_rate_ceiling))
     if redis_rate_key:
@@ -1548,18 +1554,18 @@ def supervise_campaign(
                 f"supervisor handoff: drained {orphaned} previously registered worker(s)"
             )
 
-        # Resume from the last supervisor snapshot when available. This avoids
-        # re-aggregating a multi-million-row endpoint queue just to redraw progress.
-        baseline = _runtime_progress_baseline(redis, run_id)
-        if baseline is None:
-            try:
-                baseline = _task_progress(run_id)
-                reconciled_at = time.time()
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Campaign {run_id} startup durable progress reconciliation failed: "
-                    f"{type(exc).__name__}"
-                ) from exc
+        # Reconcile durable MySQL truth once at Supervisor startup. Redis runtime
+        # snapshots are ephemeral and may be stale when the same run was advanced
+        # while no Supervisor was active. The live hot path still uses worker
+        # heartbeats after this one exact baseline.
+        try:
+            baseline = _task_progress(run_id)
+            reconciled_at = time.time()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Campaign {run_id} startup durable progress reconciliation failed: "
+                f"{type(exc).__name__}"
+            ) from exc
         has_work = _has_active_work(run_id)
 
         now = time.monotonic()
