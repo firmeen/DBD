@@ -708,8 +708,14 @@ def _write_worker_registry(
         return
 
 
-def _worker_command(run_id: int, *, concurrency: int, rate: float) -> list[str]:
-    return [
+def _worker_command(
+    run_id: int,
+    *,
+    concurrency: int,
+    rate: float,
+    worker_id: str | None = None,
+) -> list[str]:
+    command = [
         sys.executable,
         "-m",
         "dbd",
@@ -724,6 +730,9 @@ def _worker_command(run_id: int, *, concurrency: int, rate: float) -> list[str]:
         "--metrics-port",
         "0",
     ]
+    if worker_id:
+        command.extend(["--worker-instance", str(worker_id)])
+    return command
 
 
 def _normalize_supervisor_generation(value: str | None) -> str:
@@ -774,7 +783,12 @@ def _spawn_worker(
         env["DBD_ARCHIVE_WORKERS"] = str(resource_plan.archive_workers_per_worker)
         env["DBD_PROJECTION_WORKERS"] = str(resource_plan.projection_workers_per_worker)
         env["DBD_REDIS_MAX_CONNECTIONS"] = str(resource_plan.redis_connections_per_client)
-    command = _worker_command(run_id, concurrency=concurrency, rate=rate)
+    command = _worker_command(
+        run_id,
+        concurrency=concurrency,
+        rate=rate,
+        worker_id=worker_id,
+    )
     creationflags = 0
     start_new_session = False
     log_handle = None
