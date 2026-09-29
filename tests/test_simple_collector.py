@@ -36,34 +36,78 @@ async def test_auth_refresh_is_single_flight_for_concurrent_fetchers(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_failed_auth_refresh_is_shared_then_retried_once_after_backoff(monkeypatch) -> None:
+async def test_failed_auth_refresh_is_shared_then_one_later_wave_recovers(monkeypatch) -> None:
     client = SimpleAsyncDbdClient(concurrency=32, rate_per_second=500, max_retries=0)
     calls = 0
     error = DbdAuthError("auth_refresh failed: HTTP 502", status_code=502)
 
-    async def fail_once():
+    async def fail_then_succeed():
         nonlocal calls
         calls += 1
-        client._auth_last_error = error
-        client._auth_backoff_until = time.monotonic() + 0.02
-        raise error
+        if calls == 1:
+            client._auth_last_error = error
+            client._auth_backoff_until = time.monotonic() + 0.02
+            raise error
+        client._token = "recovered-token"
+        client._auth._expires_at = time.time() + 900
+        client._auth_last_error = None
+        client._auth_backoff_until = 0.0
+        return client._token
 
-    monkeypatch.setattr(client, "_refresh_token_once", fail_once)
+    monkeypatch.setattr(client, "_refresh_token_once", fail_then_succeed)
 
-    first = await asyncio.gather(
-        *(client._ensure_token() for _ in range(32)),
-        return_exceptions=True,
+    tokens = await asyncio.wait_for(
+        asyncio.gather(*(client._ensure_token() for _ in range(32))),
+        timeout=1,
     )
-    assert calls == 1
-    assert all(isinstance(item, DbdAuthError) for item in first)
 
-    await asyncio.sleep(0.03)
-    second = await asyncio.gather(
-        *(client._ensure_token() for _ in range(32)),
-        return_exceptions=True,
-    )
     assert calls == 2
-    assert all(isinstance(item, DbdAuthError) for item in second)
+    assert tokens == ["recovered-token"] * 32
+    assert client.auth_state == "ready"
+
+
+@pytest.mark.asyncio
+async def test_auth_recovery_wait_does_not_charge_http_retry_or_duplicate_requests(monkeypatch) -> None:
+    class Response:
+        status_code = 200
+        headers = {}
+        content = b'{"ok":true}'
+
+    class Session:
+        cookies = {}
+
+        async def request(self, *args, **kwargs):
+            return Response()
+
+    client = SimpleAsyncDbdClient(concurrency=16, rate_per_second=500, max_retries=0)
+    client._session = Session()
+    calls = 0
+    error = DbdAuthError("auth_refresh failed: HTTP 502", status_code=502)
+
+    async def fail_then_succeed():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            client._auth_last_error = error
+            client._auth_backoff_until = time.monotonic() + 0.01
+            raise error
+        client._token = "recovered-token"
+        client._auth._expires_at = time.time() + 900
+        client._auth_last_error = None
+        client._auth_backoff_until = 0.0
+        return client._token
+
+    monkeypatch.setattr(client, "_refresh_token_once", fail_then_succeed)
+
+    response = await asyncio.wait_for(
+        client.fetch("GET", "/synthetic/profile"),
+        timeout=1,
+    )
+
+    assert response.status == 200
+    assert calls == 2
+    assert client.requests_made == 1
+    assert client.retries_made == 0
 
 
 

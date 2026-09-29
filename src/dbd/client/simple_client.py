@@ -221,7 +221,17 @@ class SimpleAsyncDbdClient:
                 continue
 
             assert task is not None
-            return await task
+            try:
+                return await task
+            except DbdAuthError as exc:
+                # Authentication availability belongs to one shared recovery
+                # gate, not to each durable fetch task.  All concurrent callers
+                # observe the same failed refresh, wait for the shared cooldown,
+                # and then converge on one later refresh wave.  Do not surface
+                # the shared auth outage into every task's HTTP retry/defer
+                # budget.
+                self._remember_error(exc)
+                continue
 
     async def _wait_upstream(self) -> None:
         while True:
