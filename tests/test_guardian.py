@@ -169,6 +169,39 @@ def test_legacy_fixed_four_without_explicit_fleet_cap_stays_fixed(monkeypatch, t
     assert config.workers_max == 4
 
 
+def test_unversioned_fixed_four_profile_is_not_rewritten(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(
+        guardian,
+        "settings",
+        SimpleNamespace(dbd_redis_rate_key="dbd:production:global-rate"),
+    )
+    monkeypatch.setattr(
+        guardian,
+        "_runtime_profile",
+        lambda run_id: {
+            "workers": 4,
+            "workers_min": 4,
+            "workers_max": 4,
+            "fleet_rate_max": 60.0,
+        },
+    )
+    guardian._write_json_atomic(
+        guardian.guardian_profile_path(9),
+        {
+            "run_id": 9,
+            "workers": 4,
+            "workers_min": 4,
+            "workers_max": 4,
+            "fleet_rate_max": 60.0,
+        },
+    )
+
+    config = guardian.resolve_guardian_config(9, persist=False)
+
+    assert config.workers_max == 4
+
+
 def test_profile_migration_never_overrides_explicit_workers_max(monkeypatch, tmp_path) -> None:
     monkeypatch.setattr(guardian, "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(
