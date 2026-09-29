@@ -692,6 +692,9 @@ def test_powershell_watchdog_contract() -> None:
     assert "Get-GuardianOwnedWorkers" in script
     assert "$WorkerRegistryPath" in script
     assert "Get-WorkerRegistry" in script
+    assert '$registry.PSObject.Properties["stable"]' in script
+    assert "[bool]$stableProperty.Value" in script
+    assert "--worker-instance" in script
     assert '-Filter ("ProcessId = {0}" -f $pidValue)' in script
     assert "Test-GuardianDescendant" in script
     assert "ParentProcessId" in script
