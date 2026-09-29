@@ -454,10 +454,7 @@ return {
         self._admission_script = None
         self._success_script = None
         self._next_shared_recovery_at = 0.0
-        self._global_recovery_needed = False
-        self._global_recovery_target = self.shared_rate_ceiling
         self._endpoint_recovery_needed: set[str] = set()
-        self._endpoint_recovery_targets: dict[str, float] = {}
         self._last_global_circuit_state = "closed"
         self._last_endpoint_circuit_state: dict[str, str] = {}
         self.redis_commands = 0
@@ -626,13 +623,10 @@ return {
         global_rate = float(result[1])
         global_target = float(result[6])
         self._global_shared.rate = global_rate
-        self._global_recovery_target = global_target
-        self._global_recovery_needed = False
         if shared_endpoint is not None and result[2] != "":
             endpoint_rate = float(result[2])
             endpoint_target = float(result[7])
             shared_endpoint.rate = endpoint_rate
-            self._endpoint_recovery_targets[endpoint] = endpoint_target
             if endpoint_rate < endpoint_target:
                 self._endpoint_recovery_needed.add(endpoint)
             ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
@@ -697,8 +691,6 @@ return {
         global_rate = float(result[0])
         global_target = float(result[2])
         self._global_shared.rate = global_rate
-        self._global_recovery_target = global_target
-        self._global_recovery_needed = global_rate < global_target
         global_changed = global_rate if global_rate != previous_global else None
 
         endpoint_changed = None
@@ -708,7 +700,6 @@ return {
             endpoint_rate = float(result[1])
             endpoint_target = float(result[3])
             shared_endpoint.rate = endpoint_rate
-            self._endpoint_recovery_targets[endpoint] = endpoint_target
             if endpoint_rate >= endpoint_target:
                 self._endpoint_recovery_needed.discard(endpoint)
             else:
