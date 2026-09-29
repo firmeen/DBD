@@ -81,11 +81,16 @@ def test_worker_registry_tracks_exact_live_child_pids(monkeypatch, tmp_path) -> 
 
     live = WorkerProcess(1, "worker-live", Process(111))
     dead = WorkerProcess(2, "worker-dead", Process(222, 1))
-    _write_worker_registry(9, "8f0675d7ace3f411", [live, dead])
+    assert _write_worker_registry(
+        9,
+        "8f0675d7ace3f411",
+        [live, dead],
+    ) is True
 
     payload = json.loads(_worker_registry_path(9).read_text(encoding="utf-8"))
     assert payload["run_id"] == 9
     assert payload["supervisor_generation"] == "8f0675d7ace3f411"
+    assert payload["stable"] is True
     assert payload["workers"] == [
         {
             "index": 1,
@@ -94,6 +99,16 @@ def test_worker_registry_tracks_exact_live_child_pids(monkeypatch, tmp_path) -> 
             "worker_id": "worker-live",
         }
     ]
+
+    assert _write_worker_registry(
+        9,
+        "8f0675d7ace3f411",
+        [live],
+        stable=False,
+    ) is True
+    unstable = json.loads(_worker_registry_path(9).read_text(encoding="utf-8"))
+    assert unstable["stable"] is False
+    assert unstable["workers"][0]["worker_id"] == "worker-live"
 
 
 def test_seed_rate_legacy_mode_does_not_clear_existing_shared_penalty_state() -> None:
