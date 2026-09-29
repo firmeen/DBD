@@ -465,8 +465,6 @@ return {
         # Availability/circuit state is deliberately worker-local. Redis remains
         # responsible for fleet pacing and endpoint-specific upstream pressure,
         # but one worker's auth/session/transport outage must never stop peers.
-        # A versioned local-only namespace also prevents stale shared circuit
-        # keys from older deployments from participating in admission.
         self._breaker = AdaptiveCircuitBreaker(
             redis=None,
             namespace=f"{redis_key}:worker-local-circuit:{uuid4().hex}",
