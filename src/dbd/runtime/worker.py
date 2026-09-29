@@ -38,6 +38,17 @@ _MAINTENANCE_LEASE_SECONDS = 8
 _DRAIN_DB_POLL_SECONDS = 0.5
 _IDLE_PROGRESS_POLL_SECONDS = 1.0
 _SELF_DRAIN_TIMEOUT_SECONDS = 90.0
+_REDIS_CONTROL_FAILURE_BUDGET_SECONDS = 20.0
+
+
+def _redis_control_grace_exceeded(
+    last_confirmed: float,
+    *,
+    now: float | None = None,
+) -> bool:
+    """Fail closed before a 30s Supervisor lease can expire unseen."""
+    observed = time.monotonic() if now is None else float(now)
+    return observed - float(last_confirmed) >= _REDIS_CONTROL_FAILURE_BUDGET_SECONDS
 
 
 def code_batches(path: str, size: int):
@@ -445,6 +456,8 @@ async def process(
     redis_client = None
     close_async_redis = None
     redis_pool_snapshot = None
+    redis_control_last_confirmed = time.monotonic()
+    redis_control_draining = False
 
     if client_factory is None:
         from ..client.async_client import AsyncDbdClient
@@ -508,6 +521,7 @@ async def process(
                 await coordinator.open()
                 identity = WorkerIdentity(owner, int(run_id), os.getpid())
                 registration_status = await coordinator.register_worker(identity)
+                redis_control_last_confirmed = time.monotonic()
             if registration_status == "draining":
                 request_drain(release_queued=True)
         except BaseException:
@@ -635,6 +649,7 @@ async def process(
         status: str | None = None,
         release_on_drain: bool = True,
     ) -> str | None:
+        nonlocal redis_control_last_confirmed, redis_control_draining
         if coordinator is None or identity is None:
             return None
         try:
@@ -644,14 +659,30 @@ async def process(
                 metrics=heartbeat_metrics(),
             )
         except Exception as exc:
-            # Redis is an ephemeral control plane. A transient heartbeat failure
-            # must not cancel MySQL-owned in-flight work.
-            log.warning(
-                "redis_heartbeat_failed",
-                worker_id=owner,
-                error_code=type(exc).__name__,
-            )
+            # A brief Redis interruption is tolerated, but distributed workers
+            # may not keep claiming indefinitely after they can no longer prove
+            # that their Supervisor lease exists. Drain before the 30s lease can
+            # expire unseen; MySQL-owned active work still gets its normal bounded
+            # drain and attempt-neutral final release.
+            if (
+                not redis_control_draining
+                and _redis_control_grace_exceeded(redis_control_last_confirmed)
+            ):
+                redis_control_draining = True
+                request_drain(release_queued=True)
+                log.error(
+                    "redis_control_grace_exhausted",
+                    worker_id=owner,
+                    error_code=type(exc).__name__,
+                )
+            else:
+                log.warning(
+                    "redis_heartbeat_failed",
+                    worker_id=owner,
+                    error_code=type(exc).__name__,
+                )
             return None
+        redis_control_last_confirmed = time.monotonic()
         # The heartbeat Lua transition evaluates stop + targeted drain atomically.
         # This replaces the separate 0.5s control polling Redis round trip.
         if resolved == "draining":
