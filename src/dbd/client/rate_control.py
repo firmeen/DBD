@@ -595,7 +595,7 @@ return {
         # keys from older deployments from participating in admission.
         self._breaker = AdaptiveCircuitBreaker(
             redis=None,
-            namespace=f"{redis_key}:worker-local-circuit",
+            namespace=f"{redis_key}:worker-local-circuit:{uuid4().hex}",
             failure_threshold=circuit_failure_threshold,
             window_seconds=circuit_window_seconds,
             open_seconds=circuit_open_seconds,
@@ -739,9 +739,6 @@ return {
             mode = str(result[3])
             global_state = str(result[4])
             endpoint_state = str(result[5]) if endpoint is not None else None
-            self._last_global_circuit_state = global_state
-            if endpoint is not None and endpoint_state is not None:
-                self._last_endpoint_circuit_state[endpoint] = endpoint_state
             if mode == "circuit":
                 # Respect the durable circuit window instead of waking every
                 # coroutine roughly once per second. Cap the sleep so callers
@@ -782,9 +779,9 @@ return {
     ) -> tuple[float | None, float | None]:
         if self._redis is None:
             return None, None
-        half_open = admission.global_state == "half_open" or (
-            admission.endpoint_state == "half_open"
-        )
+        # Circuit transitions are worker-local. Shared Redis recovery handles
+        # only endpoint pacing state, never circuit ownership.
+        half_open = False
         endpoint_needs_recovery = (
             endpoint is not None and endpoint in self._endpoint_recovery_needed
         )
@@ -819,8 +816,8 @@ return {
                     30_000,
                     1.25,
                     0.5,
-                    admission.global_state,
-                    admission.endpoint_state or "closed",
+                    "closed",
+                    "closed",
                     admission.probe_token or "",
                 ],
             )
@@ -830,10 +827,6 @@ return {
         self._next_shared_recovery_at = (
             now + float(settings.dbd_redis_recovery_interval_seconds)
         )
-        if admission.global_state == "half_open":
-            self._last_global_circuit_state = "closed"
-        if endpoint is not None and admission.endpoint_state == "half_open":
-            self._last_endpoint_circuit_state[endpoint] = "closed"
         previous_global = self._global_shared.rate
         global_rate = float(result[0])
         global_target = float(result[2])
@@ -919,8 +912,9 @@ return {
         """Record upstream availability failure without changing pacing rate.
 
         Endpoint-scoped failures isolate one API surface. Authentication/session
-        failures pass endpoint=None and open the shared global availability
-        circuit without converting availability loss into throughput pressure.
+        failures pass endpoint=None and open only this worker's global
+        availability circuit without converting availability loss into fleet
+        throughput pressure.
         """
         key = "__global__" if endpoint is None else endpoint
         state = await self._breaker.failure(key)

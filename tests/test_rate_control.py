@@ -66,13 +66,13 @@ async def test_availability_failure_opens_circuit_without_changing_rate():
     assert controller.global_effective_rate() == 60
 
 
-async def test_global_availability_failure_does_not_change_fleet_pacer():
+async def test_global_availability_failure_is_worker_local_and_does_not_change_pacer():
     controller = EndpointRateController(60, circuit_failure_threshold=2)
 
     await controller.availability_failure()
     assert await controller.availability_failure() == "open"
 
-    assert controller.circuit_state() == "closed"
+    assert controller.circuit_state() == "open"
     assert controller.global_effective_rate() == 60
 
 
@@ -89,7 +89,7 @@ async def test_distinct_endpoint_availability_stays_worker_endpoint_local():
     controller._breaker._last_global_availability_at = 0.0
     await controller.availability_failure("profile")
 
-    assert controller.circuit_state() == "open"
+    assert controller.circuit_state() == "closed"
     assert controller.global_effective_rate() == 60
     assert controller.effective_rate("profile") == 30
     assert controller.effective_rate("committees") == 20

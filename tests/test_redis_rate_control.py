@@ -134,48 +134,42 @@ async def test_endpoint_penalty_is_immediately_visible_to_another_controller():
 
 
 
-async def test_half_open_success_is_fenced_to_probe_owner():
-    key = "dbd:test-half-open-owner:" + uuid4().hex
-    controller = EndpointRateController(
-        100,
+async def test_one_workers_local_global_circuit_does_not_block_peer():
+    key = "dbd:test-worker-isolation:" + uuid4().hex
+    first = EndpointRateController(
+        1000,
         redis_url=REDIS_URL,
         redis_key=key,
-        shared_rate_ceiling=100,
+        shared_rate_ceiling=1000,
+        circuit_failure_threshold=2,
+        circuit_open_seconds=0.1,
     )
-    await controller.open()
+    second = EndpointRateController(
+        1000,
+        redis_url=REDIS_URL,
+        redis_key=key,
+        shared_rate_ceiling=1000,
+        circuit_failure_threshold=2,
+        circuit_open_seconds=0.1,
+    )
+    await first.open()
+    await second.open()
     try:
-        state_key, opened_key, failures_key, window_key, probe_key = (
-            controller._breaker._keys("__global__")
-        )
-        await controller._redis.set(state_key, "half_open", px=60_000)
-        await controller._redis.set(probe_key, "real-owner", px=60_000)
+        await first.availability_failure()
+        assert await first.availability_failure() == "open"
+        assert first.circuit_state() == "open"
+        assert second.circuit_state() == "closed"
 
-        await controller._shared_success_recovery(
-            None,
-            AdmissionState(
-                global_state="half_open",
-                probe_token="wrong-owner",
-                shared=True,
-            ),
-        )
-        assert await controller._redis.get(state_key) == "half_open"
-        assert await controller._redis.get(probe_key) == "real-owner"
-
-        await controller._shared_success_recovery(
-            None,
-            AdmissionState(
-                global_state="half_open",
-                probe_token="real-owner",
-                shared=True,
-            ),
-        )
-        assert await controller._redis.get(state_key) == "closed"
-        assert await controller._redis.get(probe_key) is None
-        assert await controller._redis.get(opened_key) is None
-        assert await controller._redis.get(failures_key) is None
-        assert await controller._redis.get(window_key) is None
+        started = time.perf_counter()
+        admission = await second.acquire("profile")
+        assert admission.shared is True
+        assert time.perf_counter() - started < 0.5
+        assert second.circuit_state() == "closed"
     finally:
-        await controller._redis.delete(
-            *controller._breaker._keys("__global__"),
-        )
-        await controller.close()
+        if first._global_shared is not None:
+            await first._global_shared.clear_state()
+        endpoint = first._shared_endpoint("profile")
+        if endpoint is not None:
+            await endpoint.clear_state()
+        await first.close()
+        await second.close()
