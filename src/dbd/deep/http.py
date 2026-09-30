@@ -180,7 +180,23 @@ class FixedRateDbdClient:
                     return self._token
                 except DbdAuthError as exc:
                     last_error = exc
-                    if attempt >= settings.dbd_max_auth_attempts:
+                    message = str(exc).lower()
+                    # DbdAuth already exhausts its configured budget for
+                    # refresh 401/403/409. Only retry failures it deliberately
+                    # surfaces immediately: transport errors and transient
+                    # refresh/warm-up 429/5xx responses.
+                    retryable_outer = (
+                        "transport" in message
+                        or "failed: http 429" in message
+                        or any(
+                            f"failed: http {status}" in message
+                            for status in (500, 502, 503, 504)
+                        )
+                    )
+                    if (
+                        not retryable_outer
+                        or attempt >= settings.dbd_max_auth_attempts
+                    ):
                         raise
                     await asyncio.sleep(min(5.0, float(attempt)))
 
@@ -231,6 +247,23 @@ class FixedRateDbdClient:
     def cooldown_remaining(self) -> float:
         return max(0.0, self._cooldown_until - time.monotonic())
 
+    async def _admitted_token(self) -> str:
+        """Return a current token only after a fresh fixed-rate admission.
+
+        Token refresh happens before consuming the limiter slot. If another
+        worker refreshes the token, or the token becomes stale while this
+        coroutine waits for rate/cooldown admission, consume no request: loop
+        and acquire a new slot for the current token.
+        """
+        while True:
+            token = await self._ensure_token()
+            await self._admit()
+            if (
+                token == self._token
+                and time.time() < self._auth._expires_at - 15
+            ):
+                return token
+
     @staticmethod
     def _backoff(attempt: int, server_seconds: float = 0.0) -> float:
         exponential = min(30.0, 2.0 ** max(0, attempt - 1))
@@ -265,8 +298,7 @@ class FixedRateDbdClient:
             if attempt > 1:
                 self.retries_made += 1
 
-            await self._admit()
-            token = await self._ensure_token()
+            token = await self._admitted_token()
             requested_at = datetime.now(timezone.utc).replace(tzinfo=None)
 
             try:
