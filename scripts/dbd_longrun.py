@@ -9,11 +9,17 @@ import queue
 import sys
 import time
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SRC_ROOT = PROJECT_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
 
 from dbd.client.longrun_client import LongRunDbdClient
 from dbd.client.redis_admission import FixedRedisAdmission
@@ -29,6 +35,9 @@ _DEFAULT_CONCURRENCY = 8
 _DEFAULT_WORKER_RATE = 15.0
 _DEFAULT_FLEET_RATE = 60.0
 _HEALTHY_RESTART_RESET_SECONDS = 300.0
+_MANAGER_LOCK_CHECK_SECONDS = 5.0
+_HEARTBEAT_TIMEOUT_SECONDS = 60.0
+_STALL_DRAIN_SECONDS = 30.0
 _RESTART_BACKOFF_SECONDS = (1.0, 2.0, 5.0, 10.0, 30.0)
 
 
@@ -288,6 +297,8 @@ class _WorkerSlot:
     next_start_at: float = 0.0
     latest: dict[str, object] = field(default_factory=dict)
     last_message: str | None = None
+    last_heartbeat_at: float = 0.0
+    stall_stop_at: float = 0.0
 
 
 def _spawn_worker(
@@ -327,6 +338,8 @@ def _spawn_worker(
     process.start()
     state.process = process
     state.started_at = time.monotonic()
+    state.last_heartbeat_at = state.started_at
+    state.stall_stop_at = 0.0
     state.next_start_at = 0.0
 
 
@@ -377,6 +390,8 @@ def _drain_metric_queue(metric_queue, states: list[_WorkerSlot]) -> None:
         if kind == "metrics":
             state.latest = dict(event.get("metrics") or {})
             state.latest["observed_at"] = event.get("observed_at")
+            state.last_heartbeat_at = time.monotonic()
+            state.stall_stop_at = 0.0
         elif kind == "error":
             state.last_message = str(event.get("error") or "worker error")
         elif kind == "result":
@@ -494,6 +509,9 @@ def _join_or_terminate(
             continue
         process.terminate()
         process.join(timeout=10.0)
+        if process.is_alive() and hasattr(process, "kill"):
+            process.kill()
+            process.join(timeout=10.0)
 
 
 def _release_confirmed_dead(states: list[_WorkerSlot]) -> None:
@@ -528,6 +546,7 @@ def _supervise(args, manager_connection, preflight, baseline) -> int:
     exit_code = 0
     last_requests = 0
     last_rate_at = time.monotonic()
+    next_manager_check = 0.0
     observed_rate = 0.0
 
     try:
@@ -550,14 +569,16 @@ def _supervise(args, manager_connection, preflight, baseline) -> int:
                 loop_started = time.monotonic()
                 _drain_metric_queue(metric_queue, states)
 
-                try:
-                    assert_manager_lock(manager_connection)
-                except Exception:
-                    stopping = True
-                    exit_code = 1
-                    _stop_workers(states)
-
                 now = time.monotonic()
+                if now >= next_manager_check:
+                    try:
+                        assert_manager_lock(manager_connection)
+                    except Exception:
+                        stopping = True
+                        exit_code = 1
+                        _stop_workers(states)
+                    next_manager_check = now + _MANAGER_LOCK_CHECK_SECONDS
+
                 for state in states:
                     process_handle = state.process
                     if process_handle is not None and not process_handle.is_alive():
@@ -586,6 +607,23 @@ def _supervise(args, manager_connection, preflight, baseline) -> int:
                         state.next_start_at = now + _restart_delay(
                             state.restart_count
                         )
+
+                    if (
+                        not stopping
+                        and state.process is not None
+                        and state.process.is_alive()
+                        and now - state.last_heartbeat_at
+                        >= _HEARTBEAT_TIMEOUT_SECONDS
+                    ):
+                        if state.stall_stop_at <= 0:
+                            state.last_message = "heartbeat stale; draining"
+                            state.stall_stop_at = now
+                            if state.stop_flag is not None:
+                                state.stop_flag.set()
+                        elif now - state.stall_stop_at >= _STALL_DRAIN_SECONDS:
+                            state.last_message = "heartbeat stale; terminating"
+                            state.process.terminate()
+                            state.process.join(timeout=10.0)
 
                     if (
                         not stopping
@@ -702,4 +740,5 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    mp.freeze_support()
     sys.exit(main())
