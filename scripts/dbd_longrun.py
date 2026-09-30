@@ -9,17 +9,11 @@ import queue
 import sys
 import time
 from dataclasses import dataclass, field
-from pathlib import Path
 from typing import Any
 
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
-
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
-SRC_ROOT = PROJECT_ROOT / "src"
-if str(SRC_ROOT) not in sys.path:
-    sys.path.insert(0, str(SRC_ROOT))
 
 from dbd.client.longrun_client import LongRunDbdClient
 from dbd.client.redis_admission import FixedRedisAdmission
