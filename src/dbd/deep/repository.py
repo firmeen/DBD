@@ -157,6 +157,7 @@ def create_deep_engine() -> AsyncEngine:
             "init_command": "SET time_zone = '+00:00'",
             "charset": "utf8mb4",
             "connect_timeout": max(15, settings.db_timeout),
+            "read_timeout": max(15, settings.db_timeout),
         },
     )
 
@@ -760,6 +761,8 @@ class DeepRepository:
                     },
                 )
 
+        if event is not None:
+            event("phase", {"phase": "VERIFY"})
         await self.assert_invariants()
         await self._mark_prepared()
         runtime_recovered = await self.recover_runtime()
