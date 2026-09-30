@@ -19,6 +19,7 @@ from .catalog import (
     unresolved_mask,
 )
 from .http import (
+    DeepDecodeError,
     DeepNotAvailable,
     DeepPermanentHttpError,
     DeepTransientHttpError,
@@ -319,7 +320,7 @@ class DeepCollector:
                     error=str(exc),
                 )
                 return
-            except DeepPermanentHttpError as exc:
+            except (DeepPermanentHttpError, DeepDecodeError) as exc:
                 await self._commit_outcome(
                     company,
                     spec,
