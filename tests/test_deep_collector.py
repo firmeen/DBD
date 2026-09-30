@@ -44,6 +44,7 @@ def test_active_scope_masks_and_latest_fiscal_year():
     assert latest_fiscal_year("2567 2568") == "2568"
     assert latest_fiscal_year("2568 2567") == "2568"
     assert latest_fiscal_year("  2568\t2567  ") == "2568"
+    assert latest_fiscal_year("2566,2567/2568") == "2568"
 
     assert required_mask(None) == BASE_REQUIRED_MASK
     assert required_mask("") == BASE_REQUIRED_MASK
@@ -90,6 +91,26 @@ def test_profile_distinguishes_absent_from_explicit_null_fiscal_year():
         },
     )
     assert (outcome, fiscal_year, present) == ("done", None, True)
+
+
+def test_profile_oversized_fiscal_scope_is_reduced_before_storage():
+    raw_years = " ".join(str(year) for year in range(2500, 2569))
+    assert len(raw_years) > 50
+
+    outcome, fiscal_year, present = DeepCollector._validate_payload(
+        _spec("profile"),
+        {
+            "jp_type_code": "7",
+            "jp_no": "0107556000051",
+        },
+        {
+            "jpNo": "0107556000051",
+            "jpTypeCode": "7",
+            "submitFinYear": raw_years,
+        },
+    )
+
+    assert (outcome, fiscal_year, present) == ("done", "2568", True)
 
 
 def test_profile_identity_mismatch_is_terminal_identity_conflict():
