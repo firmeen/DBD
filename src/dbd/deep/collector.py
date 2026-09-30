@@ -210,7 +210,7 @@ class DeepCollector:
         spec: EndpointSpec,
         company: dict[str, Any],
         payload: object,
-    ) -> str:
+    ) -> tuple[str, str | None]:
         normalized = _normalize_resource(spec.key, payload)
 
         if spec.key == "profile":
@@ -223,11 +223,17 @@ class DeepCollector:
                 raise ContractError(
                     f"profile identity mismatch: expected {expected.code}, got {actual.code}"
                 )
+            fiscal_year = getattr(normalized, "submit_fin_year", None)
+            return "done", (
+                str(fiscal_year).strip()
+                if fiscal_year is not None and str(fiscal_year).strip()
+                else None
+            )
 
         if spec.key == "industry_benchmark" and normalized is None:
-            return "not_available"
+            return "not_available", None
 
-        return "done"
+        return "done", None
 
     async def _commit_outcome(
         self,
@@ -239,6 +245,7 @@ class DeepCollector:
         http_status: int | None,
         requested_at: datetime | None,
         error: str | None = None,
+        profile_submit_fin_year: str | None = None,
     ) -> None:
         state = await self.repo.commit_endpoint(
             jp_type_code=str(company["jp_type_code"]),
@@ -255,6 +262,7 @@ class DeepCollector:
             http_status=http_status,
             error=error,
             requested_at=requested_at,
+            profile_submit_fin_year=profile_submit_fin_year,
         )
         company.update(state)
 
@@ -333,7 +341,11 @@ class DeepCollector:
                 continue
 
             try:
-                outcome = self._validate_payload(spec, company, response.data)
+                outcome, profile_submit_fin_year = self._validate_payload(
+                    spec,
+                    company,
+                    response.data,
+                )
             except (ContractError, TypeError, ValueError) as exc:
                 await self._commit_outcome(
                     company,
@@ -353,6 +365,7 @@ class DeepCollector:
                 payload=response.data if outcome == "done" else None,
                 http_status=response.status,
                 requested_at=response.requested_at,
+                profile_submit_fin_year=profile_submit_fin_year,
             )
 
         unresolved = unresolved_mask(
