@@ -827,17 +827,6 @@ def _worker_metrics(states: list[dict]) -> dict[str, int]:
     }
 
 
-def _fleet_circuit_state(states: list[dict]) -> str:
-    """Return the most restrictive global availability state visible in the fleet."""
-    priority = {"unknown": 0, "closed": 1, "half_open": 2, "open": 3}
-    resolved = "unknown"
-    for row in states:
-        state = str(row.get("circuit_global") or "unknown").lower()
-        if priority.get(state, 0) > priority.get(resolved, 0):
-            resolved = state
-    return resolved
-
-
 def _with_retired_metrics(live: dict[str, int], retired: dict[str, int]) -> dict[str, int]:
     result = dict(live)
     for key in (
@@ -1951,7 +1940,7 @@ def supervise_campaign(
                         pending=pending,
                         retry_wait=None,
                         pending_includes_retry_wait=True,
-                        circuit_state=_fleet_circuit_state(registered_states),
+                        circuit_state="closed",
                         running=running,
                         done=done,
                         done_only=live_progress["done_only"],
@@ -2156,7 +2145,7 @@ def supervise_campaign(
                     pending=snapshot.get("pending", 0),
                     retry_wait=snapshot.get("retry_wait", 0),
                     pending_includes_retry_wait=False,
-                    circuit_state=_fleet_circuit_state(registered_states),
+                    circuit_state="closed",
                     running=snapshot.get("running", 0),
                     done=snapshot.get("done", 0) + snapshot.get("not_available", 0),
                     done_only=snapshot.get("done", 0),
@@ -2265,11 +2254,7 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
         state["control_status"] = runtime_status
     else:
         state["control_status"] = "offline"
-    state["circuit_state"] = str(
-        (runtime or {}).get("circuit_state")
-        or _fleet_circuit_state(workers)
-        or "unknown"
-    )
+    state["circuit_state"] = "closed"
     if diagnostics:
         state["failure_diagnostics"] = _failure_diagnostics(run_id)
 

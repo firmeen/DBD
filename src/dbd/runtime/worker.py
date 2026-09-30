@@ -458,7 +458,6 @@ async def process(
     def heartbeat_metrics() -> dict[str, object]:
         client = client_ref
         effective_rate = None
-        circuit_global = "unknown"
         if client is not None:
             controller = getattr(client, "endpoint_rate", None)
             if controller is not None:
@@ -466,10 +465,6 @@ async def process(
                     effective_rate = float(controller.global_effective_rate())
                 except Exception:
                     effective_rate = None
-                try:
-                    circuit_global = str(controller.circuit_state())
-                except Exception:
-                    circuit_global = "unknown"
         active = {
             "fetch": int(runtime_stats["fetch_active"]),
             "archive": int(runtime_stats["archive_active"]),
@@ -511,7 +506,6 @@ async def process(
             "http_retries": int(getattr(client, "retries_made", 0) or 0),
             "rate_limit_hits": int(getattr(client, "rate_limit_hits", 0) or 0),
             "effective_rate": effective_rate,
-            "circuit_global": circuit_global,
             "redis_commands": redis_commands,
             "redis_admissions": redis_admissions,
             "redis_pool_in_use": int(pool.get("in_use", 0)),

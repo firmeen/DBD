@@ -24,8 +24,8 @@ class CampaignCoordinator:
     """Ephemeral Redis coordination for a durable MySQL-backed campaign.
 
     MySQL remains the source of truth for work and leases. Redis carries only
-    fleet-wide control state: graceful-stop requests, targeted drains, worker
-    heartbeats, maintenance leadership and shared adaptive rate state.
+    ephemeral fleet control: graceful-stop requests, targeted drains, worker
+    heartbeats and maintenance leadership.
     """
 
     _PUBLISH_WORKER_SCRIPT = """
@@ -302,27 +302,3 @@ class CampaignCoordinator:
             if value:
                 result.append(json.loads(value))
         return result
-
-    async def seed_adaptive_rate(
-        self,
-        redis_rate_key: str,
-        effective_rate: float,
-        *,
-        ttl_seconds: int = 600,
-    ) -> None:
-        """Seed a missing shared rate without erasing an active fleet penalty/cooldown."""
-        client = self._client()
-        async with client.pipeline(transaction=False) as pipe:
-            pipe.set(
-                f"{redis_rate_key}:effective-rate",
-                str(float(effective_rate)),
-                ex=ttl_seconds,
-                nx=True,
-            )
-            pipe.set(
-                f"{redis_rate_key}:last-penalty-ms",
-                str(int(time.time() * 1000) - 120_000),
-                ex=ttl_seconds,
-                nx=True,
-            )
-            await pipe.execute()
