@@ -571,37 +571,47 @@ class DeepCollector:
             await self.repo.assert_no_overlap()
 
             self._emit("phase", phase="REFILL")
-            await self._refill()
+            refill = await self._refill()
 
-            self._emit("phase", phase="AUTH")
-            async with FixedRateDbdClient(
-                concurrency=self.concurrency,
-                rate_per_second=self.rate_per_second,
-                max_retries=self.http_retries,
-            ) as client:
-                self._emit(
-                    "started",
-                    concurrency=self.concurrency,
-                    rate_per_second=self.rate_per_second,
-                    buffer_size=self.buffer_size,
-                    company_limit=self.company_limit,
-                    active_endpoints=list(ACTIVE_ENDPOINTS),
-                    **asdict(self.stats),
-                )
-                self._emit("phase", phase="RUNNING")
-
-                async with asyncio.TaskGroup() as group:
-                    group.create_task(self._monitor_lock(lock_conn))
-                    for worker_no in range(1, self.concurrency + 1):
-                        group.create_task(self._worker(worker_no, client))
-
+            if int(refill["runtime"]) == 0:
+                self._emit("phase", phase="IDLE")
                 result = {
                     **asdict(self.stats),
-                    "http_requests": client.requests_made,
-                    "http_retries": client.retries_made,
-                    "rate_limit_hits": client.rate_limit_hits,
-                    "configured_rate": client.rate_per_second,
+                    "http_requests": 0,
+                    "http_retries": 0,
+                    "rate_limit_hits": 0,
+                    "configured_rate": self.rate_per_second,
                 }
+            else:
+                self._emit("phase", phase="AUTH")
+                async with FixedRateDbdClient(
+                    concurrency=self.concurrency,
+                    rate_per_second=self.rate_per_second,
+                    max_retries=self.http_retries,
+                ) as client:
+                    self._emit(
+                        "started",
+                        concurrency=self.concurrency,
+                        rate_per_second=self.rate_per_second,
+                        buffer_size=self.buffer_size,
+                        company_limit=self.company_limit,
+                        active_endpoints=list(ACTIVE_ENDPOINTS),
+                        **asdict(self.stats),
+                    )
+                    self._emit("phase", phase="RUNNING")
+
+                    async with asyncio.TaskGroup() as group:
+                        group.create_task(self._monitor_lock(lock_conn))
+                        for worker_no in range(1, self.concurrency + 1):
+                            group.create_task(self._worker(worker_no, client))
+
+                    result = {
+                        **asdict(self.stats),
+                        "http_requests": client.requests_made,
+                        "http_retries": client.retries_made,
+                        "rate_limit_hits": client.rate_limit_hits,
+                        "configured_rate": client.rate_per_second,
+                    }
 
         result["status"] = await self.repo.status_summary(include_coverage=False)
         return result
