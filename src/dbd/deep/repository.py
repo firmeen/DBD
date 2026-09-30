@@ -514,6 +514,7 @@ class DeepRepository:
         *,
         batch_size: int = 5000,
         event: Callable[[str, dict[str, Any]], None] | None = None,
+        lock_conn: AsyncConnection | None = None,
     ) -> dict[str, int | bool]:
         """One-time deterministic adoption of builder-created Deep rows.
 
@@ -824,6 +825,8 @@ class DeepRepository:
             last_type, last_no, batch_scanned, batch_changed = batch
             scanned += int(batch_scanned)
             changed += int(batch_changed)
+            if lock_conn is not None:
+                await self.assert_manager_lock(lock_conn)
             if event is not None:
                 event(
                     "prepare_progress",
@@ -837,6 +840,8 @@ class DeepRepository:
         if event is not None:
             event("phase", {"phase": "VERIFY"})
         await self.assert_invariants()
+        if lock_conn is not None:
+            await self.assert_manager_lock(lock_conn)
         await self._mark_prepared()
         runtime_recovered = await self.recover_runtime()
         return {
