@@ -236,8 +236,8 @@ class DeepRepository:
 
     async def preflight(self) -> tuple[EndpointSpec, ...]:
         requirements = (
-            (MASTER_TABLE, _REQUIRED_MASTER_COLUMNS),
-            (DEEP_TABLE, _REQUIRED_DEEP_COLUMNS),
+            (MASTER_TABLE, _REQUIRED_MASTER_COLUMNS | {"last_seen_at"}),
+            (DEEP_TABLE, _REQUIRED_DEEP_COLUMNS | {"updated_at"}),
             (CATALOG_TABLE, _REQUIRED_CATALOG_COLUMNS),
         )
         for table_name, required in requirements:
@@ -366,6 +366,35 @@ class DeepRepository:
         excluded from required_mask and cannot block active-scope completion.
         """
         batch_size = max(100, int(batch_size))
+        total_changed = 0
+
+        # A DONE bit without its JSON payload is not a durable completion. This
+        # can exist in migrated legacy state when endpoint state survived but
+        # the archived/projection payload did not. Clear only that impossible
+        # DONE bit so the endpoint becomes resumable; never touch inactive bits.
+        for endpoint in ACTIVE_ENDPOINTS:
+            bit = ENDPOINT_BITS[endpoint]
+            destination = DESTINATION_COLUMNS[endpoint]
+            while True:
+                async def repair_done(conn: AsyncConnection) -> int:
+                    result = await conn.execute(
+                        text(
+                            f"""
+                            UPDATE {DEEP_TABLE}
+                            SET done_mask=(done_mask & ~{bit})
+                            WHERE (done_mask & {bit}) <> 0
+                              AND {destination} IS NULL
+                            LIMIT {batch_size}
+                            """
+                        )
+                    )
+                    return int(result.rowcount or 0)
+
+                repaired = await self._transaction(repair_done)
+                total_changed += repaired
+                if repaired < batch_size:
+                    break
+
         financial_required = (
             f"CASE WHEN NULLIF(TRIM(submit_fin_year),'') IS NULL "
             f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
@@ -375,8 +404,6 @@ class DeepRepository:
             f"(((done_mask | not_available_mask | failed_mask) "
             f"& ({financial_required})) = ({financial_required}))"
         )
-        total_changed = 0
-
         while True:
             async def op(conn: AsyncConnection) -> int:
                 result = await conn.execute(
@@ -917,7 +944,10 @@ class DeepRepository:
                         last_endpoint=:endpoint,
                         last_http_status=:http_status,
                         last_request_at=COALESCE(:requested_at, last_request_at),
-                        last_error=:error,
+                        last_error=CASE
+                            WHEN :error IS NULL THEN last_error
+                            ELSE :error
+                        END,
                         last_error_at=CASE
                             WHEN :error IS NULL THEN last_error_at
                             ELSE UTC_TIMESTAMP(6)
@@ -1082,23 +1112,34 @@ class DeepRepository:
                 or 0
             )
 
+            expected_required = (
+                f"CASE WHEN NULLIF(TRIM(submit_fin_year),'') IS NULL "
+                f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
+            )
+            effective_status = _status_case(expected_required)
             deep = (
                 await conn.execute(
                     text(
                         f"""
                         SELECT
                             COUNT(*) AS total,
-                            SUM(deep_status='PENDING') AS pending,
-                            SUM(deep_status='COLLECTING') AS collecting,
-                            SUM(deep_status='COMPLETE') AS complete,
-                            SUM(deep_status='PARTIAL') AS partial,
-                            SUM(deep_status='FAILED') AS failed,
-                            SUM(
-                                ((done_mask | not_available_mask | failed_mask)
-                                  & required_mask) <> required_mask
-                            ) AS unresolved,
-                            SUM((failed_mask & required_mask) <> 0) AS with_failures
-                        FROM {DEEP_TABLE}
+                            SUM(effective_status='PENDING') AS pending,
+                            SUM(effective_status='COLLECTING') AS collecting,
+                            SUM(effective_status='COMPLETE') AS complete,
+                            SUM(effective_status='PARTIAL') AS partial,
+                            SUM(effective_status='FAILED') AS failed,
+                            SUM(unresolved) AS unresolved,
+                            SUM(with_failures) AS with_failures
+                        FROM (
+                            SELECT
+                                {effective_status} AS effective_status,
+                                (
+                                    ((done_mask | not_available_mask | failed_mask)
+                                      & ({expected_required})) <> ({expected_required})
+                                ) AS unresolved,
+                                ((failed_mask & ({expected_required})) <> 0) AS with_failures
+                            FROM {DEEP_TABLE}
+                        ) scoped
                         """
                     )
                 )
@@ -1150,7 +1191,7 @@ class DeepRepository:
                                 SUM((not_available_mask & {bit}) <> 0) AS not_available,
                                 SUM((failed_mask & {bit}) <> 0) AS failed
                             FROM {DEEP_TABLE}
-                            WHERE (required_mask & {bit}) <> 0
+                            WHERE (({expected_required}) & {bit}) <> 0
                             """
                         )
                     )
