@@ -97,6 +97,14 @@ def _retry_delay(attempts: int) -> int:
     return min(300, max(5, 5 * (2 ** min(max(attempts - 1, 0), 6))))
 
 
+def _derive_fiscal_year(value: object) -> str | None:
+    # Keep the proven legacy/fabric behavior without importing either runtime:
+    # DBD can expose multiple submitted years in one whitespace-separated field,
+    # while each financial endpoint requires exactly one fiscalYear parameter.
+    years = [part for part in str(value or "").split() if part]
+    return max(years) if years else None
+
+
 class DeepCollector:
     def __init__(
         self,
@@ -197,12 +205,12 @@ class DeepCollector:
         )
         params: dict[str, object] | None = None
         if spec.key in FINANCIAL_ENDPOINTS:
-            fiscal_year = company.get("submit_fin_year")
-            if fiscal_year is None or not str(fiscal_year).strip():
+            fiscal_year = _derive_fiscal_year(company.get("submit_fin_year"))
+            if fiscal_year is None:
                 raise RuntimeError(
                     f"{spec.key} is required but submit_fin_year is empty"
                 )
-            params = {"fiscalYear": str(fiscal_year)}
+            params = {"fiscalYear": fiscal_year}
         return path, params
 
     @staticmethod
