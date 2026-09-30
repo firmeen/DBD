@@ -1213,29 +1213,37 @@ class DeepRepository:
                 or 0
             )
 
-            coverage: dict[str, dict[str, int]] = {}
+            coverage_selects: list[str] = []
             for endpoint in ACTIVE_ENDPOINTS:
                 bit = ENDPOINT_BITS[endpoint]
                 column = DESTINATION_COLUMNS[endpoint]
-                row = (
-                    await conn.execute(
-                        text(
-                            f"""
-                            SELECT
-                                SUM({column} IS NOT NULL) AS data_rows,
-                                SUM((done_mask & {bit}) <> 0) AS done,
-                                SUM((not_available_mask & {bit}) <> 0) AS not_available,
-                                SUM((failed_mask & {bit}) <> 0) AS failed
-                            FROM {DEEP_TABLE}
-                            WHERE (({expected_required}) & {bit}) <> 0
-                            """
-                        )
+                prefix = endpoint
+                required = f"((({expected_required}) & {bit}) <> 0)"
+                coverage_selects.extend(
+                    (
+                        f"SUM({required} AND {column} IS NOT NULL) AS `{prefix}__data_rows`",
+                        f"SUM({required} AND (done_mask & {bit}) <> 0) AS `{prefix}__done`",
+                        f"SUM({required} AND (not_available_mask & {bit}) <> 0) "
+                        f"AS `{prefix}__not_available`",
+                        f"SUM({required} AND (failed_mask & {bit}) <> 0) AS `{prefix}__failed`",
                     )
-                ).mappings().one()
-                coverage[endpoint] = {
-                    key: int(value or 0)
-                    for key, value in dict(row).items()
+                )
+
+            coverage_row = (
+                await conn.execute(
+                    text(
+                        f"SELECT {', '.join(coverage_selects)} "
+                        f"FROM {DEEP_TABLE}"
+                    )
+                )
+            ).mappings().one()
+            coverage = {
+                endpoint: {
+                    key: int(coverage_row[f"{endpoint}__{key}"] or 0)
+                    for key in ("data_rows", "done", "not_available", "failed")
                 }
+                for endpoint in ACTIVE_ENDPOINTS
+            }
 
         return {
             "master": master,
