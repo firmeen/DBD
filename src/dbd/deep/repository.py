@@ -1303,6 +1303,7 @@ class DeepRepository:
         error: str | None,
         requested_at: datetime | None,
         profile_submit_fin_year: str | None = None,
+        profile_submit_fin_year_present: bool = False,
     ) -> dict[str, Any]:
         if spec.key not in ACTIVE_ENDPOINTS:
             raise ValueError(f"Inactive endpoint {spec.key}")
@@ -1339,33 +1340,30 @@ class DeepRepository:
 
         profile_scope_sql = ""
         if spec.key == "profile" and outcome == "done":
-            profile_scope_sql = f"""
-                submit_fin_year=COALESCE(
-                    NULLIF(TRIM(:profile_submit_fin_year), ''),
-                    submit_fin_year
-                ),
-                required_mask=CASE
-                    WHEN NULLIF(
-                        TRIM(
-                            COALESCE(
-                                NULLIF(TRIM(:profile_submit_fin_year), ''),
-                                submit_fin_year
-                            )
-                        ),
-                        ''
-                    ) IS NULL
-                    THEN {BASE_REQUIRED_MASK}
-                    ELSE {ACTIVE_ENDPOINT_MASK}
-                END,
-            """
+            if profile_submit_fin_year_present:
+                profile_scope_sql = f"""
+                    submit_fin_year=:profile_submit_fin_year,
+                    required_mask=CASE
+                        WHEN NULLIF(TRIM(:profile_submit_fin_year), '') IS NULL
+                        THEN {BASE_REQUIRED_MASK}
+                        ELSE {ACTIVE_ENDPOINT_MASK}
+                    END,
+                """
+            else:
+                profile_scope_sql = f"""
+                    required_mask=CASE
+                        WHEN NULLIF(TRIM(submit_fin_year), '') IS NULL
+                        THEN {BASE_REQUIRED_MASK}
+                        ELSE {ACTIVE_ENDPOINT_MASK}
+                    END,
+                """
 
         async def op(conn: AsyncConnection) -> dict[str, Any]:
             fiscal_year_changed = False
             if (
                 spec.key == "profile"
                 and outcome == "done"
-                and profile_submit_fin_year is not None
-                and profile_submit_fin_year.strip()
+                and profile_submit_fin_year_present
             ):
                 previous = (
                     await conn.execute(
@@ -1381,8 +1379,10 @@ class DeepRepository:
                         {"jp_type_code": jp_type_code, "jp_no": jp_no},
                     )
                 ).scalar_one()
-                previous_year = "" if previous is None else str(previous).strip()
-                fiscal_year_changed = previous_year != profile_submit_fin_year.strip()
+                fiscal_year_changed = (
+                    latest_fiscal_year(previous)
+                    != latest_fiscal_year(profile_submit_fin_year)
+                )
 
             await conn.execute(
                 text(
@@ -1437,7 +1437,11 @@ class DeepRepository:
                             done_mask=(done_mask & ~{FINANCIAL_MASK}),
                             not_available_mask=(not_available_mask & ~{FINANCIAL_MASK}),
                             failed_mask=(failed_mask & ~{FINANCIAL_MASK}),
-                            required_mask={ACTIVE_ENDPOINT_MASK},
+                            required_mask=CASE
+                                WHEN NULLIF(TRIM(submit_fin_year), '') IS NULL
+                                THEN {BASE_REQUIRED_MASK}
+                                ELSE {ACTIVE_ENDPOINT_MASK}
+                            END,
                             endpoint_meta=JSON_REMOVE(
                                 COALESCE(endpoint_meta, JSON_OBJECT()),
                                 '$."financial_submissions"',
@@ -1494,6 +1498,255 @@ class DeepRepository:
                 )
             ).mappings().one()
             return dict(row)
+
+        return await self._transaction(op)
+
+    async def resolve_profile_dependencies(
+        self,
+        jp_type_code: str,
+        jp_no: str,
+        *,
+        outcome: str,
+        requested_at: datetime | None,
+        error: str,
+    ) -> dict[str, Any]:
+        if outcome not in {"not_available", "failed"}:
+            raise ValueError("Profile dependency outcome must be not_available or failed")
+
+        async def op(conn: AsyncConnection) -> dict[str, Any]:
+            row = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            submit_fin_year,
+                            required_mask,
+                            done_mask,
+                            not_available_mask,
+                            failed_mask
+                        FROM {DEEP_TABLE}
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        FOR UPDATE
+                        """
+                    ),
+                    {"jp_type_code": jp_type_code, "jp_no": jp_no},
+                )
+            ).mappings().one()
+            unresolved = (
+                int(row["required_mask"])
+                & FINANCIAL_MASK
+                & ~(
+                    int(row["done_mask"])
+                    | int(row["not_available_mask"])
+                    | int(row["failed_mask"])
+                )
+            )
+            if unresolved:
+                updates = []
+                meta_args: dict[str, object] = {
+                    "dependency_error": error[:1000],
+                    "requested_at": requested_at,
+                }
+                for endpoint in (
+                    "financial_submissions",
+                    "financial_statements",
+                    "industry_benchmark",
+                ):
+                    endpoint_bit = ENDPOINT_BITS[endpoint]
+                    if unresolved & endpoint_bit:
+                        updates.extend(
+                            (
+                                f'endpoint_meta=JSON_SET('
+                                f'COALESCE(endpoint_meta, JSON_OBJECT()), '
+                                f'\'$."{endpoint}"\', '
+                                f'JSON_OBJECT('
+                                f'\'status\', :dependency_status, '
+                                f'\'requested_at\', :requested_at, '
+                                f'\'error\', :dependency_error))',
+                            )
+                        )
+
+                mask_set = (
+                    f"not_available_mask=(not_available_mask | {unresolved})"
+                    if outcome == "not_available"
+                    else f"failed_mask=(failed_mask | {unresolved})"
+                )
+                dependency_status = (
+                    "profile_dependency_not_available"
+                    if outcome == "not_available"
+                    else "profile_dependency_failed"
+                )
+                meta_args["dependency_status"] = dependency_status
+
+                # Apply metadata one endpoint at a time to avoid overwriting
+                # already-resolved endpoint metadata.
+                await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET {mask_set},
+                            last_error=:dependency_error,
+                            last_error_at=UTC_TIMESTAMP(6)
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        """
+                    ),
+                    {
+                        **meta_args,
+                        "jp_type_code": jp_type_code,
+                        "jp_no": jp_no,
+                    },
+                )
+                for endpoint in (
+                    "financial_submissions",
+                    "financial_statements",
+                    "industry_benchmark",
+                ):
+                    endpoint_bit = ENDPOINT_BITS[endpoint]
+                    if unresolved & endpoint_bit:
+                        await conn.execute(
+                            text(
+                                f"""
+                                UPDATE {DEEP_TABLE}
+                                SET endpoint_meta=JSON_SET(
+                                    COALESCE(endpoint_meta, JSON_OBJECT()),
+                                    '$."{endpoint}"',
+                                    JSON_OBJECT(
+                                        'status', :dependency_status,
+                                        'requested_at', :requested_at,
+                                        'error', :dependency_error
+                                    )
+                                )
+                                WHERE jp_type_code=:jp_type_code
+                                  AND jp_no=:jp_no
+                                """
+                            ),
+                            {
+                                **meta_args,
+                                "jp_type_code": jp_type_code,
+                                "jp_no": jp_no,
+                            },
+                        )
+
+            await conn.execute(
+                text(
+                    f"""
+                    UPDATE {DEEP_TABLE}
+                    SET deep_status={_status_case()},
+                        deep_completed_at=CASE
+                            WHEN (((done_mask | not_available_mask | failed_mask)
+                                   & required_mask) = required_mask)
+                            THEN COALESCE(last_request_at, UTC_TIMESTAMP(6))
+                            ELSE NULL
+                        END
+                    WHERE jp_type_code=:jp_type_code
+                      AND jp_no=:jp_no
+                    """
+                ),
+                {"jp_type_code": jp_type_code, "jp_no": jp_no},
+            )
+            state = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            submit_fin_year,
+                            required_mask,
+                            done_mask,
+                            not_available_mask,
+                            failed_mask,
+                            deep_status
+                        FROM {DEEP_TABLE}
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        """
+                    ),
+                    {"jp_type_code": jp_type_code, "jp_no": jp_no},
+                )
+            ).mappings().one()
+            return dict(state)
+
+        return await self._transaction(op)
+
+    async def fail_unresolved_identity(
+        self,
+        jp_type_code: str,
+        jp_no: str,
+        *,
+        error: str,
+    ) -> dict[str, Any]:
+        async def op(conn: AsyncConnection) -> dict[str, Any]:
+            row = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            submit_fin_year,
+                            required_mask,
+                            done_mask,
+                            not_available_mask,
+                            failed_mask
+                        FROM {DEEP_TABLE}
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        FOR UPDATE
+                        """
+                    ),
+                    {"jp_type_code": jp_type_code, "jp_no": jp_no},
+                )
+            ).mappings().one()
+            unresolved = int(row["required_mask"]) & ~(
+                int(row["done_mask"])
+                | int(row["not_available_mask"])
+                | int(row["failed_mask"])
+            )
+            if unresolved:
+                await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET failed_mask=(failed_mask | :unresolved),
+                            deep_status={_status_case()},
+                            deep_completed_at=COALESCE(
+                                deep_completed_at,
+                                last_request_at,
+                                UTC_TIMESTAMP(6)
+                            ),
+                            last_error=:error,
+                            last_error_at=UTC_TIMESTAMP(6)
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        """
+                    ),
+                    {
+                        "unresolved": unresolved,
+                        "error": error[:2000],
+                        "jp_type_code": jp_type_code,
+                        "jp_no": jp_no,
+                    },
+                )
+
+            state = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            submit_fin_year,
+                            required_mask,
+                            done_mask,
+                            not_available_mask,
+                            failed_mask,
+                            deep_status
+                        FROM {DEEP_TABLE}
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        """
+                    ),
+                    {"jp_type_code": jp_type_code, "jp_no": jp_no},
+                )
+            ).mappings().one()
+            return dict(state)
 
         return await self._transaction(op)
 
