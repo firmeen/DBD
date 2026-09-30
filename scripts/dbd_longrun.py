@@ -128,11 +128,12 @@ async def _preflight(
         await engine.dispose()
 
 
-async def _release_owner(worker_id: str) -> None:
+async def _release_owner(run_id: int, worker_id: str) -> None:
     engine = create_engine()
     repo = WorkerRepository(engine)
     try:
-        await repo.release(worker_id)
+        run = await repo.get_run(run_id)
+        await repo.for_run(run).release(worker_id)
     finally:
         await engine.dispose()
 
@@ -508,12 +509,16 @@ def _join_or_terminate(
             process.join(timeout=10.0)
 
 
-def _release_confirmed_dead(states: list[_WorkerSlot]) -> None:
+def _release_confirmed_dead(
+    states: list[_WorkerSlot],
+    *,
+    run_id: int,
+) -> None:
     for state in states:
         process = state.process
         if process is None or process.is_alive() or not state.worker_id:
             continue
-        asyncio.run(_release_owner(state.worker_id))
+        asyncio.run(_release_owner(run_id, state.worker_id))
 
 
 def _supervise(args, manager_connection, preflight, baseline) -> int:
@@ -581,7 +586,7 @@ def _supervise(args, manager_connection, preflight, baseline) -> int:
                         exit_status = process_handle.exitcode
 
                         _retire_metrics(state, retired)
-                        asyncio.run(_release_owner(state.worker_id))
+                        asyncio.run(_release_owner(args.run_id, state.worker_id))
                         state.process = None
                         state.stop_flag = None
 
@@ -681,7 +686,7 @@ def _supervise(args, manager_connection, preflight, baseline) -> int:
         # running until the hard-termination deadline by accident.
         _stop_workers(states)
         _join_or_terminate(states, grace_seconds=args.grace_seconds)
-        _release_confirmed_dead(states)
+        _release_confirmed_dead(states, run_id=args.run_id)
         try:
             metric_queue.close()
             metric_queue.join_thread()
