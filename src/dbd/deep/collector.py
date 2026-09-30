@@ -57,7 +57,6 @@ class CollectorStats:
     endpoints_not_available: int = 0
     endpoints_failed: int = 0
     runtime_recovered: int = 0
-    scope_reconciled: int = 0
     master_promoted: int = 0
     deep_adopted: int = 0
 
