@@ -22,9 +22,12 @@ HOME_URL = f"{settings.dbd_base_url}/"
 WARMUP_PAGE_URL = f"{settings.dbd_base_url}/biztype/overview"
 
 
-def create_session() -> requests.Session:
+def create_session(*, http_version=None) -> requests.Session:
     """A curl_cffi session that TLS-fingerprints as Chrome."""
-    session = requests.Session(impersonate="chrome")
+    session = requests.Session(
+        impersonate="chrome",
+        http_version=http_version,
+    )
     session.headers.update(
         {
             "Accept-Language": "th-TH,th;q=0.9,en-US;q=0.8,en;q=0.7",
