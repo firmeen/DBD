@@ -188,12 +188,13 @@ async def _prepare(batch_size: int, json_mode: bool) -> int:
             require_prepared=False,
             check_indexes=True,
         )
-        async with repo.manager_lock():
+        async with repo.manager_lock() as lock_conn:
             if events is not None:
                 events("phase", {"phase": "PREPARE"})
             result = await repo.prepare_active_scope(
                 batch_size=batch_size,
                 event=events,
+                lock_conn=lock_conn,
             )
         summary = await repo.status_summary(include_coverage=False)
     finally:
