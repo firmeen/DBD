@@ -2254,7 +2254,6 @@ def campaign_status(run_id: int, *, diagnostics: bool = False) -> dict:
         state["control_status"] = runtime_status
     else:
         state["control_status"] = "offline"
-    state["circuit_state"] = "closed"
     if diagnostics:
         state["failure_diagnostics"] = _failure_diagnostics(run_id)
 
