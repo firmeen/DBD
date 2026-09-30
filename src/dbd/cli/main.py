@@ -678,7 +678,7 @@ def main():
         p.add_argument(
             "--endpoint-rates",
             type=endpoint_rate_map,
-            help="Optional adaptive targets such as profile=20,industry_benchmark=8",
+            help="Optional per-endpoint caps such as profile=20,industry_benchmark=8",
         )
         p.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
         if name == "fetch-company":
