@@ -128,7 +128,7 @@ def create_deep_engine() -> AsyncEngine:
             port=settings.db_port,
             database=settings.db_name,
         ),
-        pool_size=settings.db_pool_size,
+        pool_size=max(2, settings.db_pool_size),
         max_overflow=0,
         pool_pre_ping=True,
         isolation_level="READ COMMITTED",
@@ -166,18 +166,18 @@ def _is_retryable_db_error(exc: BaseException) -> bool:
     return False
 
 
-def _status_case() -> str:
-    return """
+def _status_case(required_expr: str = "required_mask") -> str:
+    return f"""
     CASE
-        WHEN (((done_mask | not_available_mask | failed_mask) & required_mask) = required_mask)
-             AND ((failed_mask & required_mask) = 0)
+        WHEN (((done_mask | not_available_mask | failed_mask) & ({required_expr})) = ({required_expr}))
+             AND ((failed_mask & ({required_expr})) = 0)
         THEN 'COMPLETE'
-        WHEN (((done_mask | not_available_mask | failed_mask) & required_mask) = required_mask)
-             AND ((failed_mask & required_mask) = required_mask)
+        WHEN (((done_mask | not_available_mask | failed_mask) & ({required_expr})) = ({required_expr}))
+             AND ((failed_mask & ({required_expr})) = ({required_expr}))
         THEN 'FAILED'
-        WHEN (((done_mask | not_available_mask | failed_mask) & required_mask) = required_mask)
+        WHEN (((done_mask | not_available_mask | failed_mask) & ({required_expr})) = ({required_expr}))
         THEN 'PARTIAL'
-        WHEN (((done_mask | not_available_mask | failed_mask) & required_mask) = 0)
+        WHEN (((done_mask | not_available_mask | failed_mask) & ({required_expr})) = 0)
         THEN 'PENDING'
         ELSE 'COLLECTING'
     END
@@ -357,57 +357,57 @@ class DeepRepository:
 
         return await self._transaction(op)
 
-    async def reconcile_active_scope(self) -> int:
+    async def reconcile_active_scope(self, batch_size: int = 10000) -> int:
         """Adopt builder-created Deep rows into the seven-endpoint contract.
 
-        Inactive nationality/history bits are preserved in done/NA/failed masks,
-        but they are excluded from required_mask and therefore cannot block
-        COMPLETE for the active collector.
+        Reconciliation is chunked so adopting hundreds of thousands of legacy
+        Deep rows never holds one table-wide transaction for the whole pass.
+        Inactive nationality/history outcome bits are preserved, but they are
+        excluded from required_mask and cannot block active-scope completion.
         """
+        batch_size = max(100, int(batch_size))
         financial_required = (
             f"CASE WHEN NULLIF(TRIM(submit_fin_year),'') IS NULL "
             f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
         )
-        status_case = _status_case()
+        status_case = _status_case(financial_required)
+        resolved = (
+            f"(((done_mask | not_available_mask | failed_mask) "
+            f"& ({financial_required})) = ({financial_required}))"
+        )
+        total_changed = 0
 
-        async def op(conn: AsyncConnection) -> int:
-            changed = await conn.execute(
-                text(
-                    f"""
-                    UPDATE {DEEP_TABLE}
-                    SET required_mask={financial_required}
-                    WHERE required_mask <> {financial_required}
-                    """
+        while True:
+            async def op(conn: AsyncConnection) -> int:
+                result = await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET required_mask={financial_required},
+                            deep_status={status_case},
+                            deep_completed_at=CASE
+                                WHEN {resolved}
+                                THEN COALESCE(
+                                    deep_completed_at,
+                                    last_request_at,
+                                    updated_at
+                                )
+                                ELSE NULL
+                            END
+                        WHERE required_mask <> {financial_required}
+                           OR deep_status <> {status_case}
+                           OR (deep_completed_at IS NULL AND {resolved})
+                           OR (deep_completed_at IS NOT NULL AND NOT {resolved})
+                        LIMIT {batch_size}
+                        """
+                    )
                 )
-            )
-            await conn.execute(
-                text(
-                    f"""
-                    UPDATE {DEEP_TABLE}
-                    SET deep_status={status_case},
-                        deep_completed_at=CASE
-                            WHEN (((done_mask | not_available_mask | failed_mask)
-                                   & required_mask) = required_mask)
-                            THEN COALESCE(last_request_at, updated_at)
-                            ELSE NULL
-                        END
-                    WHERE deep_status <> {status_case}
-                       OR (
-                            deep_completed_at IS NULL
-                            AND (((done_mask | not_available_mask | failed_mask)
-                                  & required_mask) = required_mask)
-                          )
-                       OR (
-                            deep_completed_at IS NOT NULL
-                            AND (((done_mask | not_available_mask | failed_mask)
-                                  & required_mask) <> required_mask)
-                          )
-                    """
-                )
-            )
-            return int(changed.rowcount or 0)
+                return int(result.rowcount or 0)
 
-        return await self._transaction(op)
+            changed = await self._transaction(op)
+            total_changed += changed
+            if changed < batch_size:
+                return total_changed
 
     async def assert_invariants(self) -> None:
         async with self.engine.connect() as conn:
