@@ -42,6 +42,8 @@ def test_active_scope_masks_and_latest_fiscal_year():
     assert latest_fiscal_year(None) is None
     assert latest_fiscal_year("") is None
     assert latest_fiscal_year("2567 2568") == "2568"
+    assert latest_fiscal_year("2568 2567") == "2568"
+    assert latest_fiscal_year("  2568\t2567  ") == "2568"
 
     assert required_mask(None) == BASE_REQUIRED_MASK
     assert required_mask("") == BASE_REQUIRED_MASK
