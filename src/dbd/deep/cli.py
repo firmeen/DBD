@@ -99,8 +99,6 @@ class TerminalEvents:
             print("ACTIVE ENDPOINTS: " + ", ".join(payload["active_endpoints"]))
             if payload.get("runtime_recovered"):
                 print(f"RECOVERED RUNNING: {int(payload['runtime_recovered']):,}")
-            if payload.get("scope_reconciled"):
-                print(f"RECONCILED SCOPE: {int(payload['scope_reconciled']):,}")
             return
 
         if name in {"retry_wait", "worker_error"}:
