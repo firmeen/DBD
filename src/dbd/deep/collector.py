@@ -22,6 +22,7 @@ from .catalog import (
     ACTIVE_ENDPOINTS,
     BASE_REQUIRED_MASK,
     FINANCIAL_ENDPOINTS,
+    SUBMIT_FIN_YEAR_MAX_LENGTH,
     EndpointSpec,
     latest_fiscal_year,
     unresolved_mask,
@@ -263,15 +264,26 @@ class DeepCollector:
                 "present_fields",
                 set(),
             )
-            return (
-                "done",
-                (
-                    str(fiscal_year).strip()
-                    if fiscal_year is not None and str(fiscal_year).strip()
-                    else None
-                ),
-                fiscal_present,
+            fiscal_value = (
+                str(fiscal_year).strip()
+                if fiscal_year is not None and str(fiscal_year).strip()
+                else None
             )
+            if (
+                fiscal_value is not None
+                and len(fiscal_value) > SUBMIT_FIN_YEAR_MAX_LENGTH
+            ):
+                canonical_year = latest_fiscal_year(fiscal_value)
+                if (
+                    canonical_year is None
+                    or len(canonical_year) > SUBMIT_FIN_YEAR_MAX_LENGTH
+                ):
+                    raise ContractError(
+                        "profile submitFinYear exceeds storage bound and "
+                        "cannot be reduced to a usable fiscal year"
+                    )
+                fiscal_value = canonical_year
+            return "done", fiscal_value, fiscal_present
 
         if spec.key == "industry_benchmark" and normalized is None:
             return "not_available", None, False
