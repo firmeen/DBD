@@ -81,7 +81,7 @@ def latest_fiscal_year(value: object) -> str | None:
     # DBD normally uses whitespace-separated Buddhist years. Extracting
     # standalone four-digit values also handles legacy comma/slash-separated
     # payloads without changing the normal "2567 2568" behavior.
-    numeric_years = re.findall(r"(?<!\\d)\\d{4}(?!\\d)", text_value)
+    numeric_years = re.findall(r"(?<!\d)\d{4}(?!\d)", text_value)
     if numeric_years:
         return max(numeric_years, key=int)
 
