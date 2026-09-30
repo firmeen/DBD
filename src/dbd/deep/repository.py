@@ -1794,96 +1794,108 @@ class DeepRepository:
 
         return await self._transaction(op)
 
-    async def retry_failed(self, limit: int | None = None) -> int:
-        limit_sql = "" if limit is None else "LIMIT :limit"
-        params: dict[str, object] = {}
-        if limit is not None:
-            params["limit"] = max(1, int(limit))
+    async def retry_failed(
+        self,
+        limit: int | None = None,
+        *,
+        batch_size: int = 500,
+    ) -> int:
+        """Reopen failed active-scope rows without materializing runtime work.
 
-        async def op(conn: AsyncConnection) -> int:
-            keys = (
+        Failed bits are cleared in bounded transactions. The normal collector
+        refill path later seeds these reopened PENDING/COLLECTING rows into the
+        bounded runtime working set, preserving the single runtime-buffer
+        invariant even when the failed population is very large.
+        """
+        batch_size = max(50, min(int(batch_size), 2000))
+        remaining = None if limit is None else max(1, int(limit))
+        total = 0
+
+        while remaining is None or remaining > 0:
+            take = batch_size if remaining is None else min(batch_size, remaining)
+
+            async def op(conn: AsyncConnection) -> int:
+                rows = (
+                    await conn.execute(
+                        text(
+                            f"""
+                            SELECT jp_type_code, jp_no
+                            FROM {DEEP_TABLE}
+                            WHERE deep_status IN (
+                                'COLLECTING',
+                                'PARTIAL',
+                                'FAILED'
+                            )
+                              AND (failed_mask & required_mask) <> 0
+                            ORDER BY
+                                COALESCE(last_error_at, updated_at),
+                                jp_type_code,
+                                jp_no
+                            LIMIT :limit
+                            FOR UPDATE SKIP LOCKED
+                            """
+                        ),
+                        {"limit": int(take)},
+                    )
+                ).mappings().all()
+                selected = [
+                    (str(row["jp_type_code"]), str(row["jp_no"]))
+                    for row in rows
+                ]
+                if not selected:
+                    return 0
+
+                predicate, key_params = self._key_predicate(selected)
                 await conn.execute(
                     text(
                         f"""
-                        SELECT jp_type_code, jp_no
-                        FROM {DEEP_TABLE}
-                        WHERE deep_status IN ('COLLECTING','PARTIAL','FAILED')
-                          AND (failed_mask & required_mask) <> 0
-                        ORDER BY COALESCE(last_error_at, updated_at), jp_type_code, jp_no
-                        {limit_sql}
-                        FOR UPDATE SKIP LOCKED
+                        UPDATE {DEEP_TABLE}
+                        SET failed_mask=(
+                                failed_mask & ~{ACTIVE_ENDPOINT_MASK}
+                            ),
+                            deep_completed_at=NULL,
+                            last_error=NULL,
+                            last_error_at=NULL
+                        WHERE {predicate}
                         """
                     ),
-                    params,
+                    key_params,
                 )
-            ).mappings().all()
-            selected = [
-                (str(row["jp_type_code"]), str(row["jp_no"]))
-                for row in keys
-            ]
-            if not selected:
-                return 0
+                await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET deep_status={_status_case()}
+                        WHERE {predicate}
+                        """
+                    ),
+                    key_params,
+                )
+                # Terminal rows normally have no runtime row. Remove any stale
+                # one from an interrupted older run rather than enqueueing the
+                # whole retry population here; bounded refill owns scheduling.
+                await conn.execute(
+                    text(
+                        f"""
+                        DELETE FROM {RUNTIME_TABLE}
+                        WHERE {predicate}
+                        """
+                    ),
+                    key_params,
+                )
+                return len(selected)
 
-            predicate, key_params = self._key_predicate(selected)
-            deep_predicate, _ = self._key_predicate(selected, alias="d")
-            await conn.execute(
-                text(
-                    f"""
-                    UPDATE {DEEP_TABLE}
-                    SET failed_mask=(failed_mask & ~{ACTIVE_ENDPOINT_MASK}),
-                        deep_completed_at=NULL,
-                        last_error=NULL,
-                        last_error_at=NULL
-                    WHERE {predicate}
-                    """
-                ),
-                key_params,
-            )
-            await conn.execute(
-                text(
-                    f"""
-                    UPDATE {DEEP_TABLE}
-                    SET deep_status={_status_case()}
-                    WHERE {predicate}
-                    """
-                ),
-                key_params,
-            )
-            await conn.execute(
-                text(
-                    f"""
-                    INSERT INTO {RUNTIME_TABLE} (
-                        jp_type_code,
-                        jp_no,
-                        status,
-                        attempts,
-                        available_at,
-                        last_error
-                    )
-                    SELECT
-                        d.jp_type_code,
-                        d.jp_no,
-                        'PENDING',
-                        0,
-                        UTC_TIMESTAMP(6),
-                        NULL
-                    FROM {DEEP_TABLE} d
-                    WHERE {deep_predicate}
-                    ON DUPLICATE KEY UPDATE
-                        status='PENDING',
-                        attempts=0,
-                        available_at=UTC_TIMESTAMP(6),
-                        last_error=NULL
-                    """
-                ),
-                key_params,
-            )
-            return len(selected)
+            # Each batch selects a moving failed set. On ambiguous commit, stop
+            # and let the operator rerun; already-committed rows are no longer
+            # failed and therefore cannot be selected twice.
+            changed = await self._transaction(op, attempts=1)
+            total += changed
+            if changed == 0:
+                break
+            if remaining is not None:
+                remaining -= changed
 
-        # LIMIT selects a moving failed set. Preserve exact retry semantics by
-        # failing on commit ambiguity; rerunning the command is idempotent from
-        # the durable masks and runtime primary key.
-        return await self._transaction(op, attempts=1)
+        return total
 
     async def coverage_summary(self) -> dict[str, dict[str, int]]:
         if not await self.is_prepared():
