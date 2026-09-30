@@ -11,11 +11,17 @@ from ..contracts.company import normalize as normalize_profile
 from ..contracts.financial import normalize_statements, normalize_submissions
 from ..contracts.identity import identity
 from ..contracts.strict import normalize_collection, normalize_industry_benchmark
-from ..core.exceptions import ContractError, DbdAuthError, DbdForbiddenError
+from ..core.exceptions import (
+    ContractError,
+    DbdAuthError,
+    DbdForbiddenError,
+    IdentityConflict,
+)
 from .catalog import (
     ACTIVE_ENDPOINTS,
     FINANCIAL_ENDPOINTS,
     EndpointSpec,
+    latest_fiscal_year,
     unresolved_mask,
 )
 from .http import (
@@ -25,7 +31,7 @@ from .http import (
     DeepTransientHttpError,
     FixedRateDbdClient,
 )
-from .repository import DeepRepository
+from .repository import DeepRepository, DeepTransientDatabaseError
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
@@ -60,7 +66,10 @@ def _json_default(value: object):
     if isinstance(value, (datetime, date)):
         return value.isoformat()
     if isinstance(value, Decimal):
-        return str(value)
+        # Preserve JSON numeric type. The source decoder uses Decimal for
+        # contract precision, but Deep payload JSON must not turn numbers into
+        # quoted strings.
+        return float(value)
     raise TypeError(type(value).__name__)
 
 
@@ -97,14 +106,6 @@ def _retry_delay(attempts: int) -> int:
     return min(300, max(5, 5 * (2 ** min(max(attempts - 1, 0), 6))))
 
 
-def _derive_fiscal_year(value: object) -> str | None:
-    # Keep the proven legacy/fabric behavior without importing either runtime:
-    # DBD can expose multiple submitted years in one whitespace-separated field,
-    # while each financial endpoint requires exactly one fiscalYear parameter.
-    years = [part for part in str(value or "").split() if part]
-    return max(years) if years else None
-
-
 class DeepCollector:
     def __init__(
         self,
@@ -117,10 +118,12 @@ class DeepCollector:
         company_limit: int | None = None,
         event: EventCallback | None = None,
     ) -> None:
-        if concurrency < 1:
-            raise ValueError("concurrency must be positive")
-        if rate_per_second <= 0:
-            raise ValueError("rate_per_second must be positive")
+        if concurrency < 1 or concurrency > 256:
+            raise ValueError("concurrency must be between 1 and 256")
+        if rate_per_second <= 0 or rate_per_second > 1000:
+            raise ValueError("rate_per_second must be between 0 and 1000")
+        if http_retries < 0 or http_retries > 10:
+            raise ValueError("http_retries must be between 0 and 10")
         if company_limit is not None and company_limit < 1:
             raise ValueError("company_limit must be positive")
 
@@ -132,6 +135,8 @@ class DeepCollector:
             self.concurrency,
             int(buffer_size or max(32, self.concurrency * 4)),
         )
+        if self.buffer_size > 10000:
+            raise ValueError("buffer_size must be <= 10000")
         self.company_limit = company_limit
         self.event = event
 
@@ -205,7 +210,7 @@ class DeepCollector:
         )
         params: dict[str, object] | None = None
         if spec.key in FINANCIAL_ENDPOINTS:
-            fiscal_year = _derive_fiscal_year(company.get("submit_fin_year"))
+            fiscal_year = latest_fiscal_year(company.get("submit_fin_year"))
             if fiscal_year is None:
                 raise RuntimeError(
                     f"{spec.key} is required but submit_fin_year is empty"
@@ -218,7 +223,7 @@ class DeepCollector:
         spec: EndpointSpec,
         company: dict[str, Any],
         payload: object,
-    ) -> tuple[str, str | None]:
+    ) -> tuple[str, str | None, bool]:
         normalized = _normalize_resource(spec.key, payload)
 
         if spec.key == "profile":
@@ -228,20 +233,29 @@ class DeepCollector:
                 getattr(normalized, "jp_type_code", None),
             )
             if actual != expected:
-                raise ContractError(
+                raise IdentityConflict(
                     f"profile identity mismatch: expected {expected.code}, got {actual.code}"
                 )
             fiscal_year = getattr(normalized, "submit_fin_year", None)
-            return "done", (
-                str(fiscal_year).strip()
-                if fiscal_year is not None and str(fiscal_year).strip()
-                else None
+            fiscal_present = "submit_fin_year" in getattr(
+                normalized,
+                "present_fields",
+                set(),
+            )
+            return (
+                "done",
+                (
+                    str(fiscal_year).strip()
+                    if fiscal_year is not None and str(fiscal_year).strip()
+                    else None
+                ),
+                fiscal_present,
             )
 
         if spec.key == "industry_benchmark" and normalized is None:
-            return "not_available", None
+            return "not_available", None, False
 
-        return "done", None
+        return "done", None, False
 
     async def _commit_outcome(
         self,
@@ -254,6 +268,7 @@ class DeepCollector:
         requested_at: datetime | None,
         error: str | None = None,
         profile_submit_fin_year: str | None = None,
+        profile_submit_fin_year_present: bool = False,
     ) -> None:
         state = await self.repo.commit_endpoint(
             jp_type_code=str(company["jp_type_code"]),
@@ -271,6 +286,7 @@ class DeepCollector:
             error=error,
             requested_at=requested_at,
             profile_submit_fin_year=profile_submit_fin_year,
+            profile_submit_fin_year_present=profile_submit_fin_year_present,
         )
         company.update(state)
 
@@ -309,14 +325,25 @@ class DeepCollector:
                     referer=spec.referer_template,
                 )
             except DeepNotAvailable as exc:
+                requested_at = datetime.now(timezone.utc).replace(tzinfo=None)
                 await self._commit_outcome(
                     company,
                     spec,
                     outcome="not_available",
                     payload=None,
                     http_status=exc.status,
-                    requested_at=datetime.now(timezone.utc).replace(tzinfo=None),
+                    requested_at=requested_at,
                 )
+                if spec.key == "profile":
+                    company.update(
+                        await self.repo.resolve_profile_dependencies(
+                            jp_type_code,
+                            jp_no,
+                            outcome="not_available",
+                            requested_at=requested_at,
+                            error="profile: HTTP 404",
+                        )
+                    )
                 continue
             except DeepTransientHttpError as exc:
                 delay = _retry_delay(int(company["attempts"]))
@@ -337,24 +364,41 @@ class DeepCollector:
                 )
                 return
             except (DeepPermanentHttpError, DeepDecodeError) as exc:
+                requested_at = datetime.now(timezone.utc).replace(tzinfo=None)
+                error = f"{spec.key}: {exc}"
                 await self._commit_outcome(
                     company,
                     spec,
                     outcome="failed",
                     payload=None,
                     http_status=exc.status,
-                    requested_at=datetime.now(timezone.utc).replace(tzinfo=None),
-                    error=f"{spec.key}: {exc}",
+                    requested_at=requested_at,
+                    error=error,
                 )
+                if spec.key == "profile":
+                    company.update(
+                        await self.repo.resolve_profile_dependencies(
+                            jp_type_code,
+                            jp_no,
+                            outcome="failed",
+                            requested_at=requested_at,
+                            error=error,
+                        )
+                    )
                 continue
 
             try:
-                outcome, profile_submit_fin_year = self._validate_payload(
+                (
+                    outcome,
+                    profile_submit_fin_year,
+                    profile_submit_fin_year_present,
+                ) = self._validate_payload(
                     spec,
                     company,
                     response.data,
                 )
-            except (ContractError, TypeError, ValueError) as exc:
+            except IdentityConflict as exc:
+                error = f"profile: IdentityConflict: {exc}"
                 await self._commit_outcome(
                     company,
                     spec,
@@ -362,8 +406,46 @@ class DeepCollector:
                     payload=None,
                     http_status=response.status,
                     requested_at=response.requested_at,
-                    error=f"{spec.key}: {type(exc).__name__}: {exc}",
+                    error=error,
                 )
+                company.update(
+                    await self.repo.fail_unresolved_identity(
+                        jp_type_code,
+                        jp_no,
+                        error=error,
+                    )
+                )
+                await self.repo.finish_runtime(jp_type_code, jp_no)
+                await self._bump(companies_finished=1)
+                self._emit(
+                    "worker_error",
+                    jp_type_code=jp_type_code,
+                    jp_no=jp_no,
+                    endpoint=spec.key,
+                    error=error,
+                )
+                return
+            except (ContractError, TypeError, ValueError) as exc:
+                error = f"{spec.key}: {type(exc).__name__}: {exc}"
+                await self._commit_outcome(
+                    company,
+                    spec,
+                    outcome="failed",
+                    payload=None,
+                    http_status=response.status,
+                    requested_at=response.requested_at,
+                    error=error,
+                )
+                if spec.key == "profile":
+                    company.update(
+                        await self.repo.resolve_profile_dependencies(
+                            jp_type_code,
+                            jp_no,
+                            outcome="failed",
+                            requested_at=response.requested_at,
+                            error=error,
+                        )
+                    )
                 continue
 
             await self._commit_outcome(
@@ -374,6 +456,7 @@ class DeepCollector:
                 http_status=response.status,
                 requested_at=response.requested_at,
                 profile_submit_fin_year=profile_submit_fin_year,
+                profile_submit_fin_year_present=profile_submit_fin_year_present,
             )
 
         unresolved = unresolved_mask(
@@ -383,9 +466,6 @@ class DeepCollector:
             int(company["failed_mask"]),
         )
         if unresolved:
-            # This should normally be reachable only when the catalog/required
-            # contract changed during the run. Keep the company durable rather
-            # than deleting its runtime row.
             delay = _retry_delay(int(company["attempts"]))
             await self.repo.retry_wait(
                 jp_type_code,
@@ -419,7 +499,8 @@ class DeepCollector:
                     if runtime == 0:
                         self._stop.set()
                         return
-                    await asyncio.sleep(0.5)
+                    delay = await self.repo.next_runtime_delay()
+                    await asyncio.sleep(delay if delay is not None else 0.5)
                     continue
 
             try:
@@ -428,22 +509,19 @@ class DeepCollector:
                 raise
             except asyncio.CancelledError:
                 raise
-            except BaseException as exc:
-                # DB/infrastructure exceptions are not endpoint failures. Put
-                # the company back into durable retry state when MySQL is still
-                # reachable; if that update also fails, bubble up so restart
-                # recovery converts RUNNING -> PENDING.
-                try:
-                    delay = _retry_delay(int(company["attempts"]))
-                    await self.repo.retry_wait(
-                        str(company["jp_type_code"]),
-                        str(company["jp_no"]),
-                        delay_seconds=delay,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
-                    await self._bump(companies_retry_wait=1)
-                except BaseException:
-                    raise exc
+            except DeepTransientDatabaseError as exc:
+                # Endpoint payload writes are idempotent, so an exhausted
+                # transient DB failure can safely return the company to durable
+                # retry state. Programming/schema errors are intentionally not
+                # caught here and stop the collector.
+                delay = _retry_delay(int(company["attempts"]))
+                await self.repo.retry_wait(
+                    str(company["jp_type_code"]),
+                    str(company["jp_no"]),
+                    delay_seconds=delay,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+                await self._bump(companies_retry_wait=1)
                 self._emit(
                     "worker_error",
                     worker=worker_no,
@@ -461,29 +539,38 @@ class DeepCollector:
                 pass
 
     async def run(self) -> dict[str, Any]:
-        self._specs = await self.repo.preflight()
+        self._emit("phase", phase="PREFLIGHT")
+        self._specs = await self.repo.preflight(
+            require_runtime=True,
+            require_prepared=True,
+            check_indexes=True,
+        )
 
         async with self.repo.manager_lock() as lock_conn:
+            self._emit("phase", phase="RECOVER")
             self.stats.runtime_recovered = await self.repo.recover_runtime()
-            self.stats.scope_reconciled = await self.repo.reconcile_active_scope()
-            await self.repo.assert_invariants()
+            await self.repo.assert_no_overlap()
+
+            self._emit("phase", phase="REFILL")
             await self._refill()
 
-            self._emit(
-                "started",
-                concurrency=self.concurrency,
-                rate_per_second=self.rate_per_second,
-                buffer_size=self.buffer_size,
-                company_limit=self.company_limit,
-                active_endpoints=list(ACTIVE_ENDPOINTS),
-                **asdict(self.stats),
-            )
-
+            self._emit("phase", phase="AUTH")
             async with FixedRateDbdClient(
                 concurrency=self.concurrency,
                 rate_per_second=self.rate_per_second,
                 max_retries=self.http_retries,
             ) as client:
+                self._emit(
+                    "started",
+                    concurrency=self.concurrency,
+                    rate_per_second=self.rate_per_second,
+                    buffer_size=self.buffer_size,
+                    company_limit=self.company_limit,
+                    active_endpoints=list(ACTIVE_ENDPOINTS),
+                    **asdict(self.stats),
+                )
+                self._emit("phase", phase="RUNNING")
+
                 async with asyncio.TaskGroup() as group:
                     group.create_task(self._monitor_lock(lock_conn))
                     for worker_no in range(1, self.concurrency + 1):
@@ -497,5 +584,6 @@ class DeepCollector:
                     "configured_rate": client.rate_per_second,
                 }
 
-        result["status"] = await self.repo.status_summary()
+        result["status"] = await self.repo.status_summary(include_coverage=False)
         return result
+
