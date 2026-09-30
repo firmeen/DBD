@@ -643,11 +643,18 @@ class DeepRepository:
                     {lower_range}
                 """
 
+                clean_done = f"(done_mask & ~({done_clear_expr}))"
+                unresolved_after_repair = (
+                    f"({FINANCIAL_MASK} & ~("
+                    f"{clean_done} | not_available_mask | failed_mask"
+                    f"))"
+                )
                 masks = await conn.execute(
                     text(
                         f"""
                         UPDATE {DEEP_TABLE}
                         SET
+                            done_mask={clean_done},
                             not_available_mask=(
                                 not_available_mask
                                 | CASE
@@ -656,22 +663,9 @@ class DeepRepository:
                                     THEN {benchmark_bit}
                                     ELSE 0
                                   END
-                            ),
-                            done_mask=(
-                                done_mask & ~({done_clear_expr})
-                            ),
-                            not_available_mask=(
-                                not_available_mask
                                 | CASE
                                     WHEN (not_available_mask & {profile_bit}) <> 0
-                                    THEN (
-                                        {FINANCIAL_MASK}
-                                        & ~(
-                                            done_mask
-                                            | not_available_mask
-                                            | failed_mask
-                                        )
-                                    )
+                                    THEN {unresolved_after_repair}
                                     ELSE 0
                                   END
                             ),
@@ -679,14 +673,7 @@ class DeepRepository:
                                 failed_mask
                                 | CASE
                                     WHEN (failed_mask & {profile_bit}) <> 0
-                                    THEN (
-                                        {FINANCIAL_MASK}
-                                        & ~(
-                                            done_mask
-                                            | not_available_mask
-                                            | failed_mask
-                                        )
-                                    )
+                                    THEN {unresolved_after_repair}
                                     ELSE 0
                                   END
                             )
@@ -1543,29 +1530,10 @@ class DeepRepository:
                 )
             )
             if unresolved:
-                updates = []
                 meta_args: dict[str, object] = {
                     "dependency_error": error[:1000],
                     "requested_at": requested_at,
                 }
-                for endpoint in (
-                    "financial_submissions",
-                    "financial_statements",
-                    "industry_benchmark",
-                ):
-                    endpoint_bit = ENDPOINT_BITS[endpoint]
-                    if unresolved & endpoint_bit:
-                        updates.extend(
-                            (
-                                f'endpoint_meta=JSON_SET('
-                                f'COALESCE(endpoint_meta, JSON_OBJECT()), '
-                                f'\'$."{endpoint}"\', '
-                                f'JSON_OBJECT('
-                                f'\'status\', :dependency_status, '
-                                f'\'requested_at\', :requested_at, '
-                                f'\'error\', :dependency_error))',
-                            )
-                        )
 
                 mask_set = (
                     f"not_available_mask=(not_available_mask | {unresolved})"
