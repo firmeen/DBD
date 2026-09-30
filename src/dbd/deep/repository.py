@@ -884,12 +884,14 @@ class DeepRepository:
                     LEFT JOIN {RUNTIME_TABLE} r
                       ON r.jp_type_code=d.jp_type_code
                      AND r.jp_no=d.jp_no
-                    WHERE r.jp_no IS NULL
-                      AND (
-                        ((d.done_mask | d.not_available_mask | d.failed_mask)
-                          & d.required_mask) <> d.required_mask
-                      )
-                    ORDER BY d.updated_at, d.jp_type_code, d.jp_no
+                    WHERE d.deep_completed_at IS NULL
+                      AND d.deep_status IN ('PENDING','COLLECTING')
+                      AND r.jp_no IS NULL
+                    ORDER BY
+                        d.deep_completed_at,
+                        d.deep_status,
+                        d.jp_type_code,
+                        d.jp_no
                     LIMIT :limit
                     """
                 ),
@@ -897,10 +899,39 @@ class DeepRepository:
             )
             return int(result.rowcount or 0)
 
-        # This INSERT .. SELECT LIMIT chooses a moving set. If COMMIT succeeds
-        # but the connection is lost before acknowledgement, retrying could
-        # adopt a second set and grow the bounded runtime past its target.
+        # The persisted prepared status is the hot-path scheduling truth.
+        # This avoids re-evaluating bitwise completion expressions across Deep
+        # during every bounded refill.
         return await self._transaction(op, attempts=1)
+
+    async def next_runtime_delay(self) -> float | None:
+        async with self.engine.connect() as conn:
+            row = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            SUM(status='RUNNING') AS running,
+                            MIN(
+                                CASE
+                                    WHEN status='RETRY_WAIT'
+                                    THEN available_at
+                                    ELSE NULL
+                                END
+                            ) AS next_retry
+                        FROM {RUNTIME_TABLE}
+                        """
+                    )
+                )
+            ).mappings().one()
+
+        if int(row["running"] or 0) > 0:
+            return 0.5
+        retry_at = row["next_retry"]
+        if retry_at is None:
+            return None
+        now = datetime.utcnow()
+        return max(0.5, min(30.0, (retry_at - now).total_seconds()))
 
     @staticmethod
     def _key_predicate(
