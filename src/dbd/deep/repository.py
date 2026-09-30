@@ -18,6 +18,7 @@ from .catalog import (
     ENDPOINT_BITS,
     FINANCIAL_MASK,
     INACTIVE_ENDPOINTS,
+    SUBMIT_FIN_YEAR_MAX_LENGTH,
     EndpointSpec,
     latest_fiscal_year,
     parse_catalog_rows,
@@ -570,7 +571,7 @@ class DeepRepository:
 
         benchmark_bit = ENDPOINT_BITS["industry_benchmark"]
         profile_bit = ENDPOINT_BITS["profile"]
-        profile_fiscal = f"""
+        profile_fiscal_raw = f"""
             CASE
                 WHEN (done_mask & {profile_bit}) <> 0
                  AND profile_data IS NOT NULL
@@ -589,6 +590,27 @@ class DeepRepository:
                     )
                 END
                 ELSE submit_fin_year
+            END
+        """
+        oversized_profile_fiscal = f"""
+            (done_mask & {profile_bit}) <> 0
+            AND profile_data IS NOT NULL
+            AND JSON_TYPE(profile_data) <> 'NULL'
+            AND JSON_CONTAINS_PATH(profile_data, 'one', '$.submitFinYear')
+            AND JSON_TYPE(JSON_EXTRACT(profile_data, '$.submitFinYear')) <> 'NULL'
+            AND CHAR_LENGTH(
+                TRIM(
+                    JSON_UNQUOTE(
+                        JSON_EXTRACT(profile_data, '$.submitFinYear')
+                    )
+                )
+            ) > {SUBMIT_FIN_YEAR_MAX_LENGTH}
+        """
+        profile_fiscal = f"""
+            CASE
+                WHEN {oversized_profile_fiscal}
+                THEN submit_fin_year
+                ELSE ({profile_fiscal_raw})
             END
         """
         required_expr = f"""
@@ -659,6 +681,41 @@ class DeepRepository:
                     )
                     {lower_range}
                 """
+
+                oversized_reset = await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET
+                            financial_submissions_data=NULL,
+                            financial_statements_data=NULL,
+                            industry_benchmark_data=NULL,
+                            done_mask=(
+                                done_mask
+                                & ~({profile_bit} | {FINANCIAL_MASK})
+                            ),
+                            not_available_mask=(
+                                not_available_mask
+                                & ~({profile_bit} | {FINANCIAL_MASK})
+                            ),
+                            failed_mask=(
+                                failed_mask
+                                & ~({profile_bit} | {FINANCIAL_MASK})
+                            ),
+                            endpoint_meta=JSON_REMOVE(
+                                COALESCE(endpoint_meta, JSON_OBJECT()),
+                                '$."profile"',
+                                '$."financial_submissions"',
+                                '$."financial_statements"',
+                                '$."industry_benchmark"'
+                            ),
+                            deep_completed_at=NULL
+                        WHERE {key_range}
+                          AND {oversized_profile_fiscal}
+                        """
+                    ),
+                    range_params,
+                )
 
                 clean_done = f"(done_mask & ~({done_clear_expr}))"
                 unresolved_after_repair = (
@@ -827,7 +884,8 @@ class DeepRepository:
                     end_type,
                     end_no,
                     len(keys),
-                    int(masks.rowcount or 0)
+                    int(oversized_reset.rowcount or 0)
+                    + int(masks.rowcount or 0)
                     + int(fiscal_reset.rowcount or 0)
                     + int(payloads.rowcount or 0)
                     + int(statuses.rowcount or 0),
