@@ -154,6 +154,8 @@ async def _retry(limit: int | None, json_mode: bool) -> int:
     try:
         await repo.preflight()
         async with repo.manager_lock():
+            await repo.reconcile_active_scope()
+            await repo.assert_invariants()
             count = await repo.retry_failed(limit)
         summary = await repo.status_summary()
     finally:
