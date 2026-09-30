@@ -139,12 +139,13 @@ class FixedRateDbdClient:
             if force:
                 self._auth.invalidate()
                 self._token = None
-            self._token = await asyncio.to_thread(
-                self._auth.get_token,
-                self._auth_session,
-            )
-            if self._session is not None:
-                self._session.cookies.update(self._auth_session.cookies)
+            if self._token is None or time.time() >= self._auth._expires_at - 15:
+                self._token = await asyncio.to_thread(
+                    self._auth.get_token,
+                    self._auth_session,
+                )
+                if self._session is not None:
+                    self._session.cookies.update(self._auth_session.cookies)
             return self._token
 
     def _headers(self, token: str, referer: str) -> dict[str, str]:
