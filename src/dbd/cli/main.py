@@ -337,21 +337,24 @@ def _add_campaign_worker_options(parser):
         "--worker-rate",
         type=positive_rate,
         default=settings.dbd_rate_per_second,
-        help="Legacy/local rate input; explicit fleet-rate options decouple the fleet ceiling",
+        help="Per-worker local request cap; Redis separately enforces the fleet ceiling",
     )
     parser.add_argument(
         "--rate-mode",
         choices=("shared", "multiply", "adaptive"),
         default="adaptive",
         help=(
-            "Legacy rate derivation when fleet-rate options are omitted. "
-            "Explicit fleet-rate options keep the HTTP budget independent of worker count."
+            "Legacy ceiling-derivation name kept for existing profiles; runtime pacing is fixed, "
+            "not adaptive. Explicit fleet-rate options keep the HTTP budget independent of worker count."
         ),
     )
     parser.add_argument(
         "--fleet-rate-initial",
         type=positive_rate,
-        help="Initial shared fleet rate; enables worker-independent fleet admission",
+        help=(
+            "Compatibility fleet-rate input. With --fleet-rate-max, runtime starts directly at the "
+            "fixed hard maximum; without it, this value is the fixed fleet ceiling."
+        ),
     )
     parser.add_argument(
         "--fleet-rate-max",
