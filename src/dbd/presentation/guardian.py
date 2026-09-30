@@ -101,13 +101,14 @@ class GuardianDashboard:
             f"workers live {_int(redis.get('live_workers'))}   "
             f"stale memberships {_int(redis.get('stale_memberships'))}",
         )
+        fleet_cap = profile.get("fleet_rate_max") or profile.get("fleet_rate_initial") or "--"
         control.add_row(
             "PROFILE",
             f"workers {_int(profile.get('workers'))} "
             f"[{_int(profile.get('workers_min'))}-{_int(profile.get('workers_max'))}]   "
             f"concurrency {_int(profile.get('worker_concurrency'))}   "
-            f"rate {profile.get('fleet_rate_initial') or '--'}"
-            f"->{profile.get('fleet_rate_max') or '--'}",
+            f"worker cap {profile.get('worker_rate') or '--'}/s   "
+            f"fleet cap {fleet_cap}/s",
         )
         control.add_row("RATE KEY", str(profile.get("redis_rate_key") or "--"))
 
