@@ -403,15 +403,21 @@ class DeepRepository:
             ).mappings().all()
         return parse_catalog_rows([dict(row) for row in rows])
 
+    @staticmethod
+    def _manager_lock_params() -> dict[str, str]:
+        return {"lock_suffix": ":dbd-deep-collector"}
+
     @asynccontextmanager
     async def manager_lock(self):
         conn = await self.engine.connect()
+        params = self._manager_lock_params()
         try:
             acquired = (
                 await conn.execute(
                     text(
-                        "SELECT GET_LOCK(CONCAT(DATABASE(), ':dbd-deep-collector'), 0)"
-                    )
+                        "SELECT GET_LOCK(CONCAT(DATABASE(), :lock_suffix), 0)"
+                    ),
+                    params,
                 )
             ).scalar_one()
             if int(acquired or 0) != 1:
@@ -421,8 +427,9 @@ class DeepRepository:
             try:
                 await conn.execute(
                     text(
-                        "SELECT RELEASE_LOCK(CONCAT(DATABASE(), ':dbd-deep-collector'))"
-                    )
+                        "SELECT RELEASE_LOCK(CONCAT(DATABASE(), :lock_suffix))"
+                    ),
+                    params,
                 )
             except Exception:
                 pass
@@ -433,10 +440,11 @@ class DeepRepository:
             await conn.execute(
                 text(
                     """
-                    SELECT IS_USED_LOCK(CONCAT(DATABASE(), ':dbd-deep-collector'))
+                    SELECT IS_USED_LOCK(CONCAT(DATABASE(), :lock_suffix))
                            = CONNECTION_ID()
                     """
-                )
+                ),
+                self._manager_lock_params(),
             )
         ).scalar_one()
         if int(owned or 0) != 1:
