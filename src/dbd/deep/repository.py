@@ -684,6 +684,71 @@ class DeepRepository:
                     range_params,
                 )
 
+                old_effective_fiscal = (
+                    "NULLIF(SUBSTRING_INDEX(TRIM(COALESCE(submit_fin_year,'')),"
+                    " ' ', -1),'')"
+                )
+                new_effective_fiscal = (
+                    "NULLIF(SUBSTRING_INDEX(TRIM(COALESCE(("
+                    + profile_fiscal
+                    + "),'')), ' ', -1),'')"
+                )
+                fiscal_changed = (
+                    f"(NOT (({old_effective_fiscal}) <=> "
+                    f"({new_effective_fiscal})))"
+                )
+                fiscal_reset = await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET
+                            financial_submissions_data=CASE
+                                WHEN {fiscal_changed} THEN NULL
+                                ELSE financial_submissions_data
+                            END,
+                            financial_statements_data=CASE
+                                WHEN {fiscal_changed} THEN NULL
+                                ELSE financial_statements_data
+                            END,
+                            industry_benchmark_data=CASE
+                                WHEN {fiscal_changed} THEN NULL
+                                ELSE industry_benchmark_data
+                            END,
+                            done_mask=CASE
+                                WHEN {fiscal_changed}
+                                THEN (done_mask & ~{FINANCIAL_MASK})
+                                ELSE done_mask
+                            END,
+                            not_available_mask=CASE
+                                WHEN {fiscal_changed}
+                                THEN (not_available_mask & ~{FINANCIAL_MASK})
+                                ELSE not_available_mask
+                            END,
+                            failed_mask=CASE
+                                WHEN {fiscal_changed}
+                                THEN (failed_mask & ~{FINANCIAL_MASK})
+                                ELSE failed_mask
+                            END,
+                            endpoint_meta=CASE
+                                WHEN {fiscal_changed}
+                                THEN JSON_REMOVE(
+                                    COALESCE(endpoint_meta, JSON_OBJECT()),
+                                    '$."financial_submissions"',
+                                    '$."financial_statements"',
+                                    '$."industry_benchmark"'
+                                )
+                                ELSE endpoint_meta
+                            END,
+                            deep_completed_at=CASE
+                                WHEN {fiscal_changed} THEN NULL
+                                ELSE deep_completed_at
+                            END
+                        WHERE {key_range}
+                        """
+                    ),
+                    range_params,
+                )
+
                 payload_sets = []
                 for endpoint in ACTIVE_ENDPOINTS:
                     bit = ENDPOINT_BITS[endpoint]
@@ -740,6 +805,7 @@ class DeepRepository:
                     end_no,
                     len(keys),
                     int(masks.rowcount or 0)
+                    + int(fiscal_reset.rowcount or 0)
                     + int(payloads.rowcount or 0)
                     + int(statuses.rowcount or 0),
                 )
