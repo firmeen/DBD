@@ -644,8 +644,10 @@ def _supervise(args, manager_connection, preflight, baseline) -> int:
         stopping = True
         _stop_workers(states)
     finally:
-        if stopping:
-            _stop_workers(states)
+        # Any parent exit path must first request a bounded graceful drain.
+        # Do this even for unexpected exceptions so workers are never left
+        # running until the hard-termination deadline by accident.
+        _stop_workers(states)
         _join_or_terminate(states, grace_seconds=args.grace_seconds)
         _release_confirmed_dead(states)
         try:
