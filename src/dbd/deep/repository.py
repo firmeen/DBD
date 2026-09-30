@@ -470,63 +470,270 @@ class DeepRepository:
 
         return await self._transaction(op)
 
-    async def reconcile_active_scope(self, batch_size: int = 10000) -> int:
-        """Adopt builder-created Deep rows into the seven-endpoint contract.
+    async def _mark_prepared(self) -> None:
+        active_placeholders = ",".join(
+            f":a{i}" for i, _ in enumerate(ACTIVE_ENDPOINTS)
+        )
+        inactive_placeholders = ",".join(
+            f":i{i}" for i, _ in enumerate(INACTIVE_ENDPOINTS)
+        )
+        params = {
+            **{f"a{i}": key for i, key in enumerate(ACTIVE_ENDPOINTS)},
+            **{f"i{i}": key for i, key in enumerate(INACTIVE_ENDPOINTS)},
+        }
+        async with self.engine.begin() as conn:
+            await conn.execute(
+                text(
+                    f"""
+                    UPDATE {CATALOG_TABLE}
+                    SET is_active=CASE
+                        WHEN endpoint_key IN ({active_placeholders}) THEN 1
+                        WHEN endpoint_key IN ({inactive_placeholders}) THEN 0
+                        ELSE is_active
+                    END
+                    WHERE endpoint_key IN (
+                        {active_placeholders}, {inactive_placeholders}
+                    )
+                    """
+                ),
+                params,
+            )
 
-        Reconciliation is chunked so adopting hundreds of thousands of legacy
-        Deep rows never holds one table-wide transaction for the whole pass.
-        Inactive nationality/history outcome bits are preserved, but they are
-        excluded from required_mask and cannot block active-scope completion.
+        if not await self.is_prepared():
+            raise RuntimeError(
+                "Could not mark the endpoint catalog prepared for the seven-endpoint scope"
+            )
+
+    async def prepare_active_scope(
+        self,
+        *,
+        batch_size: int = 5000,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> dict[str, int | bool]:
+        """One-time deterministic adoption of builder-created Deep rows.
+
+        The builder created Deep with the legacy 11-endpoint required mask.
+        Preparation walks the composite primary key once, normalizes only the
+        seven active resources, then marks the four legacy catalog endpoints
+        inactive. collect/retry refuse to run until this completes.
         """
-        batch_size = max(100, int(batch_size))
-        total_changed = 0
+        batch_size = max(500, min(int(batch_size), 20000))
+        await self.ensure_runtime_table()
+        await self._assert_indexes(require_runtime=True)
+        await self.load_catalog()
 
-        # A DONE bit without its JSON payload is not a durable completion. This
-        # can exist in migrated legacy state when endpoint state survived but
-        # the archived/projection payload did not. Clear only that impossible
-        # DONE bit so the endpoint becomes resumable; never touch inactive bits.
+        if await self.is_prepared():
+            await self.assert_invariants()
+            return {
+                "already_prepared": True,
+                "rows_total": 0,
+                "rows_scanned": 0,
+                "rows_changed": 0,
+                "runtime_recovered": await self.recover_runtime(),
+            }
+
+        async with self.engine.connect() as conn:
+            rows_total = int(
+                (await conn.execute(text(f"SELECT COUNT(*) FROM {DEEP_TABLE}"))).scalar_one()
+                or 0
+            )
+
+        done_clear_terms = []
         for endpoint in ACTIVE_ENDPOINTS:
             bit = ENDPOINT_BITS[endpoint]
-            destination = DESTINATION_COLUMNS[endpoint]
-            while True:
-                async def repair_done(conn: AsyncConnection) -> int:
-                    result = await conn.execute(
+            column = DESTINATION_COLUMNS[endpoint]
+            done_clear_terms.append(
+                f"(CASE WHEN {column} IS NULL "
+                f"OR JSON_TYPE({column})='NULL' "
+                f"OR (not_available_mask & {bit}) <> 0 "
+                f"OR (failed_mask & {bit}) <> 0 "
+                f"THEN {bit} ELSE 0 END)"
+            )
+        done_clear_expr = " | ".join(done_clear_terms)
+
+        benchmark_bit = ENDPOINT_BITS["industry_benchmark"]
+        profile_bit = ENDPOINT_BITS["profile"]
+        profile_fiscal = f"""
+            CASE
+                WHEN (done_mask & {profile_bit}) <> 0
+                 AND profile_data IS NOT NULL
+                 AND JSON_TYPE(profile_data) <> 'NULL'
+                 AND JSON_CONTAINS_PATH(profile_data, 'one', '$.submitFinYear')
+                THEN CASE
+                    WHEN JSON_TYPE(JSON_EXTRACT(profile_data, '$.submitFinYear'))='NULL'
+                    THEN NULL
+                    ELSE NULLIF(
+                        TRIM(
+                            JSON_UNQUOTE(
+                                JSON_EXTRACT(profile_data, '$.submitFinYear')
+                            )
+                        ),
+                        ''
+                    )
+                END
+                ELSE submit_fin_year
+            END
+        """
+        required_expr = f"""
+            CASE
+                WHEN NULLIF(TRIM(({profile_fiscal})), '') IS NULL
+                THEN {BASE_REQUIRED_MASK}
+                ELSE {ACTIVE_ENDPOINT_MASK}
+            END
+        """
+
+        last_type: str | None = None
+        last_no: str | None = None
+        scanned = 0
+        changed = 0
+
+        while True:
+            async def op(conn: AsyncConnection):
+                params: dict[str, object] = {"limit": batch_size}
+                lower = ""
+                if last_type is not None:
+                    lower = """
+                        WHERE (
+                            jp_type_code > :last_type
+                            OR (jp_type_code=:last_type AND jp_no>:last_no)
+                        )
+                    """
+                    params["last_type"] = last_type
+                    params["last_no"] = last_no
+
+                keys = (
+                    await conn.execute(
                         text(
                             f"""
-                            UPDATE {DEEP_TABLE}
-                            SET done_mask=(done_mask & ~{bit})
-                            WHERE (done_mask & {bit}) <> 0
-                              AND {destination} IS NULL
-                            LIMIT {batch_size}
+                            SELECT jp_type_code, jp_no
+                            FROM {DEEP_TABLE}
+                            {lower}
+                            ORDER BY jp_type_code, jp_no
+                            LIMIT :limit
                             """
-                        )
+                        ),
+                        params,
                     )
-                    return int(result.rowcount or 0)
+                ).mappings().all()
+                if not keys:
+                    return None
 
-                repaired = await self._transaction(repair_done)
-                total_changed += repaired
-                if repaired < batch_size:
-                    break
+                end_type = str(keys[-1]["jp_type_code"])
+                end_no = str(keys[-1]["jp_no"])
+                range_params: dict[str, object] = {
+                    "end_type": end_type,
+                    "end_no": end_no,
+                }
+                lower_range = ""
+                if last_type is not None:
+                    lower_range = """
+                        AND (
+                            jp_type_code > :last_type
+                            OR (jp_type_code=:last_type AND jp_no>:last_no)
+                        )
+                    """
+                    range_params["last_type"] = last_type
+                    range_params["last_no"] = last_no
 
-        financial_required = (
-            f"CASE WHEN NULLIF(TRIM(submit_fin_year),'') IS NULL "
-            f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
-        )
-        status_case = _status_case(financial_required)
-        resolved = (
-            f"(((done_mask | not_available_mask | failed_mask) "
-            f"& ({financial_required})) = ({financial_required}))"
-        )
-        while True:
-            async def op(conn: AsyncConnection) -> int:
-                result = await conn.execute(
+                key_range = f"""
+                    (
+                        jp_type_code < :end_type
+                        OR (jp_type_code=:end_type AND jp_no<=:end_no)
+                    )
+                    {lower_range}
+                """
+
+                masks = await conn.execute(
                     text(
                         f"""
                         UPDATE {DEEP_TABLE}
-                        SET required_mask={financial_required},
-                            deep_status={status_case},
+                        SET
+                            not_available_mask=(
+                                not_available_mask
+                                | CASE
+                                    WHEN industry_benchmark_data IS NOT NULL
+                                     AND JSON_TYPE(industry_benchmark_data)='NULL'
+                                    THEN {benchmark_bit}
+                                    ELSE 0
+                                  END
+                            ),
+                            done_mask=(
+                                done_mask & ~({done_clear_expr})
+                            ),
+                            not_available_mask=(
+                                not_available_mask
+                                | CASE
+                                    WHEN (not_available_mask & {profile_bit}) <> 0
+                                    THEN (
+                                        {FINANCIAL_MASK}
+                                        & ~(
+                                            done_mask
+                                            | not_available_mask
+                                            | failed_mask
+                                        )
+                                    )
+                                    ELSE 0
+                                  END
+                            ),
+                            failed_mask=(
+                                failed_mask
+                                | CASE
+                                    WHEN (failed_mask & {profile_bit}) <> 0
+                                    THEN (
+                                        {FINANCIAL_MASK}
+                                        & ~(
+                                            done_mask
+                                            | not_available_mask
+                                            | failed_mask
+                                        )
+                                    )
+                                    ELSE 0
+                                  END
+                            )
+                        WHERE {key_range}
+                        """
+                    ),
+                    range_params,
+                )
+
+                payload_sets = []
+                for endpoint in ACTIVE_ENDPOINTS:
+                    bit = ENDPOINT_BITS[endpoint]
+                    column = DESTINATION_COLUMNS[endpoint]
+                    payload_sets.append(
+                        f"{column}=CASE "
+                        f"WHEN (not_available_mask & {bit}) <> 0 "
+                        f"THEN NULL ELSE {column} END"
+                    )
+
+                payloads = await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET
+                            {', '.join(payload_sets)},
+                            submit_fin_year={profile_fiscal},
+                            required_mask={required_expr}
+                        WHERE {key_range}
+                        """
+                    ),
+                    range_params,
+                )
+
+                statuses = await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET
+                            deep_status={_status_case()},
                             deep_completed_at=CASE
-                                WHEN {resolved}
+                                WHEN (
+                                    (
+                                        done_mask
+                                        | not_available_mask
+                                        | failed_mask
+                                    ) & required_mask
+                                ) = required_mask
                                 THEN COALESCE(
                                     deep_completed_at,
                                     last_request_at,
@@ -534,44 +741,90 @@ class DeepRepository:
                                 )
                                 ELSE NULL
                             END
-                        WHERE required_mask <> {financial_required}
-                           OR deep_status <> {status_case}
-                           OR (deep_completed_at IS NULL AND {resolved})
-                           OR (deep_completed_at IS NOT NULL AND NOT {resolved})
-                        LIMIT {batch_size}
+                        WHERE {key_range}
                         """
-                    )
+                    ),
+                    range_params,
                 )
-                return int(result.rowcount or 0)
 
-            changed = await self._transaction(op)
-            total_changed += changed
-            if changed < batch_size:
-                return total_changed
+                return (
+                    end_type,
+                    end_no,
+                    len(keys),
+                    int(masks.rowcount or 0)
+                    + int(payloads.rowcount or 0)
+                    + int(statuses.rowcount or 0),
+                )
 
-    async def assert_invariants(self) -> None:
+            batch = await self._transaction(op)
+            if batch is None:
+                break
+
+            last_type, last_no, batch_scanned, batch_changed = batch
+            scanned += int(batch_scanned)
+            changed += int(batch_changed)
+            if event is not None:
+                event(
+                    "prepare_progress",
+                    {
+                        "rows_total": rows_total,
+                        "rows_scanned": scanned,
+                        "rows_changed": changed,
+                    },
+                )
+
+        await self.assert_invariants()
+        await self._mark_prepared()
+        runtime_recovered = await self.recover_runtime()
+        return {
+            "already_prepared": False,
+            "rows_total": rows_total,
+            "rows_scanned": scanned,
+            "rows_changed": changed,
+            "runtime_recovered": runtime_recovered,
+        }
+
+    async def assert_no_overlap(self) -> None:
         async with self.engine.connect() as conn:
             overlap = int(
                 (
                     await conn.execute(
                         text(
                             f"""
-                            SELECT COUNT(*)
-                            FROM {MASTER_TABLE} m
-                            JOIN {DEEP_TABLE} d
-                              ON d.jp_type_code=m.jp_type_code
-                             AND d.jp_no=m.jp_no
+                            SELECT EXISTS(
+                                SELECT 1
+                                FROM {MASTER_TABLE} m
+                                JOIN {DEEP_TABLE} d
+                                  ON d.jp_type_code=m.jp_type_code
+                                 AND d.jp_no=m.jp_no
+                                LIMIT 1
+                            )
                             """
                         )
                     )
                 ).scalar_one()
                 or 0
             )
-            if overlap:
-                raise RuntimeError(
-                    f"MASTER XOR DEEP invariant violated by {overlap} company row(s)"
-                )
+        if overlap:
+            raise RuntimeError("MASTER XOR DEEP invariant is violated")
 
+    async def assert_invariants(self) -> None:
+        await self.assert_no_overlap()
+
+        payload_checks = []
+        for endpoint in ACTIVE_ENDPOINTS:
+            bit = ENDPOINT_BITS[endpoint]
+            column = DESTINATION_COLUMNS[endpoint]
+            payload_checks.append(
+                f"((done_mask & {bit}) <> 0 "
+                f"AND ({column} IS NULL OR JSON_TYPE({column})='NULL'))"
+            )
+            payload_checks.append(
+                f"((not_available_mask & {bit}) <> 0 "
+                f"AND {column} IS NOT NULL)"
+            )
+
+        async with self.engine.connect() as conn:
             invalid_masks = int(
                 (
                     await conn.execute(
@@ -579,20 +832,23 @@ class DeepRepository:
                             f"""
                             SELECT COUNT(*)
                             FROM {DEEP_TABLE}
-                            WHERE (required_mask & ~{ACTIVE_ENDPOINT_MASK}) <> 0
+                            WHERE required_mask NOT IN (
+                                {BASE_REQUIRED_MASK}, {ACTIVE_ENDPOINT_MASK}
+                            )
                                OR (done_mask & not_available_mask) <> 0
                                OR (done_mask & failed_mask) <> 0
                                OR (not_available_mask & failed_mask) <> 0
+                               OR {' OR '.join(payload_checks)}
                             """
                         )
                     )
                 ).scalar_one()
                 or 0
             )
-            if invalid_masks:
-                raise RuntimeError(
-                    f"Deep mask invariant violated by {invalid_masks} company row(s)"
-                )
+        if invalid_masks:
+            raise RuntimeError(
+                f"Deep invariant violated by {invalid_masks} company row(s)"
+            )
 
     async def runtime_size(self) -> int:
         async with self.engine.connect() as conn:
