@@ -1039,6 +1039,12 @@ class DeepRepository:
                             not_available_mask=(not_available_mask & ~{FINANCIAL_MASK}),
                             failed_mask=(failed_mask & ~{FINANCIAL_MASK}),
                             required_mask={ACTIVE_ENDPOINT_MASK},
+                            endpoint_meta=JSON_REMOVE(
+                                COALESCE(endpoint_meta, JSON_OBJECT()),
+                                '$."financial_submissions"',
+                                '$."financial_statements"',
+                                '$."industry_benchmark"'
+                            ),
                             deep_completed_at=NULL
                         WHERE jp_type_code=:jp_type_code
                           AND jp_no=:jp_no
