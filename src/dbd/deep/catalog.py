@@ -16,6 +16,15 @@ ACTIVE_ENDPOINTS = (
     "industry_benchmark",
 )
 
+# These legacy Deep endpoints remain valid schema/catalog entries for migration
+# compatibility, but the standalone collector must never schedule or require them.
+INACTIVE_ENDPOINTS = (
+    "nations",
+    "nation_history",
+    "name_history",
+    "capital_history",
+)
+
 # These bit values are the stable contract created by canary-new_model.py.
 ENDPOINT_BITS = {
     "profile": 1 << 0,
@@ -62,9 +71,17 @@ class EndpointSpec:
     required_rule: dict[str, Any]
 
 
+def latest_fiscal_year(value: object) -> str | None:
+    years = [part for part in str(value or "").split() if part]
+    return max(years) if years else None
+
+
 def required_mask(submit_fin_year: object) -> int:
-    value = "" if submit_fin_year is None else str(submit_fin_year).strip()
-    return BASE_REQUIRED_MASK | (FINANCIAL_MASK if value else 0)
+    return (
+        ACTIVE_ENDPOINT_MASK
+        if latest_fiscal_year(submit_fin_year) is not None
+        else BASE_REQUIRED_MASK
+    )
 
 
 def unresolved_mask(
