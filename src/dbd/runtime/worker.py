@@ -8,7 +8,7 @@ from uuid import uuid4
 
 from curl_cffi.requests.exceptions import RequestException as RequestsError
 
-from ..client.async_client import AsyncDbdClient, TransientHttpError
+from ..client.async_client import AsyncDbdClient, TransientHttpError\nfrom ..client.rate_control import RateControlUnavailable
 from ..contracts.identity import parse_code
 from ..core.exceptions import (
     ContractError,
@@ -220,6 +220,7 @@ def _upstream_transient(exc: BaseException) -> bool:
             DbdForbiddenError,
             DbdAuthError,
             TransientHttpError,
+            RateControlUnavailable,
             RequestsError,
             TimeoutError,
         ),

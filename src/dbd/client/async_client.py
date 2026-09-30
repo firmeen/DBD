@@ -6,7 +6,6 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
-from email.utils import parsedate_to_datetime
 from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
@@ -31,8 +30,8 @@ from ..core.telemetry import (
 )
 from .auth import DbdAuth
 from .crypto import decrypt_envelope
-from .rate_control import EndpointRateController
-from .rate_limit import TokenBucket, protective_cooldown
+from .rate_control import EndpointRateController, RateControlUnavailable
+from .rate_limit import TokenBucket
 from .session import WARMUP_PAGE_URL, create_session
 
 
@@ -63,6 +62,8 @@ def retry_after(value: str | None) -> float:
         return max(0.0, float(value))
     except ValueError:
         try:
+            from email.utils import parsedate_to_datetime
+
             return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
         except (ValueError, TypeError, OverflowError):
             return 1.0
@@ -119,24 +120,12 @@ class AsyncDbdClient:
         self._token = None
         self._session = None
         self._auth_session = None
-        self._penalty_streaks: dict[str, int] = {}
-        self._last_penalty_at: dict[str, float] = {}
         self.requests_made = self.retries_made = self.rate_limit_hits = 0
-
-    def _next_penalty_streak(self, key: str) -> int:
-        now = time.monotonic()
-        last = self._last_penalty_at.get(key, 0.0)
-        streak = self._penalty_streaks.get(key, 0) + 1 if now - last <= 30.0 else 1
-        self._penalty_streaks[key] = streak
-        self._last_penalty_at[key] = now
-        return streak
 
     async def __aenter__(self):
         await self.endpoint_rate.open()
         self._session = AsyncSession(impersonate="chrome", max_clients=self.concurrency)
         self._auth_session = create_session()
-        # Authenticate lazily on the first admitted request. A temporary DBD or
-        # network outage must not crash every worker before it can heartbeat.
         return self
 
     async def __aexit__(self, *args):
@@ -174,17 +163,6 @@ class AsyncDbdClient:
             "Sec-Fetch-Site": "same-origin",
         }
 
-    async def _mark_auth_unavailable(self) -> None:
-        # Authentication/session availability is not evidence that the caller is
-        # exceeding upstream capacity. Open the global availability circuit
-        # without ratcheting the configured pacer down.
-        await self.endpoint_rate.availability_failure()
-
-    async def _mark_upstream_unavailable(self, rate_key: str | None) -> None:
-        # Transport and ordinary upstream 5xx failures are endpoint-scoped when
-        # possible. They gate admission but do not alter throughput pacing.
-        await self.endpoint_rate.availability_failure(rate_key)
-
     async def fetch(
         self,
         method,
@@ -207,6 +185,7 @@ class AsyncDbdClient:
                     DbdTokenExpiredError,
                     DbdForbiddenError,
                     DbdAuthError,
+                    RateControlUnavailable,
                     RequestsError,
                     TimeoutError,
                 )
@@ -219,16 +198,12 @@ class AsyncDbdClient:
                     self.retries_made += 1
                     HTTP_RETRIES.inc()
                 async with self._semaphore:
-                    admission = None
                     if rate_key is not None or self._shared_admission:
-                        admission = await self.endpoint_rate.acquire(rate_key)
+                        await self.endpoint_rate.acquire(rate_key)
                     else:
                         await self.rate.acquire()
-                    try:
-                        token = await self._ensure_token()
-                    except DbdAuthError:
-                        await self._mark_auth_unavailable()
-                        raise
+
+                    token = await self._ensure_token()
                     requested = datetime.now(timezone.utc).replace(tzinfo=None)
                     self.requests_made += 1
                     with LATENCY.time():
@@ -243,7 +218,6 @@ class AsyncDbdClient:
                             )
                         except (RequestsError, TimeoutError) as exc:
                             REQUESTS.labels("network_error").inc()
-                            await self._mark_upstream_unavailable(rate_key)
                             log.warning(
                                 "http_transport_error",
                                 stage="request",
@@ -253,6 +227,7 @@ class AsyncDbdClient:
                                 curl_code=_curl_code(exc),
                             )
                             raise
+
                     status = response.status_code
                     REQUESTS.labels(str(status)).inc()
                     retry_after_header = response.headers.get("retry-after")
@@ -263,68 +238,32 @@ class AsyncDbdClient:
                     )
                     if rate_pressure:
                         self.rate_limit_hits += 1
-                        server_cooldown = retry_after(retry_after_header)
-                        penalty_key = rate_key or "__global__"
-                        streak = self._next_penalty_streak(penalty_key)
-                        global_escalated = rate_key is None
-                        if rate_key:
-                            old_effective = self.endpoint_rate.effective_rate(rate_key)
-                            expected_rate = max(0.5, old_effective * 0.5)
-                            cooldown = protective_cooldown(
-                                server_cooldown, expected_rate, streak
-                            )
-                            (
-                                old_rate,
-                                new_rate,
-                                old_global_rate,
-                                new_global_rate,
-                                global_escalated,
-                            ) = await self.endpoint_rate.penalize(rate_key, cooldown)
-                        elif self._shared_admission:
-                            old_effective = self.endpoint_rate.global_effective_rate()
-                            expected_rate = max(0.5, old_effective * 0.5)
-                            cooldown = protective_cooldown(
-                                server_cooldown, expected_rate, streak
-                            )
-                            old_global_rate, new_global_rate = (
-                                await self.endpoint_rate.penalize_global(cooldown)
-                            )
-                            old_rate, new_rate = old_global_rate, new_global_rate
+                        cooldown = retry_after(retry_after_header)
+                        if rate_key is not None or self._shared_admission:
+                            await self.endpoint_rate.cooldown(rate_key, cooldown)
                         else:
-                            old_rate = self.rate.rate
-                            new_rate = self.rate.slow_down()
-                            cooldown = protective_cooldown(server_cooldown, new_rate, streak)
                             self.rate.cooldown(cooldown)
-                            EFFECTIVE_RATE.set(new_rate)
-                            old_global_rate = old_rate
-                            new_global_rate = new_rate
                         log.warning(
-                            "rate_penalty",
+                            "rate_cooldown",
                             status=status,
                             path=path,
                             endpoint=rate_key,
-                            old_rate=old_rate,
-                            new_rate=new_rate,
-                            old_global_rate=old_global_rate,
-                            new_global_rate=new_global_rate,
-                            global_escalated=global_escalated,
-                            penalty_streak=streak,
-                            server_retry_after_seconds=server_cooldown,
-                            cooldown_seconds=cooldown,
+                            retry_after_seconds=cooldown,
+                            worker_rate=self.endpoint_rate.global_effective_rate(),
+                            fleet_rate_ceiling=self.endpoint_rate.shared_rate_ceiling,
                         )
+
                     if status == 401:
                         await self._ensure_token(rejected=token)
                         raise TransientHttpError("HTTP 401", status_code=401)
                     if status == 403:
-                        await self._mark_auth_unavailable()
                         await self._ensure_token(rejected=token, reset_warmup=True)
                         raise DbdForbiddenError("HTTP 403")
-                    if status in (500, 502, 504) or (status == 503 and not rate_pressure):
-                        await self._mark_upstream_unavailable(rate_key)
                     if status in (429, 500, 502, 503, 504):
                         raise TransientHttpError(f"HTTP {status}", status_code=status)
                     if status >= 400:
                         raise PermanentHttpError(f"HTTP {status}", status_code=status)
+
                     try:
                         data = self._decode(response, path, token)
                     except DbdTokenExpiredError:
@@ -343,37 +282,16 @@ class AsyncDbdClient:
                             body_sha256=sha256(body).hexdigest(),
                         )
                         raise
-                    if rate_key:
-                        endpoint_recovered, global_recovered = await self.endpoint_rate.recover(
-                            rate_key,
-                            admission=admission,
-                        )
-                        recovered = endpoint_recovered or global_recovered
-                        global_effective = self.endpoint_rate.global_effective_rate()
-                    elif self._shared_admission:
-                        recovered = await self.endpoint_rate.recover_global(
-                            admission=admission,
-                        )
-                        global_effective = self.endpoint_rate.global_effective_rate()
-                    else:
-                        recovered = self.rate.recover()
-                        global_effective = self.rate.rate
-                        if recovered is not None:
-                            EFFECTIVE_RATE.set(recovered)
+
                     if self.requests_made:
                         REDIS_COMMANDS_PER_HTTP.set(
                             self.endpoint_rate.redis_commands / self.requests_made
                         )
-                    if recovered is not None:
-                        log.info(
-                            "rate_recovered",
-                            path=path,
-                            endpoint=rate_key,
-                            effective_rate=recovered,
-                            global_effective_rate=global_effective,
-                        )
                     return ApiResponse(
-                        data, status, requested, datetime.now(timezone.utc).replace(tzinfo=None)
+                        data,
+                        status,
+                        requested,
+                        datetime.now(timezone.utc).replace(tzinfo=None),
                     )
 
     def _decode(self, response, path, token):

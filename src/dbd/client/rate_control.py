@@ -5,9 +5,10 @@ import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
-from uuid import uuid4
 
 from redis.asyncio import Redis
+from redis.exceptions import ConnectionError as RedisConnectionError
+from redis.exceptions import TimeoutError as RedisTimeoutError
 
 from ..core.redis import close_async_redis, create_async_redis, redis_pool_snapshot
 from ..core.settings import settings
@@ -18,7 +19,6 @@ from ..core.telemetry import (
     REDIS_POOL_CONNECTIONS,
     REDIS_RTT,
 )
-from .circuit import AdaptiveCircuitBreaker
 from .rate_limit import TokenBucket
 
 
@@ -29,92 +29,55 @@ def _positive_rate(value: float) -> float:
     return value
 
 
-class RedisPacer:
-    """Redis-backed smooth adaptive pacer shared by independent processes.
+class RateControlUnavailable(RuntimeError):
+    """Redis admission is temporarily unavailable.
 
-    `target_rate` is a hard configured ceiling. A supervisor may additionally
-    publish `<key>:target-rate`; the Lua scripts take the lower value so scale-down
-    applies immediately while scale-up preserves any active penalty and recovers
-    gradually instead of resetting shared safety state.
+    Distributed workers must fail closed before HTTP and let durable work return
+    to MySQL attempt-neutrally instead of converting control-plane loss into a
+    business-resource failure.
+    """
+
+
+class RedisPacer:
+    """Small fixed-rate Redis pacer.
+
+    This compatibility primitive intentionally has no adaptive penalty or circuit
+    state. Its configured rate is a hard ceiling; cooldown only delays admission.
     """
 
     _ACQUIRE_SCRIPT = """
 local now = redis.call('TIME')
 local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
 local ceiling = tonumber(ARGV[1])
-local runtime_target = tonumber(redis.call('GET', KEYS[5]) or ceiling)
-if runtime_target == nil or runtime_target <= 0 then runtime_target = ceiling end
-local target = math.min(ceiling, runtime_target)
 local ttl_ms = tonumber(ARGV[2])
-local rate = tonumber(redis.call('GET', KEYS[2]) or target)
-if rate > target then rate = target end
-local cooldown_ms = tonumber(redis.call('GET', KEYS[3]) or 0)
-local base_ms = now_ms
-if cooldown_ms > base_ms then base_ms = cooldown_ms end
-local next_ms = tonumber(redis.call('GET', KEYS[1]) or base_ms)
-if next_ms < base_ms then next_ms = base_ms end
+local runtime_target = tonumber(redis.call('GET', KEYS[3]) or ceiling)
+if runtime_target == nil or runtime_target <= 0 then runtime_target = ceiling end
+local rate = math.min(ceiling, runtime_target)
+
+local cooldown_until = tonumber(redis.call('GET', KEYS[2]) or 0)
+if cooldown_until > now_ms then
+  return {tostring(cooldown_until - now_ms), tostring(rate), 'cooldown'}
+end
+
+local next_ms = tonumber(redis.call('GET', KEYS[1]) or now_ms)
+if next_ms < now_ms then next_ms = now_ms end
 local interval_ms = math.max(1, 1000 / rate)
 local wait_ms = next_ms - now_ms
-local reserved_next = next_ms + interval_ms
-redis.call('PSETEX', KEYS[1], ttl_ms, tostring(reserved_next))
-redis.call('PSETEX', KEYS[2], ttl_ms, tostring(rate))
-if cooldown_ms > 0 then redis.call('PEXPIRE', KEYS[3], ttl_ms) end
-if redis.call('EXISTS', KEYS[4]) == 1 then redis.call('PEXPIRE', KEYS[4], ttl_ms) end
-if redis.call('EXISTS', KEYS[5]) == 1 then redis.call('PEXPIRE', KEYS[5], ttl_ms) end
-return {tostring(wait_ms), tostring(rate)}
+redis.call('PSETEX', KEYS[1], ttl_ms, tostring(next_ms + interval_ms))
+if redis.call('EXISTS', KEYS[2]) == 1 then redis.call('PEXPIRE', KEYS[2], ttl_ms) end
+if redis.call('EXISTS', KEYS[3]) == 1 then redis.call('PEXPIRE', KEYS[3], ttl_ms) end
+return {tostring(wait_ms), tostring(rate), 'admitted'}
 """
 
-    _PENALIZE_SCRIPT = """
+    _COOLDOWN_SCRIPT = """
 local now = redis.call('TIME')
 local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
-local ceiling = tonumber(ARGV[1])
-local runtime_target = tonumber(redis.call('GET', KEYS[5]) or ceiling)
-if runtime_target == nil or runtime_target <= 0 then runtime_target = ceiling end
-local target = math.min(ceiling, runtime_target)
-local factor = tonumber(ARGV[2])
-local floor_rate = tonumber(ARGV[3])
-local cooldown_add_ms = tonumber(ARGV[4])
-local ttl_ms = tonumber(ARGV[5])
-local old_rate = tonumber(redis.call('GET', KEYS[2]) or target)
-if old_rate > target then old_rate = target end
-local new_rate = math.min(target, math.min(old_rate, math.max(floor_rate, old_rate * factor)))
-local old_cooldown = tonumber(redis.call('GET', KEYS[3]) or 0)
-local cooldown_until = math.max(old_cooldown, now_ms + cooldown_add_ms)
-redis.call('PSETEX', KEYS[2], ttl_ms, tostring(new_rate))
-redis.call('PSETEX', KEYS[3], ttl_ms, tostring(cooldown_until))
-redis.call('PSETEX', KEYS[4], ttl_ms, tostring(now_ms))
-if redis.call('EXISTS', KEYS[5]) == 1 then redis.call('PEXPIRE', KEYS[5], ttl_ms) end
-return {tostring(old_rate), tostring(new_rate)}
-"""
-
-    _RECOVER_SCRIPT = """
-local now = redis.call('TIME')
-local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
-local ceiling = tonumber(ARGV[1])
-local runtime_target = tonumber(redis.call('GET', KEYS[5]) or ceiling)
-if runtime_target == nil or runtime_target <= 0 then runtime_target = ceiling end
-local target = math.min(ceiling, runtime_target)
-local factor = tonumber(ARGV[2])
-local step = tonumber(ARGV[3])
-local quiet_ms = tonumber(ARGV[4])
-local ttl_ms = tonumber(ARGV[5])
-local rate = tonumber(redis.call('GET', KEYS[2]) or target)
-if rate > target then rate = target end
-local cooldown_until = tonumber(redis.call('GET', KEYS[3]) or 0)
-local last_penalty = tonumber(redis.call('GET', KEYS[4]) or 0)
-if rate >= target or now_ms < cooldown_until or (now_ms - last_penalty) < quiet_ms then
-  redis.call('PSETEX', KEYS[2], ttl_ms, tostring(rate))
-  if redis.call('EXISTS', KEYS[5]) == 1 then redis.call('PEXPIRE', KEYS[5], ttl_ms) end
-  return {'', tostring(rate)}
-end
-local new_rate = math.min(target, math.max(rate + step, rate * factor))
-if new_rate <= rate then
-  return {'', tostring(rate)}
-end
-redis.call('PSETEX', KEYS[2], ttl_ms, tostring(new_rate))
-redis.call('PSETEX', KEYS[4], ttl_ms, tostring(now_ms))
-if redis.call('EXISTS', KEYS[5]) == 1 then redis.call('PEXPIRE', KEYS[5], ttl_ms) end
-return {tostring(new_rate), tostring(new_rate)}
+local requested_until = now_ms + tonumber(ARGV[1])
+local ttl_ms = tonumber(ARGV[2])
+local current_until = tonumber(redis.call('GET', KEYS[1]) or 0)
+local cooldown_until = math.max(current_until, requested_until)
+redis.call('PSETEX', KEYS[1], ttl_ms, tostring(cooldown_until))
+return tostring(math.max(0, cooldown_until - now_ms))
 """
 
     def __init__(
@@ -135,16 +98,13 @@ return {tostring(new_rate), tostring(new_rate)}
         self._max_connections = max_connections
         self._state_ttl_ms = 600_000
         self._acquire_registered = None
-        self._penalize_registered = None
-        self._recover_registered = None
+        self._cooldown_registered = None
 
     @property
-    def _keys(self) -> tuple[str, str, str, str, str]:
+    def _keys(self) -> tuple[str, str, str]:
         return (
-            self.key,
-            f"{self.key}:effective-rate",
-            f"{self.key}:cooldown-until-ms",
-            f"{self.key}:last-penalty-ms",
+            f"{self.key}:hard-next-ms",
+            f"{self.key}:hard-cooldown-until-ms",
             f"{self.key}:target-rate",
         )
 
@@ -162,24 +122,15 @@ return {tostring(new_rate), tostring(new_rate)}
             await close_async_redis(self._redis)
             self._redis = None
         self._acquire_registered = None
-        self._penalize_registered = None
-        self._recover_registered = None
+        self._cooldown_registered = None
 
     async def prepare_scripts(self) -> None:
         if self._redis is None:
             raise RuntimeError("RedisPacer is not open")
-        self._acquire_registered = self._redis.register_script(
-            self._ACQUIRE_SCRIPT
-        )
-        self._penalize_registered = self._redis.register_script(
-            self._PENALIZE_SCRIPT
-        )
-        self._recover_registered = self._redis.register_script(
-            self._RECOVER_SCRIPT
-        )
+        self._acquire_registered = self._redis.register_script(self._ACQUIRE_SCRIPT)
+        self._cooldown_registered = self._redis.register_script(self._COOLDOWN_SCRIPT)
         await self._redis.script_load(self._ACQUIRE_SCRIPT)
-        await self._redis.script_load(self._PENALIZE_SCRIPT)
-        await self._redis.script_load(self._RECOVER_SCRIPT)
+        await self._redis.script_load(self._COOLDOWN_SCRIPT)
 
     def set_rate(self, value: float) -> float:
         self.rate = self.target_rate = _positive_rate(value)
@@ -189,18 +140,40 @@ return {tostring(new_rate), tostring(new_rate)}
         if self._redis is None:
             raise RuntimeError("RedisPacer is not open")
         if self._acquire_registered is None:
-            self._acquire_registered = self._redis.register_script(
-                self._ACQUIRE_SCRIPT
+            self._acquire_registered = self._redis.register_script(self._ACQUIRE_SCRIPT)
+        while True:
+            try:
+                wait_raw, rate_raw, mode = await self._acquire_registered(
+                    keys=list(self._keys),
+                    args=[self.target_rate, self._state_ttl_ms],
+                )
+            except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
+                raise RateControlUnavailable(
+                    f"Redis hard admission unavailable: {type(exc).__name__}"
+                ) from exc
+            self.rate = float(rate_raw)
+            wait_seconds = max(0.0, float(wait_raw) / 1000.0)
+            if str(mode) == "admitted":
+                if wait_seconds:
+                    await asyncio.sleep(wait_seconds)
+                return self.rate
+            await asyncio.sleep(max(0.01, wait_seconds))
+
+    async def cooldown(self, seconds: float) -> float:
+        if self._redis is None:
+            raise RuntimeError("RedisPacer is not open")
+        if self._cooldown_registered is None:
+            self._cooldown_registered = self._redis.register_script(self._COOLDOWN_SCRIPT)
+        try:
+            wait_raw = await self._cooldown_registered(
+                keys=[self._keys[1]],
+                args=[max(0.0, float(seconds)) * 1000.0, self._state_ttl_ms],
             )
-        wait_raw, rate_raw = await self._acquire_registered(
-            keys=list(self._keys),
-            args=[self.target_rate, self._state_ttl_ms],
-        )
-        self.rate = float(rate_raw)
-        wait_ms = float(wait_raw)
-        if wait_ms > 0:
-            await asyncio.sleep(wait_ms / 1000.0)
-        return self.rate
+        except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
+            raise RateControlUnavailable(
+                f"Redis cooldown update unavailable: {type(exc).__name__}"
+            ) from exc
+        return max(0.0, float(wait_raw) / 1000.0)
 
     async def penalize(
         self,
@@ -209,25 +182,10 @@ return {tostring(new_rate), tostring(new_rate)}
         factor: float = 0.5,
         floor: float = 0.5,
     ) -> tuple[float, float]:
-        if self._redis is None:
-            raise RuntimeError("RedisPacer is not open")
-        if self._penalize_registered is None:
-            self._penalize_registered = self._redis.register_script(
-                self._PENALIZE_SCRIPT
-            )
-        old_raw, new_raw = await self._penalize_registered(
-            keys=list(self._keys),
-            args=[
-                self.target_rate,
-                factor,
-                floor,
-                max(0.0, float(cooldown_seconds)) * 1000.0,
-                self._state_ttl_ms,
-            ],
-        )
-        old_rate = float(old_raw)
-        self.rate = float(new_raw)
-        return old_rate, self.rate
+        _ = factor, floor
+        old_rate = self.rate
+        await self.cooldown(cooldown_seconds)
+        return old_rate, old_rate
 
     async def recover(
         self,
@@ -236,27 +194,10 @@ return {tostring(new_rate), tostring(new_rate)}
         step: float = 0.5,
         quiet_seconds: float = 30.0,
     ) -> float | None:
-        if self._redis is None:
-            raise RuntimeError("RedisPacer is not open")
-        if self._recover_registered is None:
-            self._recover_registered = self._redis.register_script(
-                self._RECOVER_SCRIPT
-            )
-        recovered_raw, current_raw = await self._recover_registered(
-            keys=list(self._keys),
-            args=[
-                self.target_rate,
-                factor,
-                step,
-                quiet_seconds * 1000.0,
-                self._state_ttl_ms,
-            ],
-        )
-        self.rate = float(current_raw)
-        return float(recovered_raw) if recovered_raw else None
+        _ = factor, step, quiet_seconds
+        return None
 
     async def clear_state(self) -> None:
-        """Delete only this pacer's test/operational pacing state."""
         if self._redis is None:
             raise RuntimeError("RedisPacer is not open")
         await self._redis.delete(*self._keys)
@@ -271,13 +212,12 @@ class AdmissionState:
 
 
 class EndpointRateController:
-    """Hierarchical per-worker + shared fleet/endpoint adaptive admission.
+    """Worker-local limiting plus one Redis-enforced hard fleet ceiling.
 
-    Each worker has a hard local global cap (`global_rate`). Distributed workers
-    additionally share a fleet pacer whose hard ceiling can be larger. Endpoint
-    pacers are created lazily for every endpoint so a 429 observed by one process
-    constrains that endpoint across the fleet without automatically halving the
-    global fleet rate.
+    Authentication, transport, 5xx and generic availability failures are worker
+    local. Redis owns only request admission and explicit cooldown timing. An
+    endpoint Retry-After never advances the global reservation cursor, so unrelated
+    endpoints continue using available fleet capacity.
     """
 
     _ADMISSION_SCRIPT = """
@@ -287,250 +227,77 @@ local has_endpoint = ARGV[1] == '1'
 local global_ceiling = tonumber(ARGV[2])
 local endpoint_ceiling = tonumber(ARGV[3])
 local ttl_ms = tonumber(ARGV[4])
-local probe_token = ARGV[5]
-local probe_ttl_ms = tonumber(ARGV[6])
-local circuit_ttl_ms = tonumber(ARGV[7])
 
-local function circuit_status(state_key, opened_key, probe_key)
-  local state = redis.call('GET', state_key) or 'closed'
-  local opened_until = tonumber(redis.call('GET', opened_key) or 0)
-  if state == 'open' then
-    if opened_until > now_ms then
-      return opened_until - now_ms, 'open', false
-    end
-    if redis.call('EXISTS', probe_key) == 1 then
-      local probe_wait = redis.call('PTTL', probe_key)
-      if probe_wait > 0 then return probe_wait, 'open', false end
-      return 250, 'open', false
-    end
-    return 0, 'half_open', true
-  end
-  if state == 'half_open' then
-    if redis.call('EXISTS', probe_key) == 1 then
-      local probe_wait = redis.call('PTTL', probe_key)
-      if probe_wait > 0 then return probe_wait, 'half_open', false end
-      return 250, 'half_open', false
-    end
-    return 0, 'half_open', true
-  end
-  return 0, 'closed', false
-end
+local runtime_target = tonumber(redis.call('GET', KEYS[3]) or global_ceiling)
+if runtime_target == nil or runtime_target <= 0 then runtime_target = global_ceiling end
+local global_rate = math.min(global_ceiling, runtime_target)
 
-local gwait, gstate, gprobe = circuit_status(KEYS[11], KEYS[12], KEYS[15])
-local ewait = 0
-local estate = 'closed'
-local eprobe = false
-if has_endpoint then
-  ewait, estate, eprobe = circuit_status(KEYS[16], KEYS[17], KEYS[20])
-end
-if gwait > 0 or ewait > 0 then
+local global_cooldown = tonumber(redis.call('GET', KEYS[2]) or 0)
+if global_cooldown > now_ms then
   return {
-    tostring(math.max(gwait, ewait)),
-    '',
-    '',
-    'circuit',
-    gstate,
-    estate
+    tostring(global_cooldown - now_ms),
+    'global_cooldown',
+    tostring(global_rate),
+    tostring(endpoint_ceiling)
   }
 end
 
-local global_claimed = false
-if gprobe then
-  local claimed = redis.call(
-    'SET', KEYS[15], probe_token, 'PX', probe_ttl_ms, 'NX'
-  )
-  if not claimed then
-    return {'250', '', '', 'circuit', gstate, estate}
+if has_endpoint then
+  local endpoint_cooldown = tonumber(redis.call('GET', KEYS[5]) or 0)
+  if endpoint_cooldown > now_ms then
+    return {
+      tostring(endpoint_cooldown - now_ms),
+      'endpoint_cooldown',
+      tostring(global_rate),
+      tostring(endpoint_ceiling)
+    }
   end
-  global_claimed = true
-end
 
-local endpoint_claimed = false
-if has_endpoint and eprobe then
-  local claimed = redis.call(
-    'SET', KEYS[20], probe_token, 'PX', probe_ttl_ms, 'NX'
-  )
-  if not claimed then
-    if global_claimed and redis.call('GET', KEYS[15]) == probe_token then
-      redis.call('DEL', KEYS[15])
+  if endpoint_ceiling > 0 then
+    local endpoint_next = tonumber(redis.call('GET', KEYS[4]) or now_ms)
+    if endpoint_next > now_ms then
+      return {
+        tostring(endpoint_next - now_ms),
+        'endpoint_rate',
+        tostring(global_rate),
+        tostring(endpoint_ceiling)
+      }
     end
-    return {'250', '', '', 'circuit', gstate, estate}
   end
-  endpoint_claimed = true
 end
 
-if global_claimed then
-  redis.call('PSETEX', KEYS[11], circuit_ttl_ms, 'half_open')
-  gstate = 'half_open'
-end
-if endpoint_claimed then
-  redis.call('PSETEX', KEYS[16], circuit_ttl_ms, 'half_open')
-  estate = 'half_open'
-end
-
-local function pacing_state(
-  next_key,
-  rate_key,
-  cooldown_key,
-  target_key,
-  ceiling
-)
-  local runtime_target = tonumber(redis.call('GET', target_key) or ceiling)
-  if runtime_target == nil or runtime_target <= 0 then
-    runtime_target = ceiling
-  end
-  local target = math.min(ceiling, runtime_target)
-  local rate = tonumber(redis.call('GET', rate_key) or target)
-  if rate == nil or rate <= 0 then rate = target end
-  if rate > target then rate = target end
-  local cooldown_until = tonumber(redis.call('GET', cooldown_key) or 0)
-  local base_ms = math.max(now_ms, cooldown_until)
-  local next_ms = tonumber(redis.call('GET', next_key) or base_ms)
-  if next_ms < base_ms then next_ms = base_ms end
-  return rate, next_ms, target
-end
-
-local global_rate, global_next, global_target = pacing_state(
-  KEYS[1], KEYS[2], KEYS[3], KEYS[5], global_ceiling
-)
-local endpoint_rate = 0
-local endpoint_next = now_ms
-local endpoint_target = endpoint_ceiling
-if has_endpoint then
-  endpoint_rate, endpoint_next, endpoint_target = pacing_state(
-    KEYS[6], KEYS[7], KEYS[8], KEYS[10], endpoint_ceiling
-  )
-end
-
-local admit_ms = math.max(now_ms, global_next, endpoint_next)
+local global_next = tonumber(redis.call('GET', KEYS[1]) or now_ms)
+if global_next < now_ms then global_next = now_ms end
+local wait_ms = global_next - now_ms
 local global_interval = math.max(1, 1000 / global_rate)
-redis.call(
-  'PSETEX',
-  KEYS[1],
-  ttl_ms,
-  tostring(admit_ms + global_interval)
-)
-redis.call('PSETEX', KEYS[2], ttl_ms, tostring(global_rate))
-if redis.call('EXISTS', KEYS[3]) == 1 then
-  redis.call('PEXPIRE', KEYS[3], ttl_ms)
-end
-if redis.call('EXISTS', KEYS[4]) == 1 then
-  redis.call('PEXPIRE', KEYS[4], ttl_ms)
-end
-if redis.call('EXISTS', KEYS[5]) == 1 then
-  redis.call('PEXPIRE', KEYS[5], ttl_ms)
+redis.call('PSETEX', KEYS[1], ttl_ms, tostring(global_next + global_interval))
+
+if endpoint_ceiling > 0 and has_endpoint then
+  local endpoint_interval = math.max(1, 1000 / endpoint_ceiling)
+  redis.call('PSETEX', KEYS[4], ttl_ms, tostring(global_next + endpoint_interval))
 end
 
-if has_endpoint then
-  local endpoint_interval = math.max(1, 1000 / endpoint_rate)
-  redis.call(
-    'PSETEX',
-    KEYS[6],
-    ttl_ms,
-    tostring(admit_ms + endpoint_interval)
-  )
-  redis.call('PSETEX', KEYS[7], ttl_ms, tostring(endpoint_rate))
-  if redis.call('EXISTS', KEYS[8]) == 1 then
-    redis.call('PEXPIRE', KEYS[8], ttl_ms)
-  end
-  if redis.call('EXISTS', KEYS[9]) == 1 then
-    redis.call('PEXPIRE', KEYS[9], ttl_ms)
-  end
-  if redis.call('EXISTS', KEYS[10]) == 1 then
-    redis.call('PEXPIRE', KEYS[10], ttl_ms)
-  end
-end
+if redis.call('EXISTS', KEYS[2]) == 1 then redis.call('PEXPIRE', KEYS[2], ttl_ms) end
+if redis.call('EXISTS', KEYS[3]) == 1 then redis.call('PEXPIRE', KEYS[3], ttl_ms) end
+if redis.call('EXISTS', KEYS[5]) == 1 then redis.call('PEXPIRE', KEYS[5], ttl_ms) end
 
 return {
-  tostring(math.max(0, admit_ms - now_ms)),
+  tostring(wait_ms),
+  'admitted',
   tostring(global_rate),
-  has_endpoint and tostring(endpoint_rate) or '',
-  'paced',
-  gstate,
-  estate,
-  tostring(global_target),
-  has_endpoint and tostring(endpoint_target) or ''
+  tostring(endpoint_ceiling)
 }
 """
 
-    _SUCCESS_RECOVERY_SCRIPT = """
+    _COOLDOWN_SCRIPT = """
 local now = redis.call('TIME')
 local now_ms = (tonumber(now[1]) * 1000) + math.floor(tonumber(now[2]) / 1000)
-local has_endpoint = ARGV[1] == '1'
-local global_ceiling = tonumber(ARGV[2])
-local endpoint_ceiling = tonumber(ARGV[3])
-local ttl_ms = tonumber(ARGV[4])
-local quiet_ms = tonumber(ARGV[5])
-local factor = tonumber(ARGV[6])
-local step = tonumber(ARGV[7])
-local global_admission_state = ARGV[8]
-local endpoint_admission_state = ARGV[9]
-local probe_token = ARGV[10]
-
-local function close_half_open(
-  state_key,
-  opened_key,
-  failures_key,
-  window_key,
-  probe_key
-)
-  local state = redis.call('GET', state_key) or 'closed'
-  local owner = redis.call('GET', probe_key)
-  if state == 'half_open' and owner == probe_token then
-    redis.call('PSETEX', state_key, ttl_ms, 'closed')
-    redis.call('DEL', opened_key, failures_key, window_key, probe_key)
-  end
-end
-
-if global_admission_state == 'half_open' then
-  close_half_open(KEYS[11], KEYS[12], KEYS[13], KEYS[14], KEYS[15])
-end
-if has_endpoint and endpoint_admission_state == 'half_open' then
-  close_half_open(KEYS[16], KEYS[17], KEYS[18], KEYS[19], KEYS[20])
-end
-
-local function recover_rate(rate_key, cooldown_key, penalty_key, target_key, ceiling)
-  local runtime_target = tonumber(redis.call('GET', target_key) or ceiling)
-  if runtime_target == nil or runtime_target <= 0 then
-    runtime_target = ceiling
-  end
-  local target = math.min(ceiling, runtime_target)
-  local rate = tonumber(redis.call('GET', rate_key) or target)
-  if rate == nil or rate <= 0 then rate = target end
-  if rate > target then rate = target end
-  local cooldown_until = tonumber(redis.call('GET', cooldown_key) or 0)
-  local last_penalty = tonumber(redis.call('GET', penalty_key) or 0)
-  if rate >= target
-    or now_ms < cooldown_until
-    or (now_ms - last_penalty) < quiet_ms then
-    redis.call('PSETEX', rate_key, ttl_ms, tostring(rate))
-    return rate, target
-  end
-  local recovered = math.min(target, math.max(rate + step, rate * factor))
-  if recovered > rate then
-    rate = recovered
-    redis.call('PSETEX', rate_key, ttl_ms, tostring(rate))
-    redis.call('PSETEX', penalty_key, ttl_ms, tostring(now_ms))
-  end
-  return rate, target
-end
-
-local global_rate, global_target = recover_rate(
-  KEYS[2], KEYS[3], KEYS[4], KEYS[5], global_ceiling
-)
-local endpoint_rate = 0
-local endpoint_target = endpoint_ceiling
-if has_endpoint then
-  endpoint_rate, endpoint_target = recover_rate(
-    KEYS[7], KEYS[8], KEYS[9], KEYS[10], endpoint_ceiling
-  )
-end
-return {
-  tostring(global_rate),
-  has_endpoint and tostring(endpoint_rate) or '',
-  tostring(global_target),
-  has_endpoint and tostring(endpoint_target) or ''
-}
+local requested_until = now_ms + tonumber(ARGV[1])
+local ttl_ms = tonumber(ARGV[2])
+local current_until = tonumber(redis.call('GET', KEYS[1]) or 0)
+local cooldown_until = math.max(current_until, requested_until)
+redis.call('PSETEX', KEYS[1], ttl_ms, tostring(cooldown_until))
+return tostring(math.max(0, cooldown_until - now_ms))
 """
 
     def __init__(
@@ -550,6 +317,14 @@ return {
         global_pressure_endpoint_threshold: int = 2,
         circuit_probe_seconds: float = 40.0,
     ):
+        _ = (
+            circuit_failure_threshold,
+            circuit_window_seconds,
+            circuit_open_seconds,
+            global_pressure_window_seconds,
+            global_pressure_endpoint_threshold,
+            circuit_probe_seconds,
+        )
         self.target_rate = _positive_rate(global_rate)
         self.shared_rate_ceiling = _positive_rate(shared_rate_ceiling or global_rate)
         self._endpoint_targets = {
@@ -565,74 +340,48 @@ return {
                 max_connections=redis_max_connections,
             )
         self._global_local = TokenBucket(self.target_rate)
-        self._global_shared = (
-            RedisPacer(
-                redis_url,
-                redis_key,
-                self.shared_rate_ceiling,
-                client=self._redis,
-            )
-            if redis_url
-            else None
-        )
-        self._shared_endpoints: dict[str, RedisPacer] = {}
         self._endpoints: dict[str, TokenBucket] = {}
         self._admission_script = None
-        self._success_script = None
-        self._next_shared_recovery_at = 0.0
-        self._global_recovery_needed = False
-        self._global_recovery_target = self.shared_rate_ceiling
-        self._endpoint_recovery_needed: set[str] = set()
-        self._endpoint_recovery_targets: dict[str, float] = {}
-        self._last_global_circuit_state = "closed"
-        self._last_endpoint_circuit_state: dict[str, str] = {}
+        self._cooldown_script = None
+        self._state_ttl_ms = 600_000
+        self._last_shared_rate = self.shared_rate_ceiling
         self.redis_commands = 0
         self.redis_admissions = 0
-        self._breaker = AdaptiveCircuitBreaker(
-            redis=self._redis,
-            namespace=f"{redis_key}:circuit",
-            failure_threshold=circuit_failure_threshold,
-            window_seconds=circuit_window_seconds,
-            open_seconds=circuit_open_seconds,
-            pressure_window_seconds=global_pressure_window_seconds,
-            pressure_endpoint_threshold=global_pressure_endpoint_threshold,
-            probe_seconds=circuit_probe_seconds,
-        )
-        EFFECTIVE_RATE.set(self._global_effective())
+        self._global_shared = None
+        EFFECTIVE_RATE.set(self.target_rate)
 
     async def open(self) -> None:
-        if self._redis is not None:
+        if self._redis is None:
+            return
+        try:
             await self._redis.ping()
-            self._admission_script = self._redis.register_script(
-                self._ADMISSION_SCRIPT
-            )
-            self._success_script = self._redis.register_script(
-                self._SUCCESS_RECOVERY_SCRIPT
-            )
-            # Preload once so the hot path is EVALSHA from the first request.
+            self._admission_script = self._redis.register_script(self._ADMISSION_SCRIPT)
+            self._cooldown_script = self._redis.register_script(self._COOLDOWN_SCRIPT)
             await self._redis.script_load(self._ADMISSION_SCRIPT)
-            await self._redis.script_load(self._SUCCESS_RECOVERY_SCRIPT)
-            await self._breaker.prepare_scripts()
-        elif self._global_shared is not None:
-            await self._global_shared.open()
+            await self._redis.script_load(self._COOLDOWN_SCRIPT)
+        except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
+            raise RateControlUnavailable(
+                f"Redis hard admission unavailable: {type(exc).__name__}"
+            ) from exc
+        pool = redis_pool_snapshot(self._redis)
+        REDIS_POOL_CONNECTIONS.labels("created").set(int(pool.get("created", 0)))
+        REDIS_POOL_CONNECTIONS.labels("in_use").set(int(pool.get("in_use", 0)))
 
     async def close(self) -> None:
         if self._redis is not None and self._owns_redis:
             await close_async_redis(self._redis)
             self._redis = None
-        elif self._global_shared is not None:
-            await self._global_shared.close()
         self._admission_script = None
-        self._success_script = None
+        self._cooldown_script = None
 
     def _target_for(self, endpoint: str) -> float:
         return min(self.target_rate, self._endpoint_targets.get(endpoint, self.target_rate))
 
     def _shared_target_for(self, endpoint: str) -> float:
-        return min(
-            self.shared_rate_ceiling,
-            self._endpoint_targets.get(endpoint, self.shared_rate_ceiling),
-        )
+        configured = self._endpoint_targets.get(endpoint)
+        if configured is None:
+            return 0.0
+        return min(self.shared_rate_ceiling, configured)
 
     def _bucket(self, endpoint: str) -> TokenBucket:
         bucket = self._endpoints.get(endpoint)
@@ -641,220 +390,86 @@ return {
             ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(bucket.rate)
         return bucket
 
-    def _shared_endpoint(self, endpoint: str) -> RedisPacer | None:
-        if self._redis is None or self._redis_url is None:
-            return None
-        pacer = self._shared_endpoints.get(endpoint)
-        if pacer is None:
-            pacer = RedisPacer(
-                self._redis_url,
-                f"{self._redis_key}:endpoint:{endpoint}",
-                self._shared_target_for(endpoint),
-                client=self._redis,
-            )
-            self._shared_endpoints[endpoint] = pacer
-        return pacer
-
-    def _endpoint_effective(self, endpoint: str) -> float:
-        shared = self._shared_endpoints.get(endpoint)
-        return shared.rate if shared is not None else self._bucket(endpoint).rate
-
-    def _global_effective(self) -> float:
-        shared = self._global_shared
-        return shared.rate if shared is not None else self._global_local.rate
+    def _shared_endpoint(self, endpoint: str):
+        _ = endpoint
+        return None
 
     def _shared_keys(self, endpoint: str | None) -> list[str]:
-        if self._global_shared is None:
-            raise RuntimeError("Shared Redis admission is not configured")
-        global_pacer = list(self._global_shared._keys)
-        global_circuit = list(self._breaker._keys("__global__"))
-        if endpoint is None:
-            endpoint_pacer = global_pacer
-            endpoint_circuit = global_circuit
-        else:
-            shared_endpoint = self._shared_endpoint(endpoint)
-            if shared_endpoint is None:
-                raise RuntimeError("Shared endpoint admission is not configured")
-            endpoint_pacer = list(shared_endpoint._keys)
-            endpoint_circuit = list(self._breaker._keys(endpoint))
+        endpoint_key = endpoint or "__global__"
         return [
-            *global_pacer,
-            *endpoint_pacer,
-            *global_circuit,
-            *endpoint_circuit,
+            f"{self._redis_key}:hard-next-ms",
+            f"{self._redis_key}:hard-cooldown-until-ms",
+            f"{self._redis_key}:target-rate",
+            f"{self._redis_key}:endpoint:{endpoint_key}:hard-next-ms",
+            f"{self._redis_key}:endpoint:{endpoint_key}:cooldown-until-ms",
         ]
 
     def _observe_redis_command(self, operation: str, started: float) -> None:
-        REDIS_RTT.labels(operation).observe(time.perf_counter() - started)
-        REDIS_COMMANDS.labels(operation).inc()
+        elapsed = time.perf_counter() - started
         self.redis_commands += 1
+        REDIS_COMMANDS.labels(operation).inc()
+        REDIS_RTT.labels(operation).observe(elapsed)
         if self._redis is not None:
-            snapshot = redis_pool_snapshot(self._redis)
-            for state in ("in_use", "available", "created", "max"):
-                REDIS_POOL_CONNECTIONS.labels(state).set(snapshot[state])
+            pool = redis_pool_snapshot(self._redis)
+            REDIS_POOL_CONNECTIONS.labels("created").set(int(pool.get("created", 0)))
+            REDIS_POOL_CONNECTIONS.labels("in_use").set(int(pool.get("in_use", 0)))
 
     async def _shared_admit(self, endpoint: str | None) -> AdmissionState:
         if self._redis is None:
             raise RuntimeError("Shared Redis admission is not configured")
         if self._admission_script is None:
-            self._admission_script = self._redis.register_script(
-                self._ADMISSION_SCRIPT
-            )
-
-        shared_endpoint = self._shared_endpoint(endpoint) if endpoint else None
-        endpoint_ceiling = (
-            self._shared_target_for(endpoint)
-            if endpoint is not None
-            else self.shared_rate_ceiling
-        )
-        keys = self._shared_keys(endpoint)
+            self._admission_script = self._redis.register_script(self._ADMISSION_SCRIPT)
 
         while True:
-            probe_token = uuid4().hex
             started = time.perf_counter()
             try:
                 result = await self._admission_script(
-                    keys=keys,
+                    keys=self._shared_keys(endpoint),
                     args=[
                         "1" if endpoint is not None else "0",
                         self.shared_rate_ceiling,
-                        endpoint_ceiling,
-                        self._global_shared._state_ttl_ms,
-                        probe_token,
-                        int(self._breaker.probe_seconds * 1000),
-                        self._breaker._state_ttl_ms,
+                        self._shared_target_for(endpoint) if endpoint is not None else 0.0,
+                        self._state_ttl_ms,
                     ],
                 )
+            except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
+                raise RateControlUnavailable(
+                    f"Redis hard admission unavailable: {type(exc).__name__}"
+                ) from exc
             finally:
                 self._observe_redis_command("admission", started)
 
-            wait_ms = max(0.0, float(result[0]))
-            mode = str(result[3])
-            global_state = str(result[4])
-            endpoint_state = str(result[5]) if endpoint is not None else None
-            self._last_global_circuit_state = global_state
-            if endpoint is not None and endpoint_state is not None:
-                self._last_endpoint_circuit_state[endpoint] = endpoint_state
-            if mode == "circuit":
-                # Respect the durable circuit window instead of waking every
-                # coroutine roughly once per second. Cap the sleep so callers
-                # notice a successful HALF_OPEN probe promptly.
-                wait_seconds = max(wait_ms / 1000.0, 0.05)
-                wait_cap = max(1.0, min(5.0, self._breaker.open_seconds / 2.0))
-                await asyncio.sleep(min(wait_seconds, wait_cap))
-                continue
+            wait_seconds = max(0.0, float(result[0]) / 1000.0)
+            mode = str(result[1])
+            self._last_shared_rate = float(result[2])
+            if mode == "admitted":
+                self.redis_admissions += 1
+                if wait_seconds:
+                    await asyncio.sleep(wait_seconds)
+                return AdmissionState(shared=True)
+            await asyncio.sleep(max(0.01, wait_seconds))
 
-            global_rate = float(result[1])
-            global_target = float(result[6])
-            self._global_shared.rate = global_rate
-            self._global_recovery_target = global_target
-            self._global_recovery_needed = global_rate < global_target
-            if shared_endpoint is not None and result[2] != "":
-                endpoint_rate = float(result[2])
-                endpoint_target = float(result[7])
-                shared_endpoint.rate = endpoint_rate
-                self._endpoint_recovery_targets[endpoint] = endpoint_target
-                if endpoint_rate < endpoint_target:
-                    self._endpoint_recovery_needed.add(endpoint)
-                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
-            EFFECTIVE_RATE.set(global_rate)
-            self.redis_admissions += 1
-            if wait_ms > 0:
-                await asyncio.sleep(wait_ms / 1000.0)
-            return AdmissionState(
-                global_state=global_state,
-                endpoint_state=endpoint_state,
-                probe_token=probe_token,
-                shared=True,
-            )
-
-    async def _shared_success_recovery(
-        self,
-        endpoint: str | None,
-        admission: AdmissionState,
-    ) -> tuple[float | None, float | None]:
+    async def _shared_cooldown(self, endpoint: str | None, seconds: float) -> float:
         if self._redis is None:
-            return None, None
-        half_open = admission.global_state == "half_open" or (
-            admission.endpoint_state == "half_open"
-        )
-        endpoint_needs_recovery = (
-            endpoint is not None and endpoint in self._endpoint_recovery_needed
-        )
-        now = time.monotonic()
-        if (
-            not half_open
-            and not self._global_recovery_needed
-            and not endpoint_needs_recovery
-        ):
-            return None, None
-        if not half_open and now < self._next_shared_recovery_at:
-            return None, None
-
-        if self._success_script is None:
-            self._success_script = self._redis.register_script(
-                self._SUCCESS_RECOVERY_SCRIPT
-            )
-        endpoint_ceiling = (
-            self._shared_target_for(endpoint)
-            if endpoint is not None
-            else self.shared_rate_ceiling
-        )
+            return max(0.0, float(seconds))
+        if self._cooldown_script is None:
+            self._cooldown_script = self._redis.register_script(self._COOLDOWN_SCRIPT)
+        cooldown_key = self._shared_keys(endpoint)[4 if endpoint is not None else 1]
         started = time.perf_counter()
         try:
-            result = await self._success_script(
-                keys=self._shared_keys(endpoint),
-                args=[
-                    "1" if endpoint is not None else "0",
-                    self.shared_rate_ceiling,
-                    endpoint_ceiling,
-                    self._global_shared._state_ttl_ms,
-                    30_000,
-                    1.25,
-                    0.5,
-                    admission.global_state,
-                    admission.endpoint_state or "closed",
-                    admission.probe_token or "",
-                ],
+            wait_raw = await self._cooldown_script(
+                keys=[cooldown_key],
+                args=[max(0.0, float(seconds)) * 1000.0, self._state_ttl_ms],
             )
+        except (RedisConnectionError, RedisTimeoutError, OSError) as exc:
+            raise RateControlUnavailable(
+                f"Redis cooldown update unavailable: {type(exc).__name__}"
+            ) from exc
         finally:
-            self._observe_redis_command("success_recovery", started)
-
-        self._next_shared_recovery_at = (
-            now + float(settings.dbd_redis_recovery_interval_seconds)
-        )
-        if admission.global_state == "half_open":
-            self._last_global_circuit_state = "closed"
-        if endpoint is not None and admission.endpoint_state == "half_open":
-            self._last_endpoint_circuit_state[endpoint] = "closed"
-        previous_global = self._global_shared.rate
-        global_rate = float(result[0])
-        global_target = float(result[2])
-        self._global_shared.rate = global_rate
-        self._global_recovery_target = global_target
-        self._global_recovery_needed = global_rate < global_target
-        global_changed = global_rate if global_rate != previous_global else None
-
-        endpoint_changed = None
-        if endpoint is not None and result[1] != "":
-            shared_endpoint = self._shared_endpoint(endpoint)
-            previous_endpoint = shared_endpoint.rate
-            endpoint_rate = float(result[1])
-            endpoint_target = float(result[3])
-            shared_endpoint.rate = endpoint_rate
-            self._endpoint_recovery_targets[endpoint] = endpoint_target
-            if endpoint_rate >= endpoint_target:
-                self._endpoint_recovery_needed.discard(endpoint)
-            else:
-                self._endpoint_recovery_needed.add(endpoint)
-            if endpoint_rate != previous_endpoint:
-                endpoint_changed = endpoint_rate
-            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_rate)
-        EFFECTIVE_RATE.set(global_rate)
-        return endpoint_changed, global_changed
+            self._observe_redis_command("cooldown", started)
+        return max(0.0, float(wait_raw) / 1000.0)
 
     def set_target_rate(self, value: float) -> float:
-        """Retarget the local per-worker cap without erasing shared fleet penalties."""
         self.target_rate = _positive_rate(value)
         self._global_local.target_rate = self.target_rate
         self._global_local._set_rate(self.target_rate)
@@ -862,175 +477,72 @@ return {
             target = self._target_for(endpoint)
             bucket.target_rate = target
             bucket._set_rate(target)
-            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(self._endpoint_effective(endpoint))
-        EFFECTIVE_RATE.set(self._global_effective())
+            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(bucket.rate)
+        EFFECTIVE_RATE.set(self.target_rate)
         return self.target_rate
 
     async def acquire(self, endpoint: str | None) -> AdmissionState:
-        if self._redis is None:
-            global_state = await self._breaker.before("__global__")
-            self._last_global_circuit_state = global_state
-            endpoint_state = None
-            if endpoint is not None:
-                endpoint_state = await self._breaker.before(endpoint)
-                self._last_endpoint_circuit_state[endpoint] = endpoint_state
-                await self._bucket(endpoint).acquire()
-                ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(
-                    self._endpoint_effective(endpoint)
-                )
-            await self._global_local.acquire()
-            EFFECTIVE_RATE.set(self._global_effective())
-            return AdmissionState(
-                global_state=global_state,
-                endpoint_state=endpoint_state,
-                shared=False,
-            )
-
-        # Local buckets protect one process. The Redis script then atomically
-        # evaluates both circuits and reserves endpoint/global fleet pacing for
-        # the same admission timestamp, avoiding four healthy-path Redis RTTs.
         if endpoint is not None:
             await self._bucket(endpoint).acquire()
+            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(self._bucket(endpoint).rate)
         await self._global_local.acquire()
+        EFFECTIVE_RATE.set(self.target_rate)
+        if self._redis is None:
+            return AdmissionState(shared=False)
         return await self._shared_admit(endpoint)
 
-    async def availability_failure(self, endpoint: str | None = None) -> str:
-        """Record upstream availability failure without changing pacing rate.
-
-        Endpoint-scoped failures isolate one API surface. Authentication/session
-        failures pass endpoint=None and open the shared global availability
-        circuit without converting availability loss into throughput pressure.
-        """
-        key = "__global__" if endpoint is None else endpoint
-        state = await self._breaker.failure(key)
+    async def cooldown(self, endpoint: str | None, seconds: float) -> float:
+        seconds = max(0.0, float(seconds))
         if endpoint is None:
-            self._last_global_circuit_state = state
-            return state
+            self._global_local.cooldown(seconds)
+        else:
+            self._bucket(endpoint).cooldown(seconds)
+        if self._redis is not None:
+            seconds = await self._shared_cooldown(endpoint, seconds)
+        return seconds
 
-        self._last_endpoint_circuit_state[endpoint] = state
-        if await self._breaker.record_endpoint_availability(endpoint):
-            self._last_global_circuit_state = await self._breaker.failure("__global__")
-        return state
+    async def availability_failure(self, endpoint: str | None = None) -> str:
+        _ = endpoint
+        return "closed"
 
     def circuit_state(self, endpoint: str | None = None) -> str:
-        if endpoint is None:
-            return self._last_global_circuit_state
-        return self._last_endpoint_circuit_state.get(endpoint, "closed")
+        _ = endpoint
+        return "closed"
 
     async def penalize(
         self,
         endpoint: str,
         cooldown_seconds: float,
     ) -> tuple[float, float, float, float, bool]:
-        endpoint_state = await self._breaker.failure(endpoint)
-        self._last_endpoint_circuit_state[endpoint] = endpoint_state
-        self._endpoint_recovery_needed.add(endpoint)
-        endpoint_bucket = self._bucket(endpoint)
-        shared_endpoint = self._shared_endpoint(endpoint)
-        old_endpoint = self._endpoint_effective(endpoint)
-        endpoint_bucket.slow_down()
-        endpoint_bucket.cooldown(cooldown_seconds)
-        if shared_endpoint is not None:
-            await shared_endpoint.penalize(cooldown_seconds)
-            if shared_endpoint.rate < endpoint_bucket.rate:
-                endpoint_bucket._set_rate(shared_endpoint.rate)
-        new_endpoint = self._endpoint_effective(endpoint)
-        ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(new_endpoint)
-
-        old_global = self._global_effective()
-        global_escalated = await self._breaker.record_endpoint_pressure(endpoint)
-        if global_escalated:
-            self._global_recovery_needed = True
-            self._last_global_circuit_state = await self._breaker.failure("__global__")
-            self._global_local.slow_down()
-            self._global_local.cooldown(cooldown_seconds)
-            if self._global_shared is not None:
-                await self._global_shared.penalize(cooldown_seconds)
-                if self._global_shared.rate < self._global_local.rate:
-                    self._global_local._set_rate(self._global_shared.rate)
-        new_global = self._global_effective()
-        EFFECTIVE_RATE.set(new_global)
-        return old_endpoint, new_endpoint, old_global, new_global, global_escalated
+        old_endpoint = self.effective_rate(endpoint)
+        old_global = self.global_effective_rate()
+        await self.cooldown(endpoint, cooldown_seconds)
+        return old_endpoint, old_endpoint, old_global, old_global, False
 
     async def penalize_global(self, cooldown_seconds: float) -> tuple[float, float]:
-        self._global_recovery_needed = True
-        self._last_global_circuit_state = await self._breaker.failure("__global__")
-        old_global = self._global_effective()
-        self._global_local.slow_down()
-        self._global_local.cooldown(cooldown_seconds)
-        if self._global_shared is not None:
-            await self._global_shared.penalize(cooldown_seconds)
-            if self._global_shared.rate < self._global_local.rate:
-                self._global_local._set_rate(self._global_shared.rate)
-        new_global = self._global_effective()
-        EFFECTIVE_RATE.set(new_global)
-        return old_global, new_global
+        old_global = self.global_effective_rate()
+        await self.cooldown(None, cooldown_seconds)
+        return old_global, old_global
 
     async def recover(
         self,
         endpoint: str,
+        *,
         admission: AdmissionState | None = None,
     ) -> tuple[float | None, float | None]:
-        endpoint_bucket = self._bucket(endpoint)
-        local_endpoint_recovered = endpoint_bucket.recover()
-        local_global_recovered = self._global_local.recover()
-
-        if self._redis is None:
-            endpoint_state = await self._breaker.success(endpoint)
-            global_state = await self._breaker.success("__global__")
-            self._last_endpoint_circuit_state[endpoint] = endpoint_state
-            self._last_global_circuit_state = global_state
-            endpoint_effective = self._endpoint_effective(endpoint)
-            global_effective = self._global_effective()
-            ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_effective)
-            EFFECTIVE_RATE.set(global_effective)
-            return (
-                endpoint_effective if local_endpoint_recovered is not None else None,
-                global_effective if local_global_recovered is not None else None,
-            )
-
-        shared_endpoint_changed, shared_global_changed = (
-            await self._shared_success_recovery(
-                endpoint,
-                admission or AdmissionState(shared=True),
-            )
-        )
-        endpoint_effective = self._endpoint_effective(endpoint)
-        global_effective = self._global_effective()
-        ENDPOINT_EFFECTIVE_RATE.labels(endpoint).set(endpoint_effective)
-        EFFECTIVE_RATE.set(global_effective)
-        return (
-            endpoint_effective
-            if local_endpoint_recovered is not None
-            or shared_endpoint_changed is not None
-            else None,
-            global_effective
-            if local_global_recovered is not None
-            or shared_global_changed is not None
-            else None,
-        )
+        _ = endpoint, admission
+        return None, None
 
     async def recover_global(
         self,
+        *,
         admission: AdmissionState | None = None,
     ) -> float | None:
-        local_recovered = self._global_local.recover()
-        if self._redis is None:
-            self._last_global_circuit_state = await self._breaker.success("__global__")
-            effective = self._global_effective()
-            EFFECTIVE_RATE.set(effective)
-            return effective if local_recovered is not None else None
-
-        _, shared_recovered = await self._shared_success_recovery(
-            None,
-            admission or AdmissionState(shared=True),
-        )
-        effective = self._global_effective()
-        EFFECTIVE_RATE.set(effective)
-        return effective if local_recovered is not None or shared_recovered is not None else None
+        _ = admission
+        return None
 
     def effective_rate(self, endpoint: str) -> float:
-        return self._endpoint_effective(endpoint)
+        return self._bucket(endpoint).rate
 
     def global_effective_rate(self) -> float:
-        return self._global_effective()
+        return self.target_rate

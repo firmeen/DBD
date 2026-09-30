@@ -198,22 +198,19 @@ def build_rate_plan(
     independent = fleet_rate_initial is not None or fleet_rate_max is not None
     if independent:
         ceiling = float(fleet_rate_max if fleet_rate_max is not None else fleet_rate_initial)
-        initial = float(
-            fleet_rate_initial if fleet_rate_initial is not None else min(worker_rate, ceiling)
+        requested_initial = float(
+            fleet_rate_initial if fleet_rate_initial is not None else ceiling
         )
-        if initial <= 0 or ceiling <= 0 or initial > ceiling:
+        if requested_initial <= 0 or ceiling <= 0 or requested_initial > ceiling:
             raise ValueError("fleet rate must satisfy 0 < initial <= max")
-        return CampaignRatePlan(mode, ceiling, workers, ceiling, initial, True)
+        # Explicit fleet configuration is a fixed hard ceiling. Keep worker_rate
+        # local to each process; never replace it with the fleet ceiling.
+        return CampaignRatePlan(mode, worker_rate, workers, ceiling, ceiling, True)
 
-    if mode == "shared":
-        ceiling = initial = worker_rate
-    elif mode == "multiply":
-        ceiling = worker_rate * workers
-        initial = worker_rate * initial_workers
-    else:
-        ceiling = worker_rate * workers
-        initial = worker_rate
-    return CampaignRatePlan(mode, worker_rate, workers, ceiling, initial, False)
+    # Keep legacy mode names for CLI/profile compatibility, but derive one fixed
+    # ceiling. Production admission no longer adapts the fleet rate downward.
+    ceiling = worker_rate if mode == "shared" else worker_rate * workers
+    return CampaignRatePlan(mode, worker_rate, workers, ceiling, ceiling, False)
 
 
 def build_resource_plan(
@@ -704,44 +701,38 @@ def _seed_rate(
     initial_rate: float,
     target_rate: float | None = None,
 ) -> None:
-    """Seed shared safety state without erasing an active penalty/cooldown."""
+    """Publish the fixed runtime target and overwrite stale adaptive display state."""
     target = float(initial_rate if target_rate is None else target_rate)
     pipe = redis.pipeline(transaction=False)
-    pipe.set(f"{rate_key}:effective-rate", str(initial_rate), ex=_RATE_STATE_TTL_SECONDS, nx=True)
     pipe.set(
-        f"{rate_key}:last-penalty-ms",
-        str(int(time.time() * 1000) - 120_000),
+        f"{rate_key}:effective-rate",
+        str(target),
         ex=_RATE_STATE_TTL_SECONDS,
-        nx=True,
     )
-    pipe.set(_rate_target_key(rate_key), str(target), ex=_RATE_STATE_TTL_SECONDS)
+    pipe.set(
+        _rate_target_key(rate_key),
+        str(target),
+        ex=_RATE_STATE_TTL_SECONDS,
+    )
     pipe.execute()
 
 
 def _set_rate_target(redis: Redis, rate_key: str, target_rate: float) -> float:
-    """Retarget the fleet atomically; scale-down clamps immediately, scale-up recovers gradually."""
-    script = """
-    local target = tonumber(ARGV[1])
-    local ttl = tonumber(ARGV[2])
-    local current = tonumber(redis.call('GET', KEYS[1]) or target)
-    redis.call('SET', KEYS[2], tostring(target), 'EX', ttl)
-    if current > target then
-      current = target
-      redis.call('SET', KEYS[1], tostring(current), 'EX', ttl)
-    elseif redis.call('EXISTS', KEYS[1]) == 1 then
-      redis.call('EXPIRE', KEYS[1], ttl)
-    end
-    return tostring(current)
-    """
-    result = redis.eval(
-        script,
-        2,
+    """Publish a fixed supervisor target; no adaptive recovery state exists."""
+    target = float(target_rate)
+    pipe = redis.pipeline(transaction=False)
+    pipe.set(
         f"{rate_key}:effective-rate",
-        _rate_target_key(rate_key),
-        str(float(target_rate)),
-        str(_RATE_STATE_TTL_SECONDS),
+        str(target),
+        ex=_RATE_STATE_TTL_SECONDS,
     )
-    return float(result)
+    pipe.set(
+        _rate_target_key(rate_key),
+        str(target),
+        ex=_RATE_STATE_TTL_SECONDS,
+    )
+    pipe.execute()
+    return target
 
 
 def _effective_rate(redis: Redis, rate_key: str, fallback: float) -> float:
