@@ -18,7 +18,9 @@ from ..core.exceptions import (
     IdentityConflict,
 )
 from .catalog import (
+    ACTIVE_ENDPOINT_MASK,
     ACTIVE_ENDPOINTS,
+    BASE_REQUIRED_MASK,
     FINANCIAL_ENDPOINTS,
     EndpointSpec,
     latest_fiscal_year,
@@ -323,6 +325,24 @@ class DeepCollector:
     ) -> None:
         jp_type_code = str(company["jp_type_code"])
         jp_no = str(company["jp_no"])
+
+        required = int(company["required_mask"])
+        done = int(company["done_mask"])
+        not_available = int(company["not_available_mask"])
+        failed = int(company["failed_mask"])
+        if required not in {BASE_REQUIRED_MASK, ACTIVE_ENDPOINT_MASK}:
+            raise RuntimeError(
+                f"{jp_type_code}{jp_no}: unprepared required_mask={required}; "
+                "run dbd-deep prepare"
+            )
+        if (
+            (done & not_available)
+            or (done & failed)
+            or (not_available & failed)
+        ):
+            raise RuntimeError(
+                f"{jp_type_code}{jp_no}: overlapping Deep outcome masks"
+            )
 
         for spec in self._specs:
             unresolved = unresolved_mask(
