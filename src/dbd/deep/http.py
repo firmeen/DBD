@@ -172,10 +172,22 @@ class FixedRateDbdClient:
         while True:
             async with self._cooldown_lock:
                 delay = self._cooldown_until - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+                continue
+
+            await self._limiter.acquire()
+
+            # A different request can receive 429/503 while this coroutine is
+            # queued inside the limiter. Re-check after admission so already
+            # waiting workers cannot leak requests through the shared cooldown.
+            async with self._cooldown_lock:
+                delay = self._cooldown_until - time.monotonic()
             if delay <= 0:
-                break
+                return
             await asyncio.sleep(delay)
-        await self._limiter.acquire()
+            # Re-acquire the limiter after cooldown. Otherwise all waiters that
+            # slept to the same deadline could burst at once.
 
     @staticmethod
     def _backoff(attempt: int, server_seconds: float = 0.0) -> float:
