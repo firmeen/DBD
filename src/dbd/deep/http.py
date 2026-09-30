@@ -42,6 +42,12 @@ class DeepTransientHttpError(DeepHttpError):
         self.status = status
 
 
+class DeepDecodeError(DeepHttpError):
+    def __init__(self, message: str, *, status: int = 200):
+        super().__init__(message)
+        self.status = int(status)
+
+
 @dataclass(frozen=True)
 class DeepResponse:
     data: object
@@ -267,6 +273,11 @@ class FixedRateDbdClient:
                 await self._ensure_token(force=True)
                 await asyncio.sleep(self._backoff(attempt))
                 continue
+            except Exception as exc:
+                raise DeepDecodeError(
+                    f"HTTP {status} response decode failed: {type(exc).__name__}: {exc}",
+                    status=status,
+                ) from exc
 
             return DeepResponse(
                 data=data,
