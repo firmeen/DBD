@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import random
 import time
 from dataclasses import dataclass
@@ -86,8 +87,8 @@ class FixedRateDbdClient:
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be positive")
-        if rate_per_second <= 0:
-            raise ValueError("rate_per_second must be positive")
+        if rate_per_second <= 0 or not math.isfinite(rate_per_second):
+            raise ValueError("rate_per_second must be finite and positive")
         if max_retries < 0:
             raise ValueError("max_retries cannot be negative")
 
