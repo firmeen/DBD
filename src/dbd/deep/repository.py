@@ -894,6 +894,7 @@ class DeepRepository:
         http_status: int | None,
         error: str | None,
         requested_at: datetime | None,
+        profile_submit_fin_year: str | None = None,
     ) -> dict[str, Any]:
         if spec.key not in ACTIVE_ENDPOINTS:
             raise ValueError(f"Inactive endpoint {spec.key}")
@@ -928,6 +929,28 @@ class DeepRepository:
             """
             payload_sql = ""
 
+        profile_scope_sql = ""
+        if spec.key == "profile" and outcome == "done":
+            profile_scope_sql = f"""
+                submit_fin_year=COALESCE(
+                    NULLIF(TRIM(:profile_submit_fin_year), ''),
+                    submit_fin_year
+                ),
+                required_mask=CASE
+                    WHEN NULLIF(
+                        TRIM(
+                            COALESCE(
+                                NULLIF(TRIM(:profile_submit_fin_year), ''),
+                                submit_fin_year
+                            )
+                        ),
+                        ''
+                    ) IS NULL
+                    THEN {BASE_REQUIRED_MASK}
+                    ELSE {ACTIVE_ENDPOINT_MASK}
+                END,
+            """
+
         async def op(conn: AsyncConnection) -> dict[str, Any]:
             await conn.execute(
                 text(
@@ -936,6 +959,7 @@ class DeepRepository:
                     SET
                         {payload_sql}
                         {mask_sql}
+                        {profile_scope_sql}
                         endpoint_meta=JSON_SET(
                             COALESCE(endpoint_meta, JSON_OBJECT()),
                             :json_path,
@@ -964,6 +988,7 @@ class DeepRepository:
                     "http_status": http_status,
                     "requested_at": requested_at,
                     "error": error[:2000] if error else None,
+                    "profile_submit_fin_year": profile_submit_fin_year,
                     "jp_type_code": jp_type_code,
                     "jp_no": jp_no,
                 },
