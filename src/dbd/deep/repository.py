@@ -16,6 +16,7 @@ from .catalog import (
     BASE_REQUIRED_MASK,
     DESTINATION_COLUMNS,
     ENDPOINT_BITS,
+    FINANCIAL_MASK,
     EndpointSpec,
     parse_catalog_rows,
 )
@@ -960,6 +961,30 @@ class DeepRepository:
             """
 
         async def op(conn: AsyncConnection) -> dict[str, Any]:
+            fiscal_year_changed = False
+            if (
+                spec.key == "profile"
+                and outcome == "done"
+                and profile_submit_fin_year is not None
+                and profile_submit_fin_year.strip()
+            ):
+                previous = (
+                    await conn.execute(
+                        text(
+                            f"""
+                            SELECT submit_fin_year
+                            FROM {DEEP_TABLE}
+                            WHERE jp_type_code=:jp_type_code
+                              AND jp_no=:jp_no
+                            FOR UPDATE
+                            """
+                        ),
+                        {"jp_type_code": jp_type_code, "jp_no": jp_no},
+                    )
+                ).scalar_one()
+                previous_year = "" if previous is None else str(previous).strip()
+                fiscal_year_changed = previous_year != profile_submit_fin_year.strip()
+
             await conn.execute(
                 text(
                     f"""
@@ -1001,6 +1026,26 @@ class DeepRepository:
                     "jp_no": jp_no,
                 },
             )
+
+            if fiscal_year_changed:
+                await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {DEEP_TABLE}
+                        SET financial_submissions_data=NULL,
+                            financial_statements_data=NULL,
+                            industry_benchmark_data=NULL,
+                            done_mask=(done_mask & ~{FINANCIAL_MASK}),
+                            not_available_mask=(not_available_mask & ~{FINANCIAL_MASK}),
+                            failed_mask=(failed_mask & ~{FINANCIAL_MASK}),
+                            required_mask={ACTIVE_ENDPOINT_MASK},
+                            deep_completed_at=NULL
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        """
+                    ),
+                    {"jp_type_code": jp_type_code, "jp_no": jp_no},
+                )
 
             await conn.execute(
                 text(
