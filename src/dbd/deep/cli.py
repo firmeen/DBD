@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
 import sys
 import time
 from typing import Any
@@ -29,8 +30,8 @@ def _non_negative_int(value: str) -> int:
 
 def _positive_rate(value: str) -> float:
     parsed = float(value)
-    if parsed <= 0:
-        raise argparse.ArgumentTypeError("must be > 0")
+    if parsed <= 0 or not math.isfinite(parsed):
+        raise argparse.ArgumentTypeError("must be a finite value > 0")
     return parsed
 
 
