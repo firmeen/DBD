@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from email.utils import parsedate_to_datetime
 from hashlib import sha256
 
 from curl_cffi.requests import AsyncSession
@@ -62,8 +63,6 @@ def retry_after(value: str | None) -> float:
         return max(0.0, float(value))
     except ValueError:
         try:
-            from email.utils import parsedate_to_datetime
-
             return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
         except (ValueError, TypeError, OverflowError):
             return 1.0
@@ -102,15 +101,6 @@ class AsyncDbdClient:
             shared_rate_ceiling=settings.dbd_fleet_rate_ceiling,
             redis_max_connections=settings.dbd_redis_max_connections,
             redis_client=redis_client,
-            circuit_failure_threshold=settings.dbd_circuit_failure_threshold,
-            circuit_window_seconds=settings.dbd_circuit_window_seconds,
-            circuit_open_seconds=settings.dbd_circuit_open_seconds,
-            global_pressure_window_seconds=settings.dbd_global_pressure_window_seconds,
-            global_pressure_endpoint_threshold=settings.dbd_global_pressure_endpoint_threshold,
-            circuit_probe_seconds=max(
-                float(settings.request_timeout) + 10.0,
-                float(settings.dbd_circuit_open_seconds),
-            ),
         )
         EFFECTIVE_RATE.set(self.rate.rate)
         self.max_retries = settings.dbd_http_retries if max_retries is None else max_retries
