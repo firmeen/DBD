@@ -169,7 +169,9 @@ class LongRunDbdClient:
         return self.admission.last_error_at or self._last_error_at
 
     async def __aenter__(self) -> "LongRunDbdClient":
-        await self.admission.open()
+        # Startup Redis availability is checked once by the parent preflight.
+        # Workers connect lazily at admission time so a later Redis outage parks
+        # requests in-place instead of turning dependency loss into restart churn.
         self._session = AsyncSession(
             impersonate="chrome",
             max_clients=self.concurrency,
