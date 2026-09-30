@@ -524,8 +524,11 @@ class DeepRepository:
         """
         batch_size = max(500, min(int(batch_size), 20000))
         await self.ensure_runtime_table()
-        await self._assert_indexes(require_runtime=True)
-        await self.load_catalog()
+        await self.preflight(
+            require_runtime=True,
+            require_prepared=False,
+            check_indexes=True,
+        )
 
         if await self.is_prepared():
             await self.assert_invariants()
