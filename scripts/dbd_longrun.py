@@ -206,13 +206,16 @@ async def _worker_async(
         }
         try:
             metric_queue.put_nowait(payload)
-        except (queue.Full, BrokenPipeError, EOFError, OSError):
+        except (queue.Full, BrokenPipeError, EOFError, OSError, ValueError):
             pass
 
     async def watch_parent_and_stop() -> None:
         parent = mp.parent_process()
         while not local_stop.is_set():
-            parent_alive = parent is None or parent.is_alive()
+            try:
+                parent_alive = parent is None or parent.is_alive()
+            except Exception:
+                parent_alive = False
             if stop_flag.is_set() or not parent_alive:
                 local_stop.set()
                 return
@@ -244,7 +247,7 @@ async def _worker_async(
                     "result": dict(result),
                 }
             )
-        except (queue.Full, BrokenPipeError, EOFError, OSError):
+        except (queue.Full, BrokenPipeError, EOFError, OSError, ValueError):
             pass
     except BaseException as exc:
         try:
@@ -258,7 +261,7 @@ async def _worker_async(
                     "error": f"{type(exc).__name__}: {str(exc) or type(exc).__name__}",
                 }
             )
-        except (queue.Full, BrokenPipeError, EOFError, OSError):
+        except (queue.Full, BrokenPipeError, EOFError, OSError, ValueError):
             pass
         raise
     finally:
