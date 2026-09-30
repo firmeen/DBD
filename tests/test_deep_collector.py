@@ -1,4 +1,3 @@
-import json
 from decimal import Decimal
 
 import pytest
@@ -10,6 +9,7 @@ from dbd.deep.catalog import (
     ENDPOINT_BITS,
     FINANCIAL_MASK,
     EndpointSpec,
+    deep_status,
     latest_fiscal_year,
     required_mask,
 )
@@ -105,10 +105,20 @@ def test_profile_identity_mismatch_is_terminal_identity_conflict():
         )
 
 
-def test_deep_payload_preserves_json_numeric_type():
-    encoded = _json_payload({"amount": Decimal("123.5")})
-    decoded = json.loads(encoded)
+def test_deep_status_resolves_only_required_active_bits():
+    assert deep_status(BASE_REQUIRED_MASK, 0, 0, 0) == "PENDING"
+    assert deep_status(BASE_REQUIRED_MASK, ENDPOINT_BITS["profile"], 0, 0) == "COLLECTING"
+    assert deep_status(BASE_REQUIRED_MASK, BASE_REQUIRED_MASK, 0, 0) == "COMPLETE"
+    assert deep_status(BASE_REQUIRED_MASK, 0, 0, BASE_REQUIRED_MASK) == "FAILED"
 
-    assert decoded["amount"] == 123.5
-    assert isinstance(decoded["amount"], float)
-    assert '"123.5"' not in encoded
+    one_failed = ENDPOINT_BITS["committees"]
+    done = BASE_REQUIRED_MASK & ~one_failed
+    assert deep_status(BASE_REQUIRED_MASK, done, 0, one_failed) == "PARTIAL"
+
+
+def test_deep_payload_preserves_exact_json_numeric_type():
+    value = Decimal("12345678901234567890.123456789")
+    encoded = _json_payload({"amount": value})
+
+    assert encoded == '{"amount":12345678901234567890.123456789}'
+    assert '"12345678901234567890.123456789"' not in encoded
