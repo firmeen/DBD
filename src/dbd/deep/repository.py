@@ -692,18 +692,25 @@ class DeepRepository:
                     range_params,
                 )
 
-                old_effective_fiscal = (
-                    "NULLIF(SUBSTRING_INDEX(TRIM(COALESCE(submit_fin_year,'')),"
-                    " ' ', -1),'')"
+                # Migration is deliberately conservative. Legacy Deep
+                # payloads do not carry a trustworthy per-payload fiscal-year
+                # provenance. If the normalized profile fiscal scope differs
+                # at all from the Master value, invalidate the three migrated
+                # financial payloads and let the runtime recollect them using
+                # latest_fiscal_year(). This cannot leave stale financial data
+                # behind even when a multi-year string is not sorted.
+                old_fiscal_scope = (
+                    "NULLIF(REGEXP_REPLACE(TRIM(COALESCE("
+                    "submit_fin_year,'')), '[[:space:]]+', ' '),'')"
                 )
-                new_effective_fiscal = (
-                    "NULLIF(SUBSTRING_INDEX(TRIM(COALESCE(("
+                new_fiscal_scope = (
+                    "NULLIF(REGEXP_REPLACE(TRIM(COALESCE(("
                     + profile_fiscal
-                    + "),'')), ' ', -1),'')"
+                    + "),'')), '[[:space:]]+', ' '),'')"
                 )
                 fiscal_changed = (
-                    f"(NOT (({old_effective_fiscal}) <=> "
-                    f"({new_effective_fiscal})))"
+                    f"(NOT (({old_fiscal_scope}) <=> "
+                    f"({new_fiscal_scope})))"
                 )
                 fiscal_reset = await conn.execute(
                     text(
