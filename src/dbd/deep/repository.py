@@ -1763,7 +1763,8 @@ class DeepRepository:
                         f"""
                         SELECT jp_type_code, jp_no
                         FROM {DEEP_TABLE}
-                        WHERE (failed_mask & required_mask) <> 0
+                        WHERE deep_status IN ('COLLECTING','PARTIAL','FAILED')
+                          AND (failed_mask & required_mask) <> 0
                         ORDER BY COALESCE(last_error_at, updated_at), jp_type_code, jp_no
                         {limit_sql}
                         FOR UPDATE SKIP LOCKED
@@ -1840,120 +1841,158 @@ class DeepRepository:
         # the durable masks and runtime primary key.
         return await self._transaction(op, attempts=1)
 
-    async def status_summary(self) -> dict[str, Any]:
-        async with self.engine.connect() as conn:
-            master = int(
+    async def coverage_summary(self) -> dict[str, dict[str, int]]:
+        if not await self.is_prepared():
+            raise RuntimeError(
+                "Endpoint coverage requires the prepared seven-endpoint model; "
+                "run dbd-deep prepare first"
+            )
+
+        coverage_selects: list[str] = []
+        for endpoint in ACTIVE_ENDPOINTS:
+            bit = ENDPOINT_BITS[endpoint]
+            column = DESTINATION_COLUMNS[endpoint]
+            prefix = endpoint
+            required = f"((required_mask & {bit}) <> 0)"
+            coverage_selects.extend(
                 (
+                    f"SUM({required} AND {column} IS NOT NULL) "
+                    f"AS `{prefix}__data_rows`",
+                    f"SUM({required} AND (done_mask & {bit}) <> 0) "
+                    f"AS `{prefix}__done`",
+                    f"SUM({required} AND (not_available_mask & {bit}) <> 0) "
+                    f"AS `{prefix}__not_available`",
+                    f"SUM({required} AND (failed_mask & {bit}) <> 0) "
+                    f"AS `{prefix}__failed`",
+                )
+            )
+
+        async with asyncio.timeout(float(settings.dbd_count_timeout_seconds)):
+            async with self.engine.connect() as conn:
+                row = (
                     await conn.execute(
-                        text(f"SELECT COUNT(*) FROM {MASTER_TABLE}")
+                        text(
+                            f"SELECT {', '.join(coverage_selects)} "
+                            f"FROM {DEEP_TABLE}"
+                        )
                     )
-                ).scalar_one()
-                or 0
-            )
+                ).mappings().one()
 
-            expected_required = (
-                f"CASE WHEN NULLIF(TRIM(submit_fin_year),'') IS NULL "
-                f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
-            )
-            effective_status = _status_case(expected_required)
-            deep = (
-                await conn.execute(
-                    text(
-                        f"""
-                        SELECT
-                            COUNT(*) AS total,
-                            SUM(effective_status='PENDING') AS pending,
-                            SUM(effective_status='COLLECTING') AS collecting,
-                            SUM(effective_status='COMPLETE') AS complete,
-                            SUM(effective_status='PARTIAL') AS partial,
-                            SUM(effective_status='FAILED') AS failed,
-                            SUM(unresolved) AS unresolved,
-                            SUM(with_failures) AS with_failures
-                        FROM (
-                            SELECT
-                                {effective_status} AS effective_status,
-                                (
-                                    ((done_mask | not_available_mask | failed_mask)
-                                      & ({expected_required})) <> ({expected_required})
-                                ) AS unresolved,
-                                ((failed_mask & ({expected_required})) <> 0) AS with_failures
-                            FROM {DEEP_TABLE}
-                        ) scoped
-                        """
-                    )
+        return {
+            endpoint: {
+                key: int(row[f"{endpoint}__{key}"] or 0)
+                for key in ("data_rows", "done", "not_available", "failed")
+            }
+            for endpoint in ACTIVE_ENDPOINTS
+        }
+
+    async def status_summary(
+        self,
+        *,
+        include_coverage: bool = False,
+    ) -> dict[str, Any]:
+        runtime_exists = await self.table_exists(RUNTIME_TABLE)
+        prepared = await self.is_prepared()
+
+        async with asyncio.timeout(float(settings.dbd_count_timeout_seconds)):
+            async with self.engine.connect() as conn:
+                master = int(
+                    (
+                        await conn.execute(
+                            text(f"SELECT COUNT(*) FROM {MASTER_TABLE}")
+                        )
+                    ).scalar_one()
+                    or 0
                 )
-            ).mappings().one()
 
-            runtime = (
-                await conn.execute(
-                    text(
-                        f"""
-                        SELECT
-                            COUNT(*) AS total,
-                            SUM(status='PENDING') AS pending,
-                            SUM(status='RUNNING') AS running,
-                            SUM(status='RETRY_WAIT') AS retry_wait
-                        FROM {RUNTIME_TABLE}
-                        """
-                    )
-                )
-            ).mappings().one()
-
-            overlap = int(
-                (
+                deep_rows = (
                     await conn.execute(
                         text(
                             f"""
-                            SELECT COUNT(*)
-                            FROM {MASTER_TABLE} m
-                            JOIN {DEEP_TABLE} d
-                              ON d.jp_type_code=m.jp_type_code
-                             AND d.jp_no=m.jp_no
+                            SELECT deep_status, COUNT(*) AS count
+                            FROM {DEEP_TABLE}
+                            GROUP BY deep_status
                             """
                         )
                     )
-                ).scalar_one()
-                or 0
-            )
-
-            coverage_selects: list[str] = []
-            for endpoint in ACTIVE_ENDPOINTS:
-                bit = ENDPOINT_BITS[endpoint]
-                column = DESTINATION_COLUMNS[endpoint]
-                prefix = endpoint
-                required = f"((({expected_required}) & {bit}) <> 0)"
-                coverage_selects.extend(
-                    (
-                        f"SUM({required} AND {column} IS NOT NULL) AS `{prefix}__data_rows`",
-                        f"SUM({required} AND (done_mask & {bit}) <> 0) AS `{prefix}__done`",
-                        f"SUM({required} AND (not_available_mask & {bit}) <> 0) "
-                        f"AS `{prefix}__not_available`",
-                        f"SUM({required} AND (failed_mask & {bit}) <> 0) AS `{prefix}__failed`",
-                    )
-                )
-
-            coverage_row = (
-                await conn.execute(
-                    text(
-                        f"SELECT {', '.join(coverage_selects)} "
-                        f"FROM {DEEP_TABLE}"
-                    )
-                )
-            ).mappings().one()
-            coverage = {
-                endpoint: {
-                    key: int(coverage_row[f"{endpoint}__{key}"] or 0)
-                    for key in ("data_rows", "done", "not_available", "failed")
+                ).mappings().all()
+                deep_counts = {
+                    "pending": 0,
+                    "collecting": 0,
+                    "complete": 0,
+                    "partial": 0,
+                    "failed": 0,
                 }
-                for endpoint in ACTIVE_ENDPOINTS
-            }
+                for row in deep_rows:
+                    key = str(row["deep_status"]).lower()
+                    if key in deep_counts:
+                        deep_counts[key] = int(row["count"] or 0)
+                deep_total = sum(deep_counts.values())
+                deep_counts["total"] = deep_total
+                deep_counts["unresolved"] = (
+                    deep_counts["pending"] + deep_counts["collecting"]
+                )
+                deep_counts["terminal_failures"] = (
+                    deep_counts["partial"] + deep_counts["failed"]
+                )
 
+                runtime_counts = {
+                    "total": 0,
+                    "pending": 0,
+                    "running": 0,
+                    "retry_wait": 0,
+                }
+                if runtime_exists:
+                    runtime_rows = (
+                        await conn.execute(
+                            text(
+                                f"""
+                                SELECT status, COUNT(*) AS count
+                                FROM {RUNTIME_TABLE}
+                                GROUP BY status
+                                """
+                            )
+                        )
+                    ).mappings().all()
+                    for row in runtime_rows:
+                        key = str(row["status"]).lower()
+                        if key in runtime_counts:
+                            runtime_counts[key] = int(row["count"] or 0)
+                    runtime_counts["total"] = sum(
+                        runtime_counts[key]
+                        for key in ("pending", "running", "retry_wait")
+                    )
+
+                overlap = int(
+                    (
+                        await conn.execute(
+                            text(
+                                f"""
+                                SELECT EXISTS(
+                                    SELECT 1
+                                    FROM {MASTER_TABLE} m
+                                    JOIN {DEEP_TABLE} d
+                                      ON d.jp_type_code=m.jp_type_code
+                                     AND d.jp_no=m.jp_no
+                                    LIMIT 1
+                                )
+                                """
+                            )
+                        )
+                    ).scalar_one()
+                    or 0
+                )
+
+        coverage = await self.coverage_summary() if include_coverage else {}
         return {
+            "prepared": prepared,
+            "runtime_exists": runtime_exists,
             "master": master,
-            "deep": {key: int(value or 0) for key, value in dict(deep).items()},
-            "runtime": {key: int(value or 0) for key, value in dict(runtime).items()},
+            "deep": deep_counts,
+            "runtime": runtime_counts,
             "overlap": overlap,
-            "universe": master + int(deep["total"] or 0),
+            "universe": master + deep_total,
             "active_endpoint_mask": ACTIVE_ENDPOINT_MASK,
             "coverage": coverage,
         }
+
