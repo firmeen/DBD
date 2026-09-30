@@ -439,8 +439,7 @@ class TerminalPresenter:
         )
         fleet.add_row(
             "CONTROL",
-            f"{str(state.get('control_status') or 'unknown').upper()} · "
-            f"circuit {str(state.get('circuit_state') or 'unknown').upper()}",
+            str(state.get("control_status") or "unknown").upper(),
         )
         fleet.add_row(
             "HTTP",
