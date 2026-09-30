@@ -17,7 +17,9 @@ from .catalog import (
     DESTINATION_COLUMNS,
     ENDPOINT_BITS,
     FINANCIAL_MASK,
+    INACTIVE_ENDPOINTS,
     EndpointSpec,
+    latest_fiscal_year,
     parse_catalog_rows,
 )
 
@@ -110,7 +112,23 @@ _REQUIRED_CATALOG_COLUMNS = {
 }
 
 _TRANSIENT_DB_CODES = {1205, 1213, 2006, 2013}
+
+_REQUIRED_INDEXES = {
+    MASTER_TABLE: {"PRIMARY", "idx_dbd_master_last_seen"},
+    DEEP_TABLE: {
+        "PRIMARY",
+        "idx_dbd_deep_status",
+        "idx_dbd_deep_incomplete",
+        "idx_dbd_deep_updated",
+    },
+    RUNTIME_TABLE: {"PRIMARY", "idx_dbd_deep_runtime_ready"},
+}
+
 T = TypeVar("T")
+
+
+class DeepTransientDatabaseError(RuntimeError):
+    """Transient MySQL failure after repository-local retries were exhausted."""
 
 
 def create_deep_engine() -> AsyncEngine:
@@ -206,13 +224,18 @@ class DeepRepository:
                 async with self.engine.begin() as conn:
                     return await operation(conn)
             except BaseException as exc:
-                if not _is_retryable_db_error(exc) or attempt >= attempts:
+                if not _is_retryable_db_error(exc):
                     raise
                 last_error = exc
+                if attempt >= attempts:
+                    raise DeepTransientDatabaseError(
+                        f"MySQL transient failure after {attempt} attempt(s): "
+                        f"{type(exc).__name__}: {exc}"
+                    ) from exc
                 await self.engine.dispose()
                 await asyncio.sleep(min(5.0, 0.5 * (2 ** (attempt - 1))))
         assert last_error is not None
-        raise last_error
+        raise DeepTransientDatabaseError(str(last_error)) from last_error
 
     async def _table_columns(self, table_name: str) -> set[str]:
         async with self.engine.connect() as conn:
@@ -231,30 +254,119 @@ class DeepRepository:
             ).scalars().all()
         return {str(row) for row in rows}
 
+    async def _table_indexes(self, table_name: str) -> set[str]:
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        """
+                        SELECT DISTINCT index_name
+                        FROM information_schema.statistics
+                        WHERE table_schema=:schema
+                          AND table_name=:table_name
+                        """
+                    ),
+                    {"schema": settings.db_name, "table_name": table_name},
+                )
+            ).scalars().all()
+        return {str(row) for row in rows}
+
+    async def table_exists(self, table_name: str) -> bool:
+        return bool(await self._table_columns(table_name))
+
     async def ensure_runtime_table(self) -> None:
         async with self.engine.begin() as conn:
             await conn.execute(text(_RUNTIME_DDL))
 
-    async def preflight(self) -> tuple[EndpointSpec, ...]:
-        requirements = (
+    async def is_prepared(self) -> bool:
+        keys = (*ACTIVE_ENDPOINTS, *INACTIVE_ENDPOINTS)
+        placeholders = ",".join(f":k{i}" for i, _ in enumerate(keys))
+        params = {f"k{i}": key for i, key in enumerate(keys)}
+        async with self.engine.connect() as conn:
+            rows = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT endpoint_key, is_active
+                        FROM {CATALOG_TABLE}
+                        WHERE endpoint_key IN ({placeholders})
+                        """
+                    ),
+                    params,
+                )
+            ).mappings().all()
+        states = {str(row["endpoint_key"]): bool(row["is_active"]) for row in rows}
+        return (
+            all(states.get(key) is True for key in ACTIVE_ENDPOINTS)
+            and all(states.get(key) is False for key in INACTIVE_ENDPOINTS)
+        )
+
+    async def _assert_indexes(self, *, require_runtime: bool) -> None:
+        tables = (MASTER_TABLE, DEEP_TABLE, RUNTIME_TABLE) if require_runtime else (
+            MASTER_TABLE,
+            DEEP_TABLE,
+        )
+        for table_name in tables:
+            indexes = await self._table_indexes(table_name)
+            missing = sorted(_REQUIRED_INDEXES[table_name] - indexes)
+            if missing:
+                raise RuntimeError(
+                    f"{table_name} missing required index(es): {', '.join(missing)}"
+                )
+
+    async def preflight(
+        self,
+        *,
+        require_runtime: bool = True,
+        require_prepared: bool = True,
+        check_indexes: bool = True,
+    ) -> tuple[EndpointSpec, ...]:
+        requirements = [
             (MASTER_TABLE, _REQUIRED_MASTER_COLUMNS | {"last_seen_at"}),
             (DEEP_TABLE, _REQUIRED_DEEP_COLUMNS | {"updated_at"}),
             (CATALOG_TABLE, _REQUIRED_CATALOG_COLUMNS),
-        )
+        ]
+        if require_runtime:
+            requirements.append(
+                (
+                    RUNTIME_TABLE,
+                    {
+                        "jp_type_code",
+                        "jp_no",
+                        "status",
+                        "attempts",
+                        "available_at",
+                        "last_error",
+                        "updated_at",
+                    },
+                )
+            )
+
         for table_name, required in requirements:
             columns = await self._table_columns(table_name)
             if not columns:
-                raise RuntimeError(
-                    f"Required table {table_name} does not exist; build the new Master/Deep model first"
+                action = (
+                    "run dbd-deep prepare first"
+                    if table_name == RUNTIME_TABLE
+                    else "build the new Master/Deep model first"
                 )
+                raise RuntimeError(f"Required table {table_name} does not exist; {action}")
             missing = sorted(required - columns)
             if missing:
                 raise RuntimeError(
                     f"{table_name} missing required column(s): {', '.join(missing)}"
                 )
 
-        await self.ensure_runtime_table()
-        return await self.load_catalog()
+        if check_indexes:
+            await self._assert_indexes(require_runtime=require_runtime)
+
+        specs = await self.load_catalog()
+        if require_prepared and not await self.is_prepared():
+            raise RuntimeError(
+                "Deep model is not prepared for the seven-endpoint runtime; "
+                "run dbd-deep prepare before collect/retry"
+            )
+        return specs
 
     async def load_catalog(self) -> tuple[EndpointSpec, ...]:
         placeholders = ",".join(f":e{i}" for i, _ in enumerate(ACTIVE_ENDPOINTS))
