@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -73,8 +74,19 @@ class EndpointSpec:
 
 
 def latest_fiscal_year(value: object) -> str | None:
-    years = [part for part in str(value or "").split() if part]
-    return max(years) if years else None
+    text_value = str(value or "").strip()
+    if not text_value:
+        return None
+
+    # DBD normally uses whitespace-separated Buddhist years. Extracting
+    # standalone four-digit values also handles legacy comma/slash-separated
+    # payloads without changing the normal "2567 2568" behavior.
+    numeric_years = re.findall(r"(?<!\\d)\\d{4}(?!\\d)", text_value)
+    if numeric_years:
+        return max(numeric_years, key=int)
+
+    parts = [part for part in text_value.split() if part]
+    return max(parts) if parts else None
 
 
 def required_mask(submit_fin_year: object) -> int:
