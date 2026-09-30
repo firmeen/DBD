@@ -157,7 +157,11 @@ def create_deep_engine() -> AsyncEngine:
             "init_command": "SET time_zone = '+00:00'",
             "charset": "utf8mb4",
             "connect_timeout": max(15, settings.db_timeout),
-            "read_timeout": max(15, settings.db_timeout),
+            "read_timeout": max(
+                60,
+                settings.db_timeout,
+                settings.dbd_count_timeout_seconds,
+            ),
         },
     )
 
