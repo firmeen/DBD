@@ -108,7 +108,6 @@ return tostring(math.max(0, cooldown_until - now_ms))
         shared_rate_ceiling: float | None = None,
         redis_max_connections: int | None = None,
         redis_client: Redis | None = None,
-        **_legacy_options,
     ):
         self.target_rate = _positive_rate(global_rate)
         self.shared_rate_ceiling = _positive_rate(shared_rate_ceiling or global_rate)
