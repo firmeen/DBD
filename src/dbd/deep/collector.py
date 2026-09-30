@@ -61,24 +61,44 @@ class CollectorStats:
     deep_adopted: int = 0
 
 
-def _json_default(value: object):
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, Decimal):
-        # Preserve JSON numeric type. The source decoder uses Decimal for
-        # contract precision, but Deep payload JSON must not turn numbers into
-        # quoted strings.
-        return float(value)
-    raise TypeError(type(value).__name__)
-
-
 def _json_payload(value: object) -> str:
-    return json.dumps(
-        value,
-        ensure_ascii=False,
-        separators=(",", ":"),
-        default=_json_default,
-    )
+    """Serialize logical API JSON while preserving Decimal as JSON numbers."""
+
+    def encode(item: object) -> str:
+        if item is None:
+            return "null"
+        if item is True:
+            return "true"
+        if item is False:
+            return "false"
+        if isinstance(item, str):
+            return json.dumps(item, ensure_ascii=False)
+        if isinstance(item, Decimal):
+            if not item.is_finite():
+                raise ValueError("Non-finite Decimal cannot be stored as JSON")
+            return str(item)
+        if isinstance(item, int):
+            return str(item)
+        if isinstance(item, float):
+            return json.dumps(item, allow_nan=False)
+        if isinstance(item, (datetime, date)):
+            return json.dumps(item.isoformat(), ensure_ascii=False)
+        if isinstance(item, (list, tuple)):
+            return "[" + ",".join(encode(child) for child in item) + "]"
+        if isinstance(item, dict):
+            parts: list[str] = []
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise TypeError("JSON object keys must be strings")
+                parts.append(
+                    json.dumps(key, ensure_ascii=False)
+                    + ":"
+                    + encode(child)
+                )
+            return "{" + ",".join(parts) + "}"
+        raise TypeError(type(item).__name__)
+
+    return encode(value)
 
 
 def _meta(
