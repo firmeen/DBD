@@ -268,9 +268,11 @@ class FixedRateDbdClient:
 
             try:
                 data = self._decode(response, path, token)
-            except DbdTokenExpiredError:
+            except DbdTokenExpiredError as exc:
                 if attempt > self.max_retries:
-                    raise
+                    raise DbdAuthError(
+                        "DBD token remained expired after response-decode retries"
+                    ) from exc
                 await self._ensure_token(force=True)
                 await asyncio.sleep(self._backoff(attempt))
                 continue
