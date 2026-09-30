@@ -47,6 +47,26 @@ class TerminalEvents:
             self._width = 0
 
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
+        if name == "phase":
+            self._clear()
+            print(f"PHASE                {payload.get('phase')}")
+            return
+
+        if name == "prepare_progress":
+            total = int(payload.get("rows_total", 0))
+            scanned = int(payload.get("rows_scanned", 0))
+            changed = int(payload.get("rows_changed", 0))
+            pct = (scanned / total * 100.0) if total else 100.0
+            line = (
+                f"PREPARE rows {scanned:,}/{total:,} "
+                f"({pct:6.2f}%) | changed {changed:,}"
+            )
+            padding = " " * max(0, self._width - len(line))
+            sys.stdout.write("\r" + line + padding)
+            sys.stdout.flush()
+            self._width = len(line)
+            return
+
         if name == "progress":
             now = time.monotonic()
             if now - self._last < 0.5:
@@ -104,10 +124,12 @@ def _print_status(summary: dict[str, Any]) -> None:
     print("=" * 72)
     print(" DBD DEEP STATUS")
     print("=" * 72)
+    print(f"Prepared             : {'YES' if summary['prepared'] else 'NO'}")
+    print(f"Runtime table        : {'READY' if summary['runtime_exists'] else 'MISSING'}")
     print(f"Master waiting       : {summary['master']:,}")
     print(f"Deep total           : {deep['total']:,}")
     print(f"Universe             : {summary['universe']:,}")
-    print(f"Master/Deep overlap  : {summary['overlap']:,}")
+    print(f"Master/Deep overlap  : {'YES' if summary['overlap'] else 'NO'}")
     print()
     print(f"Deep pending         : {deep['pending']:,}")
     print(f"Deep collecting      : {deep['collecting']:,}")
@@ -115,31 +137,38 @@ def _print_status(summary: dict[str, Any]) -> None:
     print(f"Deep partial         : {deep['partial']:,}")
     print(f"Deep failed          : {deep['failed']:,}")
     print(f"Deep unresolved      : {deep['unresolved']:,}")
-    print(f"Deep with failures   : {deep['with_failures']:,}")
+    print(f"Terminal failures    : {deep['terminal_failures']:,}")
     print()
     print(f"Runtime total        : {runtime['total']:,}")
     print(f"Runtime pending      : {runtime['pending']:,}")
     print(f"Runtime running      : {runtime['running']:,}")
     print(f"Runtime retry wait   : {runtime['retry_wait']:,}")
-    print()
-    print("ACTIVE ENDPOINT COVERAGE")
-    for endpoint in ACTIVE_ENDPOINTS:
-        row = summary["coverage"][endpoint]
-        print(
-            f"  {endpoint:<24}"
-            f" data={row['data_rows']:>10,}"
-            f" done={row['done']:>10,}"
-            f" n/a={row['not_available']:>10,}"
-            f" failed={row['failed']:>10,}"
-        )
+
+    coverage = summary.get("coverage") or {}
+    if coverage:
+        print()
+        print("ACTIVE ENDPOINT COVERAGE")
+        for endpoint in ACTIVE_ENDPOINTS:
+            row = coverage[endpoint]
+            print(
+                f"  {endpoint:<24}"
+                f" data={row['data_rows']:>10,}"
+                f" done={row['done']:>10,}"
+                f" n/a={row['not_available']:>10,}"
+                f" failed={row['failed']:>10,}"
+            )
     print("=" * 72)
 
 
-async def _status(json_mode: bool) -> int:
+async def _status(json_mode: bool, coverage: bool) -> int:
     repo = DeepRepository()
     try:
-        await repo.preflight()
-        summary = await repo.status_summary()
+        await repo.preflight(
+            require_runtime=False,
+            require_prepared=False,
+            check_indexes=False,
+        )
+        summary = await repo.status_summary(include_coverage=coverage)
     finally:
         await repo.close()
 
@@ -150,15 +179,60 @@ async def _status(json_mode: bool) -> int:
     return 1 if summary["overlap"] else 0
 
 
+async def _prepare(batch_size: int, json_mode: bool) -> int:
+    repo = DeepRepository()
+    events = None if json_mode else TerminalEvents()
+    try:
+        if events is not None:
+            events("phase", {"phase": "PREFLIGHT"})
+        await repo.preflight(
+            require_runtime=False,
+            require_prepared=False,
+            check_indexes=True,
+        )
+        async with repo.manager_lock():
+            if events is not None:
+                events("phase", {"phase": "PREPARE"})
+            result = await repo.prepare_active_scope(
+                batch_size=batch_size,
+                event=events,
+            )
+        summary = await repo.status_summary(include_coverage=False)
+    finally:
+        if events is not None:
+            events.close()
+        await repo.close()
+
+    payload = {"prepare": result, "status": summary}
+    if json_mode:
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+    else:
+        print()
+        print("=" * 72)
+        print(" DBD DEEP PREPARE COMPLETE")
+        print("=" * 72)
+        print(f"Already prepared     : {'YES' if result['already_prepared'] else 'NO'}")
+        print(f"Rows total           : {int(result['rows_total']):,}")
+        print(f"Rows scanned         : {int(result['rows_scanned']):,}")
+        print(f"Rows changed         : {int(result['rows_changed']):,}")
+        print(f"Runtime recovered    : {int(result['runtime_recovered']):,}")
+        print("=" * 72)
+        _print_status(summary)
+    return 1 if summary["overlap"] else 0
+
+
 async def _retry(limit: int | None, json_mode: bool) -> int:
     repo = DeepRepository()
     try:
-        await repo.preflight()
+        await repo.preflight(
+            require_runtime=True,
+            require_prepared=True,
+            check_indexes=True,
+        )
         async with repo.manager_lock():
-            await repo.reconcile_active_scope()
-            await repo.assert_invariants()
+            await repo.assert_no_overlap()
             count = await repo.retry_failed(limit)
-        summary = await repo.status_summary()
+        summary = await repo.status_summary(include_coverage=False)
     finally:
         await repo.close()
 
@@ -220,6 +294,18 @@ def parse_args(argv: list[str] | None = None):
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
+    prepare = sub.add_parser(
+        "prepare",
+        help="One-time adoption of builder-created Deep rows into the seven-endpoint runtime",
+    )
+    prepare.add_argument(
+        "--batch-size",
+        type=_positive_int,
+        default=5000,
+        help="Primary-key migration batch size; bounded to 500..20000 internally",
+    )
+    prepare.add_argument("--json", action="store_true")
+
     collect = sub.add_parser(
         "collect",
         help="Resume Deep rows first, then atomically promote Master companies",
@@ -252,7 +338,15 @@ def parse_args(argv: list[str] | None = None):
     )
     collect.add_argument("--json", action="store_true")
 
-    status = sub.add_parser("status", help="Show Master/Deep/runtime and endpoint coverage")
+    status = sub.add_parser(
+        "status",
+        help="Fast read-only Master/Deep/runtime status",
+    )
+    status.add_argument(
+        "--coverage",
+        action="store_true",
+        help="Also scan active endpoint coverage; intentionally heavier",
+    )
     status.add_argument("--json", action="store_true")
 
     retry = sub.add_parser(
@@ -268,10 +362,12 @@ def parse_args(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     try:
-        if args.command == "collect":
+        if args.command == "prepare":
+            code = asyncio.run(_prepare(args.batch_size, args.json))
+        elif args.command == "collect":
             code = asyncio.run(_collect(args))
         elif args.command == "status":
-            code = asyncio.run(_status(args.json))
+            code = asyncio.run(_status(args.json, args.coverage))
         elif args.command == "retry":
             code = asyncio.run(_retry(args.limit, args.json))
         else:
