@@ -6,6 +6,7 @@ import math
 import multiprocessing as mp
 import os
 import queue
+import signal
 import sys
 import time
 from dataclasses import dataclass, field
@@ -284,6 +285,10 @@ def _worker_entry(
     stop_flag,
     metric_queue,
 ) -> None:
+    # The console Ctrl+C belongs to the parent only. Children receive a clean
+    # stop_flag and drain through the existing durable worker pipeline instead
+    # of emitting KeyboardInterrupt/CancelledError tracebacks.
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     asyncio.run(
         _worker_async(
             run_id=run_id,
