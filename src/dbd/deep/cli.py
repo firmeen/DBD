@@ -238,7 +238,7 @@ async def _retry(limit: int | None, json_mode: bool) -> int:
     if json_mode:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
-        print(f"REQUEUED FAILED COMPANIES: {count:,}")
+        print(f"REOPENED FAILED COMPANIES: {count:,}")
         _print_status(summary)
     return 0
 
@@ -349,7 +349,7 @@ def parse_args(argv: list[str] | None = None):
 
     retry = sub.add_parser(
         "retry",
-        help="Clear active failed bits and requeue terminal Deep failures",
+        help="Reopen terminal Deep failures; bounded collect refill schedules them later",
     )
     retry.add_argument("--limit", type=_positive_int)
     retry.add_argument("--json", action="store_true")
