@@ -528,7 +528,10 @@ class DeepRepository:
             )
             return int(result.rowcount or 0)
 
-        return await self._transaction(op)
+        # This INSERT .. SELECT LIMIT chooses a moving set. If COMMIT succeeds
+        # but the connection is lost before acknowledgement, retrying could
+        # adopt a second set and grow the bounded runtime past its target.
+        return await self._transaction(op, attempts=1)
 
     @staticmethod
     def _key_predicate(
@@ -738,7 +741,10 @@ class DeepRepository:
             )
             return max(len(keys), int(runtime_result.rowcount or 0))
 
-        return await self._transaction(op)
+        # Selected Master keys are chosen inside this transaction. On ambiguous
+        # COMMIT, fail the collector and let restart recovery inspect durable
+        # MASTER/DEEP state instead of selecting a different batch on retry.
+        return await self._transaction(op, attempts=1)
 
     async def refill(self, target: int) -> dict[str, int]:
         target = max(1, int(target))
@@ -813,7 +819,9 @@ class DeepRepository:
             result["attempts"] = int(result["attempts"] or 0) + 1
             return result
 
-        return await self._transaction(op)
+        # An ambiguous RUNNING claim must not be retried against another row.
+        # A process restart safely recovers every stranded RUNNING row.
+        return await self._transaction(op, attempts=1)
 
     async def finish_runtime(self, jp_type_code: str, jp_no: str) -> None:
         async def op(conn: AsyncConnection) -> None:
@@ -1124,7 +1132,10 @@ class DeepRepository:
             )
             return len(selected)
 
-        return await self._transaction(op)
+        # LIMIT selects a moving failed set. Preserve exact retry semantics by
+        # failing on commit ambiguity; rerunning the command is idempotent from
+        # the durable masks and runtime primary key.
+        return await self._transaction(op, attempts=1)
 
     async def status_summary(self) -> dict[str, Any]:
         async with self.engine.connect() as conn:
