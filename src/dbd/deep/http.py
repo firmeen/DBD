@@ -132,21 +132,60 @@ class FixedRateDbdClient:
             self._auth_session.close()
             self._auth_session = None
 
-    async def _ensure_token(self, *, force: bool = False) -> str:
+    async def _ensure_token(
+        self,
+        *,
+        force: bool = False,
+        rejected: str | None = None,
+        reset_session: bool = False,
+    ) -> str:
         if self._auth_session is None:
             raise RuntimeError("HTTP client is not open")
+
         async with self._auth_lock:
-            if force:
+            # Another worker may already have refreshed the token while this
+            # request was in flight. Never invalidate a newer token because an
+            # older rejected token reported 401/403.
+            if (
+                rejected is not None
+                and self._token is not None
+                and rejected != self._token
+            ):
+                return self._token
+
+            if reset_session:
+                self._auth_session.close()
+                self._auth_session = create_session()
+                self._auth = DbdAuth()
+                self._token = None
+            elif force or (
+                rejected is not None
+                and rejected == self._token
+            ):
                 self._auth.invalidate()
                 self._token = None
-            if self._token is None or time.time() >= self._auth._expires_at - 15:
-                self._token = await asyncio.to_thread(
-                    self._auth.get_token,
-                    self._auth_session,
-                )
-                if self._session is not None:
-                    self._session.cookies.update(self._auth_session.cookies)
-            return self._token
+
+            if self._token is not None and time.time() < self._auth._expires_at - 15:
+                return self._token
+
+            last_error: BaseException | None = None
+            for attempt in range(1, settings.dbd_max_auth_attempts + 1):
+                try:
+                    self._token = await asyncio.to_thread(
+                        self._auth.get_token,
+                        self._auth_session,
+                    )
+                    if self._session is not None:
+                        self._session.cookies.update(self._auth_session.cookies)
+                    return self._token
+                except DbdAuthError as exc:
+                    last_error = exc
+                    if attempt >= settings.dbd_max_auth_attempts:
+                        raise
+                    await asyncio.sleep(min(5.0, float(attempt)))
+
+            assert last_error is not None
+            raise DbdAuthError(str(last_error))
 
     def _headers(self, token: str, referer: str) -> dict[str, str]:
         return {
@@ -188,6 +227,9 @@ class FixedRateDbdClient:
             await asyncio.sleep(delay)
             # Re-acquire the limiter after cooldown. Otherwise all waiters that
             # slept to the same deadline could burst at once.
+
+    def cooldown_remaining(self) -> float:
+        return max(0.0, self._cooldown_until - time.monotonic())
 
     @staticmethod
     def _backoff(attempt: int, server_seconds: float = 0.0) -> float:
@@ -252,27 +294,49 @@ class FixedRateDbdClient:
                 last_error = DbdAuthError("HTTP 401")
                 if attempt > self.max_retries:
                     raise last_error
-                await self._ensure_token(force=True)
+                await self._ensure_token(rejected=token)
                 await asyncio.sleep(self._backoff(attempt))
                 continue
 
             if status == 403:
-                raise DbdForbiddenError("HTTP 403")
+                if attempt > self.max_retries:
+                    raise DbdForbiddenError(
+                        f"HTTP 403 remained after {attempt} attempt(s)"
+                    )
+                await self._ensure_token(
+                    rejected=token,
+                    reset_session=True,
+                )
+                await asyncio.sleep(self._backoff(attempt))
+                continue
 
             if status == 404:
                 raise DeepNotAvailable(status)
 
             if status in (429, 500, 502, 503, 504):
+                retry_after_header = response.headers.get("retry-after")
+                shared_pressure = status == 429 or (
+                    status == 503
+                    and retry_after_header is not None
+                    and str(retry_after_header).strip() != ""
+                )
                 if status == 429:
                     self.rate_limit_hits += 1
-                server_seconds = _retry_after(response.headers.get("retry-after"))
+                server_seconds = (
+                    _retry_after(retry_after_header)
+                    if retry_after_header
+                    else 0.0
+                )
                 delay = self._backoff(attempt, server_seconds)
-                if status in (429, 503):
+                if shared_pressure:
                     await self._set_cooldown(delay)
-                last_error = DeepTransientHttpError(f"HTTP {status}", status=status)
+                last_error = DeepTransientHttpError(
+                    f"HTTP {status}",
+                    status=status,
+                )
                 if attempt > self.max_retries:
                     raise last_error
-                if status not in (429, 503):
+                if not shared_pressure:
                     await asyncio.sleep(delay)
                 continue
 
@@ -286,7 +350,7 @@ class FixedRateDbdClient:
                     raise DbdAuthError(
                         "DBD token remained expired after response-decode retries"
                     ) from exc
-                await self._ensure_token(force=True)
+                await self._ensure_token(rejected=token)
                 await asyncio.sleep(self._backoff(attempt))
                 continue
             except Exception as exc:
