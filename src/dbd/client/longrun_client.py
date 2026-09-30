@@ -174,9 +174,10 @@ class LongRunDbdClient:
         # requests in-place instead of turning dependency loss into restart churn.
         self._session = AsyncSession(
             impersonate="chrome",
+            http_version="v1",
             max_clients=self.concurrency,
         )
-        self._auth_session = create_session()
+        self._auth_session = create_session(http_version="v1")
         return self
 
     async def __aexit__(self, *args) -> None:
@@ -195,6 +196,17 @@ class LongRunDbdClient:
     def _token_valid(self) -> bool:
         return bool(self._token) and time.time() < self._auth._expires_at - 15
 
+    def _reset_auth_session(self) -> None:
+        if self._auth_session is not None:
+            try:
+                self._auth_session.close()
+            except Exception:
+                pass
+        self._auth_session = create_session(http_version="v1")
+        self._auth.invalidate(reset_warmup=True)
+        self._token = None
+        self._auth_refresh_task = None
+
     async def _refresh_token_once(self) -> str:
         try:
             token = await asyncio.to_thread(
@@ -207,7 +219,20 @@ class LongRunDbdClient:
             self.auth_failures += 1
             self.last_auth_error_at = time.time()
             self._remember_error(exc)
-            self._auth_backoff_until = time.monotonic() + _AUTH_RETRY_SECONDS
+            message = str(exc).lower()
+            bootstrap_failed = (
+                getattr(exc, "status_code", None) == 403
+                or "warmup_" in message
+                or "curl=16" in message
+                or "curl=55" in message
+            )
+            if bootstrap_failed:
+                self._reset_auth_session()
+            self._auth_backoff_until = (
+                time.monotonic()
+                + _AUTH_RETRY_SECONDS
+                + random.uniform(0.5, 2.5)
+            )
             raise
 
         self._token = token
@@ -358,9 +383,12 @@ class LongRunDbdClient:
                     raise TransientHttpError("HTTP 401", status_code=401)
 
                 if status == 403:
+                    # First recover the bearer token on the existing warmed
+                    # browser session. Re-running document warmup immediately
+                    # on every API 403 creates a synchronized WAF stampede.
                     await self._ensure_token(
                         rejected=token,
-                        reset_warmup=True,
+                        reset_warmup=False,
                     )
                     raise DbdForbiddenError("HTTP 403")
 
