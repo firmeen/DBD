@@ -28,6 +28,7 @@ _DEFAULT_WORKERS = 4
 _DEFAULT_CONCURRENCY = 8
 _DEFAULT_WORKER_RATE = 15.0
 _DEFAULT_FLEET_RATE = 60.0
+_MAX_FLEET_RATE = 60.0
 _HEALTHY_RESTART_RESET_SECONDS = 300.0
 _MANAGER_LOCK_CHECK_SECONDS = 5.0
 _HEARTBEAT_TIMEOUT_SECONDS = 60.0
@@ -47,6 +48,21 @@ def _positive_rate(value: str) -> float:
     if not math.isfinite(parsed) or parsed <= 0:
         raise argparse.ArgumentTypeError("must be a finite positive rate")
     return parsed
+
+
+def _max_safe_workers() -> int:
+    projection_per_worker = min(
+        settings.dbd_projection_workers,
+        settings.db_pool_size,
+    )
+    limits = (
+        settings.dbd_fleet_db_connections_max // settings.db_pool_size,
+        settings.dbd_fleet_archive_workers_max // settings.dbd_archive_workers,
+        settings.dbd_fleet_projection_workers_max // projection_per_worker,
+        settings.dbd_fleet_redis_connections_max
+        // settings.dbd_redis_max_connections,
+    )
+    return max(1, min(int(limit) for limit in limits))
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -714,6 +730,15 @@ def main() -> int:
         raise SystemExit("DBD_REDIS_URL is required")
     if args.concurrency > 256:
         raise SystemExit("--concurrency must be <= 256")
+    max_workers = _max_safe_workers()
+    if args.workers > max_workers:
+        raise SystemExit(
+            f"--workers must be <= {max_workers} for the configured fleet resource budgets"
+        )
+    if args.fleet_rate > _MAX_FLEET_RATE:
+        raise SystemExit(
+            f"--fleet-rate must be <= {_MAX_FLEET_RATE:g} req/s"
+        )
     if not args.redis_key.strip():
         raise SystemExit("--redis-key must not be empty")
 
