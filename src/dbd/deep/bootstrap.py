@@ -259,6 +259,7 @@ def _catalog_rows() -> list[dict[str, Any]]:
             "path_template": "/api/v1/company-profiles/infos",
             "referer_template": "https://datawarehouse.dbd.go.th/juristic/searchInfo",
             "request_schema": {"location": "body", "required": ["keyword"]},
+            "response_kind": "paged_object",
             "response_schema": {
                 "type": "object",
                 "contents": "array<company>",
@@ -271,7 +272,7 @@ def _catalog_rows() -> list[dict[str, Any]]:
         }
     ]
     for endpoint in ACTIVE_ENDPOINTS:
-        sequence, path, _response_kind, response_schema, required_rule = active[endpoint]
+        sequence, path, response_kind, response_schema, required_rule = active[endpoint]
         rows.append(
             {
                 "endpoint_key": endpoint,
@@ -294,6 +295,7 @@ def _catalog_rows() -> list[dict[str, Any]]:
                         else {}
                     ),
                 },
+                "response_kind": response_kind,
                 "response_schema": response_schema,
                 "destination_column": DESTINATION_COLUMNS[endpoint],
                 "required_rule": required_rule,
@@ -327,6 +329,7 @@ def _catalog_rows() -> list[dict[str, Any]]:
                 "path_template": path,
                 "referer_template": None,
                 "request_schema": {"path": {"jp_type_code": "string", "jp_no": "string"}},
+                "response_kind": response_kind,
                 "response_schema": {"type": response_kind, "allow_extra_fields": True},
                 "destination_column": f"{endpoint}_data",
                 "required_rule": {"type": "inactive"},
@@ -375,7 +378,7 @@ class DeepBootstrap:
         await self.ensure_indexes()
 
     async def seed_catalog(self) -> None:
-        columns = (
+        base_columns = [
             "endpoint_key",
             "endpoint_layer",
             "sequence_no",
@@ -388,42 +391,60 @@ class DeepBootstrap:
             "destination_column",
             "required_rule",
             "is_active",
-        )
+        ]
+        async with self.engine.connect() as conn:
+            has_response_kind = bool(
+                (
+                    await conn.execute(
+                        text(
+                            """
+                            SELECT COUNT(*)
+                            FROM information_schema.columns
+                            WHERE table_schema=DATABASE()
+                              AND table_name=:table_name
+                              AND column_name='response_kind'
+                            """
+                        ),
+                        {"table_name": CATALOG_TABLE},
+                    )
+                ).scalar_one()
+            )
+
+        columns = list(base_columns)
+        if has_response_kind:
+            columns.insert(columns.index("response_schema"), "response_kind")
+        binds = ",".join(f":{column}" for column in columns)
+        assignments = [
+            f"{column}=VALUES({column})"
+            for column in columns
+            if column not in {"endpoint_key", "is_active"}
+        ]
         active_upsert = f"""
             INSERT INTO {CATALOG_TABLE} ({", ".join(columns)})
-            VALUES (
-                :endpoint_key,:endpoint_layer,:sequence_no,:bit_value,:http_method,
-                :path_template,:referer_template,:request_schema,
-                :response_schema,:destination_column,:required_rule,:is_active
-            )
+            VALUES ({binds})
             ON DUPLICATE KEY UPDATE
-                endpoint_layer=VALUES(endpoint_layer),
-                sequence_no=VALUES(sequence_no),
-                bit_value=VALUES(bit_value),
-                http_method=VALUES(http_method),
-                path_template=VALUES(path_template),
-                referer_template=VALUES(referer_template),
-                request_schema=VALUES(request_schema),
-                response_schema=VALUES(response_schema),
-                destination_column=VALUES(destination_column),
-                required_rule=VALUES(required_rule),
+                {", ".join(assignments)},
                 is_active=1
         """
-        inactive_insert = f"""
+        inactive_upsert = f"""
             INSERT INTO {CATALOG_TABLE} ({", ".join(columns)})
-            VALUES (
-                :endpoint_key,:endpoint_layer,:sequence_no,:bit_value,:http_method,
-                :path_template,:referer_template,:request_schema,
-                :response_schema,:destination_column,:required_rule,0
-            )
+            VALUES ({binds})
             ON DUPLICATE KEY UPDATE is_active=0
         """
+
         rows = []
         for row in _catalog_rows():
             item = dict(row)
             for key in ("request_schema", "response_schema", "required_rule"):
-                item[key] = json.dumps(item[key], ensure_ascii=False, separators=(",", ":"))
+                item[key] = json.dumps(
+                    item[key],
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            if not has_response_kind:
+                item.pop("response_kind", None)
             rows.append(item)
+
         active_rows = [
             row
             for row in rows
@@ -435,7 +456,7 @@ class DeepBootstrap:
         ]
         async with self.engine.begin() as conn:
             await conn.execute(text(active_upsert), active_rows)
-            await conn.execute(text(inactive_insert), inactive_rows)
+            await conn.execute(text(inactive_upsert), inactive_rows)
 
     async def ensure_indexes(self) -> None:
         async with self.engine.begin() as conn:
