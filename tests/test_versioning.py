@@ -11,8 +11,8 @@ from dbd import __version__
 from dbd.cli.main import main
 
 
-def test_release_version_is_0_4_0() -> None:
-    assert __version__ == "0.4.0"
+def test_release_version_is_0_5_0() -> None:
+    assert __version__ == "0.5.0"
 
 
 def test_pyproject_uses_source_version_as_single_authority() -> None:
