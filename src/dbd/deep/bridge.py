@@ -8,18 +8,19 @@ CATALOG_TABLE = "dbd_endpoint_catalog"
 
 _MODEL_TABLES = {MASTER_TABLE, DEEP_TABLE, CATALOG_TABLE}
 
-_MASTER_COLUMNS = {
+_COMMON_COLUMNS = {
     "jp_type_code", "jp_no", "jp_name", "jp_name_e", "jp_stat_code",
     "jp_stat_desc", "jp_type_desc", "address", "pv_code", "pv_desc",
     "ampur_code", "ampur_desc", "tumbon_code", "tumbon_desc", "zip_code",
     "business_size_code", "business_type_code", "business_type_desc",
     "setup_obj_code", "setup_obj_desc", "submit_obj_code", "submit_obj_desc",
     "cap_amt", "paid_amt", "total_asset", "total_equity", "total_income",
-    "net_profit", "submit_fin_year", "master_data", "first_seen_at",
-    "last_seen_at", "updated_at",
+    "net_profit", "submit_fin_year", "master_data", "updated_at",
 }
 
-_DEEP_COLUMNS = _MASTER_COLUMNS | {
+_MASTER_COLUMNS = _COMMON_COLUMNS | {"first_seen_at", "last_seen_at"}
+
+_DEEP_COLUMNS = _COMMON_COLUMNS | {
     "profile_data", "financial_submissions_data", "financial_statements_data",
     "industry_benchmark_data", "committees_data", "committee_signs_data",
     "transformations_data", "required_mask", "done_mask",
