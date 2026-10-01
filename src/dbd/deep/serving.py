@@ -16,7 +16,6 @@ from ..contracts.master_deep import (
     SERVING_COLUMNS,
     SERVING_FIELDS,
     mysql_create_table_sql,
-    ordered_values,
     sanitize_serving_row,
     serving_row_hash,
 )
