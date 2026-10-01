@@ -1410,6 +1410,7 @@ class DeepRepository:
                 "adopted": 0,
                 "promoted": 0,
                 "refreshed": 0,
+                "refresh_scanned": False,
             }
 
         capacity = target - current
@@ -1422,7 +1423,8 @@ class DeepRepository:
             current = await self.runtime_size()
 
         refreshed = 0
-        if current < target and include_refresh:
+        refresh_scanned = current < target and include_refresh
+        if refresh_scanned:
             reopened = await self.reopen_stale_active(target - current)
             if reopened:
                 # Reuse the existing bounded runtime queue rather than
@@ -1436,6 +1438,7 @@ class DeepRepository:
             "adopted": adopted,
             "promoted": promoted,
             "refreshed": refreshed,
+            "refresh_scanned": refresh_scanned,
         }
 
     async def claim(self) -> dict[str, Any] | None:

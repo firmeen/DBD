@@ -55,6 +55,7 @@ async def test_refill_priority_is_unresolved_then_master_then_refresh() -> None:
         "adopted": 1,
         "promoted": 1,
         "refreshed": 1,
+        "refresh_scanned": True,
     }
     assert repo.events == [
         ("seed:unresolved", 1),
@@ -89,5 +90,6 @@ async def test_refill_can_poll_new_work_without_repeating_stale_scan() -> None:
         "adopted": 0,
         "promoted": 0,
         "refreshed": 0,
+        "refresh_scanned": False,
     }
     assert not any(name == "refresh" for name, _ in repo.events)

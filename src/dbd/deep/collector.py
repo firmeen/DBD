@@ -236,6 +236,7 @@ class DeepCollector:
                     "adopted": 0,
                     "promoted": 0,
                     "refreshed": 0,
+                    "refresh_scanned": False,
                 }
 
             remaining = await self._remaining_budget()
@@ -245,6 +246,7 @@ class DeepCollector:
                     "adopted": 0,
                     "promoted": 0,
                     "refreshed": 0,
+                    "refresh_scanned": False,
                 }
 
             target = self.buffer_size
@@ -280,11 +282,13 @@ class DeepCollector:
             else:
                 self._queue_source = "IDLE"
 
+            if self.continuous and result.get("refresh_scanned") and not result.get("refreshed"):
+                self._next_refresh_scan_at = (
+                    time.monotonic() + self._refresh_scan_seconds
+                )
+
             if int(result["runtime"]) == 0 and self.continuous:
-                now = time.monotonic()
-                self._empty_until = now + self.idle_seconds
-                if include_refresh:
-                    self._next_refresh_scan_at = now + self._refresh_scan_seconds
+                self._empty_until = time.monotonic() + self.idle_seconds
             else:
                 self._empty_until = 0.0
 

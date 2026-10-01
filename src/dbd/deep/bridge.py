@@ -90,31 +90,27 @@ JSON_OBJECT(
 """
 
 
-def _table_columns(cur, table_name: str) -> set[str]:
-    cur.execute(
-        """
-        SELECT column_name
-        FROM information_schema.columns
-        WHERE table_schema=DATABASE()
-          AND table_name=%s
-        """,
-        (table_name,),
-    )
-    return {str(row["column_name"]) for row in cur.fetchall()}
-
-
 def _model_available(cur) -> bool:
+    # One information_schema query per Discovery microbatch. This is on the hot
+    # persistence path, so avoid four metadata round-trips merely to prove the
+    # optional Deep model is installed and compatible.
     placeholders = ",".join(["%s"] * len(_MODEL_TABLES))
     cur.execute(
         f"""
-        SELECT table_name
-        FROM information_schema.tables
+        SELECT table_name, column_name
+        FROM information_schema.columns
         WHERE table_schema=DATABASE()
           AND table_name IN ({placeholders})
         """,
         tuple(sorted(_MODEL_TABLES)),
     )
-    present = {str(row["table_name"]) for row in cur.fetchall()}
+    columns_by_table: dict[str, set[str]] = {}
+    for row in cur.fetchall():
+        columns_by_table.setdefault(str(row["table_name"]), set()).add(
+            str(row["column_name"])
+        )
+
+    present = set(columns_by_table)
     if not present:
         return False
     if present != _MODEL_TABLES:
@@ -129,8 +125,7 @@ def _model_available(cur) -> bool:
         (CATALOG_TABLE, _CATALOG_COLUMNS),
     )
     for table_name, required in requirements:
-        columns = _table_columns(cur, table_name)
-        missing = sorted(required - columns)
+        missing = sorted(required - columns_by_table[table_name])
         if missing:
             raise RuntimeError(
                 f"{table_name} missing required column(s): {', '.join(missing)}"
