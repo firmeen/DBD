@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from uuid import uuid4
 
 import pytest
@@ -249,7 +249,7 @@ async def test_discovery_bridge_registers_new_master_and_syncs_existing_deep_sta
 
 @pytest.mark.asyncio
 async def test_active_stale_refresh_reopens_exact_endpoint_and_preserves_payload() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(UTC).replace(tzinfo=None)
     old = (now - timedelta(hours=48)).isoformat()
     fresh = now.isoformat()
     endpoint_meta = {
@@ -469,7 +469,7 @@ async def test_repeated_discovery_upserts_one_master_identity() -> None:
 
 @pytest.mark.asyncio
 async def test_active_refresh_reopens_exact_multiple_required_bits() -> None:
-    now = datetime.utcnow()
+    now = datetime.now(UTC).replace(tzinfo=None)
     old = (now - timedelta(hours=240)).isoformat()
     fresh = now.isoformat()
     endpoint_meta = {

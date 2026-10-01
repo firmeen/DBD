@@ -97,7 +97,9 @@ def _model_available(cur) -> bool:
     placeholders = ",".join(["%s"] * len(_MODEL_TABLES))
     cur.execute(
         f"""
-        SELECT table_name, column_name
+        SELECT
+            TABLE_NAME AS table_name,
+            COLUMN_NAME AS column_name
         FROM information_schema.columns
         WHERE table_schema=DATABASE()
           AND table_name IN ({placeholders})
