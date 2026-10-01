@@ -676,7 +676,7 @@ class DeepBootstrap:
         repo = DeepRepository(self.engine)
         await repo.preflight(
             require_runtime=False,
-            require_prepared=False,
+            require_prepared=True,
             check_indexes=True,
         )
         placeholders = ",".join(
@@ -737,20 +737,23 @@ class DeepBootstrap:
 
     async def run(self, *, batch_size: int = 5000) -> dict[str, Any]:
         repo = DeepRepository(self.engine)
-        async with repo.manager_lock() as lock_conn:
+        async with repo.manager_lock():
             await self.ensure_model()
-            await repo.ensure_runtime_table()
-            prepared = await repo.prepare_active_scope(
-                batch_size=batch_size,
-                lock_conn=lock_conn,
+
+            # Bootstrap is intentionally non-destructive to existing Deep rows.
+            # Legacy 11-endpoint mask adoption remains an explicit dbd-deep
+            # prepare operation; do not hide payload/mask migration here.
+            await repo.preflight(
+                require_runtime=False,
+                require_prepared=True,
+                check_indexes=True,
             )
+
             identities = await self.backfill_identity_master()
             master = await self.backfill_master(batch_size=batch_size)
             validation = await self.validate()
         return {
             "company_master_identities_added": identities,
-            "prepared_rows_scanned": int(prepared.get("rows_scanned") or 0),
-            "prepared_rows_changed": int(prepared.get("rows_changed") or 0),
             **master,
             **validation,
         }
