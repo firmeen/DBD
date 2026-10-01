@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+import dbd.pipelines.discovery as discovery_pipeline
 from dbd.client.endpoints.search import SearchFilters
 from dbd.deep.catalog import BASE_REQUIRED_MASK, ENDPOINT_BITS
 from dbd.deep.repository import DeepRepository
@@ -551,3 +552,112 @@ async def test_active_refresh_reopens_exact_multiple_required_bits() -> None:
         assert row["financial_statements_data"] is not None
         assert row["committees_data"] is not None
         assert row["profile_data"] is not None
+
+
+@pytest.mark.asyncio
+async def test_older_discovery_response_cannot_revert_newer_deep_status(
+    monkeypatch,
+) -> None:
+    jp_no = str(int(uuid4().hex[:12], 16)).zfill(13)[:13]
+    newer = datetime(2026, 10, 1, 12, 0, 0)
+    older = datetime(2026, 10, 1, 11, 0, 0)
+
+    class Client:
+        concurrency = 1
+
+        def __init__(self, status: str) -> None:
+            self.status = status
+
+        async def post(self, path, payload, **kwargs):
+            return {
+                "meta": {"currentPage": 1, "totalItems": 1, "totalPages": 1},
+                "contents": [
+                    {
+                        "jpNo": jp_no,
+                        "jpTypeCode": "7",
+                        "jpName": "Out Of Order Status Co",
+                        "jpStatCode": self.status,
+                    }
+                ],
+            }
+
+    monkeypatch.setattr(discovery_pipeline, "_now", lambda: newer)
+    filters_new = SearchFilters("newer-status-" + uuid4().hex)
+    bucket_new = upsert_bucket(filters_new)
+    await _drain_bucket(
+        Client("1"),
+        bucket_new,
+        filters_new,
+        1,
+        verbose=False,
+    )
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO dbd_company_deep (
+                jp_type_code,jp_no,jp_stat_code,master_data,profile_data,
+                required_mask,done_mask,not_available_mask,failed_mask,
+                deep_status,endpoint_meta,deep_completed_at
+            )
+            VALUES (
+                '7',%s,'1',JSON_OBJECT(),JSON_OBJECT(),%s,%s,0,0,
+                'COMPLETE',JSON_OBJECT(),UTC_TIMESTAMP(6)
+            )
+            """,
+            (jp_no, BASE_REQUIRED_MASK, BASE_REQUIRED_MASK),
+        )
+        cur.execute(
+            "DELETE FROM dbd_company_master "
+            "WHERE jp_type_code='7' AND jp_no=%s",
+            (jp_no,),
+        )
+        conn.commit()
+
+    # Simulate an older request finishing later. Its status must not replace
+    # the newer observation already committed to legacy company_master.
+    monkeypatch.setattr(discovery_pipeline, "_now", lambda: older)
+    filters_old = SearchFilters("older-status-" + uuid4().hex)
+    bucket_old = upsert_bucket(filters_old)
+    await _drain_bucket(
+        Client("5"),
+        bucket_old,
+        filters_old,
+        1,
+        verbose=False,
+    )
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT observed_jp_stat_code, observed_status_at
+            FROM company_master
+            WHERE jp_type_code='7' AND jp_no=%s
+            """,
+            (jp_no,),
+        )
+        observed = cur.fetchone()
+        assert observed["observed_jp_stat_code"] == "1"
+        assert observed["observed_status_at"] == newer
+
+        cur.execute(
+            """
+            SELECT jp_stat_code, deep_status, done_mask
+            FROM dbd_company_deep
+            WHERE jp_type_code='7' AND jp_no=%s
+            """,
+            (jp_no,),
+        )
+        deep = cur.fetchone()
+        assert deep == {
+            "jp_stat_code": "1",
+            "deep_status": "COMPLETE",
+            "done_mask": BASE_REQUIRED_MASK,
+        }
+
+        cur.execute(
+            "SELECT COUNT(*) n FROM dbd_company_master "
+            "WHERE jp_type_code='7' AND jp_no=%s",
+            (jp_no,),
+        )
+        assert cur.fetchone()["n"] == 0

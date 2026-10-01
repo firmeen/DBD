@@ -188,11 +188,23 @@ def persist_page_batch(records: list[dict]) -> list[dict]:
                           last_seen_at=GREATEST(last_seen_at,VALUES(last_seen_at)),
                           observed_jp_stat_code=IF(
                             VALUES(observed_jp_stat_code) IS NULL,
-                            observed_jp_stat_code,VALUES(observed_jp_stat_code)
+                            observed_jp_stat_code,
+                            IF(
+                              company_master.observed_status_at IS NULL
+                              OR VALUES(observed_status_at) >= company_master.observed_status_at,
+                              VALUES(observed_jp_stat_code),
+                              observed_jp_stat_code
+                            )
                           ),
                           observed_status_at=IF(
                             VALUES(observed_jp_stat_code) IS NULL,
-                            observed_status_at,VALUES(observed_status_at)
+                            observed_status_at,
+                            IF(
+                              company_master.observed_status_at IS NULL
+                              OR VALUES(observed_status_at) >= company_master.observed_status_at,
+                              VALUES(observed_status_at),
+                              observed_status_at
+                            )
                           ),
                           change_mask=IF(company_master.master_hash <=> VALUES(master_hash),0,127),
                           last_master_changed_at=IF(
