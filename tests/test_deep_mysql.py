@@ -8,7 +8,8 @@ import pytest
 
 import dbd.pipelines.discovery as discovery_pipeline
 from dbd.client.endpoints.search import SearchFilters
-from dbd.deep.catalog import BASE_REQUIRED_MASK, ENDPOINT_BITS
+from dbd.deep.bootstrap import DeepBootstrap
+from dbd.deep.catalog import BASE_REQUIRED_MASK, ENDPOINT_BITS, INACTIVE_ENDPOINTS
 from dbd.deep.repository import DeepRepository
 from dbd.pipelines.discovery import _drain_bucket
 from dbd.storage.mysql.engine import connect
@@ -165,6 +166,71 @@ def deep_model():
         yield
     finally:
         _drop_model()
+
+
+@pytest.mark.asyncio
+async def test_bootstrap_refuses_legacy_scope_without_mutating_deep_payload_or_masks() -> None:
+    bootstrap = DeepBootstrap()
+    try:
+        await bootstrap.ensure_model()
+
+        with connect() as conn, conn.cursor() as cur:
+            placeholders = ",".join(["%s"] * len(INACTIVE_ENDPOINTS))
+            cur.execute(
+                f"""
+                UPDATE dbd_endpoint_catalog
+                SET is_active=1
+                WHERE endpoint_key IN ({placeholders})
+                """,
+                tuple(INACTIVE_ENDPOINTS),
+            )
+            cur.execute(
+                """
+                INSERT INTO dbd_company_deep (
+                    jp_type_code,jp_no,jp_stat_code,master_data,profile_data,
+                    required_mask,done_mask,not_available_mask,failed_mask,
+                    deep_status,endpoint_meta,deep_completed_at
+                )
+                VALUES (
+                    '7','9000000000099','1',JSON_OBJECT(),
+                    JSON_OBJECT('sentinel','keep'),
+                    2047,2047,0,0,'COMPLETE',JSON_OBJECT(),UTC_TIMESTAMP(6)
+                )
+                """
+            )
+            conn.commit()
+
+        with pytest.raises(RuntimeError, match="not prepared"):
+            await bootstrap.run(batch_size=500)
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT required_mask,done_mask,deep_status,deep_completed_at,
+                       JSON_UNQUOTE(JSON_EXTRACT(profile_data,'$.sentinel')) sentinel
+                FROM dbd_company_deep
+                WHERE jp_type_code='7' AND jp_no='9000000000099'
+                """
+            )
+            row = cur.fetchone()
+            assert row["required_mask"] == 2047
+            assert row["done_mask"] == 2047
+            assert row["deep_status"] == "COMPLETE"
+            assert row["deep_completed_at"] is not None
+            assert row["sentinel"] == "keep"
+
+            cur.execute(
+                f"""
+                SELECT endpoint_key,is_active
+                FROM dbd_endpoint_catalog
+                WHERE endpoint_key IN ({placeholders})
+                ORDER BY endpoint_key
+                """,
+                tuple(INACTIVE_ENDPOINTS),
+            )
+            assert all(bool(item["is_active"]) for item in cur.fetchall())
+    finally:
+        await bootstrap.close()
 
 
 @pytest.mark.asyncio
