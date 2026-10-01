@@ -173,3 +173,48 @@ Terminal rendering must not change:
 - archive-before-projection ordering
 - projection freshness
 - Redis coordination semantics
+
+
+## Standalone dbd-deep
+
+`dbd-deep` has its own presentation boundary and does not import Campaign, Fabric,
+Guardian, Supervisor or Redis fleet state.
+
+Normal one-shot collection:
+
+```powershell
+dbd-deep collect --concurrency 12 --rate 20 --buffer-size 64
+```
+
+Continuous collection keeps one standalone manager process alive and checks MySQL
+again after the idle interval when work drains:
+
+```powershell
+dbd-deep collect --continuous --concurrency 12 --rate 20 --buffer-size 64 --idle-seconds 5
+```
+
+`--limit N` remains a whole-command company budget, including continuous mode.
+It is not reset on every internal refill cycle.
+
+Interactive terminals use a compact Rich live view. Redirected output is newline
+based and does not use cursor-return repainting. Explicit `--json` remains machine
+readable and does not mix Rich output into stdout.
+
+Static/status commands use the same Deep presentation layer:
+
+```powershell
+dbd-deep prepare
+dbd-deep status
+dbd-deep status --coverage
+dbd-deep retry --limit 500
+```
+
+Version identities are intentionally separate:
+
+```text
+dbd-data --version  -> dbd-data 0.5.0
+dbd-deep --version  -> dbd-deep 0.1.0
+```
+
+Both console scripts are still shipped by the single `dbd-data` Python
+distribution.
