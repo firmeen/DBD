@@ -358,14 +358,20 @@ class DeepBootstrap:
                         SELECT table_name
                         FROM information_schema.tables
                         WHERE table_schema=DATABASE()
-                          AND table_name IN ('companies','company_master','discovery_sightings')
-                    """
+                          AND table_name IN (
+                              'companies',
+                              'company_master',
+                              'discovery_sightings'
+                          )
+                        """
+                    )
                 )
             ).scalars().all()
         missing = sorted(required - {str(row) for row in rows})
         if missing:
             raise RuntimeError(
-                "Core DBD schema is not migrated; missing table(s): " + ", ".join(missing)
+                "Core DBD schema is not migrated; missing table(s): "
+                + ", ".join(missing)
             )
 
     async def ensure_model(self) -> None:
