@@ -232,4 +232,3 @@ if __name__ == "__main__":
             "No automatic restart will be performed."
         )
         raise SystemExit(130)
-```
