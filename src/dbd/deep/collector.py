@@ -36,6 +36,7 @@ from .http import (
     FixedRateDbdClient,
 )
 from .repository import DeepRepository, DeepTransientDatabaseError
+from .serving import ServingProjector
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
@@ -186,6 +187,8 @@ class DeepCollector:
         # polled every few seconds, but an empty exact stale scan should not be
         # repeated at that same cadence across a multi-million COMPLETE set.
         self._refresh_scan_seconds = max(60.0, self.idle_seconds)
+        self._serving = ServingProjector(self.repo.engine)
+        self._next_serving_projection_at = 0.0
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -298,7 +301,35 @@ class DeepCollector:
                 queue_source=self._queue_source,
                 **result,
             )
+            await self._reconcile_serving()
             return result
+
+    async def _reconcile_serving(self) -> None:
+        now = time.monotonic()
+        if now < self._next_serving_projection_at:
+            return
+        self._next_serving_projection_at = now + 10.0
+        try:
+            result = await self._serving.project_incremental(
+                limit=max(1, min(self.buffer_size, 100))
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._next_serving_projection_at = time.monotonic() + 30.0
+            self._emit(
+                "serving_error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        if not result.get("ready"):
+            self._next_serving_projection_at = time.monotonic() + 60.0
+            return
+        self._emit("serving", **result)
+
+    async def _idle_wait(self) -> None:
+        await asyncio.sleep(self.idle_seconds)
+        await self._reconcile_serving()
 
     async def _idle_cycle(self) -> None:
         async with self._idle_lock:
@@ -311,7 +342,7 @@ class DeepCollector:
                     idle_seconds=self.idle_seconds,
                     queue_source=self._queue_source,
                 )
-                task = asyncio.create_task(asyncio.sleep(self.idle_seconds))
+                task = asyncio.create_task(self._idle_wait())
                 self._idle_task = task
         await task
 

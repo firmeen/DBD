@@ -21,6 +21,13 @@ class Settings(BaseSettings):
     db_user: str = "dbd_app"
     db_password: str = Field("", repr=False)
     db_pool_size: int = Field(8, ge=1, le=100)
+    mssql_server: str | None = None
+    mssql_port: int | None = Field(None, ge=1, le=65535)
+    mssql_database: str = "TIPDataIntelligence"
+    mssql_user: str | None = None
+    mssql_password: str | None = Field(None, repr=False)
+    mssql_login_timeout: int = Field(15, ge=1, le=300)
+    mssql_timeout: int = Field(60, ge=1, le=3600)
     dbd_fleet_db_connections_max: int = Field(96, ge=3, le=10000)
     dbd_fleet_archive_workers_max: int = Field(24, ge=1, le=10000)
     dbd_fleet_projection_workers_max: int = Field(48, ge=1, le=10000)
