@@ -164,8 +164,7 @@ def flatten_complete_row(row: dict[str, Any], *, projected_at: datetime | None =
     if statuses["industry_benchmark"] == "DONE":
         benchmark = normalize_industry_benchmark(_json_value(row.get("industry_benchmark_data")))
 
-    profile_value = lambda name: getattr(profile, name, None) if profile is not None else None
-    fiscal_source = _prefer(profile_value("submit_fin_year"), row.get("submit_fin_year"))
+    def profile_value(name: str) -> object:\n        return getattr(profile, name, None) if profile is not None else None\n    fiscal_source = _prefer(profile_value("submit_fin_year"), row.get("submit_fin_year"))
     latest_year = (
         str(latest_statement.fiscal_year)
         if latest_statement is not None
