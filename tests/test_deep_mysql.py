@@ -355,8 +355,12 @@ async def test_partial_deep_model_fails_discovery_transaction_without_partial_br
                 ],
             }
 
-    with pytest.raises(RuntimeError, match="partially installed"):
+    with pytest.raises(BaseExceptionGroup) as captured:
         await _drain_bucket(Client(), bucket, filters, 1, verbose=False)
+    assert any(
+        "partially installed" in str(child)
+        for child in captured.value.exceptions
+    )
 
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
