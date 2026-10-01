@@ -404,7 +404,6 @@ class DeepBootstrap:
                 path_template=VALUES(path_template),
                 referer_template=VALUES(referer_template),
                 request_schema=VALUES(request_schema),
-                response_kind=VALUES(response_kind),
                 response_schema=VALUES(response_schema),
                 destination_column=VALUES(destination_column),
                 required_rule=VALUES(required_rule),
