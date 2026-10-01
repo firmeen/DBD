@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -179,6 +180,7 @@ class DeepCollector:
         self._specs: tuple[EndpointSpec, ...] = ()
         self._cycle = 0
         self._queue_source = "IDLE"
+        self._empty_until = 0.0
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -220,6 +222,17 @@ class DeepCollector:
 
     async def _refill(self) -> dict[str, int]:
         async with self._refill_lock:
+            # When many workers observe an empty queue together, only the
+            # first worker in an idle window performs the expensive
+            # unresolved/Master/stale scan. Others reuse the empty result.
+            if self.continuous and time.monotonic() < self._empty_until:
+                return {
+                    "runtime": 0,
+                    "adopted": 0,
+                    "promoted": 0,
+                    "refreshed": 0,
+                }
+
             remaining = await self._remaining_budget()
             if remaining == 0:
                 return {
@@ -256,6 +269,11 @@ class DeepCollector:
                 self._queue_source = "RUNTIME"
             else:
                 self._queue_source = "IDLE"
+
+            if int(result["runtime"]) == 0 and self.continuous:
+                self._empty_until = time.monotonic() + self.idle_seconds
+            else:
+                self._empty_until = 0.0
 
             self._emit(
                 "cycle",
