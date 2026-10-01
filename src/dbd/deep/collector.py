@@ -181,6 +181,11 @@ class DeepCollector:
         self._cycle = 0
         self._queue_source = "IDLE"
         self._empty_until = 0.0
+        self._next_refresh_scan_at = 0.0
+        # Endpoint freshness horizons are measured in hours. Discovery may be
+        # polled every few seconds, but an empty exact stale scan should not be
+        # repeated at that same cadence across a multi-million COMPLETE set.
+        self._refresh_scan_seconds = max(60.0, self.idle_seconds)
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -248,7 +253,12 @@ class DeepCollector:
                 # actually process; this keeps canary runs minimally invasive.
                 target = min(target, remaining)
 
-            result = await self.repo.refill(max(1, target))
+            now = time.monotonic()
+            include_refresh = now >= self._next_refresh_scan_at
+            result = await self.repo.refill(
+                max(1, target),
+                include_refresh=include_refresh,
+            )
             sources = []
             if result["adopted"]:
                 sources.append("UNRESOLVED")
@@ -271,7 +281,10 @@ class DeepCollector:
                 self._queue_source = "IDLE"
 
             if int(result["runtime"]) == 0 and self.continuous:
-                self._empty_until = time.monotonic() + self.idle_seconds
+                now = time.monotonic()
+                self._empty_until = now + self.idle_seconds
+                if include_refresh:
+                    self._next_refresh_scan_at = now + self._refresh_scan_seconds
             else:
                 self._empty_until = 0.0
 

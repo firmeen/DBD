@@ -1396,7 +1396,12 @@ class DeepRepository:
         # adopt them on the next bounded refill.
         return await self._transaction(op, attempts=1)
 
-    async def refill(self, target: int) -> dict[str, int]:
+    async def refill(
+        self,
+        target: int,
+        *,
+        include_refresh: bool = True,
+    ) -> dict[str, int]:
         target = max(1, int(target))
         current = await self.runtime_size()
         if current >= target:
@@ -1417,7 +1422,7 @@ class DeepRepository:
             current = await self.runtime_size()
 
         refreshed = 0
-        if current < target:
+        if current < target and include_refresh:
             reopened = await self.reopen_stale_active(target - current)
             if reopened:
                 # Reuse the existing bounded runtime queue rather than

@@ -76,3 +76,18 @@ async def test_refill_does_not_reopen_stale_when_higher_priority_fills_buffer() 
     assert result["promoted"] == 2
     assert result["refreshed"] == 0
     assert not any(name == "refresh" for name, _ in repo.events)
+
+
+@pytest.mark.asyncio
+async def test_refill_can_poll_new_work_without_repeating_stale_scan() -> None:
+    repo = RefillHarness(unresolved=0, master=0, stale=100)
+
+    result = await DeepRepository.refill(repo, 4, include_refresh=False)
+
+    assert result == {
+        "runtime": 0,
+        "adopted": 0,
+        "promoted": 0,
+        "refreshed": 0,
+    }
+    assert not any(name == "refresh" for name, _ in repo.events)
