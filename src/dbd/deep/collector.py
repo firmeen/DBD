@@ -304,9 +304,9 @@ class DeepCollector:
             await self._reconcile_serving()
             return result
 
-    async def _reconcile_serving(self) -> None:
+    async def _reconcile_serving(self, *, force: bool = False) -> None:
         now = time.monotonic()
-        if now < self._next_serving_projection_at:
+        if not force and now < self._next_serving_projection_at:
             return
         self._next_serving_projection_at = now + 10.0
         try:
@@ -787,6 +787,11 @@ class DeepCollector:
                         "rate_limit_hits": client.rate_limit_hits,
                         "configured_rate": client.rate_per_second,
                     }
+
+            # Derived output must not make the HTTP/runtime transaction fail,
+            # but a final bounded pass prevents short one-shot/--limit runs
+            # from exiting before the normal serving throttle opens again.
+            await self._reconcile_serving(force=True)
 
         result["cycle"] = self._cycle
         result["queue_source"] = self._queue_source
