@@ -301,7 +301,7 @@ def _catalog_rows() -> list[dict[str, Any]]:
             }
         )
 
-    inactiv = {
+    inactive = {
         "nations": (80, "/api/v1/company-profiles/nations/{jp_type_code}/{jp_no}", "array"),
         "nation_history": (
             90,
@@ -316,7 +316,7 @@ def _catalog_rows() -> list[dict[str, Any]]:
         ),
     }
     for endpoint in INACTIVE_ENDPOINTS:
-        sequence, path, _response_kind = inactive[endpoint]
+        sequence, path, response_kind = inactive[endpoint]
         rows.append(
             {
                 "endpoint_key": endpoint,
