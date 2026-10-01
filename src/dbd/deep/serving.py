@@ -381,7 +381,7 @@ class ServingProjector:
                         AND index_name=:index_name
                         """
                     ),
-                    {"table_name": DEEP_TABLE, "index_name": _SERVING_INDEX,
+                    {"table_name": DEEP_TABLE, "index_name": _SERVING_INDEX},
                 )
             ).scalar_one()
             if not index_exists:
@@ -389,11 +389,11 @@ class ServingProjector:
                     text(
                         f"""
                         ALTER TABLE {DEEP_TABLE}
-                        ADD INDEX {_SERVING_INDEX
+                        ADD INDEX {_SERVING_INDEX}
                         (deep_status, updated_at, jp_type_code, jp_no)
                         """
                     )
-               )
+                )
         await self.validate_schema()
 
     async def _fetch_page(
