@@ -107,3 +107,23 @@ def test_json_status_output_stays_machine_readable() -> None:
     stream = StringIO()
     DeepPresenter(json_mode=True, stream=stream).status(_summary())
     assert json.loads(stream.getvalue()) == _summary()
+
+
+def test_live_state_returns_to_running_when_cycle_finds_work() -> None:
+    stream = StringIO()
+    events = DeepTerminalEvents("collect", stream=stream)
+    events("idle", {"cycle": 1, "idle_seconds": 5.0, "queue_source": "IDLE"})
+    assert events.state["phase"] == "IDLE"
+
+    events(
+        "cycle",
+        {
+            "cycle": 2,
+            "queue_source": "ACTIVE REFRESH",
+            "runtime": 1,
+            "adopted": 0,
+            "promoted": 0,
+            "refreshed": 1,
+        },
+    )
+    assert events.state["phase"] == "RUNNING"

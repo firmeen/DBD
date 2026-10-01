@@ -87,7 +87,9 @@ class DeepTerminalEvents:
             self.state["phase"] = payload.get("phase", self.state["phase"])
         elif name in {"started", "progress", "cycle", "prepare_progress"}:
             self.state.update(payload)
-            if name == "started":
+            if name == "started" or (
+                name == "cycle" and payload.get("queue_source") != "IDLE"
+            ):
                 self.state["phase"] = "RUNNING"
         elif name == "idle":
             self.state.update(payload)

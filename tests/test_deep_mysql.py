@@ -318,3 +318,55 @@ async def test_active_stale_refresh_reopens_exact_endpoint_and_preserves_payload
             {"jp_no": "9000000000002", "deep_status": "COMPLETE"},
             {"jp_no": "9000000000003", "deep_status": "COMPLETE"},
         ]
+
+
+@pytest.mark.asyncio
+async def test_partial_deep_model_fails_discovery_transaction_without_partial_bridge_state() -> None:
+    _drop_model()
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE dbd_company_master (
+                jp_type_code VARCHAR(4) NOT NULL,
+                jp_no VARCHAR(20) NOT NULL,
+                PRIMARY KEY (jp_type_code, jp_no)
+            ) ENGINE=InnoDB
+            """
+        )
+        conn.commit()
+
+    jp_no = str(int(uuid4().hex[:12], 16)).zfill(13)[:13]
+    filters = SearchFilters("partial-deep-" + uuid4().hex)
+    bucket = upsert_bucket(filters)
+
+    class Client:
+        concurrency = 1
+
+        async def post(self, path, payload, **kwargs):
+            return {
+                "meta": {"currentPage": 1, "totalItems": 1, "totalPages": 1},
+                "contents": [
+                    {
+                        "jpNo": jp_no,
+                        "jpTypeCode": "7",
+                        "jpName": "Partial Model Co",
+                        "jpStatCode": "1",
+                    }
+                ],
+            }
+
+    with pytest.raises(RuntimeError, match="partially installed"):
+        await _drain_bucket(Client(), bucket, filters, 1, verbose=False)
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) n FROM discovery_sightings "
+            "WHERE jp_type_code='7' AND jp_no=%s",
+            (jp_no,),
+        )
+        assert cur.fetchone()["n"] == 0
+        cur.execute(
+            "SELECT COUNT(*) n FROM dbd_company_master WHERE jp_no=%s",
+            (jp_no,),
+        )
+        assert cur.fetchone()["n"] == 0

@@ -1305,7 +1305,8 @@ class DeepRepository:
         )
         return (
             f"((required_mask & {bit}) <> 0 AND "
-            f"({requested} IS NULL OR {requested}='' OR {requested} <= {cutoff}))"
+            f"({requested} IS NULL OR {requested} IN ('', 'null') "
+            f"OR {requested} <= {cutoff}))"
         )
 
     @classmethod
