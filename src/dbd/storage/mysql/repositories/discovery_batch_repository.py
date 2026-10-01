@@ -4,6 +4,7 @@ import json
 from hashlib import sha256
 
 from ....core.telemetry import DISCOVERY_PAGE_RESULTS, DISCOVERY_VALID_ROWS, PIPELINE_BATCH_SIZE
+from ....deep.bridge import sync_discovery_batch
 from ....runtime.delta import MASTER_HASH_VERSION, master_fingerprint
 from ..engine import connect
 from .company_repository import company_upsert_sql, company_values
@@ -219,6 +220,8 @@ def persist_page_batch(records: list[dict]) -> list[dict]:
                         """,
                         sighting_rows,
                     )
+
+                sync_discovery_batch(cur, prepared)
 
                 for record, archive_id in prepared:
                     rejections = list(record.get("rejections") or [])
