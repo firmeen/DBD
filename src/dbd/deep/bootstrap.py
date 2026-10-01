@@ -426,10 +426,16 @@ class DeepBootstrap:
                 {", ".join(assignments)},
                 is_active=1
         """
+        inactive_assignments = [
+            f"{column}=VALUES({column})"
+            for column in columns
+            if column not in {"endpoint_key", "bit_value", "is_active"}
+        ]
         inactive_upsert = f"""
             INSERT INTO {CATALOG_TABLE} ({", ".join(columns)})
             VALUES ({binds})
-            ON DUPLICATE KEY UPDATE is_active=0
+            ON DUPLICATE KEY UPDATE
+                {", ".join(inactive_assignments)}
         """
 
         rows = []
