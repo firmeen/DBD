@@ -466,9 +466,13 @@ class DeepPresenter:
                             "Retry wait",
                             _priority_count(runtime["retry_wait"], "yellow"),
                             "Overlap",
-                            _styled(
-                                "YES" if summary["overlap"] else "0",
-                                "bold red" if summary["overlap"] else "green",
+                            (
+                                _styled(
+                                    "YES" if summary["overlap"] else "0",
+                                    "bold red" if summary["overlap"] else "green",
+                                )
+                                if summary.get("overlap_verified", True)
+                                else _styled("NOT CHECKED · use --verify", "yellow")
                             ),
                         ),
                     ]

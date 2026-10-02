@@ -244,39 +244,71 @@ class DeepRepository:
         assert last_error is not None
         raise DeepTransientDatabaseError(str(last_error)) from last_error
 
-    async def _table_columns(self, table_name: str) -> set[str]:
+    async def _table_columns_many(
+        self,
+        table_names: tuple[str, ...],
+    ) -> dict[str, set[str]]:
+        if not table_names:
+            return {}
+        placeholders = ",".join(f":t{i}" for i, _ in enumerate(table_names))
+        params = {
+            "schema": settings.db_name,
+            **{f"t{i}": table_name for i, table_name in enumerate(table_names)},
+        }
         async with self.engine.connect() as conn:
             rows = (
                 await conn.execute(
                     text(
-                        """
-                        SELECT column_name
+                        f"""
+                        SELECT table_name, column_name
                         FROM information_schema.columns
                         WHERE table_schema=:schema
-                          AND table_name=:table_name
+                          AND table_name IN ({placeholders})
                         """
                     ),
-                    {"schema": settings.db_name, "table_name": table_name},
+                    params,
                 )
-            ).scalars().all()
-        return {str(row) for row in rows}
+            ).all()
+        result = {table_name: set() for table_name in table_names}
+        for table_name, column_name in rows:
+            result[str(table_name)].add(str(column_name))
+        return result
 
-    async def _table_indexes(self, table_name: str) -> set[str]:
+    async def _table_columns(self, table_name: str) -> set[str]:
+        return (await self._table_columns_many((table_name,)))[table_name]
+
+    async def _table_indexes_many(
+        self,
+        table_names: tuple[str, ...],
+    ) -> dict[str, set[str]]:
+        if not table_names:
+            return {}
+        placeholders = ",".join(f":t{i}" for i, _ in enumerate(table_names))
+        params = {
+            "schema": settings.db_name,
+            **{f"t{i}": table_name for i, table_name in enumerate(table_names)},
+        }
         async with self.engine.connect() as conn:
             rows = (
                 await conn.execute(
                     text(
-                        """
-                        SELECT DISTINCT index_name
+                        f"""
+                        SELECT DISTINCT table_name, index_name
                         FROM information_schema.statistics
                         WHERE table_schema=:schema
-                          AND table_name=:table_name
+                          AND table_name IN ({placeholders})
                         """
                     ),
-                    {"schema": settings.db_name, "table_name": table_name},
+                    params,
                 )
-            ).scalars().all()
-        return {str(row) for row in rows}
+            ).all()
+        result = {table_name: set() for table_name in table_names}
+        for table_name, index_name in rows:
+            result[str(table_name)].add(str(index_name))
+        return result
+
+    async def _table_indexes(self, table_name: str) -> set[str]:
+        return (await self._table_indexes_many((table_name,)))[table_name]
 
     async def table_exists(self, table_name: str) -> bool:
         return bool(await self._table_columns(table_name))
@@ -309,13 +341,16 @@ class DeepRepository:
         )
 
     async def _assert_indexes(self, *, require_runtime: bool) -> None:
-        tables = (MASTER_TABLE, DEEP_TABLE, RUNTIME_TABLE) if require_runtime else (
-            MASTER_TABLE,
-            DEEP_TABLE,
+        tables = (
+            (MASTER_TABLE, DEEP_TABLE, RUNTIME_TABLE)
+            if require_runtime
+            else (MASTER_TABLE, DEEP_TABLE)
         )
+        indexes_by_table = await self._table_indexes_many(tables)
         for table_name in tables:
-            indexes = await self._table_indexes(table_name)
-            missing = sorted(_REQUIRED_INDEXES[table_name] - indexes)
+            missing = sorted(
+                _REQUIRED_INDEXES[table_name] - indexes_by_table[table_name]
+            )
             if missing:
                 raise RuntimeError(
                     f"{table_name} missing required index(es): {', '.join(missing)}"
@@ -349,8 +384,11 @@ class DeepRepository:
                 )
             )
 
+        columns_by_table = await self._table_columns_many(
+            tuple(table_name for table_name, _ in requirements)
+        )
         for table_name, required in requirements:
-            columns = await self._table_columns(table_name)
+            columns = columns_by_table[table_name]
             if not columns:
                 action = (
                     "run dbd-deep prepare first"
@@ -935,10 +973,10 @@ class DeepRepository:
                             f"""
                             SELECT EXISTS(
                                 SELECT 1
-                                FROM {MASTER_TABLE} m
-                                JOIN {DEEP_TABLE} d
-                                  ON d.jp_type_code=m.jp_type_code
-                                 AND d.jp_no=m.jp_no
+                                FROM {DEEP_TABLE} d
+                                STRAIGHT_JOIN {MASTER_TABLE} m
+                                  ON m.jp_type_code=d.jp_type_code
+                                 AND m.jp_no=d.jp_no
                                 LIMIT 1
                             )
                             """
@@ -2157,6 +2195,7 @@ class DeepRepository:
         self,
         *,
         include_coverage: bool = False,
+        verify_overlap: bool = True,
     ) -> dict[str, Any]:
         runtime_exists = await self.table_exists(RUNTIME_TABLE)
         prepared = await self.is_prepared()
@@ -2230,25 +2269,27 @@ class DeepRepository:
                         for key in ("pending", "running", "retry_wait")
                     )
 
-                overlap = int(
-                    (
-                        await conn.execute(
-                            text(
-                                f"""
-                                SELECT EXISTS(
-                                    SELECT 1
-                                    FROM {MASTER_TABLE} m
-                                    JOIN {DEEP_TABLE} d
-                                      ON d.jp_type_code=m.jp_type_code
-                                     AND d.jp_no=m.jp_no
-                                    LIMIT 1
+                overlap: int | None = None
+                if verify_overlap:
+                    overlap = int(
+                        (
+                            await conn.execute(
+                                text(
+                                    f"""
+                                    SELECT EXISTS(
+                                        SELECT 1
+                                        FROM {DEEP_TABLE} d
+                                        STRAIGHT_JOIN {MASTER_TABLE} m
+                                          ON m.jp_type_code=d.jp_type_code
+                                         AND m.jp_no=d.jp_no
+                                        LIMIT 1
+                                    )
+                                    """
                                 )
-                                """
                             )
-                        )
-                    ).scalar_one()
-                    or 0
-                )
+                        ).scalar_one()
+                        or 0
+                    )
 
         coverage = await self.coverage_summary() if include_coverage else {}
         return {
@@ -2258,6 +2299,7 @@ class DeepRepository:
             "deep": deep_counts,
             "runtime": runtime_counts,
             "overlap": overlap,
+            "overlap_verified": bool(verify_overlap),
             "universe": master + deep_total,
             "active_endpoint_mask": ACTIVE_ENDPOINT_MASK,
             "coverage": coverage,

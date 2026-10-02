@@ -676,29 +676,115 @@ class TerminalPresenter:
         if self.json_mode:
             self.json(dict(data))
             return
-        rows = (
-            ("unique companies", f"{_int(data.get('unique_companies')):,}"),
-            ("rows fetched", f"{_int(data.get('rows_fetched')):,}"),
-            (
-                "buckets",
-                f"{_int(data.get('buckets')):,} total · {_int(data.get('buckets_done')):,} done · "
-                f"{_int(data.get('buckets_split')):,} split · {_int(data.get('buckets_open')):,} open · "
-                f"{_int(data.get('buckets_failed')):,} failed",
-            ),
-            (
-                "backlog",
-                f"{_int(data.get('buckets_uncounted')):,} uncounted buckets · "
-                f"{_int(data.get('remaining_counted_pages')):,} known pages",
-            ),
-            (
-                "pages",
-                f"{_int(data.get('pages_done')):,} done · {_int(data.get('pages_partial')):,} partial · "
-                f"{_int(data.get('pages_failed')):,} failed",
-            ),
-            ("quarantine", f"{_int(data.get('unresolved_rejections')):,} unresolved row(s)"),
-            ("lossy partitions", f"{_int(data.get('partitions_lossy')):,}"),
+
+        def count(value: Any, style: str, *, zero_style: str = "dim") -> Text:
+            number = _int(value)
+            return Text(
+                f"{number:,}",
+                style=style if number > 0 else zero_style,
+            )
+
+        buckets_failed = _int(data.get("buckets_failed"))
+        pages_failed = _int(data.get("pages_failed"))
+        pages_partial = _int(data.get("pages_partial"))
+        quarantined = _int(data.get("unresolved_rejections"))
+        lossy = _int(data.get("partitions_lossy"))
+        open_buckets = _int(data.get("buckets_open"))
+
+        if buckets_failed or pages_failed or lossy:
+            state = Text("ATTENTION", style="bold red")
+        elif pages_partial or quarantined:
+            state = Text("DEGRADED", style="bold yellow")
+        elif open_buckets:
+            state = Text("IN PROGRESS", style="cyan")
+        else:
+            state = Text("COMPLETE", style="bold green")
+
+        hero = Text()
+        hero.append("DBD DISCOVERY  ", style="bold white")
+        hero.append_text(state)
+
+        population = Table.grid(expand=True, padding=(0, 2))
+        population.add_column(style="dim")
+        population.add_column(justify="right")
+        population.add_column(style="dim")
+        population.add_column(justify="right")
+        population.add_row(
+            "UNIQUE COMPANIES",
+            Text(f"{_int(data.get('unique_companies')):,}", style="bold white"),
+            "ROWS FETCHED",
+            Text(f"{_int(data.get('rows_fetched')):,}", style="bold white"),
         )
-        self.key_values("DBD · DISCOVERY STATUS", rows)
+
+        buckets = Table.grid(expand=True, padding=(0, 2))
+        buckets.add_column(style="dim")
+        buckets.add_column(justify="right")
+        buckets.add_column(style="dim")
+        buckets.add_column(justify="right")
+        buckets.add_row(
+            "TOTAL",
+            Text(f"{_int(data.get('buckets')):,}", style="bold white"),
+            "DONE",
+            count(data.get("buckets_done"), "green"),
+        )
+        buckets.add_row(
+            "OPEN",
+            count(data.get("buckets_open"), "blue"),
+            "SPLIT",
+            count(data.get("buckets_split"), "magenta"),
+        )
+        buckets.add_row(
+            "UNCOUNTED",
+            count(data.get("buckets_uncounted"), "blue"),
+            "FAILED",
+            count(data.get("buckets_failed"), "bold red"),
+        )
+
+        pages = Table.grid(expand=True, padding=(0, 2))
+        pages.add_column(style="dim")
+        pages.add_column(justify="right")
+        pages.add_column(style="dim")
+        pages.add_column(justify="right")
+        pages.add_row(
+            "DONE",
+            count(data.get("pages_done"), "green"),
+            "REMAINING",
+            count(data.get("remaining_counted_pages"), "blue"),
+        )
+        pages.add_row(
+            "PARTIAL",
+            count(data.get("pages_partial"), "yellow"),
+            "FAILED",
+            count(data.get("pages_failed"), "bold red"),
+        )
+
+        integrity = Table.grid(expand=True, padding=(0, 2))
+        integrity.add_column(style="dim")
+        integrity.add_column(justify="right")
+        integrity.add_column(style="dim")
+        integrity.add_column(justify="right")
+        integrity.add_row(
+            "QUARANTINE",
+            count(data.get("unresolved_rejections"), "yellow"),
+            "LOSSY PARTITIONS",
+            count(data.get("partitions_lossy"), "bold red"),
+        )
+
+        self.console.print(
+            Panel(
+                Group(
+                    hero,
+                    Text(""),
+                    Panel(population, title="Population"),
+                    Panel(buckets, title="Buckets"),
+                    Panel(pages, title="Pages"),
+                    Panel(integrity, title="Integrity"),
+                ),
+                title="DBD · DISCOVERY STATUS",
+                border_style="cyan",
+                padding=(1, 2),
+            )
+        )
 
     def command_result(self, title: str, payload: Mapping[str, Any]) -> None:
         if self.json_mode:

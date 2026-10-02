@@ -40,7 +40,7 @@ def _idle_seconds(value: str) -> float:
     return parsed
 
 
-async def _status(json_mode: bool, coverage: bool) -> int:
+async def _status(json_mode: bool, coverage: bool, verify: bool) -> int:
     repo = DeepRepository()
     try:
         await repo.preflight(
@@ -48,7 +48,10 @@ async def _status(json_mode: bool, coverage: bool) -> int:
             require_prepared=False,
             check_indexes=False,
         )
-        summary = await repo.status_summary(include_coverage=coverage)
+        summary = await repo.status_summary(
+            include_coverage=coverage,
+            verify_overlap=verify,
+        )
     finally:
         await repo.close()
 
@@ -205,6 +208,11 @@ def parse_args(argv: list[str] | None = None):
         action="store_true",
         help="Also scan active endpoint coverage; intentionally heavier",
     )
+    status.add_argument(
+        "--verify",
+        action="store_true",
+        help="Also run the exact Master/Deep overlap integrity audit; intentionally heavier",
+    )
     status.add_argument("--json", action="store_true")
 
     retry = sub.add_parser(
@@ -225,7 +233,7 @@ def main(argv: list[str] | None = None) -> None:
         elif args.command == "collect":
             code = asyncio.run(_collect(args))
         elif args.command == "status":
-            code = asyncio.run(_status(args.json, args.coverage))
+            code = asyncio.run(_status(args.json, args.coverage, args.verify))
         elif args.command == "retry":
             code = asyncio.run(_retry(args.limit, args.json))
         else:

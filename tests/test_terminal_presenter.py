@@ -184,6 +184,36 @@ def test_json_mode_preserves_machine_readable_status() -> None:
     assert json.loads(stream.getvalue()) == payload
 
 
+def test_discovery_status_groups_operational_state() -> None:
+    output, stream = presenter()
+    output.discovery_status(
+        {
+            "unique_companies": 1000,
+            "rows_fetched": 1200,
+            "buckets": 20,
+            "buckets_done": 10,
+            "buckets_split": 2,
+            "buckets_open": 7,
+            "buckets_failed": 1,
+            "buckets_uncounted": 3,
+            "partitions_lossy": 0,
+            "pages_done": 100,
+            "pages_failed": 2,
+            "pages_partial": 1,
+            "remaining_counted_pages": 50,
+            "unresolved_rejections": 4,
+        }
+    )
+
+    text = stream.getvalue()
+    assert "DBD · DISCOVERY STATUS" in text
+    assert "POPULATION" in text.upper()
+    assert "BUCKETS" in text.upper()
+    assert "PAGES" in text.upper()
+    assert "INTEGRITY" in text.upper()
+    assert "ATTENTION" in text
+
+
 def test_master_status_is_not_raw_json_by_default() -> None:
     output, stream = presenter()
     output.master_status(

@@ -19,7 +19,7 @@ from ..client.endpoints.search import (
 )
 from ..contracts.company import normalize
 from ..core.exceptions import ContractError
-from ..core.progress import ProgressLine
+from ..presentation.discovery import DiscoveryTerminal
 from ..core.settings import settings
 from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
@@ -230,7 +230,7 @@ async def _drain_bucket(
     verbose=False,
     first_page=None,
     master_cache: dict[tuple[str, str], str] | None = None,
-    progress_line: ProgressLine | None = None,
+    progress_line: DiscoveryTerminal | None = None,
     lease_owner: str | None = None,
     lease_version: int | None = None,
 ):
@@ -241,7 +241,7 @@ async def _drain_bucket(
     del start_page
     local_progress = None
     if progress_line is None and verbose:
-        local_progress = ProgressLine("DISCOVERY", interval=0.75)
+        local_progress = DiscoveryTerminal(interval=0.75)
         progress_line = local_progress
 
     def owned_update(**fields) -> None:
@@ -383,13 +383,16 @@ async def _drain_bucket(
                 rows_seen=state["rows"] + state["rejected"],
             )
             if progress_line is not None:
-                progress_line.update(
-                    state["done"],
-                    pages_total,
-                    detail=(
-                        f"bucket {bucket_id} | rows {state['rows']:,} | "
-                        f"partial {state['partial']} | batch {controller.size} | q {result_queue.qsize()}"
-                    ),
+                progress_line.update_bucket(
+                    bucket_id=bucket_id,
+                    pages_done=state["done"],
+                    pages_total=pages_total,
+                    rows=state["rows"],
+                    failed=state["failed"],
+                    partial=state["partial"],
+                    rejected=state["rejected"],
+                    batch_size=controller.size,
+                    queue_depth=result_queue.qsize(),
                 )
 
     async with asyncio.TaskGroup() as group:
@@ -421,7 +424,7 @@ async def _process_bucket(
     provinces: list[str],
     *,
     master_cache: dict[tuple[str, str], str],
-    progress_line: ProgressLine | None,
+    progress_line: DiscoveryTerminal | None,
     lease_owner: str | None = None,
     lease_version: int | None = None,
 ) -> tuple[int, int]:
@@ -541,7 +544,7 @@ async def _run_work(
     *,
     distributed: bool,
     owner: str,
-    progress_line: ProgressLine,
+    progress_line: DiscoveryTerminal,
 ) -> DiscoveryResult:
     buckets_processed = pages_fetched = companies_written = 0
     provinces = await fetch_provinces(client)
@@ -625,6 +628,12 @@ async def _run_work(
         buckets_processed += len(batch)
         pages_fetched += sum(pages for pages, _ in results)
         companies_written += sum(written for _, written in results)
+        progress_line.update_totals(
+            buckets_processed=buckets_processed,
+            pages_fetched=pages_fetched,
+            companies_written=companies_written,
+            requests=client.requests_made,
+        )
 
     validate_splits(False)
     return DiscoveryResult(buckets_processed, pages_fetched, companies_written, client.requests_made)
@@ -646,7 +655,7 @@ async def run(
     stop = asyncio.Event()
     owner_label = os.environ.get("DBD_WORKER_ID") or "discovery"
     owner = f"{owner_label}-{uuid4().hex}"
-    progress_line = ProgressLine("DISCOVERY", interval=0.75, enabled=verbose)
+    progress_line = DiscoveryTerminal(interval=0.75, enabled=verbose)
     global_rate = settings.dbd_rate_per_second if rate is None else rate
 
     async with AsyncDbdClient(
@@ -695,11 +704,12 @@ async def run(
     result = task.result()
     status = discovery_summary()
     progress_line.close(
+        status=status,
         message=(
             f"Discovery: companies={int(status.get('unique_companies') or 0):,} "
             f"pages_done={int(status.get('pages_done') or 0):,} "
             f"open_buckets={int(status.get('buckets_open') or 0):,}"
-        )
+        ),
     )
     blockers = []
     if int(status.get("buckets_failed") or 0):

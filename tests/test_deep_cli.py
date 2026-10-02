@@ -46,6 +46,23 @@ def test_deep_version_is_separate_from_distribution_version(capsys) -> None:
     assert capsys.readouterr().out.strip() == "dbd-deep 0.1.0"
 
 
+def test_status_verify_is_explicit_and_off_by_default() -> None:
+    assert parse_args(["status"]).verify is False
+    assert parse_args(["status", "--verify"]).verify is True
+
+
+def test_status_marks_overlap_as_not_checked_when_fast_mode_skips_audit() -> None:
+    stream = StringIO()
+    summary = _summary()
+    summary["overlap"] = None
+    summary["overlap_verified"] = False
+
+    DeepPresenter(stream=stream).status(summary)
+
+    assert "NOT CHECKED" in stream.getvalue()
+    assert "--verify" in stream.getvalue()
+
+
 def test_collect_continuous_options_are_explicit() -> None:
     args = parse_args(
         [
