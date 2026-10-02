@@ -11,7 +11,7 @@ from pathlib import Path
 # CONFIG
 # ============================================================
 
-RETRY_DELAY_SECONDS = 20
+RETRY_DELAY_SECONDS = 50
 
 CANARY_COMMAND = [
     "collect",
