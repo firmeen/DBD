@@ -19,8 +19,8 @@ from ..client.endpoints.search import (
 )
 from ..contracts.company import normalize
 from ..core.exceptions import ContractError
-from ..presentation.discovery import DiscoveryTerminal
 from ..core.settings import settings
+from ..presentation.discovery import DiscoveryTerminal
 from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
     DiscoveryLeaseLost,
