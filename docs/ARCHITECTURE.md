@@ -14,6 +14,62 @@
 
 Default collection scope is tabs 1-2: seven endpoints. Tabs 3-4 remain opt-in.
 
+## Standalone Deep path
+
+Standalone `dbd-deep` เป็นอีก execution path ที่แยกจาก Campaign/Fabric runtime โดยตั้งใจ และไม่ใช้ Redis, Supervisor, Guardian หรือ Campaign run ID เป็น dependency
+
+```text
+DBD upstream
+    │
+    ▼
+Discovery
+    │
+    ├── companies / company_master / discovery_sightings
+    │
+    ▼
+Deep bridge
+    │
+    ▼
+dbd_company_master
+waiting population
+    │
+    │ bounded promotion
+    ▼
+dbd_company_deep
+authoritative Deep row + 7 endpoint state
+    │
+    ├── dbd_deep_runtime   bounded temporary work only
+    │
+    └── COMPLETE rows only
+             │
+             ▼
+       dbd_master_deep
+       flat MySQL serving
+             │
+             ▼
+TIPDataIntelligence.dbo.DBD_MASTER_DEEP
+```
+
+Key invariants:
+
+- company identity is `(jp_type_code, jp_no)`;
+- `dbd_company_master ∩ dbd_company_deep = 0`;
+- active standalone scope is exactly 7 endpoints: profile, committees, committee_signs, transformations, financial_submissions, financial_statements and industry_benchmark;
+- legacy nations/history endpoints remain compatibility data and are not scheduled by standalone Deep;
+- `dbd_company_deep` remains the authoritative current Deep state;
+- `dbd_master_deep` is derived output only, contains scalar/human-readable fields and no endpoint JSON blobs;
+- serving projection uses only `deep_status='COMPLETE'`; when an ACTIVE company is reopened for refresh, its previous serving row remains until a new COMPLETE snapshot is available;
+- SQL Server synchronization is INSERT + UPDATE + SKIP by `row_hash`; target-only rows are reported and are not automatically deleted;
+- `TIPDataIntelligence.dbo.DBD_COMPANY` is outside this serving pipeline.
+
+Normal collector scheduling priority remains unresolved Deep work → waiting Master companies → stale ACTIVE COMPLETE refresh → idle. The runtime table is bounded temporary work, not a permanent company registry.
+
+### Standalone presentation boundary
+
+`src/dbd/deep/presentation.py` renders `dbd-deep` commands. `src/dbd/presentation/master_deep.py` renders bootstrap, MySQL serving and SQL Server sync. Both consume structured state only; neither owns MySQL/HTTP/scheduling decisions.
+
+Interactive TTY output may use Rich colors and live repaint. Redirected output remains plain newline text, and explicit JSON modes remain machine-readable.
+
 ## V2 staged bulk path
 
 ```text
