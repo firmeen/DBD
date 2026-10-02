@@ -26,6 +26,64 @@ def _limit(value: Any) -> str:
     return "∞" if value is None else _number(value)
 
 
+def _styled(value: Any, style: str | None) -> Text:
+    return Text(str(value), style=style)
+
+
+def _state(value: Any) -> Text:
+    label = str(value)
+    normalized = label.upper().replace("_", " ")
+    if any(token in normalized for token in ("FAILED", "ERROR", "MISSING")):
+        style = "bold red"
+    elif any(
+        token in normalized
+        for token in ("DEGRADED", "WAITING", "RETRY WAIT", "NOT INITIALIZED", "INTERRUPTED")
+    ):
+        style = "bold yellow"
+    elif any(token in normalized for token in ("COMPLETE", "READY", "HEALTHY")):
+        style = "bold green"
+    elif normalized == "IDLE":
+        style = "dim"
+    elif any(
+        token in normalized
+        for token in (
+            "RUNNING",
+            "ACTIVE",
+            "STARTING",
+            "PREFLIGHT",
+            "PREPARE",
+            "AUTH",
+            "RECOVER",
+            "REFILL",
+        )
+    ):
+        style = "cyan"
+    else:
+        style = None
+    return _styled(label, style)
+
+
+def _priority_count(value: Any, positive_style: str, *, zero_style: str = "dim") -> Text:
+    label = _number(value)
+    try:
+        active = int(value or 0) > 0
+    except (TypeError, ValueError):
+        active = bool(value)
+    return _styled(label, positive_style if active else zero_style)
+
+
+def _queue_source(value: Any) -> Text:
+    label = str(value or "IDLE")
+    normalized = label.upper()
+    if normalized == "IDLE":
+        return _styled(label, "dim")
+    if "REFRESH" in normalized:
+        return _styled(label, "magenta")
+    if "MASTER" in normalized or "NEW" in normalized or "PROMOT" in normalized:
+        return _styled(label, "blue")
+    return _styled(label, "cyan")
+
+
 def _grid(rows: list[tuple[str, Any, str, Any]]) -> Table:
     table = Table.grid(expand=True, padding=(0, 1))
     table.add_column(style="dim", no_wrap=True)
@@ -35,9 +93,9 @@ def _grid(rows: list[tuple[str, Any, str, Any]]) -> Table:
     for left_key, left_value, right_key, right_value in rows:
         table.add_row(
             left_key,
-            str(left_value),
+            left_value if isinstance(left_value, Text) else str(left_value),
             right_key,
-            str(right_value),
+            right_value if isinstance(right_value, Text) else str(right_value),
         )
     return table
 
@@ -203,12 +261,17 @@ class DeepTerminalEvents:
             return Panel(
                 _grid(
                     [
-                        ("Phase", self.state["phase"], "Progress", f"{pct:,.2f}%"),
+                        (
+                            "Phase",
+                            _state(self.state["phase"]),
+                            "Progress",
+                            _styled(f"{pct:,.2f}%", "bold white"),
+                        ),
                         (
                             "Scanned",
-                            f"{rows_scanned:,}/{rows_total:,}",
+                            _styled(f"{rows_scanned:,}/{rows_total:,}", "bold white"),
                             "Changed",
-                            _number(self.state.get("rows_changed")),
+                            _priority_count(self.state.get("rows_changed"), "magenta"),
                         ),
                     ]
                 ),
@@ -216,37 +279,43 @@ class DeepTerminalEvents:
             )
 
         elapsed = int(time.monotonic() - self.started_at)
-        header = Text(
-            f"DBD DEEP v{__version__} • {self.state['phase']} "
-            f"• {elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d} "
-            f"• Cycle {self.state['cycle']}"
+        header = Text()
+        header.append(f"DBD DEEP v{__version__}", style="bold white")
+        header.append(" • ", style="dim")
+        header.append_text(_state(self.state["phase"]))
+        header.append(" • ", style="dim")
+        header.append(
+            f"{elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}",
+            style="dim",
         )
+        header.append(" • Cycle ", style="dim")
+        header.append(str(self.state["cycle"]), style="bold white")
         collector = Panel(
             _grid(
                 [
                     (
                         "Concurrency",
-                        self.state.get("concurrency", "-"),
+                        _styled(self.state.get("concurrency", "-"), "cyan"),
                         "Rate",
-                        f"{self.state.get('rate_per_second', '-')} req/s",
+                        _styled(f"{self.state.get('rate_per_second', '-')} req/s", "cyan"),
                     ),
                     (
                         "Buffer",
-                        self.state.get("buffer_size", "-"),
+                        _styled(self.state.get("buffer_size", "-"), "cyan"),
                         "Limit",
-                        _limit(self.state.get("company_limit")),
+                        _styled(_limit(self.state.get("company_limit")), "bold white"),
                     ),
                     (
                         "Claimed",
-                        _number(self.state.get("companies_claimed")),
+                        _priority_count(self.state.get("companies_claimed"), "blue"),
                         "Finished",
-                        _number(self.state.get("companies_finished")),
+                        _priority_count(self.state.get("companies_finished"), "green"),
                     ),
                     (
                         "Source",
-                        self.state.get("queue_source", "IDLE"),
+                        _queue_source(self.state.get("queue_source", "IDLE")),
                         "Runtime",
-                        _number(self.state.get("runtime")),
+                        _priority_count(self.state.get("runtime"), "blue"),
                     ),
                 ]
             ),
@@ -257,27 +326,27 @@ class DeepTerminalEvents:
                 [
                     (
                         "Promoted",
-                        _number(self.state.get("master_promoted")),
+                        _priority_count(self.state.get("master_promoted"), "blue"),
                         "Adopted",
-                        _number(self.state.get("deep_adopted")),
+                        _priority_count(self.state.get("deep_adopted"), "blue"),
                     ),
                     (
                         "ACTIVE refresh",
-                        _number(self.state.get("active_refreshed")),
+                        _priority_count(self.state.get("active_refreshed"), "magenta"),
                         "Retry wait",
-                        _number(self.state.get("companies_retry_wait")),
+                        _priority_count(self.state.get("companies_retry_wait"), "yellow"),
                     ),
                     (
                         "Endpoint done",
-                        _number(self.state.get("endpoints_done")),
+                        _priority_count(self.state.get("endpoints_done"), "green"),
                         "N/A",
-                        _number(self.state.get("endpoints_not_available")),
+                        _priority_count(self.state.get("endpoints_not_available"), "dim"),
                     ),
                     (
                         "Endpoint failed",
-                        _number(self.state.get("endpoints_failed")),
+                        _priority_count(self.state.get("endpoints_failed"), "bold red"),
                         "Recovered",
-                        _number(self.state.get("runtime_recovered")),
+                        _priority_count(self.state.get("runtime_recovered"), "blue"),
                     ),
                 ]
             ),
@@ -297,40 +366,41 @@ class DeepTerminalEvents:
                 [
                     (
                         "Status",
-                        serving_status,
+                        _state(serving_status),
                         "Target",
-                        "dbd_master_deep",
+                        _styled("dbd_master_deep", "dim"),
                     ),
                     (
                         "Scanned",
-                        _number(self.state.get("serving_scanned")),
+                        _styled(_number(self.state.get("serving_scanned")), "bold white"),
                         "Inserted",
-                        _number(self.state.get("serving_inserted")),
+                        _priority_count(self.state.get("serving_inserted"), "green"),
                     ),
                     (
                         "Updated",
-                        _number(self.state.get("serving_updated")),
+                        _priority_count(self.state.get("serving_updated"), "magenta"),
                         "Unchanged",
-                        _number(self.state.get("serving_unchanged")),
+                        _styled(_number(self.state.get("serving_unchanged")), "dim"),
                     ),
                     (
                         "Missing identity",
-                        _number(self.state.get("serving_missing_identity")),
+                        _priority_count(self.state.get("serving_missing_identity"), "bold red"),
                         "Normalize errors",
-                        _number(self.state.get("serving_normalization_error")),
+                        _priority_count(self.state.get("serving_normalization_error"), "yellow"),
                     ),
                 ]
             ),
             title="Serving Projection",
         )
-        footer = Text(
-            (
-                "IDLE • waiting for work"
-                if self.state["phase"] == "IDLE"
-                else f"ACTIVE • {self.state.get('queue_source', 'RUNTIME')}"
-            )
-            + " • Ctrl+C graceful shutdown"
-        )
+        footer = Text()
+        if self.state["phase"] == "IDLE":
+            footer.append("IDLE", style="dim")
+            footer.append(" • waiting for work", style="dim")
+        else:
+            footer.append("ACTIVE", style="cyan")
+            footer.append(" • ", style="dim")
+            footer.append_text(_queue_source(self.state.get("queue_source", "RUNTIME")))
+        footer.append(" • Ctrl+C graceful shutdown", style="dim")
         if self.state.get("serving_last_error"):
             footer.append(" • SERVING DEGRADED", style="bold yellow")
         return Group(Panel(header, title="DBD DEEP"), collector, runtime, serving, footer)
@@ -367,33 +437,39 @@ class DeepPresenter:
                     [
                         (
                             "Prepared",
-                            "YES" if summary["prepared"] else "NO",
+                            _styled(
+                                "YES" if summary["prepared"] else "NO",
+                                "bold green" if summary["prepared"] else "bold yellow",
+                            ),
                             "Runtime",
-                            "READY" if summary["runtime_exists"] else "MISSING",
+                            _state("READY" if summary["runtime_exists"] else "MISSING"),
                         ),
                         (
                             "Master waiting",
-                            _number(summary["master"]),
+                            _priority_count(summary["master"], "blue"),
                             "Deep total",
-                            _number(deep["total"]),
+                            _styled(_number(deep["total"]), "bold white"),
                         ),
                         (
                             "Complete",
-                            _number(deep["complete"]),
+                            _priority_count(deep["complete"], "green"),
                             "Unresolved",
-                            _number(deep["unresolved"]),
+                            _priority_count(deep["unresolved"], "yellow"),
                         ),
                         (
                             "Runtime pending",
-                            _number(runtime["pending"]),
+                            _priority_count(runtime["pending"], "blue"),
                             "Running",
-                            _number(runtime["running"]),
+                            _priority_count(runtime["running"], "cyan"),
                         ),
                         (
                             "Retry wait",
-                            _number(runtime["retry_wait"]),
+                            _priority_count(runtime["retry_wait"], "yellow"),
                             "Overlap",
-                            "YES" if summary["overlap"] else "0",
+                            _styled(
+                                "YES" if summary["overlap"] else "0",
+                                "bold red" if summary["overlap"] else "green",
+                            ),
                         ),
                     ]
                 ),
@@ -411,10 +487,10 @@ class DeepPresenter:
             for endpoint, row in coverage.items():
                 table.add_row(
                     endpoint,
-                    _number(row["data_rows"]),
-                    _number(row["done"]),
-                    _number(row["not_available"]),
-                    _number(row["failed"]),
+                    _styled(_number(row["data_rows"]), "bold white"),
+                    _priority_count(row["done"], "green"),
+                    _styled(_number(row["not_available"]), "dim"),
+                    _priority_count(row["failed"], "bold red"),
                 )
             self.console.print(table)
 
@@ -428,21 +504,27 @@ class DeepPresenter:
                     [
                         (
                             "Already prepared",
-                            "YES" if result["already_prepared"] else "NO",
+                            _styled(
+                                "YES" if result["already_prepared"] else "NO",
+                                "green" if result["already_prepared"] else "yellow",
+                            ),
                             "Rows total",
-                            _number(result["rows_total"]),
+                            _styled(_number(result["rows_total"]), "bold white"),
                         ),
                         (
                             "Rows scanned",
-                            _number(result["rows_scanned"]),
+                            _styled(_number(result["rows_scanned"]), "bold white"),
                             "Rows changed",
-                            _number(result["rows_changed"]),
+                            _priority_count(result["rows_changed"], "magenta"),
                         ),
                         (
                             "Recovered",
-                            _number(result["runtime_recovered"]),
+                            _priority_count(result["runtime_recovered"], "blue"),
                             "Overlap",
-                            "YES" if summary["overlap"] else "0",
+                            _styled(
+                                "YES" if summary["overlap"] else "0",
+                                "bold red" if summary["overlap"] else "green",
+                            ),
                         ),
                     ]
                 ),
@@ -458,12 +540,20 @@ class DeepPresenter:
             Panel(
                 _grid(
                     [
-                        ("Reopened", _number(count), "Runtime", _number(summary["runtime"]["total"])),
+                        (
+                            "Reopened",
+                            _priority_count(count, "blue"),
+                            "Runtime",
+                            _priority_count(summary["runtime"]["total"], "blue"),
+                        ),
                         (
                             "Unresolved",
-                            _number(summary["deep"]["unresolved"]),
+                            _priority_count(summary["deep"]["unresolved"], "yellow"),
                             "Overlap",
-                            "YES" if summary["overlap"] else "0",
+                            _styled(
+                                "YES" if summary["overlap"] else "0",
+                                "bold red" if summary["overlap"] else "green",
+                            ),
                         ),
                     ]
                 ),
@@ -481,27 +571,27 @@ class DeepPresenter:
                     [
                         (
                             "Claimed",
-                            _number(result["companies_claimed"]),
+                            _priority_count(result["companies_claimed"], "blue"),
                             "Finished",
-                            _number(result["companies_finished"]),
+                            _priority_count(result["companies_finished"], "green"),
                         ),
                         (
                             "Promoted",
-                            _number(result["master_promoted"]),
+                            _priority_count(result["master_promoted"], "blue"),
                             "ACTIVE refresh",
-                            _number(result.get("active_refreshed")),
+                            _priority_count(result.get("active_refreshed"), "magenta"),
                         ),
                         (
                             "HTTP requests",
-                            _number(result["http_requests"]),
+                            _priority_count(result["http_requests"], "cyan"),
                             "Retries",
-                            _number(result["http_retries"]),
+                            _priority_count(result["http_retries"], "yellow"),
                         ),
                         (
                             "429",
-                            _number(result["rate_limit_hits"]),
+                            _priority_count(result["rate_limit_hits"], "yellow"),
                             "Cycles",
-                            _number(result.get("cycle")),
+                            _styled(_number(result.get("cycle")), "dim"),
                         ),
                     ]
                 ),
