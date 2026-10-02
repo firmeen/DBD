@@ -316,7 +316,7 @@ class ServingProjector:
                     ),
                     {"table_name": SERVING_TABLE},
                 )
-            ).mappings().all()
+            ).all()
             index_rows = (
                 await conn.execute(
                     text(
@@ -329,17 +329,24 @@ class ServingProjector:
                     ),
                     {"table_name": SERVING_TABLE},
                 )
-            ).mappings().all()
+            ).all()
 
-        actual = {str(row["column_name"]): row for row in rows}
+        actual = {
+            str(row[0]): {
+                "column_type": row[1],
+                "data_type": row[2],
+                "is_nullable": row[3],
+            }
+            for row in rows
+        }
         missing = sorted(set(SERVING_COLUMNS) - set(actual))
         if missing:
             raise ServingProjectionError(
                 f"{SERVING_TABLE} missing required column(s): {', '.join(missing)}"
             )
         json_columns = sorted(
-            str(row["column_name"])
-            for row in rows
+            str(name)
+            for name, row in actual.items()
             if str(row["data_type"]).lower() == "json"
         )
         if json_columns:
@@ -363,8 +370,8 @@ class ServingProjector:
 
         indexes: dict[str, list[tuple[int, str, int]]] = {}
         for row in index_rows:
-            indexes.setdefault(str(row["index_name"]), []).append(
-                (int(row["seq_in_index"]), str(row["column_name"]), int(row["non_unique"]))
+            indexes.setdefault(str(row[0]), []).append(
+                (int(row[2]), str(row[3]), int(row[1]))
             )
         expected_indexes = {
             "PRIMARY": (["company_id"], 0),

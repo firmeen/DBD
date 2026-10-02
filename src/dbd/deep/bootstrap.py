@@ -433,25 +433,25 @@ class DeepBootstrap:
             columns.insert(columns.index("response_schema"), "response_kind")
         binds = ",".join(f":{column}" for column in columns)
         assignments = [
-            f"{column}=VALUES({column})"
+            f"{column}=new.{column}"
             for column in columns
             if column not in {"endpoint_key", "is_active"}
         ]
         active_upsert = f"""
             INSERT INTO {CATALOG_TABLE} ({", ".join(columns)})
-            VALUES ({binds})
+            VALUES ({binds}) AS new
             ON DUPLICATE KEY UPDATE
                 {", ".join(assignments)},
                 is_active=1
         """
         inactive_assignments = [
-            f"{column}=VALUES({column})"
+            f"{column}=new.{column}"
             for column in columns
             if column not in {"endpoint_key", "bit_value", "is_active"}
         ]
         inactive_upsert = f"""
             INSERT INTO {CATALOG_TABLE} ({", ".join(columns)})
-            VALUES ({binds})
+            VALUES ({binds}) AS new
             ON DUPLICATE KEY UPDATE
                 {", ".join(inactive_assignments)}
         """
@@ -599,63 +599,89 @@ class DeepBootstrap:
                             cap_amt,paid_amt,total_asset,total_equity,total_income,
                             net_profit,submit_fin_year,master_data,first_seen_at,last_seen_at
                          )
-                        SELECT
-                            s.jp_type_code,s.jp_no,c.jp_name,c.jp_name_e,
-                            COALESCE(cm.observed_jp_stat_code,c.jp_stat_code),
-                            c.jp_stat_desc,c.jp_type_desc,c.address,c.pv_code,c.pv_desc,
-                            c.ampur_code,c.ampur_desc,c.tumbon_code,c.tumbon_desc,c.zip_code,
-                            c.business_size_code,c.business_type_code,c.business_type_desc,
-                            c.setup_obj_code,c.setup_obj_desc,c.submit_obj_code,c.submit_obj_desc,
-                            c.cap_amt,c.paid_amt,c.total_asset,c.total_equity,c.total_income,
-                            c.net_profit,c.submit_fin_year,{MASTER_JSON_SQL},
-                            s.first_seen_at,s.last_seen_at
-                        FROM discovery_sightings s
-                        LEFT JOIN companies c
-                          ON c.jp_type_code=s.jp_type_code
-                         AND c.jp_no=s.jp_no
-                        LEFT JOIN company_master cm
-                          ON cm.jp_type_code=s.jp_type_code
-                          AND cm.jp_no=s.jp_no
-                        LEFT JOIN {DEEP_TABLE} d
-                          ON d.jp_type_code=s.jp_type_code
-                         AND d.jp_no=s.jp_no
-                        WHERE d.jp_no IS NULL
-                          {range_lower}
-                          AND (
-                            s.jp_type_code < :end_type
-                            OR (s.jp_type_code=:end_type AND s.jp_no<=:end_no)
-                        )
+                        SELECT *
+                        FROM (
+                            SELECT
+                                s.jp_type_code AS jp_type_code,
+                                s.jp_no AS jp_no,
+                                c.jp_name AS jp_name,
+                                c.jp_name_e AS jp_name_e,
+                                COALESCE(cm.observed_jp_stat_code,c.jp_stat_code) AS jp_stat_code,
+                                c.jp_stat_desc AS jp_stat_desc,
+                                c.jp_type_desc AS jp_type_desc,
+                                c.address AS address,
+                                c.pv_code AS pv_code,
+                                c.pv_desc AS pv_desc,
+                                c.ampur_code AS ampur_code,
+                                c.ampur_desc AS ampur_desc,
+                                c.tumbon_code AS tumbon_code,
+                                c.tumbon_desc AS tumbon_desc,
+                                c.zip_code AS zip_code,
+                                c.business_size_code AS business_size_code,
+                                c.business_type_code AS business_type_code,
+                                c.business_type_desc AS business_type_desc,
+                                c.setup_obj_code AS setup_obj_code,
+                                c.setup_obj_desc AS setup_obj_desc,
+                                c.submit_obj_code AS submit_obj_code,
+                                c.submit_obj_desc AS submit_obj_desc,
+                                c.cap_amt AS cap_amt,
+                                c.paid_amt AS paid_amt,
+                                c.total_asset AS total_asset,
+                                c.total_equity AS total_equity,
+                                c.total_income AS total_income,
+                                c.net_profit AS net_profit,
+                                c.submit_fin_year AS submit_fin_year,
+                                {MASTER_JSON_SQL} AS master_data,
+                                s.first_seen_at AS first_seen_at,
+                                s.last_seen_at AS last_seen_at
+                            FROM discovery_sightings s
+                            LEFT JOIN companies c
+                              ON c.jp_type_code=s.jp_type_code
+                             AND c.jp_no=s.jp_no
+                            LEFT JOIN company_master cm
+                              ON cm.jp_type_code=s.jp_type_code
+                             AND cm.jp_no=s.jp_no
+                            LEFT JOIN {DEEP_TABLE} d
+                              ON d.jp_type_code=s.jp_type_code
+                             AND d.jp_no=s.jp_no
+                            WHERE d.jp_no IS NULL
+                              {range_lower}
+                              AND (
+                                s.jp_type_code < :end_type
+                                OR (s.jp_type_code=:end_type AND s.jp_no<=:end_no)
+                            )
+                        ) AS new
                         ON DUPLICATE KEY UPDATE
-                            jp_name=VALUES(jp_name),
-                            jp_name_e=VALUES(jp_name_e),
-                            jp_stat_code=VALUES(jp_stat_code),
-                            jp_stat_desc=VALUES(jp_stat_desc),
-                            jp_type_desc=VALUES(jp_type_desc),
-                            address=VALUES(address),
-                            pv_code=VALUES(pv_code),
-                            pv_desc=VALUES(pv_desc),
-                            ampur_code=VALUES(ampur_code),
-                            ampur_desc=VALUES(ampur_desc),
-                            tumbon_code=VALUES(tumbon_code),
-                            tumbon_desc=VALUES(tumbon_desc),
-                            zip_code=VALUES(zip_code),
-                            business_size_code=VALUES(business_size_code),
-                            business_type_code=VALUES(business_type_code),
-                            business_type_desc=VALUES(business_type_desc),
-                            setup_obj_code=VALUES(setup_obj_code),
-                            setup_obj_desc=VALUES(setup_obj_desc),
-                            submit_obj_code=VALUES(submit_obj_code),
-                            submit_obj_desc=VALUES(submit_obj_desc),
-                            cap_amt=VALUES(cap_amt),
-                            paid_amt=VALUES(paid_amt),
-                            total_asset=VALUES(total_asset),
-                            total_equity=VALUES(total_equity),
-                            total_income=VALUES(total_income),
-                            net_profit=VALUES(net_profit),
-                            submit_fin_year=VALUES(submit_fin_year),
-                            master_data=VALUES(master_data),
-                            first_seen_at=LEAST({MASTER_TABLE}.first_seen_at,VALUES(first_seen_at)),
-                            last_seen_at=GREATEST({MASTER_TABLE}.last_seen_at,VALUES(last_seen_at))
+                            jp_name=new.jp_name,
+                            jp_name_e=new.jp_name_e,
+                            jp_stat_code=new.jp_stat_code,
+                            jp_stat_desc=new.jp_stat_desc,
+                            jp_type_desc=new.jp_type_desc,
+                            address=new.address,
+                            pv_code=new.pv_code,
+                            pv_desc=new.pv_desc,
+                            ampur_code=new.ampur_code,
+                            ampur_desc=new.ampur_desc,
+                            tumbon_code=new.tumbon_code,
+                            tumbon_desc=new.tumbon_desc,
+                            zip_code=new.zip_code,
+                            business_size_code=new.business_size_code,
+                            business_type_code=new.business_type_code,
+                            business_type_desc=new.business_type_desc,
+                            setup_obj_code=new.setup_obj_code,
+                            setup_obj_desc=new.setup_obj_desc,
+                            submit_obj_code=new.submit_obj_code,
+                            submit_obj_desc=new.submit_obj_desc,
+                            cap_amt=new.cap_amt,
+                            paid_amt=new.paid_amt,
+                            total_asset=new.total_asset,
+                            total_equity=new.total_equity,
+                            total_income=new.total_income,
+                            net_profit=new.net_profit,
+                            submit_fin_year=new.submit_fin_year,
+                            master_data=new.master_data,
+                            first_seen_at=LEAST({MASTER_TABLE}.first_seen_at,new.first_seen_at),
+                            last_seen_at=GREATEST({MASTER_TABLE}.last_seen_at,new.last_seen_at)
                         """
                     ),
                     range_params,

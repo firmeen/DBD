@@ -237,3 +237,15 @@ def test_master_deep_terminal_output_is_human_readable_not_json() -> None:
         },
     )
     assert "SQLSYNC scanned=100 inserted=80 updated=10 unchanged=10" in sql_stream.getvalue()
+
+
+def test_master_deep_terminal_error_render_includes_exception() -> None:
+    stream = StringIO()
+    terminal = MasterDeepTerminal("serving", stream=stream)
+    terminal.state["phase"] = "ERROR"
+    terminal.state["error"] = "NoSuchColumnError: column_name"
+    terminal.console.print(terminal._render())
+
+    output = stream.getvalue()
+    assert "NoSuchColumnError: column_name" in output
+    assert "Error" in output

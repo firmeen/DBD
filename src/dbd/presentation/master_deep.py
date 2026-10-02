@@ -310,10 +310,19 @@ class MasterDeepTerminal:
 
     def _render(self):
         if self.command == "bootstrap":
-            return self._render_bootstrap()
-        if self.command == "serving":
-            return self._render_serving()
-        return self._render_sqlserver()
+            renderable = self._render_bootstrap()
+        elif self.command == "serving":
+            renderable = self._render_serving()
+        else:
+            renderable = self._render_sqlserver()
+
+        error = self.state.get("error")
+        if error:
+            return Group(
+                renderable,
+                Panel(Text(str(error), style="bold red"), title="Error"),
+            )
+        return renderable
 
     def complete(self, result: Mapping[str, Any]) -> None:
         self("complete", result)
