@@ -13,6 +13,7 @@ from ..core.settings import settings
 from .catalog import (
     ACTIVE_ENDPOINT_MASK,
     ACTIVE_ENDPOINTS,
+    ACTIVE_STATUS_CODE,
     BASE_REQUIRED_MASK,
     DESTINATION_COLUMNS,
     ENDPOINT_BITS,
@@ -1287,11 +1288,130 @@ class DeepRepository:
         # MASTER/DEEP state instead of selecting a different batch on retry.
         return await self._transaction(op, attempts=1)
 
-    async def refill(self, target: int) -> dict[str, int]:
+    @staticmethod
+    def _stale_endpoint_sql(endpoint: str) -> str:
+        bit = ENDPOINT_BITS[endpoint]
+        hours = float(settings.dbd_refresh_stale_hours.get(endpoint, 168.0))
+        stale_seconds = max(1, int(hours * 3600))
+        requested = (
+            "JSON_UNQUOTE(JSON_EXTRACT("
+            "COALESCE(endpoint_meta, JSON_OBJECT()), "
+            f"'$.\"{endpoint}\".requested_at'))"
+        )
+        cutoff = (
+            "DATE_FORMAT("
+            f"TIMESTAMPADD(SECOND, -{stale_seconds}, UTC_TIMESTAMP(6)), "
+            "'%Y-%m-%dT%H:%i:%s.%f')"
+        )
+        return (
+            f"((required_mask & {bit}) <> 0 AND "
+            f"({requested} IS NULL OR {requested} IN ('', 'null') "
+            f"OR {requested} <= {cutoff}))"
+        )
+
+    @classmethod
+    def _stale_mask_sql(cls) -> tuple[str, str]:
+        predicates: list[str] = []
+        mask_terms: list[str] = []
+        for endpoint in ACTIVE_ENDPOINTS:
+            predicate = cls._stale_endpoint_sql(endpoint)
+            predicates.append(predicate)
+            mask_terms.append(
+                f"(CASE WHEN {predicate} THEN {ENDPOINT_BITS[endpoint]} ELSE 0 END)"
+            )
+        return " OR ".join(predicates), " | ".join(mask_terms)
+
+    async def reopen_stale_active(self, limit: int) -> int:
+        """Reopen only stale required endpoints for ACTIVE COMPLETE companies."""
+        if limit <= 0:
+            return 0
+
+        stale_predicate, stale_mask = self._stale_mask_sql()
+
+        async def op(conn: AsyncConnection) -> int:
+            rows = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            jp_type_code,
+                            jp_no,
+                            ({stale_mask}) AS stale_mask
+                        FROM {DEEP_TABLE}
+                        WHERE deep_status='COMPLETE'
+                          AND jp_stat_code=:active_status
+                          AND ({stale_predicate})
+                        ORDER BY jp_type_code, jp_no
+                        LIMIT :limit
+                        FOR UPDATE SKIP LOCKED
+                        """
+                    ),
+                    {
+                        "active_status": ACTIVE_STATUS_CODE,
+                        "limit": int(limit),
+                    },
+                )
+            ).mappings().all()
+            selected = [
+                {
+                    "jp_type_code": str(row["jp_type_code"]),
+                    "jp_no": str(row["jp_no"]),
+                    "stale_mask": int(row["stale_mask"] or 0),
+                }
+                for row in rows
+                if int(row["stale_mask"] or 0) != 0
+            ]
+            if not selected:
+                return 0
+
+            await conn.execute(
+                text(
+                    f"""
+                    UPDATE {DEEP_TABLE}
+                    SET done_mask=(done_mask & ~:stale_mask),
+                        not_available_mask=(not_available_mask & ~:stale_mask),
+                        failed_mask=(failed_mask & ~:stale_mask),
+                        deep_status=CASE
+                            WHEN (
+                                (
+                                    (done_mask & ~:stale_mask)
+                                    | (not_available_mask & ~:stale_mask)
+                                    | (failed_mask & ~:stale_mask)
+                                ) & required_mask
+                            ) = 0
+                            THEN 'PENDING'
+                            ELSE 'COLLECTING'
+                        END,
+                        deep_completed_at=NULL
+                    WHERE jp_type_code=:jp_type_code
+                      AND jp_no=:jp_no
+                    """
+                ),
+                selected,
+            )
+            return len(selected)
+
+        # A crash after commit but before runtime seeding is safe: the reopened
+        # rows are ordinary unresolved Deep work and seed_existing_deep() will
+        # adopt them on the next bounded refill.
+        return await self._transaction(op, attempts=1)
+
+    async def refill(
+        self,
+        target: int,
+        *,
+        include_refresh: bool = True,
+    ) -> dict[str, int]:
         target = max(1, int(target))
         current = await self.runtime_size()
         if current >= target:
-            return {"runtime": current, "adopted": 0, "promoted": 0}
+            return {
+                "runtime": current,
+                "adopted": 0,
+                "promoted": 0,
+                "refreshed": 0,
+                "refresh_scanned": False,
+            }
 
         capacity = target - current
         adopted = await self.seed_existing_deep(capacity)
@@ -1302,10 +1422,23 @@ class DeepRepository:
             promoted = await self.promote_master(target - current)
             current = await self.runtime_size()
 
+        refreshed = 0
+        refresh_scanned = current < target and include_refresh
+        if refresh_scanned:
+            reopened = await self.reopen_stale_active(target - current)
+            if reopened:
+                # Reuse the existing bounded runtime queue rather than
+                # materializing a second refresh scheduler.
+                await self.seed_existing_deep(min(reopened, target - current))
+                current = await self.runtime_size()
+                refreshed = reopened
+
         return {
             "runtime": current,
             "adopted": adopted,
             "promoted": promoted,
+            "refreshed": refreshed,
+            "refresh_scanned": refresh_scanned,
         }
 
     async def claim(self) -> dict[str, Any] | None:

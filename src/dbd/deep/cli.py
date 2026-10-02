@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import argparse
 import asyncio
-import json
 import math
 import sys
-import time
-from typing import Any
 
 from ..core.settings import settings
-from .catalog import ACTIVE_ENDPOINTS
+from ._version import __version__ as DEEP_VERSION
 from .collector import DeepCollector
+from .presentation import DeepPresenter, DeepTerminalEvents
 from .repository import DeepRepository
 
 
@@ -35,127 +33,11 @@ def _positive_rate(value: str) -> float:
     return parsed
 
 
-class TerminalEvents:
-    def __init__(self) -> None:
-        self._last = 0.0
-        self._width = 0
-
-    def _clear(self) -> None:
-        if self._width:
-            sys.stdout.write("\r" + (" " * self._width) + "\r")
-            sys.stdout.flush()
-            self._width = 0
-
-    def __call__(self, name: str, payload: dict[str, Any]) -> None:
-        if name == "phase":
-            self._clear()
-            print(f"PHASE                {payload.get('phase')}")
-            return
-
-        if name == "prepare_progress":
-            total = int(payload.get("rows_total", 0))
-            scanned = int(payload.get("rows_scanned", 0))
-            changed = int(payload.get("rows_changed", 0))
-            pct = (scanned / total * 100.0) if total else 100.0
-            line = (
-                f"PREPARE rows {scanned:,}/{total:,} "
-                f"({pct:6.2f}%) | changed {changed:,}"
-            )
-            padding = " " * max(0, self._width - len(line))
-            sys.stdout.write("\r" + line + padding)
-            sys.stdout.flush()
-            self._width = len(line)
-            return
-
-        if name == "progress":
-            now = time.monotonic()
-            if now - self._last < 0.5:
-                return
-            self._last = now
-            line = (
-                "DEEP "
-                f"companies {int(payload.get('companies_finished', 0)):,} done "
-                f"| retry {int(payload.get('companies_retry_wait', 0)):,} "
-                f"| endpoints "
-                f"{int(payload.get('endpoints_done', 0)):,} done / "
-                f"{int(payload.get('endpoints_not_available', 0)):,} n/a / "
-                f"{int(payload.get('endpoints_failed', 0)):,} failed "
-                f"| promoted {int(payload.get('master_promoted', 0)):,}"
-            )
-            padding = " " * max(0, self._width - len(line))
-            sys.stdout.write("\r" + line + padding)
-            sys.stdout.flush()
-            self._width = len(line)
-            return
-
-        if name == "started":
-            self._clear()
-            print(
-                "DBD DEEP COLLECTOR"
-                f" | concurrency={payload['concurrency']}"
-                f" | rate={payload['rate_per_second']}/s"
-                f" | buffer={payload['buffer_size']}"
-            )
-            print("ACTIVE ENDPOINTS: " + ", ".join(payload["active_endpoints"]))
-            if payload.get("runtime_recovered"):
-                print(f"RECOVERED RUNNING: {int(payload['runtime_recovered']):,}")
-            return
-
-        if name in {"retry_wait", "worker_error"}:
-            self._clear()
-            endpoint = payload.get("endpoint")
-            endpoint_text = f" endpoint={endpoint}" if endpoint else ""
-            print(
-                f"{name.upper()} "
-                f"{payload.get('jp_type_code')}{payload.get('jp_no')}"
-                f"{endpoint_text} | {payload.get('error')}"
-            )
-
-    def close(self) -> None:
-        self._clear()
-
-
-def _print_status(summary: dict[str, Any]) -> None:
-    deep = summary["deep"]
-    runtime = summary["runtime"]
-
-    print("=" * 72)
-    print(" DBD DEEP STATUS")
-    print("=" * 72)
-    print(f"Prepared             : {'YES' if summary['prepared'] else 'NO'}")
-    print(f"Runtime table        : {'READY' if summary['runtime_exists'] else 'MISSING'}")
-    print(f"Master waiting       : {summary['master']:,}")
-    print(f"Deep total           : {deep['total']:,}")
-    print(f"Universe             : {summary['universe']:,}")
-    print(f"Master/Deep overlap  : {'YES' if summary['overlap'] else 'NO'}")
-    print()
-    print(f"Deep pending         : {deep['pending']:,}")
-    print(f"Deep collecting      : {deep['collecting']:,}")
-    print(f"Deep complete        : {deep['complete']:,}")
-    print(f"Deep partial         : {deep['partial']:,}")
-    print(f"Deep failed          : {deep['failed']:,}")
-    print(f"Deep unresolved      : {deep['unresolved']:,}")
-    print(f"Terminal failures    : {deep['terminal_failures']:,}")
-    print()
-    print(f"Runtime total        : {runtime['total']:,}")
-    print(f"Runtime pending      : {runtime['pending']:,}")
-    print(f"Runtime running      : {runtime['running']:,}")
-    print(f"Runtime retry wait   : {runtime['retry_wait']:,}")
-
-    coverage = summary.get("coverage") or {}
-    if coverage:
-        print()
-        print("ACTIVE ENDPOINT COVERAGE")
-        for endpoint in ACTIVE_ENDPOINTS:
-            row = coverage[endpoint]
-            print(
-                f"  {endpoint:<24}"
-                f" data={row['data_rows']:>10,}"
-                f" done={row['done']:>10,}"
-                f" n/a={row['not_available']:>10,}"
-                f" failed={row['failed']:>10,}"
-            )
-    print("=" * 72)
+def _idle_seconds(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed) or parsed < 0.5 or parsed > 3600:
+        raise argparse.ArgumentTypeError("must be between 0.5 and 3600 seconds")
+    return parsed
 
 
 async def _status(json_mode: bool, coverage: bool) -> int:
@@ -170,16 +52,13 @@ async def _status(json_mode: bool, coverage: bool) -> int:
     finally:
         await repo.close()
 
-    if json_mode:
-        print(json.dumps(summary, ensure_ascii=False, indent=2))
-    else:
-        _print_status(summary)
+    DeepPresenter(json_mode=json_mode).status(summary)
     return 1 if summary["overlap"] else 0
 
 
 async def _prepare(batch_size: int, json_mode: bool) -> int:
     repo = DeepRepository()
-    events = None if json_mode else TerminalEvents()
+    events = None if json_mode else DeepTerminalEvents("prepare")
     try:
         if events is not None:
             events("phase", {"phase": "PREFLIGHT"})
@@ -202,21 +81,7 @@ async def _prepare(batch_size: int, json_mode: bool) -> int:
             events.close()
         await repo.close()
 
-    payload = {"prepare": result, "status": summary}
-    if json_mode:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        print()
-        print("=" * 72)
-        print(" DBD DEEP PREPARE COMPLETE")
-        print("=" * 72)
-        print(f"Already prepared     : {'YES' if result['already_prepared'] else 'NO'}")
-        print(f"Rows total           : {int(result['rows_total']):,}")
-        print(f"Rows scanned         : {int(result['rows_scanned']):,}")
-        print(f"Rows changed         : {int(result['rows_changed']):,}")
-        print(f"Runtime recovered    : {int(result['runtime_recovered']):,}")
-        print("=" * 72)
-        _print_status(summary)
+    DeepPresenter(json_mode=json_mode).prepare(result, summary)
     return 1 if summary["overlap"] else 0
 
 
@@ -235,18 +100,13 @@ async def _retry(limit: int | None, json_mode: bool) -> int:
     finally:
         await repo.close()
 
-    payload = {"requeued": count, "status": summary}
-    if json_mode:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-    else:
-        print(f"REOPENED FAILED COMPANIES: {count:,}")
-        _print_status(summary)
+    DeepPresenter(json_mode=json_mode).retry(count, summary)
     return 0
 
 
 async def _collect(args) -> int:
     repo = DeepRepository()
-    events = None if args.json else TerminalEvents()
+    events = None if args.json else DeepTerminalEvents("collect")
     collector = DeepCollector(
         repository=repo,
         concurrency=args.concurrency,
@@ -254,6 +114,8 @@ async def _collect(args) -> int:
         http_retries=args.http_retries,
         buffer_size=args.buffer_size,
         company_limit=args.limit,
+        continuous=args.continuous,
+        idle_seconds=args.idle_seconds,
         event=events,
     )
     try:
@@ -263,26 +125,7 @@ async def _collect(args) -> int:
             events.close()
         await repo.close()
 
-    if args.json:
-        print(json.dumps(result, ensure_ascii=False, indent=2))
-    else:
-        print()
-        print("=" * 72)
-        print(" DBD DEEP COLLECTOR COMPLETE")
-        print("=" * 72)
-        print(f"Companies claimed    : {result['companies_claimed']:,}")
-        print(f"Companies finished   : {result['companies_finished']:,}")
-        print(f"Companies retry wait : {result['companies_retry_wait']:,}")
-        print(f"Endpoints done       : {result['endpoints_done']:,}")
-        print(f"Endpoints n/a        : {result['endpoints_not_available']:,}")
-        print(f"Endpoints failed     : {result['endpoints_failed']:,}")
-        print(f"HTTP requests        : {result['http_requests']:,}")
-        print(f"HTTP retries         : {result['http_retries']:,}")
-        print(f"429 hits             : {result['rate_limit_hits']:,}")
-        print(f"Configured rate      : {result['configured_rate']}/s")
-        print("=" * 72)
-        _print_status(result["status"])
-
+    DeepPresenter(json_mode=args.json).collect(result)
     return 1 if result["status"]["overlap"] else 0
 
 
@@ -290,6 +133,11 @@ def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="dbd-deep",
         description="Standalone seven-endpoint DBD Master/Deep collector",
+    )
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=f"%(prog)s {DEEP_VERSION}",
     )
     sub = parser.add_subparsers(dest="command", required=True)
 
@@ -307,7 +155,7 @@ def parse_args(argv: list[str] | None = None):
 
     collect = sub.add_parser(
         "collect",
-        help="Resume Deep rows first, then atomically promote Master companies",
+        help="Resume Deep rows, promote Master, then refresh stale ACTIVE companies",
     )
     collect.add_argument(
         "--concurrency",
@@ -333,7 +181,18 @@ def parse_args(argv: list[str] | None = None):
     collect.add_argument(
         "--limit",
         type=_positive_int,
-        help="Canary: process at most N companies without promoting beyond that budget",
+        help="Process at most N companies across the whole command, including continuous mode",
+    )
+    collect.add_argument(
+        "--continuous",
+        action="store_true",
+        help="Stay running when work drains and check again after the idle interval",
+    )
+    collect.add_argument(
+        "--idle-seconds",
+        type=_idle_seconds,
+        default=5.0,
+        help="Continuous-mode no-work check interval (default: 5 seconds)",
     )
     collect.add_argument("--json", action="store_true")
 

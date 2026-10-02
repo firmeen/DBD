@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -35,6 +36,7 @@ from .http import (
     FixedRateDbdClient,
 )
 from .repository import DeepRepository, DeepTransientDatabaseError
+from .serving import ServingProjector
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
@@ -62,6 +64,7 @@ class CollectorStats:
     runtime_recovered: int = 0
     master_promoted: int = 0
     deep_adopted: int = 0
+    active_refreshed: int = 0
 
 
 def _json_payload(value: object) -> str:
@@ -138,6 +141,8 @@ class DeepCollector:
         http_retries: int,
         buffer_size: int | None = None,
         company_limit: int | None = None,
+        continuous: bool = False,
+        idle_seconds: float = 5.0,
         event: EventCallback | None = None,
     ) -> None:
         if concurrency < 1 or concurrency > 256:
@@ -148,6 +153,8 @@ class DeepCollector:
             raise ValueError("http_retries must be between 0 and 10")
         if company_limit is not None and company_limit < 1:
             raise ValueError("company_limit must be positive")
+        if idle_seconds < 0.5 or idle_seconds > 3600:
+            raise ValueError("idle_seconds must be between 0.5 and 3600")
 
         self.repo = repository
         self.concurrency = int(concurrency)
@@ -160,14 +167,29 @@ class DeepCollector:
         if self.buffer_size > 10000:
             raise ValueError("buffer_size must be <= 10000")
         self.company_limit = company_limit
+        self.continuous = bool(continuous)
+        self.idle_seconds = float(idle_seconds)
         self.event = event
 
         self.stats = CollectorStats()
         self._stats_lock = asyncio.Lock()
         self._claim_lock = asyncio.Lock()
         self._refill_lock = asyncio.Lock()
+        self._idle_lock = asyncio.Lock()
+        self._idle_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._specs: tuple[EndpointSpec, ...] = ()
+        self._cycle = 0
+        self._queue_source = "IDLE"
+        self._empty_until = 0.0
+        self._next_refresh_scan_at = 0.0
+        # Endpoint freshness horizons are measured in hours. Discovery may be
+        # polled every few seconds, but an empty exact stale scan should not be
+        # repeated at that same cadence across a multi-million COMPLETE set.
+        self._refresh_scan_seconds = max(60.0, self.idle_seconds)
+        self._serving = ServingProjector(self.repo.engine)
+        self._next_serving_projection_at = 0.0
+        self._serving_timeout_seconds = 5.0
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -178,7 +200,12 @@ class DeepCollector:
             for key, value in increments.items():
                 setattr(self.stats, key, int(getattr(self.stats, key)) + int(value))
             snapshot = asdict(self.stats)
-        self._emit("progress", **snapshot)
+        self._emit(
+            "progress",
+            cycle=self._cycle,
+            queue_source=self._queue_source,
+            **snapshot,
+        )
 
     async def _remaining_budget(self) -> int | None:
         if self.company_limit is None:
@@ -204,22 +231,135 @@ class DeepCollector:
 
     async def _refill(self) -> dict[str, int]:
         async with self._refill_lock:
+            # When many workers observe an empty queue together, only the
+            # first worker in an idle window performs the expensive
+            # unresolved/Master/stale scan. Others reuse the empty result.
+            if self.continuous and time.monotonic() < self._empty_until:
+                return {
+                    "runtime": 0,
+                    "adopted": 0,
+                    "promoted": 0,
+                    "refreshed": 0,
+                    "refresh_scanned": False,
+                }
+
             remaining = await self._remaining_budget()
             if remaining == 0:
-                return {"runtime": await self.repo.runtime_size(), "adopted": 0, "promoted": 0}
+                return {
+                    "runtime": await self.repo.runtime_size(),
+                    "adopted": 0,
+                    "promoted": 0,
+                    "refreshed": 0,
+                    "refresh_scanned": False,
+                }
 
             target = self.buffer_size
             if remaining is not None:
-                # Do not promote more Master companies than a --limit run can
+                # Do not promote/reopen more companies than a --limit run can
                 # actually process; this keeps canary runs minimally invasive.
                 target = min(target, remaining)
 
-            result = await self.repo.refill(max(1, target))
+            now = time.monotonic()
+            include_refresh = now >= self._next_refresh_scan_at
+            result = await self.repo.refill(
+                max(1, target),
+                include_refresh=include_refresh,
+            )
+            sources = []
             if result["adopted"]:
+                sources.append("UNRESOLVED")
                 await self._bump(deep_adopted=result["adopted"])
             if result["promoted"]:
+                sources.append("NEW COMPANY")
                 await self._bump(master_promoted=result["promoted"])
+            if result.get("refreshed"):
+                sources.append("ACTIVE REFRESH")
+                await self._bump(active_refreshed=result["refreshed"])
+
+            self._cycle += 1
+            if len(sources) > 1:
+                self._queue_source = "MIXED"
+            elif sources:
+                self._queue_source = sources[0]
+            elif int(result["runtime"]) > 0:
+                self._queue_source = "RUNTIME"
+            else:
+                self._queue_source = "IDLE"
+
+            if self.continuous and result.get("refresh_scanned") and not result.get("refreshed"):
+                self._next_refresh_scan_at = (
+                    time.monotonic() + self._refresh_scan_seconds
+                )
+
+            if int(result["runtime"]) == 0 and self.continuous:
+                self._empty_until = time.monotonic() + self.idle_seconds
+            else:
+                self._empty_until = 0.0
+
+            self._emit(
+                "cycle",
+                cycle=self._cycle,
+                queue_source=self._queue_source,
+                **result,
+            )
+            await self._reconcile_serving()
             return result
+
+    async def _reconcile_serving(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now < self._next_serving_projection_at:
+            return
+        self._next_serving_projection_at = now + 10.0
+        try:
+            async with asyncio.timeout(self._serving_timeout_seconds):
+                result = await self._serving.project_incremental(
+                    limit=max(1, min(self.buffer_size, 100))
+                )
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            self._next_serving_projection_at = time.monotonic() + 60.0
+            self._emit(
+                "serving_error",
+                error=(
+                    "TimeoutError: serving projection exceeded "
+                    f"{self._serving_timeout_seconds:.0f}s; Deep collection continues"
+                ),
+            )
+            return
+        except Exception as exc:
+            self._next_serving_projection_at = time.monotonic() + 30.0
+            self._emit(
+                "serving_error",
+                error=f"{type(exc).__name__}: {exc}",
+            )
+            return
+        if not result.get("ready"):
+            self._next_serving_projection_at = time.monotonic() + 60.0
+            self._emit("serving", **result)
+            return
+        if int(result.get("scanned") or 0) == 0:
+            self._next_serving_projection_at = time.monotonic() + 60.0
+        self._emit("serving", **result)
+
+    async def _idle_wait(self) -> None:
+        await asyncio.sleep(self.idle_seconds)
+        await self._reconcile_serving()
+
+    async def _idle_cycle(self) -> None:
+        async with self._idle_lock:
+            task = self._idle_task
+            if task is None or task.done():
+                self._queue_source = "IDLE"
+                self._emit(
+                    "idle",
+                    cycle=self._cycle,
+                    idle_seconds=self.idle_seconds,
+                    queue_source=self._queue_source,
+                )
+                task = asyncio.create_task(self._idle_wait())
+                self._idle_task = task
+        await task
 
     @staticmethod
     def _request_for(
@@ -548,8 +688,11 @@ class DeepCollector:
                 if company is None:
                     runtime = int(refill["runtime"])
                     if runtime == 0:
-                        self._stop.set()
-                        return
+                        if not self.continuous:
+                            self._stop.set()
+                            return
+                        await self._idle_cycle()
+                        continue
                     delay = await self.repo.next_runtime_delay()
                     await asyncio.sleep(delay if delay is not None else 0.5)
                     continue
@@ -605,6 +748,19 @@ class DeepCollector:
             self._emit("phase", phase="REFILL")
             refill = await self._refill()
 
+            # Continuous mode may start before Discovery has produced work.
+            # Keep the manager lock, but do not open/authenticate the HTTP client
+            # until a bounded refill actually produces runtime work.
+            while int(refill["runtime"]) == 0 and self.continuous:
+                remaining = await self._remaining_budget()
+                if remaining == 0:
+                    self._stop.set()
+                    break
+                self._emit("phase", phase="IDLE")
+                await self._idle_cycle()
+                await self.repo.assert_manager_lock(lock_conn)
+                refill = await self._refill()
+
             if int(refill["runtime"]) == 0:
                 self._emit("phase", phase="IDLE")
                 result = {
@@ -627,6 +783,8 @@ class DeepCollector:
                         rate_per_second=self.rate_per_second,
                         buffer_size=self.buffer_size,
                         company_limit=self.company_limit,
+                        continuous=self.continuous,
+                        idle_seconds=self.idle_seconds,
                         active_endpoints=list(ACTIVE_ENDPOINTS),
                         **asdict(self.stats),
                     )
@@ -645,6 +803,14 @@ class DeepCollector:
                         "configured_rate": client.rate_per_second,
                     }
 
+            # Derived output must not make the HTTP/runtime transaction fail,
+            # but a final bounded pass prevents short one-shot/--limit runs
+            # from exiting before the normal serving throttle opens again.
+            await self._reconcile_serving(force=True)
+
+        result["cycle"] = self._cycle
+        result["queue_source"] = self._queue_source
+        result["continuous"] = self.continuous
         result["status"] = await self.repo.status_summary(include_coverage=False)
         return result
 
