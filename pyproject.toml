@@ -55,6 +55,7 @@ version = {attr = "dbd._version.__version__"}
 
 [project.scripts]
 dbd-data = "dbd.cli.main:main"
+dbd-deep = "dbd.deep.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

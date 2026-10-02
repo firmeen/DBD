@@ -64,6 +64,9 @@ jobs:
           python -c "import dbd; print(dbd.__version__)"
           python -m dbd --version
           dbd-data --version
+          dbd-deep --version
+          dbd-deep --help
+          dbd-deep collect --help
       - name: Watchdog source encoding contract
         run: |
           python - <<'PY'
