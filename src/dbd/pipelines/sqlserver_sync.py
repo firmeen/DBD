@@ -20,7 +20,7 @@ def _validate_source_schema() -> None:
     with mysql_connection() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT column_name
+            SELECT COLUMN_NAME AS column_name
             FROM information_schema.columns
             WHERE table_schema=DATABASE() AND table_name=%s
             """,

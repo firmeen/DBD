@@ -29,6 +29,8 @@ from .repository import DEEP_TABLE, create_deep_engine
 SERVING_TABLE = "dbd_master_deep"
 COMPANY_ID_TABLE = "company_master"
 _SERVING_INDEX = "idx_dbd_deep_serving"
+_BACKFILL_INDEX = "idx_dbd_deep_status"
+_DETAIL_FETCH_CHUNK = 500
 
 
 class ServingProjectionError(RuntimeError):
@@ -416,16 +418,15 @@ class ServingProjector:
                 )
         await self.validate_schema()
 
-    async def _fetch_page(
+    async def _select_keys(
         self,
         *,
         limit: int,
-        after: tuple[str, str] | None = None,
+        after: tuple[str, str] | None,
         incremental: bool,
-    ) -> list[dict[str, Any]]:
-        lower = ""
+    ) -> list[tuple[str, str]]:
         params: dict[str, Any] = {"limit": int(limit)}
-        order = "d.jp_type_code, d.jp_no"
+        lower = ""
         if after is not None:
             lower = """
               AND (
@@ -434,49 +435,104 @@ class ServingProjector:
               )
             """
             params["after_type"], params["after_no"] = after
-        stale = ""
+
         if incremental:
-            stale = """
-              AND (
-                s.company_id IS NULL
-                OR d.updated_at > s.source_deep_updated_at
-              )
+            query = f"""
+                SELECT d.jp_type_code,d.jp_no
+                FROM {DEEP_TABLE} d FORCE INDEX ({_SERVING_INDEX})
+                LEFT JOIN {SERVING_TABLE} s
+                  ON s.juristic_type_code=d.jp_type_code
+                 AND s.registration_no=d.jp_no
+                WHERE d.deep_status='COMPLETE'
+                  AND (
+                    s.company_id IS NULL
+                    OR d.updated_at > s.source_deep_updated_at
+                  )
+                ORDER BY d.updated_at DESC,d.jp_type_code,d.jp_no
+                LIMIT :limit
             """
-            order = "d.updated_at DESC, d.jp_type_code, d.jp_no"
+        else:
+            query = f"""
+                SELECT d.jp_type_code,d.jp_no
+                FROM {DEEP_TABLE} d FORCE INDEX ({_BACKFILL_INDEX})
+                WHERE d.deep_status='COMPLETE'
+                  {lower}
+                ORDER BY d.jp_type_code,d.jp_no
+                LIMIT :limit
+            """
 
         async with self.engine.connect() as conn:
-            rows = (
-                await conn.execute(
-                    text(
-                        f"""
-                        SELECT
-                            d.*,
-                            cm.company_id,
-                            s.row_hash AS serving_row_hash,
-                            s.registration_no AS serving_registration_no,
-                            s.juristic_type_code AS serving_juristic_type_code,
-                            si.company_id AS identity_company_id
-                        FROM {DEEP_TABLE} d
-                        LEFT JOIN {COMPANY_ID_TABLE} cm
-                          ON cm.jp_type_code=d.jp_type_code
-                         AND cm.jp_no=d.jp_no
-                        LEFT JOIN {SERVING_TABLE} s
-                          ON s.company_id=cm.company_id
-                        LEFT JOIN {SERVING_TABLE} si
-                          ON si.juristic_type_code=d.jp_type_code
-                         AND si.registration_no=d.jp_no
+            rows = (await conn.execute(text(query), params)).all()
+        return [(str(row[0]), str(row[1])) for row in rows]
 
-                        WHERE d.deep_status='COMPLETE'
-                          {lower}
-                          {stale}
-                        ORDER BY {order}
-                        LIMIT :limit
-                        """
-                    ),
-                    params,
-                )
-            ).mappings().all()
-        return [dict(row) for row in rows]
+    async def _fetch_details(
+        self,
+        keys: list[tuple[str, str]],
+    ) -> list[dict[str, Any]]:
+        if not keys:
+            return []
+
+        by_identity: dict[tuple[str, str], dict[str, Any]] = {}
+        async with self.engine.connect() as conn:
+            for offset in range(0, len(keys), _DETAIL_FETCH_CHUNK):
+                chunk = keys[offset : offset + _DETAIL_FETCH_CHUNK]
+                placeholders = []
+                params: dict[str, Any] = {}
+                for index, (jp_type_code, jp_no) in enumerate(chunk):
+                    type_key = f"key_type_{index}"
+                    no_key = f"key_no_{index}"
+                    placeholders.append(f"(:{type_key},:{no_key})")
+                    params[type_key] = jp_type_code
+                    params[no_key] = jp_no
+
+                rows = (
+                    await conn.execute(
+                        text(
+                            f"""
+                            SELECT
+                                d.*,
+                                cm.company_id,
+                                s.row_hash AS serving_row_hash,
+                                s.registration_no AS serving_registration_no,
+                                s.juristic_type_code AS serving_juristic_type_code,
+                                si.company_id AS identity_company_id
+                            FROM {DEEP_TABLE} d
+                            LEFT JOIN {COMPANY_ID_TABLE} cm
+                              ON cm.jp_type_code=d.jp_type_code
+                             AND cm.jp_no=d.jp_no
+                            LEFT JOIN {SERVING_TABLE} s
+                              ON s.company_id=cm.company_id
+                            LEFT JOIN {SERVING_TABLE} si
+                              ON si.juristic_type_code=d.jp_type_code
+                             AND si.registration_no=d.jp_no
+                            WHERE d.deep_status='COMPLETE'
+                              AND (d.jp_type_code,d.jp_no) IN (
+                                {",".join(placeholders)}
+                              )
+                            """
+                        ),
+                        params,
+                    )
+                ).mappings().all()
+                for row in rows:
+                    item = dict(row)
+                    by_identity[(str(item["jp_type_code"]), str(item["jp_no"]))] = item
+
+        return [by_identity[key] for key in keys if key in by_identity]
+
+    async def _fetch_page(
+        self,
+        *,
+        limit: int,
+        after: tuple[str, str] | None = None,
+        incremental: bool,
+    ) -> list[dict[str, Any]]:
+        keys = await self._select_keys(
+            limit=limit,
+            after=after,
+            incremental=incremental,
+        )
+        return await self._fetch_details(keys)
 
     @staticmethod
     def _classify(
@@ -514,7 +570,7 @@ class ServingProjector:
         columns = ", ".join(f"`{column}`" for column in SERVING_COLUMNS)
         values = ", ".join(f":{column}" for column in SERVING_COLUMNS)
         updates = ", ".join(
-            f"`{column}`=VALUES(`{column}`)"
+            f"`{column}`=new.`{column}`"
             for column in SERVING_COLUMNS
             if column != "company_id"
         )
@@ -523,7 +579,7 @@ class ServingProjector:
                 text(
                     f"""
                     INSERT INTO {SERVING_TABLE} ({columns})
-                    VALUES ({values})
+                    VALUES ({values}) AS new
                     ON DUPLICATE KEY UPDATE {updates}
                     """
                 ),

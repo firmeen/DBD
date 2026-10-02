@@ -189,6 +189,7 @@ class DeepCollector:
         self._refresh_scan_seconds = max(60.0, self.idle_seconds)
         self._serving = ServingProjector(self.repo.engine)
         self._next_serving_projection_at = 0.0
+        self._serving_timeout_seconds = 5.0
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -310,11 +311,22 @@ class DeepCollector:
             return
         self._next_serving_projection_at = now + 10.0
         try:
-            result = await self._serving.project_incremental(
-                limit=max(1, min(self.buffer_size, 100))
-            )
+            async with asyncio.timeout(self._serving_timeout_seconds):
+                result = await self._serving.project_incremental(
+                    limit=max(1, min(self.buffer_size, 100))
+                )
         except asyncio.CancelledError:
             raise
+        except TimeoutError:
+            self._next_serving_projection_at = time.monotonic() + 60.0
+            self._emit(
+                "serving_error",
+                error=(
+                    "TimeoutError: serving projection exceeded "
+                    f"{self._serving_timeout_seconds:.0f}s; Deep collection continues"
+                ),
+            )
+            return
         except Exception as exc:
             self._next_serving_projection_at = time.monotonic() + 30.0
             self._emit(
@@ -326,6 +338,8 @@ class DeepCollector:
             self._next_serving_projection_at = time.monotonic() + 60.0
             self._emit("serving", **result)
             return
+        if int(result.get("scanned") or 0) == 0:
+            self._next_serving_projection_at = time.monotonic() + 60.0
         self._emit("serving", **result)
 
     async def _idle_wait(self) -> None:
