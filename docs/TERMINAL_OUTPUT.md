@@ -180,6 +180,25 @@ Terminal rendering must not change:
 `dbd-deep` has its own presentation boundary and does not import Campaign, Fabric,
 Guardian, Supervisor or Redis fleet state.
 
+### Semantic color contract
+
+สีใน interactive Deep Terminal UI เป็น state/priority signal ไม่ใช่ decoration และใช้กับ **value/state** เป็นหลัก:
+
+| Color | Meaning | Examples |
+| --- | --- | --- |
+| bold red | critical/failure/operator attention | FAILED, ERROR, overlap > 0, missing identity > 0 |
+| yellow / bold yellow | warning/degraded/retry | DEGRADED, RETRY_WAIT, 429 > 0, normalization error > 0 |
+| green / bold green | healthy/completed/success | READY, COMPLETE, finished, successful inserts |
+| cyan | active execution/throughput/configured work | RUNNING, ACTIVE, requests, rate, concurrency |
+| blue | queued/scheduled/promoted work | claimed, pending, Master promoted, recovered runtime |
+| magenta | refresh/change semantics | ACTIVE refresh, updated serving rows |
+| bold white | primary totals/important values | total/scanned/limits |
+| dim | secondary/context/no-change | IDLE, unchanged, elapsed, table/context labels |
+
+Alarm-like counters are conditional: zero failures/429/overlap/missing-identity/normalization-errors are not rendered as alarms; color appears only when the value is non-zero.
+
+This styling exists only in the interactive Rich render path. Redirected/non-TTY output remains plain newline text without ANSI repaint sequences, and JSON output remains unstyled structured JSON.
+
 Normal one-shot collection:
 
 ```powershell
@@ -218,3 +237,24 @@ dbd-deep --version  -> dbd-deep 0.1.0
 
 Both console scripts are still shipped by the single `dbd-data` Python
 distribution.
+
+
+### Bootstrap, serving and SQL Server terminal views
+
+The current-model maintenance/output commands use the separate human-only `MasterDeepTerminal` presentation boundary:
+
+```powershell
+python -m dbd.deep.bootstrap --batch-size 5000
+python -m dbd.deep.serving --ensure --backfill --batch-size 100 --limit 100
+python -m dbd.pipelines.sqlserver_sync --batch-size 100 --limit 100
+```
+
+The same semantic colors apply:
+
+- bootstrap overlap is red only when non-zero;
+- serving INSERT is green, UPDATE is magenta, unchanged is dim;
+- missing identity is red only when non-zero;
+- normalization errors and target-only counts are warnings when non-zero;
+- phase/state values follow RUNNING/ACTIVE cyan, COMPLETE/READY green, DEGRADED/waiting yellow and ERROR/FAILED red.
+
+These terminal classes remain presentation-only. They do not change source selection, database transactions, collector scheduling or SQL Server synchronization semantics.

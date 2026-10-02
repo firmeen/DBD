@@ -23,6 +23,55 @@ def _limit(value: Any) -> str:
     return "∞" if value is None else _number(value)
 
 
+def _styled(value: Any, style: str | None) -> Text:
+    return Text(str(value), style=style)
+
+
+def _state(value: Any) -> Text:
+    label = str(value)
+    normalized = label.upper().replace("_", " ")
+    if any(token in normalized for token in ("FAILED", "ERROR", "MISSING")):
+        style = "bold red"
+    elif any(
+        token in normalized
+        for token in ("DEGRADED", "WAITING", "RETRY WAIT", "NOT INITIALIZED", "INTERRUPTED")
+    ):
+        style = "bold yellow"
+    elif any(token in normalized for token in ("COMPLETE", "READY", "HEALTHY")):
+        style = "bold green"
+    elif normalized == "IDLE":
+        style = "dim"
+    elif any(
+        token in normalized
+        for token in (
+            "RUNNING",
+            "ACTIVE",
+            "STARTING",
+            "PREFLIGHT",
+            "PREPARE",
+            "VALIDATE",
+            "ENSURE",
+            "BACKFILL",
+            "RECONCILE",
+            "VERIFY",
+            "AUDIT",
+        )
+    ):
+        style = "cyan"
+    else:
+        style = None
+    return _styled(label, style)
+
+
+def _priority_count(value: Any, positive_style: str, *, zero_style: str = "dim") -> Text:
+    label = _number(value)
+    try:
+        active = int(value or 0) > 0
+    except (TypeError, ValueError):
+        active = bool(value)
+    return _styled(label, positive_style if active else zero_style)
+
+
 def _grid(rows: list[tuple[str, Any, str, Any]]) -> Table:
     table = Table.grid(expand=True, padding=(0, 1))
     table.add_column(style="dim", no_wrap=True)
@@ -32,9 +81,9 @@ def _grid(rows: list[tuple[str, Any, str, Any]]) -> Table:
     for left_key, left_value, right_key, right_value in rows:
         table.add_row(
             left_key,
-            str(left_value),
+            left_value if isinstance(left_value, Text) else str(left_value),
             right_key,
-            str(right_value),
+            right_value if isinstance(right_value, Text) else str(right_value),
         )
     return table
 
@@ -164,9 +213,14 @@ class MasterDeepTerminal:
 
     def _header(self, title: str, mode: str) -> Panel:
         elapsed = int(time.monotonic() - self.started_at)
-        text = Text(
-            f"{mode} • {self.state['phase']} "
-            f"• {elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}"
+        text = Text()
+        text.append(mode, style="bold white")
+        text.append(" • ", style="dim")
+        text.append_text(_state(self.state["phase"]))
+        text.append(" • ", style="dim")
+        text.append(
+            f"{elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}",
+            style="dim",
         )
         return Panel(text, title=title)
 
@@ -176,15 +230,18 @@ class MasterDeepTerminal:
                 [
                     (
                         "Active endpoints",
-                        _number(self.state.get("active_endpoints")),
+                        _styled(_number(self.state.get("active_endpoints")), "bold white"),
                         "Legacy inactive",
-                        _number(self.state.get("inactive_endpoints")),
+                        _styled(_number(self.state.get("inactive_endpoints")), "dim"),
                     ),
                     (
                         "Identity added",
-                        _number(self.state.get("company_master_identities_added")),
+                        _priority_count(
+                            self.state.get("company_master_identities_added"),
+                            "blue",
+                        ),
                         "Overlap",
-                        _number(self.state.get("overlap")),
+                        _priority_count(self.state.get("overlap"), "bold red", zero_style="green"),
                     ),
                 ]
             ),
@@ -195,15 +252,15 @@ class MasterDeepTerminal:
                 [
                     (
                         "Scanned",
-                        _number(self.state.get("scanned")),
+                        _styled(_number(self.state.get("scanned")), "bold white"),
                         "Upserted",
-                        _number(self.state.get("upserted")),
+                        _priority_count(self.state.get("upserted"), "green"),
                     ),
                     (
                         "Overlap removed",
-                        _number(self.state.get("overlap_removed")),
+                        _priority_count(self.state.get("overlap_removed"), "blue"),
                         "Batch",
-                        _number(self.state.get("batch_size")),
+                        _styled(_number(self.state.get("batch_size")), "cyan"),
                     ),
                 ]
             ),
@@ -213,16 +270,31 @@ class MasterDeepTerminal:
             self._header("DBD DEEP BOOTSTRAP", "CURRENT MODEL"),
             model,
             backfill,
-            Text("SAFE • CURRENT 7 ENDPOINT MODEL • NO DEEP PAYLOAD RESET"),
+            Text("SAFE • CURRENT 7 ENDPOINT MODEL • NO DEEP PAYLOAD RESET", style="green"),
         )
 
     def _render_serving(self):
         pipeline = Panel(
             _grid(
                 [
-                    ("Source", "dbd_company_deep", "Filter", "COMPLETE ONLY"),
-                    ("Target", "dbd_master_deep", "Batch", _number(self.state.get("batch_size"))),
-                    ("Limit", _limit(self.state.get("limit")), "Storage", "MYSQL"),
+                    (
+                        "Source",
+                        _styled("dbd_company_deep", "dim"),
+                        "Filter",
+                        _styled("COMPLETE ONLY", "green"),
+                    ),
+                    (
+                        "Target",
+                        _styled("dbd_master_deep", "bold white"),
+                        "Batch",
+                        _styled(_number(self.state.get("batch_size")), "cyan"),
+                    ),
+                    (
+                        "Limit",
+                        _styled(_limit(self.state.get("limit")), "bold white"),
+                        "Storage",
+                        _styled("MYSQL", "cyan"),
+                    ),
                 ]
             ),
             title="Pipeline",
@@ -232,21 +304,21 @@ class MasterDeepTerminal:
                 [
                     (
                         "Scanned",
-                        _number(self.state.get("scanned")),
+                        _styled(_number(self.state.get("scanned")), "bold white"),
                         "Inserted",
-                        _number(self.state.get("inserted")),
+                        _priority_count(self.state.get("inserted"), "green"),
                     ),
                     (
                         "Updated",
-                        _number(self.state.get("updated")),
+                        _priority_count(self.state.get("updated"), "magenta"),
                         "Unchanged",
-                        _number(self.state.get("unchanged")),
+                        _styled(_number(self.state.get("unchanged")), "dim"),
                     ),
                     (
                         "Missing identity",
-                        _number(self.state.get("missing_identity")),
+                        _priority_count(self.state.get("missing_identity"), "bold red"),
                         "Normalize errors",
-                        _number(self.state.get("normalization_error")),
+                        _priority_count(self.state.get("normalization_error"), "yellow"),
                     ),
                 ]
             ),
@@ -256,16 +328,31 @@ class MasterDeepTerminal:
             self._header("DBD MASTER DEEP", "MYSQL SERVING"),
             pipeline,
             projection,
-            Text("MYSQL ONLY • SQL SERVER NOT TOUCHED"),
+            Text("MYSQL ONLY • SQL SERVER NOT TOUCHED", style="dim"),
         )
 
     def _render_sqlserver(self):
         pipeline = Panel(
             _grid(
                 [
-                    ("Source", "MySQL dbd_master_deep", "Target", "dbo.DBD_MASTER_DEEP"),
-                    ("Database", "TIPDataIntelligence", "Batch", _number(self.state.get("batch_size"))),
-                    ("Limit", _limit(self.state.get("limit")), "Mode", "INSERT + UPDATE + SKIP"),
+                    (
+                        "Source",
+                        _styled("MySQL dbd_master_deep", "dim"),
+                        "Target",
+                        _styled("dbo.DBD_MASTER_DEEP", "bold white"),
+                    ),
+                    (
+                        "Database",
+                        _styled("TIPDataIntelligence", "cyan"),
+                        "Batch",
+                        _styled(_number(self.state.get("batch_size")), "cyan"),
+                    ),
+                    (
+                        "Limit",
+                        _styled(_limit(self.state.get("limit")), "bold white"),
+                        "Mode",
+                        _styled("INSERT + UPDATE + SKIP", "cyan"),
+                    ),
                 ]
             ),
             title="Pipeline",
@@ -275,27 +362,27 @@ class MasterDeepTerminal:
                 [
                     (
                         "Source rows",
-                        _number(self.state.get("source_rows")),
+                        _styled(_number(self.state.get("source_rows")), "bold white"),
                         "Target rows",
-                        _number(self.state.get("target_rows")),
+                        _styled(_number(self.state.get("target_rows")), "bold white"),
                     ),
                     (
                         "Scanned",
-                        _number(self.state.get("scanned")),
+                        _styled(_number(self.state.get("scanned")), "bold white"),
                         "Inserted",
-                        _number(self.state.get("inserted")),
+                        _priority_count(self.state.get("inserted"), "green"),
                     ),
                     (
                         "Updated",
-                        _number(self.state.get("updated")),
+                        _priority_count(self.state.get("updated"), "magenta"),
                         "Unchanged",
-                        _number(self.state.get("unchanged")),
+                        _styled(_number(self.state.get("unchanged")), "dim"),
                     ),
                     (
                         "Target-only",
-                        _number(self.state.get("target_only")),
+                        _priority_count(self.state.get("target_only"), "yellow"),
                         "NUL removed",
-                        _number(self.state.get("nul_removed")),
+                        _priority_count(self.state.get("nul_removed"), "yellow"),
                     ),
                 ]
             ),
@@ -305,7 +392,7 @@ class MasterDeepTerminal:
             self._header("DBD MASTER DEEP SYNC", "MYSQL → SQL SERVER"),
             pipeline,
             transfer,
-            Text("SAFE SYNC • TARGET-ONLY REPORTED • NO AUTOMATIC DELETE"),
+            Text("SAFE SYNC • TARGET-ONLY REPORTED • NO AUTOMATIC DELETE", style="green"),
         )
 
     def _render(self):
@@ -331,8 +418,8 @@ class MasterDeepTerminal:
         errors = list(result.get("errors") or [])
         if errors:
             table = Table(title="Projection Errors", expand=False)
-            table.add_column("Identity")
-            table.add_column("Error")
+            table.add_column("Identity", style="dim")
+            table.add_column("Error", style="bold red")
             for item in errors[:20]:
                 table.add_row(str(item.get("identity") or "-"), str(item.get("error") or "-"))
             self.console.print(table)

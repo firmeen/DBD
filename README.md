@@ -8,32 +8,36 @@
 
 ## ระบบนี้ทำอะไร
 
-ภาพรวมการทำงาน:
+ระบบมี 2 เส้นทางการเก็บข้อมูลที่อยู่ร่วมกัน:
+
+**Standalone Deep** — เส้นทางปัจจุบันสำหรับเก็บ 7 endpoints ต่อบริษัทแบบตรงไปตรงมา:
 
 ```text
 DBD DataWarehouse
        │
        ▼
 Discovery
-ค้นหา/เก็บ master บริษัท
        │
        ▼
-company_master (MySQL)
+dbd_company_master
+บริษัทที่รอเข้า Deep
        │
        ▼
-Campaign / Bulk collection
+dbd_company_deep
+ข้อมูล Deep + durable endpoint state
        │
-       ├── fetch
-       ├── durable archive
-       └── project
-               │
-               ▼
-        normalized tables
+       │ COMPLETE เท่านั้น
+       ▼
+dbd_master_deep
+ตารางแบน อ่านง่าย ไม่มี JSON
+       │
+       ▼
+TIPDataIntelligence.dbo.DBD_MASTER_DEEP
 ```
 
-MySQL เก็บ durable state ของงานทั้งหมด เช่น master company, run, task, lease และ archive metadata
+**Campaign / Bulk** — เส้นทาง distributed เดิมสำหรับ run/task/archive/worker fleet และงานที่ต้องใช้ Redis coordination
 
-Redis ไม่ใช่ฐานข้อมูลหลัก ใช้สำหรับ coordination เช่น shared rate, worker heartbeat, cooldown และ campaign control
+MySQL เป็น durable source of truth ของทั้งสองเส้นทาง ส่วน Redis ใช้เฉพาะงาน Campaign/distributed coordination; standalone `dbd-deep` ไม่พึ่ง Redis control plane
 
 ---
 
@@ -111,7 +115,28 @@ dbd-data master-status
 dbd-data discover-status
 ```
 
-จากจุดนี้ single-process workflow ใช้งานได้แล้ว
+จากจุดนี้ Discovery ใช้งานได้แล้ว
+
+ถ้าจะใช้ **Standalone Deep** ให้ตรวจสถานะก่อน:
+
+```powershell
+dbd-deep --version
+dbd-deep status
+```
+
+ถ้าระบบยังต้อง adopt Deep rows เดิมเข้าสู่ seven-endpoint runtime ให้รัน:
+
+```powershell
+dbd-deep prepare
+```
+
+จากนั้นเริ่มแบบ canary ก่อน:
+
+```powershell
+dbd-deep collect --limit 20 --concurrency 4 --rate 5 --http-retries 3
+```
+
+ดูขั้นตอนเต็มที่ [Standalone Deep quick start](docs/DEEP_QUICKSTART.md)
 
 ถ้าจะใช้ **Campaign / distributed workers** ให้ตั้ง Redis เพิ่มตาม [Redis setup](docs/setup/REDIS.md)
 
@@ -132,6 +157,7 @@ dbd-data discover-status
 | [DBD Remote Client](docs/DBD_REMOTE_CLIENT.md) | คู่มือฝั่ง Client ตั้งแต่ clone repo ถึงต่อ VS Code/DBeaver |
 | [DBD Remote Server](docs/DBD_REMOTE_SERVER.md) | คู่มือฝั่ง Server สำหรับ MySQL + cloudflared + gateway |
 | [DBD Remote Gateway](docs/DBD_REMOTE_GATEWAY.md) | ภาพรวม architecture และเลือกคู่มือ Client/Server |
+| [Standalone Deep quick start](docs/DEEP_QUICKSTART.md) | ใช้ `dbd-deep`, serving projection และ SQL Server sync แบบ step-by-step |
 | [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md) | Canary, production campaign, status, stop และ resume |
 
 ---
@@ -172,14 +198,58 @@ financial_statements
 industry_benchmark
 ```
 
-Tabs 3-4 ยังรองรับแบบ opt-in:
+สำหรับ **Standalone Deep** ขอบเขต active มีเท่านี้ exactly 7 endpoints เท่านั้น
 
-```text
-nationality
-history
-```
+`nations`, `nation_history`, `name_history`, `capital_history` ยังอยู่เพื่อ compatibility แต่ไม่ถูก schedule โดย standalone Deep ส่วน Campaign/Bulk เดิมอาจมี scope อื่นตามโหมดที่เลือก
 
 Financial endpoints ต้องพึ่งข้อมูลจาก profile ก่อน ถ้า source ยืนยันว่าไม่มี fiscal year ที่ต้องใช้ task สามารถจบเป็น `not_available` ได้ ซึ่งไม่ถือเป็น failure
+
+---
+
+## Standalone Deep
+
+Standalone Deep ใช้ MySQL เป็น durable state โดยตรงและไม่ใช้ Campaign/Fabric/Guardian/Redis scheduler
+
+ลำดับปกติ:
+
+```text
+Discovery
+→ dbd_company_master
+→ dbd_company_deep
+→ 7 endpoints
+→ COMPLETE
+```
+
+คำสั่งหลัก:
+
+```powershell
+dbd-deep status
+dbd-deep prepare
+dbd-deep collect
+dbd-deep retry
+```
+
+รันต่อเนื่อง:
+
+```powershell
+dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --buffer-size 32 --idle-seconds 5
+```
+
+เมื่อ Deep row เป็น `COMPLETE` สามารถ project เป็นตารางอ่านง่าย `dbd_master_deep`:
+
+```powershell
+python -m dbd.deep.serving --ensure --backfill --batch-size 100 --limit 100
+```
+
+หลัง canary ผ่านจึงค่อยเพิ่ม batch หรือทำ full backfill
+
+ถ้าต้อง sync ไป SQL Server target ใหม่ `TIPDataIntelligence.dbo.DBD_MASTER_DEEP`:
+
+```powershell
+python -m dbd.pipelines.sqlserver_sync --batch-size 100 --limit 100
+```
+
+pipeline นี้ไม่ใช้และไม่ลบ `dbo.DBD_COMPANY` อัตโนมัติ รายละเอียดทั้งหมดอยู่ที่ [Standalone Deep quick start](docs/DEEP_QUICKSTART.md)
 
 ---
 
@@ -421,6 +491,7 @@ Integration tests ต้องใช้ disposable test database ที่ชื
 หลังจากใช้งานพื้นฐานได้แล้ว เอกสารเหล่านี้อธิบายรายละเอียดระดับระบบ:
 
 - [Architecture](docs/ARCHITECTURE.md) — design และ correctness invariants
+- [Standalone Deep quick start](docs/DEEP_QUICKSTART.md) — ตั้งแต่ Deep status/prepare/collect ถึง serving และ SQL Server sync
 - [High-throughput V2](docs/HIGH_THROUGHPUT_V2.md) — staged pipeline, Redis และ archive backend
 - [Runbook](docs/RUNBOOK.md) — ขั้นตอน operation
 - [Operations](docs/OPERATIONS.md) — configuration และ failure handling
@@ -437,10 +508,11 @@ Integration tests ต้องใช้ disposable test database ที่ชื
 
 ```text
 MySQL = durable source of truth
-Redis = coordination / shared rate control
-Archive = recovery boundary
-Run ID = งานที่ต้อง resume ให้ถูกตัว
+Standalone Deep = ไม่ต้องใช้ Redis scheduler
+Redis = coordination สำหรับ Campaign / distributed mode
+dbd_company_deep = Deep source of truth
+dbd_master_deep = flat serving output จาก COMPLETE rows
 Canary = ต้องผ่านก่อนเพิ่ม load
 ```
 
-ถ้าจำ 5 ข้อนี้ได้ จะเข้าใจวิธี operate ระบบส่วนใหญ่ได้ถูกต้อง
+แยกให้ออกว่า **Deep source of truth** กับ **serving/output table** เป็นคนละหน้าที่ จะช่วยให้ operate ระบบได้ถูกต้องและไม่เผลอใช้ตารางปลายทางเป็น runtime state

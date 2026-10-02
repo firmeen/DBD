@@ -3,6 +3,64 @@
 Operational path from an empty MySQL schema to a durable DBD collection. Current
 production scope is tabs 1-2: seven endpoints per company.
 
+## Standalone Deep — current direct path
+
+ถ้าต้องการใช้ collector ใหม่แบบตรงไปตรงมา ให้ใช้ flow นี้แทนการสร้าง Campaign run
+
+1. ตรวจ environment และ Discovery:
+
+```powershell
+dbd-data check-db
+dbd-data discover-status
+dbd-deep --version
+dbd-deep status
+```
+
+2. ถ้า `dbd-deep status` แสดงว่ายังไม่ prepared สำหรับ seven-endpoint runtime ให้ทำ explicit adoption:
+
+```powershell
+dbd-deep prepare
+dbd-deep status
+```
+
+3. เริ่ม collection ด้วย bounded canary:
+
+```powershell
+dbd-deep collect --limit 20 --concurrency 4 --rate 5 --http-retries 3
+```
+
+4. เมื่อ canary ผ่านจึงรันต่อเนื่องด้วยค่าที่พิสูจน์บนเครื่องจริงแล้ว เช่น:
+
+```powershell
+dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --buffer-size 32 --idle-seconds 5
+```
+
+5. Serving output เป็นขั้น derived แยกจาก endpoint commit. เริ่มด้วย canary:
+
+```powershell
+python -m dbd.deep.serving --ensure --backfill --batch-size 100 --limit 100
+```
+
+รันซ้ำควรกลายเป็น unchanged สำหรับ row ที่ข้อมูลไม่เปลี่ยน จากนั้นจึงค่อยเพิ่ม batch/full backfill
+
+6. SQL Server ใช้ target ใหม่ `TIPDataIntelligence.dbo.DBD_MASTER_DEEP`:
+
+```powershell
+python -m dbd.pipelines.sqlserver_sync --batch-size 100 --limit 100
+```
+
+Full sync ใช้ keyset scan และ row-hash comparison; NEW → INSERT, CHANGED → UPDATE, SAME → SKIP, TARGET-ONLY → report only. ไม่มี automatic delete
+
+`python -m dbd.deep.bootstrap` เป็น maintenance/current-model backfill/validation command ไม่ใช่ normal collector loop และไม่ควรถูกใช้แทน `dbd-deep prepare` โดยไม่ดูสถานะก่อน
+
+คู่มือแบบละเอียดและคำอธิบายสำหรับผู้ใช้ทั่วไปอยู่ที่ [DEEP_QUICKSTART.md](DEEP_QUICKSTART.md)
+
+---
+
+## Campaign / Bulk runbook
+
+ส่วนด้านล่างเป็น flow เดิมสำหรับ Campaign/Bulk/distributed runtime และยังคงใช้ได้แยกจาก standalone Deep
+
 ## 1. Prepare
 
 ```powershell
