@@ -127,3 +127,27 @@ def test_live_state_returns_to_running_when_cycle_finds_work() -> None:
         },
     )
     assert events.state["phase"] == "RUNNING"
+
+
+def test_serving_events_are_visible_without_changing_collector_state() -> None:
+    stream = StringIO()
+    events = DeepTerminalEvents("collect", stream=stream)
+    events(
+        "serving",
+        {
+            "ready": True,
+            "scanned": 32,
+            "inserted": 20,
+            "updated": 4,
+            "unchanged": 8,
+            "missing_identity": 0,
+            "normalization_error": 0,
+        },
+    )
+    assert events.state["serving_ready"] is True
+    assert events.state["serving_inserted"] == 20
+    assert "SERVING ready=YES" in stream.getvalue()
+
+    events("serving_error", {"error": "database unavailable"})
+    assert events.state["serving_last_error"] == "database unavailable"
+    assert "SERVING DEGRADED" in stream.getvalue()

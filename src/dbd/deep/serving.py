@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from collections.abc import Callable
 from datetime import datetime, timezone
 from typing import Any
 
@@ -21,6 +22,7 @@ from ..contracts.master_deep import (
 )
 from ..contracts.strict import normalize_collection, normalize_industry_benchmark
 from ..core.exceptions import ContractError
+from ..presentation.master_deep import MasterDeepTerminal
 from .catalog import ACTIVE_ENDPOINTS, ENDPOINT_BITS, latest_fiscal_year
 from .repository import DEEP_TABLE, create_deep_engine
 
@@ -266,9 +268,19 @@ def flatten_complete_row(row: dict[str, Any], *, projected_at: datetime | None =
 
 
 class ServingProjector:
-    def __init__(self, engine: AsyncEngine | None = None) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine | None = None,
+        *,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self.engine = engine or create_deep_engine()
         self._owns_engine = engine is None
+        self.event = event
+
+    def _emit(self, name: str, **payload: Any) -> None:
+        if self.event is not None:
+            self.event(name, payload)
 
     async def close(self) -> None:
         if self._owns_engine:
@@ -582,6 +594,7 @@ class ServingProjector:
         sources = await self._fetch_page(limit=limit, incremental=True)
         result = await self._project_sources(sources)
         result["ready"] = True
+        self._emit("progress", **result)
         return result
 
     async def backfill(
@@ -630,6 +643,7 @@ class ServingProjector:
             for error in batch["errors"]:
                 if len(total["errors"]) < 20:
                     total["errors"].append(error)
+            self._emit("progress", **total)
 
             last = sources[-1]
             after = (str(last["jp_type_code"]), str(last["jp_no"]))
@@ -639,12 +653,17 @@ class ServingProjector:
         return total
 
 
-async def _run(args: argparse.Namespace) -> dict[str, Any]:
-    projector = ServingProjector()
+async def _run(
+    args: argparse.Namespace,
+    event: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    projector = ServingProjector(event=event)
     try:
         if args.ensure:
+            projector._emit("phase", phase="ENSURE MYSQL SERVING")
             await projector.ensure_schema()
         elif await projector.table_exists():
+            projector._emit("phase", phase="VALIDATE MYSQL SERVING")
             await projector.validate_schema()
 
         if not await projector.table_exists():
@@ -653,10 +672,12 @@ async def _run(args: argparse.Namespace) -> dict[str, Any]:
             )
 
         if args.backfill:
+            projector._emit("phase", phase="BACKFILL COMPLETE DEEP")
             return await projector.backfill(
                 batch_size=args.batch_size,
                 limit=args.limit,
             )
+        projector._emit("phase", phase="INCREMENTAL RECONCILE")
         return await projector.project_incremental(
             limit=args.limit or args.batch_size,
         )
@@ -671,8 +692,25 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--limit", type=int)
     args = parser.parse_args(argv)
-    result = asyncio.run(_run(args))
-    print(json.dumps(result, ensure_ascii=False, default=str, sort_keys=True))
+
+    terminal = MasterDeepTerminal("serving")
+    terminal(
+        "started",
+        {
+            "batch_size": args.batch_size,
+            "limit": args.limit,
+            "phase": "STARTING",
+        },
+    )
+    try:
+        result = asyncio.run(_run(args, terminal))
+    except KeyboardInterrupt:
+        terminal.error(KeyboardInterrupt("Interrupted; committed MySQL batches are preserved"))
+        raise SystemExit(130) from None
+    except Exception as exc:
+        terminal.error(exc)
+        raise SystemExit(1) from None
+    terminal.complete(result)
 
 
 if __name__ == "__main__":

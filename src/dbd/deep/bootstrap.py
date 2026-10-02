@@ -3,11 +3,13 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+from collections.abc import Callable
 from typing import Any
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from ..presentation.master_deep import MasterDeepTerminal
 from .bridge import MASTER_JSON_SQL
 from .catalog import (
     ACTIVE_ENDPOINT_MASK,
@@ -340,9 +342,19 @@ def _catalog_rows() -> list[dict[str, Any]]:
 
 
 class DeepBootstrap:
-    def __init__(self, engine: AsyncEngine | None = None) -> None:
+    def __init__(
+        self,
+        engine: AsyncEngine | None = None,
+        *,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self.engine = engine or create_deep_engine()
         self._owns_engine = engine is None
+        self.event = event
+
+    def _emit(self, name: str, **payload: Any) -> None:
+        if self.event is not None:
+            self.event(name, payload)
 
     async def close(self) -> None:
         if self._owns_engine:
@@ -675,6 +687,7 @@ class DeepBootstrap:
             stats["upserted"] += int(result.rowcount or 0)
             stats["overlap_removed"] += int(overlap.rowcount or 0)
             last_type, last_no = end_type, end_no
+            self._emit("progress", **stats)
 
         return stats
 
@@ -743,21 +756,31 @@ class DeepBootstrap:
 
     async def run(self, *, batch_size: int = 5000) -> dict[str, Any]:
         repo = DeepRepository(self.engine)
+        self._emit("phase", phase="PREFLIGHT")
         async with repo.manager_lock():
+            self._emit("phase", phase="ENSURE MODEL")
             await self.ensure_model()
 
             # Bootstrap is intentionally non-destructive to existing Deep rows.
             # Legacy 11-endpoint mask adoption remains an explicit dbd-deep
             # prepare operation; do not hide payload/mask migration here.
+            self._emit("phase", phase="PREPARE CHECK")
             await repo.preflight(
                 require_runtime=False,
                 require_prepared=True,
                 check_indexes=True,
             )
 
+            self._emit("phase", phase="IDENTITY BACKFILL")
             identities = await self.backfill_identity_master()
+            self._emit("progress", company_master_identities_added=identities)
+
+            self._emit("phase", phase="MASTER BACKFILL")
             master = await self.backfill_master(batch_size=batch_size)
+
+            self._emit("phase", phase="VALIDATE")
             validation = await self.validate()
+
         return {
             "company_master_identities_added": identities,
             **master,
@@ -765,8 +788,11 @@ class DeepBootstrap:
         }
 
 
-async def _run(batch_size: int) -> dict[str, Any]:
-    bootstrap = DeepBootstrap()
+async def _run(
+    batch_size: int,
+    event: Callable[[str, dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    bootstrap = DeepBootstrap(event=event)
     try:
         return await bootstrap.run(batch_size=batch_size)
     finally:
@@ -777,8 +803,18 @@ def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="python -m dbd.deep.bootstrap")
     parser.add_argument("--batch-size", type=int, default=5000)
     args = parser.parse_args(argv)
-    result = asyncio.run(_run(args.batch_size))
-    print(json.dumps(result, ensure_ascii=False, default=str, sort_keys=True))
+
+    terminal = MasterDeepTerminal("bootstrap")
+    terminal("started", {"batch_size": args.batch_size, "phase": "STARTING"})
+    try:
+        result = asyncio.run(_run(args.batch_size, terminal))
+    except KeyboardInterrupt:
+        terminal.error(KeyboardInterrupt("Interrupted; durable database state is preserved"))
+        raise SystemExit(130) from None
+    except Exception as exc:
+        terminal.error(exc)
+        raise SystemExit(1) from None
+    terminal.complete(result)
 
 
 if __name__ == "__main__":

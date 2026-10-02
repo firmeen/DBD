@@ -324,6 +324,7 @@ class DeepCollector:
             return
         if not result.get("ready"):
             self._next_serving_projection_at = time.monotonic() + 60.0
+            self._emit("serving", **result)
             return
         self._emit("serving", **result)
 

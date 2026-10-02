@@ -80,6 +80,14 @@ class DeepTerminalEvents:
             "rows_total": 0,
             "rows_scanned": 0,
             "rows_changed": 0,
+            "serving_ready": None,
+            "serving_scanned": 0,
+            "serving_inserted": 0,
+            "serving_updated": 0,
+            "serving_unchanged": 0,
+            "serving_missing_identity": 0,
+            "serving_normalization_error": 0,
+            "serving_last_error": None,
         }
 
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
@@ -98,6 +106,17 @@ class DeepTerminalEvents:
             self.state["last_event"] = name.upper()
             self.state["last_error"] = payload.get("error")
             self.state["last_endpoint"] = payload.get("endpoint")
+        elif name == "serving":
+            self.state["serving_ready"] = bool(payload.get("ready"))
+            self.state["serving_scanned"] = payload.get("scanned", 0)
+            self.state["serving_inserted"] = payload.get("inserted", 0)
+            self.state["serving_updated"] = payload.get("updated", 0)
+            self.state["serving_unchanged"] = payload.get("unchanged", 0)
+            self.state["serving_missing_identity"] = payload.get("missing_identity", 0)
+            self.state["serving_normalization_error"] = payload.get("normalization_error", 0)
+            self.state["serving_last_error"] = None
+        elif name == "serving_error":
+            self.state["serving_last_error"] = payload.get("error")
 
         if self.interactive:
             self._refresh_live()
@@ -125,6 +144,22 @@ class DeepTerminalEvents:
             endpoint = payload.get("endpoint") or "-"
             self.console.print(
                 f"{name.upper()} endpoint={endpoint} error={payload.get('error')}"
+            )
+            return
+        if name == "serving":
+            ready = "YES" if payload.get("ready") else "NO"
+            self.console.print(
+                "SERVING "
+                f"ready={ready} "
+                f"scanned={_number(payload.get('scanned'))} "
+                f"inserted={_number(payload.get('inserted'))} "
+                f"updated={_number(payload.get('updated'))} "
+                f"unchanged={_number(payload.get('unchanged'))}"
+            )
+            return
+        if name == "serving_error":
+            self.console.print(
+                f"SERVING DEGRADED error={payload.get('error')} • Deep collection continues"
             )
             return
 
@@ -248,6 +283,46 @@ class DeepTerminalEvents:
             ),
             title="Session",
         )
+        serving_ready = self.state.get("serving_ready")
+        if self.state.get("serving_last_error"):
+            serving_status = "DEGRADED"
+        elif serving_ready is True:
+            serving_status = "READY"
+        elif serving_ready is False:
+            serving_status = "NOT INITIALIZED"
+        else:
+            serving_status = "WAITING"
+        serving = Panel(
+            _grid(
+                [
+                    (
+                        "Status",
+                        serving_status,
+                        "Target",
+                        "dbd_master_deep",
+                    ),
+                    (
+                        "Scanned",
+                        _number(self.state.get("serving_scanned")),
+                        "Inserted",
+                        _number(self.state.get("serving_inserted")),
+                    ),
+                    (
+                        "Updated",
+                        _number(self.state.get("serving_updated")),
+                        "Unchanged",
+                        _number(self.state.get("serving_unchanged")),
+                    ),
+                    (
+                        "Missing identity",
+                        _number(self.state.get("serving_missing_identity")),
+                        "Normalize errors",
+                        _number(self.state.get("serving_normalization_error")),
+                    ),
+                ]
+            ),
+            title="Serving Projection",
+        )
         footer = Text(
             (
                 "IDLE • waiting for work"
@@ -256,7 +331,9 @@ class DeepTerminalEvents:
             )
             + " • Ctrl+C graceful shutdown"
         )
-        return Group(Panel(header, title="DBD DEEP"), collector, runtime, footer)
+        if self.state.get("serving_last_error"):
+            footer.append(" • SERVING DEGRADED", style="bold yellow")
+        return Group(Panel(header, title="DBD DEEP"), collector, runtime, serving, footer)
 
     def close(self) -> None:
         if self.live is not None:

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal
+from io import StringIO
 
 import pytest
 
@@ -9,6 +10,7 @@ from dbd.contracts.master_deep import serving_row_hash
 from dbd.deep.catalog import ACTIVE_ENDPOINT_MASK, BASE_REQUIRED_MASK
 from dbd.deep.serving import ServingProjectionError, flatten_complete_row
 from dbd.pipelines.sqlserver_sync import classify_batch
+from dbd.presentation.master_deep import MasterDeepTerminal
 
 
 def _deep_row() -> dict:
@@ -189,3 +191,49 @@ def test_complete_without_financial_scope_marks_financial_endpoints_not_required
     assert row["industry_benchmark_status"] == "NOT_REQUIRED"
     assert row["financial_submission_count"] == 0
     assert row["financial_statement_year_count"] == 0
+
+
+def test_master_deep_terminal_output_is_human_readable_not_json() -> None:
+    serving_stream = StringIO()
+    serving = MasterDeepTerminal("serving", stream=serving_stream)
+    serving("started", {"batch_size": 100, "limit": 100})
+    serving(
+        "progress",
+        {
+            "scanned": 100,
+            "inserted": 90,
+            "updated": 5,
+            "unchanged": 5,
+            "missing_identity": 0,
+            "normalization_error": 0,
+        },
+    )
+    serving.complete(
+        {
+            "scanned": 100,
+            "inserted": 90,
+            "updated": 5,
+            "unchanged": 5,
+            "missing_identity": 0,
+            "normalization_error": 0,
+            "errors": [],
+        }
+    )
+    serving_output = serving_stream.getvalue()
+    assert "SERVING scanned=100 inserted=90 updated=5 unchanged=5" in serving_output
+    assert "COMPLETE scanned=100 inserted=90 updated=5 unchanged=5" in serving_output
+    assert not serving_output.lstrip().startswith("{")
+
+    sql_stream = StringIO()
+    sql = MasterDeepTerminal("sqlserver", stream=sql_stream)
+    sql("started", {"batch_size": 100, "limit": 100})
+    sql(
+        "progress",
+        {
+            "scanned": 100,
+            "inserted": 80,
+            "updated": 10,
+            "unchanged": 10,
+        },
+    )
+    assert "SQLSYNC scanned=100 inserted=80 updated=10 unchanged=10" in sql_stream.getvalue()

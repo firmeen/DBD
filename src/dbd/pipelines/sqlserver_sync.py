@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import argparse
-import json
+from collections.abc import Callable
 from typing import Any, Iterator
 
 from ..contracts.master_deep import SERVING_COLUMNS
+from ..presentation.master_deep import MasterDeepTerminal
 from ..storage.mysql.engine import connect as mysql_connection
 from ..storage.sqlserver.repository import SqlServerRepository
 
@@ -117,8 +118,15 @@ class SqlServerSync:
     def __init__(
         self,
         repository: SqlServerRepository | None = None,
+        *,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self.repository = repository or SqlServerRepository()
+        self.event = event
+
+    def _emit(self, name: str, **payload: Any) -> None:
+        if self.event is not None:
+            self.event(name, payload)
 
     def sync(
         self,
@@ -133,7 +141,9 @@ class SqlServerSync:
         if limit is not None and limit < 1:
             raise ValueError("limit must be positive")
 
+        self._emit("phase", phase="VALIDATE MYSQL SOURCE")
         _validate_source_schema()
+        self._emit("phase", phase="ENSURE SQL SERVER TARGET" if ensure_target else "VALIDATE SQL SERVER TARGET")
         if ensure_target:
             self.repository.ensure_table()
         else:
@@ -163,10 +173,13 @@ class SqlServerSync:
             stats["unchanged"] += int(unchanged)
             stats["nul_removed"] += int(insert_result["nul_removed"])
             stats["nul_removed"] += int(update_result["nul_removed"])
+            self._emit("progress", **stats)
 
+        self._emit("phase", phase="VERIFY TARGET")
         stats["target_rows"] = self.repository.count_rows()
 
         if report_target_only and limit is None:
+            self._emit("phase", phase="TARGET-ONLY AUDIT")
             for identities in self.repository.iter_identities(batch_size=batch_size):
                 ids = [int(item["company_id"]) for item in identities]
                 present = _source_identity_ids(ids)
@@ -176,6 +189,7 @@ class SqlServerSync:
                     stats["target_only"] += 1
                     if len(stats["target_only_sample"]) < 20:
                         stats["target_only_sample"].append(item)
+                self._emit("progress", **stats)
 
         return stats
 
@@ -191,12 +205,28 @@ def main(argv: list[str] | None = None) -> None:
     )
     args = parser.parse_args(argv)
 
-    result = SqlServerSync().sync(
-        batch_size=args.batch_size,
-        limit=args.limit,
-        report_target_only=not args.no_target_only,
+    terminal = MasterDeepTerminal("sqlserver")
+    terminal(
+        "started",
+        {
+            "batch_size": args.batch_size,
+            "limit": args.limit,
+            "phase": "STARTING",
+        },
     )
-    print(json.dumps(result, ensure_ascii=False, default=str, sort_keys=True))
+    try:
+        result = SqlServerSync(event=terminal).sync(
+            batch_size=args.batch_size,
+            limit=args.limit,
+            report_target_only=not args.no_target_only,
+        )
+    except KeyboardInterrupt:
+        terminal.error(KeyboardInterrupt("Interrupted; committed SQL Server batches are preserved"))
+        raise SystemExit(130) from None
+    except Exception as exc:
+        terminal.error(exc)
+        raise SystemExit(1) from None
+    terminal.complete(result)
 
 
 if __name__ == "__main__":
