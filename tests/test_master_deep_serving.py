@@ -71,7 +71,7 @@ def _deep_row() -> dict:
             "address": "Current address",
             "phoneNo": "020000000",
             "email": "test@example.com",
-            "regDate": "2020-01-02",
+            "regDate": [2020, 1, 2],
             "capAmt": "1200000.00",
             "paidAmt": "1100000.00",
             "shareQty": "1000",
