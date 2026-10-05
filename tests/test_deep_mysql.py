@@ -330,7 +330,7 @@ async def test_promotion_duplicate_preserves_checkpoints_and_runtime(promotion_r
         if existing_runtime:
             assert runtime == [runtime_before]
         elif terminal:
-            assert runtime == []
+            assert not runtime
         else:
             assert len(runtime) == 1
             assert runtime[0]["status"] == "PENDING"

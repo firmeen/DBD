@@ -2267,3 +2267,4 @@ class DeepRepository:
             "active_endpoint_mask": ACTIVE_ENDPOINT_MASK,
             "coverage": coverage,
         }
+
