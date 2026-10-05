@@ -924,7 +924,21 @@ def verify_generation_one(source_rows: int) -> dict[str, int]:
             (),
         ),
         "invalid_generation": (
-            "SELECT COUNT(*) FROM dbo.DBD_COMPANY WHERE dataset_generation<>1",
+            """
+            SELECT
+                (SELECT COUNT(*) FROM dbo.DBD_COMPANY
+                 WHERE dataset_generation<>1
+                    OR first_seen_generation<>1
+                    OR last_seen_generation<>1)
+              + (SELECT COUNT(*) FROM dbo.DBD_COMPANY_RELATION
+                 WHERE first_seen_generation<>1 OR last_seen_generation<>1)
+              + (SELECT COUNT(*) FROM dbo.DBD_COMPANY_EVENT
+                 WHERE first_seen_generation<>1 OR last_seen_generation<>1)
+              + (SELECT COUNT(*) FROM dbo.DBD_FINANCIAL
+                 WHERE first_seen_generation<>1 OR last_seen_generation<>1)
+              + (SELECT COUNT(*) FROM dbo.DBD_INDUSTRY
+                 WHERE first_seen_generation<>1 OR last_seen_generation<>1)
+            """,
             (),
         ),
         "relations": ("SELECT COUNT(*) FROM dbo.DBD_COMPANY_RELATION", ()),
