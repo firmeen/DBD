@@ -1235,7 +1235,10 @@ class DeepRepository:
                 await conn.execute(
                     text(
                         f"""
-                        SELECT jp_type_code, jp_no
+                        SELECT
+                            jp_type_code,
+                            jp_no,
+                            UTC_TIMESTAMP(6) AS batch_cutoff
                         FROM {MASTER_TABLE} FORCE INDEX (PRIMARY)
                         ORDER BY jp_type_code, jp_no
                         LIMIT :offset, 1
@@ -1250,7 +1253,10 @@ class DeepRepository:
                     await conn.execute(
                         text(
                             f"""
-                            SELECT jp_type_code, jp_no
+                            SELECT
+                                jp_type_code,
+                                jp_no,
+                                UTC_TIMESTAMP(6) AS batch_cutoff
                             FROM {MASTER_TABLE} FORCE INDEX (PRIMARY)
                             ORDER BY jp_type_code DESC, jp_no DESC
                             LIMIT 1
@@ -1267,6 +1273,7 @@ class DeepRepository:
             params = {
                 "end_type": end_type,
                 "end_no": end_no,
+                "batch_cutoff": boundary["batch_cutoff"],
             }
             range_predicate = """
                 (
@@ -1276,6 +1283,7 @@ class DeepRepository:
                         AND m.jp_no<=:end_no
                     )
                 )
+                AND m.updated_at <= :batch_cutoff
             """
             delete_predicate = """
                 (
@@ -1285,6 +1293,7 @@ class DeepRepository:
                         AND jp_no<=:end_no
                     )
                 )
+                AND updated_at <= :batch_cutoff
             """
             financial_required = (
                 f"CASE WHEN NULLIF(TRIM(m.submit_fin_year),'') IS NULL "
@@ -1455,8 +1464,8 @@ class DeepRepository:
             return staged
 
         # Every batch is one transaction. A crash before COMMIT rolls back both
-        # the Deep upsert and Master delete; committed batches resume naturally
-        # because their Master rows are already gone.
+        # writes. The cutoff keeps Master rows changed after boundary selection
+        # for a later batch instead of deleting a concurrent Discovery update.
         return await self._transaction(op, attempts=1)
 
     @staticmethod
