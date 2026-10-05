@@ -57,8 +57,6 @@ def test_collect_continuous_options_are_explicit() -> None:
             "12",
             "--rate",
             "20",
-            "--buffer-size",
-            "64",
             "--limit",
             "100",
         ]
@@ -67,7 +65,6 @@ def test_collect_continuous_options_are_explicit() -> None:
     assert args.idle_seconds == 7.5
     assert args.concurrency == 12
     assert args.rate == 20.0
-    assert args.buffer_size == 64
     assert args.limit == 100
 
 
@@ -76,14 +73,13 @@ def test_redirected_event_output_has_no_live_repaint_sequences() -> None:
     events = DeepTerminalEvents("collect", stream=stream)
     events("phase", {"phase": "PREFLIGHT"})
     events(
-        "cycle",
+        "started",
         {
-            "cycle": 1,
-            "queue_source": "NEW COMPANY",
-            "runtime": 4,
-            "adopted": 0,
-            "promoted": 4,
-            "refreshed": 0,
+            "concurrency": 8,
+            "rate_per_second": 15.0,
+            "company_limit": None,
+            "continuous": True,
+            "idle_seconds": 5.0,
         },
     )
     events(
@@ -100,7 +96,7 @@ def test_redirected_event_output_has_no_live_repaint_sequences() -> None:
     assert "\r" not in output
     assert "\x1b[" not in output
     assert "PHASE PREFLIGHT" in output
-    assert "CYCLE 1" in output
+    assert "CYCLE" not in output
 
 
 def test_json_status_output_stays_machine_readable() -> None:
@@ -109,45 +105,33 @@ def test_json_status_output_stays_machine_readable() -> None:
     assert json.loads(stream.getvalue()) == _summary()
 
 
-def test_live_state_returns_to_running_when_cycle_finds_work() -> None:
+def test_live_state_returns_to_running_when_collection_starts() -> None:
     stream = StringIO()
     events = DeepTerminalEvents("collect", stream=stream)
-    events("idle", {"cycle": 1, "idle_seconds": 5.0, "queue_source": "IDLE"})
+    events("idle", {"idle_seconds": 5.0})
     assert events.state["phase"] == "IDLE"
 
     events(
-        "cycle",
+        "started",
         {
-            "cycle": 2,
-            "queue_source": "ACTIVE REFRESH",
-            "runtime": 1,
-            "adopted": 0,
-            "promoted": 0,
-            "refreshed": 1,
+            "concurrency": 8,
+            "rate_per_second": 15.0,
+            "company_limit": None,
+            "continuous": True,
+            "idle_seconds": 5.0,
         },
     )
     assert events.state["phase"] == "RUNNING"
 
 
-def test_serving_events_are_visible_without_changing_collector_state() -> None:
+def test_collect_terminal_has_no_buffer_cycle_or_serving_panel() -> None:
     stream = StringIO()
     events = DeepTerminalEvents("collect", stream=stream)
-    events(
-        "serving",
-        {
-            "ready": True,
-            "scanned": 32,
-            "inserted": 20,
-            "updated": 4,
-            "unchanged": 8,
-            "missing_identity": 0,
-            "normalization_error": 0,
-        },
-    )
-    assert events.state["serving_ready"] is True
-    assert events.state["serving_inserted"] == 20
-    assert "SERVING ready=YES" in stream.getvalue()
 
-    events("serving_error", {"error": "database unavailable"})
-    assert events.state["serving_last_error"] == "database unavailable"
-    assert "SERVING DEGRADED" in stream.getvalue()
+    events.console.print(events._render())
+
+    output = stream.getvalue()
+    assert "Buffer" not in output
+    assert "Cycle" not in output
+    assert "Serving Projection" not in output
+    assert "In flight" in output
