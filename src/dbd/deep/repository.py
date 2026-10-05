@@ -983,7 +983,24 @@ class DeepRepository:
         return int(value or 0)
 
     async def assert_master_empty(self) -> None:
-        if await self.master_size():
+        async with self.engine.connect() as conn:
+            has_master = int(
+                (
+                    await conn.execute(
+                        text(
+                            f"""
+                            SELECT EXISTS(
+                                SELECT 1
+                                FROM {MASTER_TABLE}
+                                LIMIT 1
+                            )
+                            """
+                        )
+                    )
+                ).scalar_one()
+                or 0
+            )
+        if has_master:
             raise RuntimeError(
                 "dbd_company_master still contains unstaged companies; "
                 "run dbd-deep prepare before collect"
@@ -1460,12 +1477,14 @@ class DeepRepository:
                             d.failed_mask,
                             d.deep_status
                         FROM {DEEP_TABLE} d
-                        LEFT JOIN {RUNTIME_TABLE} r
-                          ON r.jp_type_code=d.jp_type_code
-                         AND r.jp_no=d.jp_no
                         WHERE d.deep_completed_at IS NULL
                           AND d.deep_status IN ('PENDING','COLLECTING')
-                          AND r.jp_no IS NULL
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {RUNTIME_TABLE} r
+                              WHERE r.jp_type_code=d.jp_type_code
+                                AND r.jp_no=d.jp_no
+                          )
                         ORDER BY d.deep_status, d.jp_type_code, d.jp_no
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
