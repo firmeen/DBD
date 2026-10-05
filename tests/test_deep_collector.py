@@ -149,101 +149,92 @@ def test_deep_payload_preserves_exact_json_numeric_type():
     assert '"12345678901234567890.123456789"' not in encoded
 
 
-class _RollingRefillRepo:
-    def __init__(self, runtime_sizes: list[int]) -> None:
-        self.engine = object()
-        self.runtime_size = AsyncMock(side_effect=runtime_sizes)
-        self.refill = AsyncMock(
-            return_value={
-                "runtime": 32,
-                "adopted": 0,
-                "promoted": 16,
-                "refreshed": 0,
-                "refresh_scanned": False,
-            }
-        )
+class _DirectClaimRepo:
+    def __init__(self, companies: list[dict] | None = None) -> None:
+        self.companies = list(companies or [])
+        self.claim = AsyncMock(side_effect=[*self.companies, None])
+        self.next_runtime_delay = AsyncMock(return_value=None)
 
 
-@pytest.mark.asyncio
-async def test_rolling_prefetch_refills_at_low_water_without_running_serving() -> None:
-    repo = _RollingRefillRepo([17, 16])
+def _company(jp_no: str) -> dict:
+    return {
+        "jp_type_code": "7",
+        "jp_no": jp_no,
+        "attempts": 1,
+        "submit_fin_year": None,
+        "required_mask": BASE_REQUIRED_MASK,
+        "done_mask": 0,
+        "not_available_mask": 0,
+        "failed_mask": 0,
+        "deep_status": "PENDING",
+    }
+
+
+def test_collector_has_no_buffer_refill_or_serving_scheduler() -> None:
+    repo = SimpleNamespace()
     collector = DeepCollector(
         repository=repo,
         concurrency=8,
         rate_per_second=15,
         http_retries=3,
-        buffer_size=32,
         continuous=True,
     )
-    collector._reconcile_serving = AsyncMock()
 
-    above_watermark = await collector._refill(prefetch=True)
-
-    assert collector._refill_low_watermark == 16
-    assert above_watermark["runtime"] == 17
-    repo.refill.assert_not_awaited()
-    collector._reconcile_serving.assert_not_awaited()
-
-    at_watermark = await collector._refill(prefetch=True)
-
-    assert at_watermark["runtime"] == 32
-    repo.refill.assert_awaited_once_with(32, include_refresh=True)
-    assert collector.stats.master_promoted == 16
-    assert collector._cycle == 1
-    collector._reconcile_serving.assert_not_awaited()
+    assert not hasattr(collector, "buffer_size")
+    assert not hasattr(collector, "_refill")
+    assert not hasattr(collector, "_refill_loop")
+    assert not hasattr(collector, "_serving")
+    assert not hasattr(collector, "_serving_loop")
+    assert not hasattr(collector, "_reconcile_serving")
 
 
 @pytest.mark.asyncio
-async def test_refill_loop_coalesces_completion_signal_into_prefetch() -> None:
-    repo = SimpleNamespace(engine=object())
+async def test_worker_claims_next_deep_company_immediately_after_finish() -> None:
+    companies = [_company("9000000000001"), _company("9000000000002")]
+    repo = _DirectClaimRepo(companies)
     collector = DeepCollector(
         repository=repo,
-        concurrency=8,
+        concurrency=1,
         rate_per_second=15,
         http_retries=3,
-        buffer_size=32,
-        continuous=True,
+        continuous=False,
     )
+    collector._process_company = AsyncMock()
 
-    async def refill_once(*, prefetch: bool = False):
-        assert prefetch is True
-        collector._stop.set()
-        return {
-            "runtime": 32,
-            "adopted": 0,
-            "promoted": 0,
-            "refreshed": 0,
-            "refresh_scanned": False,
-        }
+    await collector._worker(1, object())
 
-    collector._refill = AsyncMock(side_effect=refill_once)
-    collector._request_prefetch()
-    collector._request_prefetch()
-
-    await collector._refill_loop()
-
-    collector._refill.assert_awaited_once_with(prefetch=True)
+    assert [call.args[0]["jp_no"] for call in collector._process_company.await_args_list] == [
+        "9000000000001",
+        "9000000000002",
+    ]
+    assert repo.claim.await_count == 3
+    assert collector.stats.companies_claimed == 2
+    assert collector.stats.companies_in_flight == 0
+    assert collector.stats.companies_finished == 0
 
 
 @pytest.mark.asyncio
-async def test_serving_loop_runs_independently_of_refill_lock() -> None:
-    repo = SimpleNamespace(engine=object())
+async def test_company_limit_stops_direct_claim_without_prefetch() -> None:
+    companies = [
+        _company("9000000000001"),
+        _company("9000000000002"),
+        _company("9000000000003"),
+    ]
+    repo = _DirectClaimRepo(companies)
     collector = DeepCollector(
         repository=repo,
-        concurrency=8,
+        concurrency=1,
         rate_per_second=15,
         http_retries=3,
-        buffer_size=32,
+        company_limit=2,
         continuous=True,
     )
+    collector._process_company = AsyncMock()
 
-    async def project_once(*, force: bool = False):
-        assert force is False
-        assert not collector._refill_lock.locked()
-        collector._stop.set()
+    await collector._worker(1, object())
 
-    collector._reconcile_serving = AsyncMock(side_effect=project_once)
+    assert collector.stats.companies_claimed == 2
+    assert collector.stats.companies_in_flight == 0
+    assert repo.claim.await_count == 2
+    assert collector._stop.is_set()
 
-    await collector._serving_loop()
-
-    collector._reconcile_serving.assert_awaited_once_with()
