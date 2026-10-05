@@ -36,7 +36,6 @@ from .http import (
     FixedRateDbdClient,
 )
 from .repository import DeepRepository, DeepTransientDatabaseError
-from .serving import ServingProjector
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
@@ -192,9 +191,6 @@ class DeepCollector:
         # polled every few seconds, but an empty exact stale scan should not be
         # repeated at that same cadence across a multi-million COMPLETE set.
         self._refresh_scan_seconds = max(60.0, self.idle_seconds)
-        self._serving = ServingProjector(self.repo.engine)
-        self._next_serving_projection_at = 0.0
-        self._serving_timeout_seconds = 5.0
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -340,54 +336,8 @@ class DeepCollector:
             self._refill_requested.clear()
             await self._refill(prefetch=True)
 
-    async def _serving_loop(self) -> None:
-        while not self._stop.is_set():
-            await self._reconcile_serving()
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
-            except TimeoutError:
-                pass
-
-    async def _reconcile_serving(self, *, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now < self._next_serving_projection_at:
-            return
-        self._next_serving_projection_at = now + 10.0
-        try:
-            async with asyncio.timeout(self._serving_timeout_seconds):
-                result = await self._serving.project_incremental(
-                    limit=max(1, min(self.buffer_size, 100))
-                )
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            self._next_serving_projection_at = time.monotonic() + 60.0
-            self._emit(
-                "serving_error",
-                error=(
-                    "TimeoutError: serving projection exceeded "
-                    f"{self._serving_timeout_seconds:.0f}s; Deep collection continues"
-                ),
-            )
-            return
-        except Exception as exc:
-            self._next_serving_projection_at = time.monotonic() + 30.0
-            self._emit(
-                "serving_error",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            return
-        if not result.get("ready"):
-            self._next_serving_projection_at = time.monotonic() + 60.0
-            self._emit("serving", **result)
-            return
-        if int(result.get("scanned") or 0) == 0:
-            self._next_serving_projection_at = time.monotonic() + 60.0
-        self._emit("serving", **result)
-
     async def _idle_wait(self) -> None:
         await asyncio.sleep(self.idle_seconds)
-        await self._reconcile_serving()
 
     async def _idle_cycle(self) -> None:
         async with self._idle_lock:
@@ -838,7 +788,6 @@ class DeepCollector:
                     async with asyncio.TaskGroup() as group:
                         group.create_task(self._monitor_lock(lock_conn))
                         group.create_task(self._refill_loop())
-                        group.create_task(self._serving_loop())
                         for worker_no in range(1, self.concurrency + 1):
                             group.create_task(self._worker(worker_no, client))
 
@@ -849,11 +798,6 @@ class DeepCollector:
                         "rate_limit_hits": client.rate_limit_hits,
                         "configured_rate": client.rate_per_second,
                     }
-
-            # Derived output must not make the HTTP/runtime transaction fail,
-            # but a final bounded pass prevents short one-shot/--limit runs
-            # from exiting before the normal serving throttle opens again.
-            await self._reconcile_serving(force=True)
 
         result["cycle"] = self._cycle
         result["queue_source"] = self._queue_source
