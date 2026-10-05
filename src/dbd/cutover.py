@@ -12,13 +12,13 @@ from .contracts.company import (
     normalize as normalize_profile,
     normalize_committee_signs,
     normalize_committees,
-    normalize_transformations,
 )
 from .contracts.financial import (
     normalize_benchmark,
     normalize_statements,
     normalize_submissions,
 )
+from .contracts.strict import normalize_collection
 from .core.exceptions import ContractError
 from .deep.catalog import latest_fiscal_year
 from .storage.mysql.engine import connect as mysql_connection
@@ -468,7 +468,9 @@ def transform_events(
     raw_data = _decode_json(
         row.get("transformations_data"), field="transformations_data"
     )
-    normalized = normalize_transformations(raw_data)
+    normalized = (
+        [] if raw_data is None else normalize_collection("transformations", raw_data)
+    )
     raw_rows = _raw_transformation_rows(raw_data)
     if len(normalized) != len(raw_rows):
         raise ContractError("transformations normalization changed row cardinality")
