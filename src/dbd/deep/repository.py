@@ -561,6 +561,15 @@ class DeepRepository:
                 "runtime_recovered": 0,
             }
 
+        if event is not None:
+            event(
+                "prepare_scope",
+                {
+                    "legacy_scope": "LEGACY",
+                    "legacy_action": "NORMALIZING",
+                },
+            )
+
         async with self.engine.connect() as conn:
             rows_total = int(
                 (await conn.execute(text(f"SELECT COUNT(*) FROM {DEEP_TABLE}"))).scalar_one()
