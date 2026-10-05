@@ -113,6 +113,7 @@ class DeepTerminalEvents:
         self.interactive = bool(isatty and isatty())
         self.started_at = time.monotonic()
         self.last_plain_progress = 0.0
+        self.last_live_update = 0.0
         self.live: Live | None = None
         self.state: dict[str, Any] = {
             "phase": "STARTING",
@@ -157,7 +158,10 @@ class DeepTerminalEvents:
             self.state["last_error"] = payload.get("error")
             self.state["last_endpoint"] = payload.get("endpoint")
         if self.interactive:
-            self._refresh_live()
+            now = time.monotonic()
+            if self.live is None or now - self.last_live_update >= 0.5:
+                self._refresh_live()
+                self.last_live_update = now
         else:
             self._plain_event(name, payload)
 
