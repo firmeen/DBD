@@ -3,7 +3,8 @@ from __future__ import annotations
 import time
 from datetime import date, datetime
 from datetime import time as datetime_time
-from typing import Any, Iterable
+from contextlib import contextmanager
+from typing import Any, Iterable, Iterator
 
 from ...contracts.master_deep import (
     SERVING_COLUMNS,
@@ -11,7 +12,13 @@ from ...contracts.master_deep import (
     mssql_create_table_sql,
     ordered_values,
 )
-from .engine import _pymssql, connection
+from .engine import _pymssql, check_connection, connection, transaction as sqlserver_transaction
+from .schema import (
+    MANAGED_TABLES,
+    TABLE_COLUMNS,
+    ensure_schema as ensure_production_schema,
+    validate_schema as validate_production_schema,
+)
 
 TARGET_TABLE = "dbo.DBD_MASTER_DEEP"
 
@@ -443,3 +450,246 @@ class SqlServerRepository:
                 return
             yield rows
             last_id = int(rows[-1]["company_id"])
+
+
+
+# v0.6 production storage. The legacy SqlServerRepository above intentionally
+# remains for the pre-v0.6 DBD_MASTER_DEEP sync utility only.
+def _production_value(value: Any) -> Any:
+    if isinstance(value, str):
+        cleaned = value.replace("\x00", "")
+        return None if not cleaned.strip() else cleaned
+    return value
+
+
+def _table_write_columns(table_name: str) -> tuple[str, ...]:
+    return tuple(
+        column.name
+        for column in TABLE_COLUMNS[table_name]
+        if not column.identity
+    )
+
+
+def _upsert_many(
+    conn,
+    *,
+    table_name: str,
+    rows: list[dict[str, Any]],
+    key_columns: tuple[str, ...],
+    preserve_on_update: tuple[str, ...] = ("first_seen_generation",),
+) -> int:
+    if not rows:
+        return 0
+
+    columns = _table_write_columns(table_name)
+    update_columns = tuple(
+        column
+        for column in columns
+        if column not in key_columns and column not in preserve_on_update
+    )
+    set_sql = ", ".join(f"[{column}]=%s" for column in update_columns)
+    where_sql = " AND ".join(f"[{column}]=%s" for column in key_columns)
+    insert_columns = ", ".join(f"[{column}]" for column in columns)
+    insert_values = ", ".join(["%s"] * len(columns))
+    statement = f"""
+        UPDATE {table_name} WITH (UPDLOCK, SERIALIZABLE)
+        SET {set_sql}
+        WHERE {where_sql};
+        IF @@ROWCOUNT = 0
+        BEGIN
+            INSERT INTO {table_name} ({insert_columns})
+            VALUES ({insert_values});
+        END
+    """
+
+    parameters = []
+    for row in rows:
+        missing = [column for column in key_columns if row.get(column) is None]
+        if missing:
+            raise SqlServerWriteError(
+                f"{table_name} missing natural-key value(s): {', '.join(missing)}"
+            )
+        parameters.append(
+            tuple(_production_value(row.get(column)) for column in update_columns)
+            + tuple(_production_value(row.get(column)) for column in key_columns)
+            + tuple(_production_value(row.get(column)) for column in columns)
+        )
+
+    cur = conn.cursor()
+    try:
+        cur.executemany(statement, parameters)
+    finally:
+        cur.close()
+    return len(rows)
+
+
+class ProductionSqlServerRepository:
+    """Persistence boundary for the five-table v0.6 production contract.
+
+    Methods never commit. Callers compose company/checkpoint and domain writes
+    inside one transaction through transaction().
+    """
+
+    @contextmanager
+    def transaction(self) -> Iterator[Any]:
+        with sqlserver_transaction() as conn:
+            yield conn
+
+    def ensure_schema(self) -> dict[str, object]:
+        with self.transaction() as conn:
+            return ensure_production_schema(conn)
+
+    def validate_schema(self) -> dict[str, object]:
+        with connection() as conn:
+            return validate_production_schema(conn)
+
+    def check_database(self) -> dict[str, object]:
+        info = check_connection()
+        with connection() as conn:
+            schema = validate_production_schema(conn)
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                        HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'),
+                        HAS_PERMS_BY_NAME('dbo', 'SCHEMA', 'ALTER'),
+                        HAS_PERMS_BY_NAME('dbo.DBD_COMPANY', 'OBJECT', 'SELECT'),
+                        HAS_PERMS_BY_NAME('dbo.DBD_COMPANY', 'OBJECT', 'INSERT'),
+                        HAS_PERMS_BY_NAME('dbo.DBD_COMPANY', 'OBJECT', 'UPDATE')
+                    """
+                )
+                create_table, alter_schema, can_select, can_insert, can_update = cur.fetchone()
+            finally:
+                cur.close()
+        return {
+            **info,
+            "schema": schema["status"],
+            "managed_tables": int(schema["managed_tables"]),
+            "expected_tables": len(MANAGED_TABLES),
+            "create_table": bool(create_table),
+            "alter_schema": bool(alter_schema),
+            "select": bool(can_select),
+            "insert": bool(can_insert),
+            "update": bool(can_update),
+        }
+
+    def max_generation(self, conn=None) -> int | None:
+        if conn is not None:
+            cur = conn.cursor()
+            try:
+                cur.execute("SELECT MAX(dataset_generation) FROM dbo.DBD_COMPANY")
+                value = cur.fetchone()[0]
+                return None if value is None else int(value)
+            finally:
+                cur.close()
+        with connection() as owned:
+            return self.max_generation(owned)
+
+    def upsert_companies(
+        self,
+        conn,
+        rows: list[dict[str, Any]],
+    ) -> dict[tuple[str, str], int]:
+        _upsert_many(
+            conn,
+            table_name="dbo.DBD_COMPANY",
+            rows=rows,
+            key_columns=("juristic_type_code", "registration_no"),
+        )
+        return self.company_ids(
+            conn,
+            [
+                (str(row["juristic_type_code"]), str(row["registration_no"]))
+                for row in rows
+            ],
+        )
+
+    def company_ids(
+        self,
+        conn,
+        identities: Iterable[tuple[str, str]],
+    ) -> dict[tuple[str, str], int]:
+        unique = list(dict.fromkeys((str(t), str(n)) for t, n in identities))
+        result: dict[tuple[str, str], int] = {}
+        chunk_size = 500
+        for offset in range(0, len(unique), chunk_size):
+            chunk = unique[offset : offset + chunk_size]
+            if not chunk:
+                continue
+            values_sql = ",".join(["(%s,%s)"] * len(chunk))
+            params: list[str] = []
+            for jp_type, jp_no in chunk:
+                params.extend((jp_type, jp_no))
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f"""
+                    SELECT c.juristic_type_code,c.registration_no,c.company_id
+                    FROM dbo.DBD_COMPANY c
+                    JOIN (VALUES {values_sql}) v(juristic_type_code,registration_no)
+                      ON v.juristic_type_code=c.juristic_type_code
+                     AND v.registration_no=c.registration_no
+                    """,
+                    tuple(params),
+                )
+                for jp_type, jp_no, company_id in cur.fetchall():
+                    result[(str(jp_type), str(jp_no))] = int(company_id)
+            finally:
+                cur.close()
+        if len(result) != len(unique):
+            missing = [identity for identity in unique if identity not in result]
+            raise SqlServerWriteError(
+                "Unable to resolve SQL Server company_id for "
+                + ", ".join(f"{jp_type}/{jp_no}" for jp_type, jp_no in missing[:10])
+            )
+        return result
+
+    def upsert_relations(self, conn, rows: list[dict[str, Any]]) -> int:
+        return _upsert_many(
+            conn,
+            table_name="dbo.DBD_COMPANY_RELATION",
+            rows=rows,
+            key_columns=("company_id", "relation_type", "source_key"),
+        )
+
+    def upsert_events(self, conn, rows: list[dict[str, Any]]) -> int:
+        return _upsert_many(
+            conn,
+            table_name="dbo.DBD_COMPANY_EVENT",
+            rows=rows,
+            key_columns=("company_id", "event_type", "source_key"),
+        )
+
+    def upsert_financials(self, conn, rows: list[dict[str, Any]]) -> int:
+        return _upsert_many(
+            conn,
+            table_name="dbo.DBD_FINANCIAL",
+            rows=rows,
+            key_columns=("company_id", "fiscal_year"),
+        )
+
+    def upsert_industries(self, conn, rows: list[dict[str, Any]]) -> int:
+        return _upsert_many(
+            conn,
+            table_name="dbo.DBD_INDUSTRY",
+            rows=rows,
+            key_columns=(
+                "submit_objective_code",
+                "fiscal_year",
+                "business_size_code",
+                "location_type",
+                "location_no",
+            ),
+        )
+
+    def count_generation_one(self) -> int:
+        with connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT COUNT(*) FROM dbo.DBD_COMPANY WHERE dataset_generation=1"
+                )
+                return int(cur.fetchone()[0] or 0)
+            finally:
+                cur.close()
