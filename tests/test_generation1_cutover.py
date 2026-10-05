@@ -8,6 +8,7 @@ from decimal import Decimal
 import pytest
 
 import dbd.cutover as cutover
+from dbd.core.exceptions import ContractError
 from dbd.cutover import (
     CutoverSafetyError,
     source_batches,
@@ -19,7 +20,6 @@ from dbd.cutover import (
     transform_industries,
     transform_relations,
 )
-from dbd.core.exceptions import ContractError
 
 
 def _source_row() -> dict:
