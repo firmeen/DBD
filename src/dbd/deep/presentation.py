@@ -26,6 +26,11 @@ def _limit(value: Any) -> str:
     return "∞" if value is None else _number(value)
 
 
+def _duration(seconds: float | int | None) -> str:
+    total = max(0, int(float(seconds or 0)))
+    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
 def _styled(value: Any, style: str | None) -> Text:
     return Text(str(value), style=style)
 
@@ -100,11 +105,25 @@ class DeepTerminalEvents:
         isatty = getattr(self.stream, "isatty", None)
         self.interactive = bool(isatty and isatty())
         self.started_at = time.monotonic()
+        self.step_started_at = self.started_at
+        self.last_commit_at: float | None = None
         self.last_plain_progress = 0.0
         self.last_live_update = 0.0
         self.live: Live | None = None
         self.state: dict[str, Any] = {
             "phase": "STARTING",
+            "prepare_step": "-",
+            "legacy_scope": "CHECKING",
+            "legacy_action": "-",
+            "batch": 0,
+            "batch_rows": 0,
+            "batches_committed": 0,
+            "master_staged": 0,
+            "rows_per_second": 0.0,
+            "rows_total": 0,
+            "rows_scanned": 0,
+            "rows_changed": 0,
+            "runtime_recovered": 0,
             "companies_claimed": 0,
             "companies_finished": 0,
             "companies_in_flight": 0,
@@ -112,22 +131,47 @@ class DeepTerminalEvents:
             "endpoints_done": 0,
             "endpoints_not_available": 0,
             "endpoints_failed": 0,
-            "runtime_recovered": 0,
             "concurrency": "-",
             "rate_per_second": "-",
             "company_limit": None,
             "continuous": False,
             "idle_seconds": None,
-            "rows_total": 0,
-            "rows_scanned": 0,
-            "rows_changed": 0,
-            "master_staged": 0,
         }
 
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
+        now = time.monotonic()
+
         if name == "phase":
             self.state["phase"] = payload.get("phase", self.state["phase"])
-        elif name in {"started", "progress", "prepare_progress", "prepare_stage"}:
+        elif name == "prepare_scope":
+            self.state.update(payload)
+        elif name == "prepare_step":
+            self.state["prepare_step"] = payload.get(
+                "step",
+                self.state["prepare_step"],
+            )
+            self.state["batch"] = payload.get("batch", self.state["batch"])
+            self.state["batch_rows"] = payload.get(
+                "batch_rows",
+                self.state["batch_rows"],
+            )
+            self.step_started_at = now
+        elif name == "prepare_stage":
+            self.state.update(payload)
+            self.state["batches_committed"] = payload.get(
+                "batch",
+                self.state["batches_committed"],
+            )
+            self.state["prepare_step"] = "COMMITTED"
+            self.last_commit_at = now
+            self.step_started_at = now
+        elif name == "prepare_ready":
+            self.state.update(payload)
+            self.state["phase"] = "READY"
+            self.state["prepare_step"] = "READY"
+            self.last_commit_at = now
+            self.step_started_at = now
+        elif name in {"started", "progress", "prepare_progress"}:
             self.state.update(payload)
             if name == "started":
                 self.state["phase"] = "RUNNING"
@@ -138,9 +182,10 @@ class DeepTerminalEvents:
             self.state["last_event"] = name.upper()
             self.state["last_error"] = payload.get("error")
             self.state["last_endpoint"] = payload.get("endpoint")
+        elif name == "heartbeat":
+            pass
 
         if self.interactive:
-            now = time.monotonic()
             if self.live is None or now - self.last_live_update >= 0.5:
                 self._refresh_live()
                 self.last_live_update = now
@@ -150,6 +195,37 @@ class DeepTerminalEvents:
     def _plain_event(self, name: str, payload: Mapping[str, Any]) -> None:
         if name == "phase":
             self.console.print(f"PHASE {payload.get('phase')}")
+            return
+        if name == "prepare_scope":
+            self.console.print(
+                "LEGACY "
+                f"scope={payload.get('legacy_scope')} "
+                f"action={payload.get('legacy_action')}"
+            )
+            return
+        if name == "prepare_step":
+            self.console.print(
+                "PREPARE "
+                f"batch={_number(payload.get('batch'))} "
+                f"step={payload.get('step')} "
+                f"rows={_number(payload.get('batch_rows'))}"
+            )
+            return
+        if name == "prepare_stage":
+            self.console.print(
+                "STAGED "
+                f"batch={_number(payload.get('batch'))} "
+                f"rows={_number(payload.get('batch_rows'))} "
+                f"total={_number(payload.get('master_staged'))} "
+                f"rate={float(payload.get('rows_per_second') or 0):,.0f} rows/s"
+            )
+            return
+        if name == "prepare_ready":
+            self.console.print(
+                "READY "
+                f"staged={_number(payload.get('master_staged'))} "
+                f"batches={_number(payload.get('batch'))}"
+            )
             return
         if name == "idle":
             self.console.print(
@@ -162,10 +238,7 @@ class DeepTerminalEvents:
                 f"{name.upper()} endpoint={endpoint} error={payload.get('error')}"
             )
             return
-        if name == "prepare_stage":
-            self.console.print(
-                f"STAGE master={_number(payload.get('master_staged'))}"
-            )
+        if name == "heartbeat":
             return
 
         now = time.monotonic()
@@ -174,7 +247,7 @@ class DeepTerminalEvents:
         self.last_plain_progress = now
         if name == "prepare_progress":
             self.console.print(
-                "PREPARE "
+                "LEGACY PREPARE "
                 f"{_number(payload.get('rows_scanned'))}/"
                 f"{_number(payload.get('rows_total'))} "
                 f"changed={_number(payload.get('rows_changed'))}"
@@ -203,34 +276,106 @@ class DeepTerminalEvents:
 
     def _render(self):
         if self.command == "prepare":
-            rows_total = int(self.state.get("rows_total") or 0)
-            rows_scanned = int(self.state.get("rows_scanned") or 0)
-            pct = 100.0 if rows_total == 0 else rows_scanned / rows_total * 100.0
-            return Panel(
+            now = time.monotonic()
+            elapsed = now - self.started_at
+            step_elapsed = now - self.step_started_at
+            last_commit_age = (
+                None
+                if self.last_commit_at is None
+                else max(0.0, now - self.last_commit_at)
+            )
+
+            header = Text()
+            header.append(f"DBD DEEP PREPARE v{__version__}", style="bold white")
+            header.append(" • ", style="dim")
+            header.append_text(_state(self.state["phase"]))
+            header.append(" • ", style="dim")
+            header.append(_duration(elapsed), style="dim")
+
+            work = Panel(
                 _grid(
                     [
                         (
                             "Phase",
                             _state(self.state["phase"]),
-                            "Legacy Deep",
-                            _styled(f"{pct:,.2f}%", "bold white"),
+                            "Current step",
+                            _styled(self.state.get("prepare_step", "-"), "cyan"),
                         ),
                         (
-                            "Scanned",
-                            _styled(f"{rows_scanned:,}/{rows_total:,}", "bold white"),
-                            "Changed",
-                            _priority_count(self.state.get("rows_changed"), "magenta"),
+                            "Batch",
+                            _styled(_number(self.state.get("batch")), "bold white"),
+                            "Batch rows",
+                            _styled(_number(self.state.get("batch_rows")), "bold white"),
                         ),
                         (
-                            "Master staged",
-                            _priority_count(self.state.get("master_staged"), "green"),
-                            "Target",
-                            _styled("dbd_company_deep", "dim"),
+                            "Step elapsed",
+                            _styled(_duration(step_elapsed), "bold white"),
+                            "Legacy scope",
+                            _styled(
+                                self.state.get("legacy_scope", "CHECKING"),
+                                "green"
+                                if self.state.get("legacy_scope") == "READY"
+                                else "yellow",
+                            ),
                         ),
                     ]
                 ),
-                title=f"DBD DEEP PREPARE v{__version__}",
+                title="Current Work",
             )
+
+            commit_label = (
+                "-"
+                if last_commit_age is None
+                else f"{last_commit_age:,.1f}s ago"
+            )
+            progress = Panel(
+                _grid(
+                    [
+                        (
+                            "Master staged",
+                            _priority_count(self.state.get("master_staged"), "green"),
+                            "Committed batches",
+                            _priority_count(
+                                self.state.get("batches_committed"),
+                                "blue",
+                            ),
+                        ),
+                        (
+                            "Average",
+                            _styled(
+                                f"{float(self.state.get('rows_per_second') or 0):,.0f} rows/s",
+                                "cyan",
+                            ),
+                            "Last commit",
+                            _styled(commit_label, "dim"),
+                        ),
+                        (
+                            "Legacy scanned",
+                            _styled(
+                                f"{_number(self.state.get('rows_scanned'))}/"
+                                f"{_number(self.state.get('rows_total'))}",
+                                "dim",
+                            ),
+                            "Legacy action",
+                            _styled(self.state.get("legacy_action", "-"), "dim"),
+                        ),
+                    ]
+                ),
+                title="Progress",
+            )
+
+            footer = Text()
+            if self.state["phase"] == "READY":
+                footer.append("READY", style="bold green")
+                footer.append(" • dbd_company_deep ready for collection", style="dim")
+            else:
+                footer.append("ACTIVE", style="cyan")
+                footer.append(
+                    " • dbd_company_master → dbd_company_deep",
+                    style="dim",
+                )
+            footer.append(" • Ctrl+C safe between committed batches", style="dim")
+            return Group(Panel(header, title="DBD DEEP"), work, progress, footer)
 
         elapsed = int(time.monotonic() - self.started_at)
         header = Text()
