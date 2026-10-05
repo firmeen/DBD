@@ -106,7 +106,8 @@ async def _retry(limit: int | None, json_mode: bool) -> int:
 
 def _collector_pool_size(concurrency: int) -> int:
     requested = max(settings.db_pool_size, int(concurrency) + 2)
-    return min(requested, settings.dbd_fleet_db_connections_max)
+    cap = max(settings.db_pool_size, settings.dbd_fleet_db_connections_max)
+    return min(requested, cap)
 
 
 async def _collect(args) -> int:
