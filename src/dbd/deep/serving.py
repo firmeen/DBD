@@ -748,20 +748,8 @@ async def _run(
             )
 
         projector._emit("phase", phase="CONTINUOUS INCREMENTAL")
-        last_result: dict[str, Any] = {
-            "ready": True,
-            "scanned": 0,
-            "inserted": 0,
-            "updated": 0,
-            "unchanged": 0,
-            "missing_identity": 0,
-            "normalization_error": 0,
-            "errors": [],
-        }
         while True:
-            last_result = await projector.project_incremental(
-                limit=args.batch_size,
-            )
+            await projector.project_incremental(limit=args.batch_size)
             await asyncio.sleep(args.interval_seconds)
     finally:
         await projector.close()
