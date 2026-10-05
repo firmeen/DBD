@@ -169,7 +169,6 @@ class DeepTerminalEvents:
             self.state.update(payload)
             self.state["phase"] = "READY"
             self.state["prepare_step"] = "READY"
-            self.last_commit_at = now
             self.step_started_at = now
         elif name in {"started", "progress", "prepare_progress"}:
             self.state.update(payload)
