@@ -113,49 +113,35 @@ class DeepTerminalEvents:
         self.interactive = bool(isatty and isatty())
         self.started_at = time.monotonic()
         self.last_plain_progress = 0.0
+        self.last_live_update = 0.0
         self.live: Live | None = None
         self.state: dict[str, Any] = {
             "phase": "STARTING",
-            "cycle": 0,
-            "queue_source": "IDLE",
             "companies_claimed": 0,
             "companies_finished": 0,
+            "companies_in_flight": 0,
             "companies_retry_wait": 0,
-            "master_promoted": 0,
-            "deep_adopted": 0,
-            "active_refreshed": 0,
             "endpoints_done": 0,
             "endpoints_not_available": 0,
             "endpoints_failed": 0,
             "runtime_recovered": 0,
-            "runtime": 0,
             "concurrency": "-",
             "rate_per_second": "-",
-            "buffer_size": "-",
             "company_limit": None,
             "continuous": False,
             "idle_seconds": None,
             "rows_total": 0,
             "rows_scanned": 0,
             "rows_changed": 0,
-            "serving_ready": None,
-            "serving_scanned": 0,
-            "serving_inserted": 0,
-            "serving_updated": 0,
-            "serving_unchanged": 0,
-            "serving_missing_identity": 0,
-            "serving_normalization_error": 0,
-            "serving_last_error": None,
+            "master_staged": 0,
         }
 
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
         if name == "phase":
             self.state["phase"] = payload.get("phase", self.state["phase"])
-        elif name in {"started", "progress", "cycle", "prepare_progress"}:
+        elif name in {"started", "progress", "prepare_progress", "prepare_stage"}:
             self.state.update(payload)
-            if name == "started" or (
-                name == "cycle" and payload.get("queue_source") != "IDLE"
-            ):
+            if name == "started":
                 self.state["phase"] = "RUNNING"
         elif name == "idle":
             self.state.update(payload)
@@ -164,20 +150,12 @@ class DeepTerminalEvents:
             self.state["last_event"] = name.upper()
             self.state["last_error"] = payload.get("error")
             self.state["last_endpoint"] = payload.get("endpoint")
-        elif name == "serving":
-            self.state["serving_ready"] = bool(payload.get("ready"))
-            self.state["serving_scanned"] = payload.get("scanned", 0)
-            self.state["serving_inserted"] = payload.get("inserted", 0)
-            self.state["serving_updated"] = payload.get("updated", 0)
-            self.state["serving_unchanged"] = payload.get("unchanged", 0)
-            self.state["serving_missing_identity"] = payload.get("missing_identity", 0)
-            self.state["serving_normalization_error"] = payload.get("normalization_error", 0)
-            self.state["serving_last_error"] = None
-        elif name == "serving_error":
-            self.state["serving_last_error"] = payload.get("error")
 
         if self.interactive:
-            self._refresh_live()
+            now = time.monotonic()
+            if self.live is None or now - self.last_live_update >= 0.5:
+                self._refresh_live()
+                self.last_live_update = now
         else:
             self._plain_event(name, payload)
 
@@ -187,15 +165,7 @@ class DeepTerminalEvents:
             return
         if name == "idle":
             self.console.print(
-                f"IDLE cycle={self.state['cycle']} "
-                f"next_check={float(payload.get('idle_seconds') or 0):g}s"
-            )
-            return
-        if name == "cycle":
-            self.console.print(
-                f"CYCLE {self.state['cycle']} "
-                f"source={self.state['queue_source']} "
-                f"runtime={_number(payload.get('runtime'))}"
+                f"IDLE next_check={float(payload.get('idle_seconds') or 0):g}s"
             )
             return
         if name in {"retry_wait", "worker_error"}:
@@ -204,20 +174,9 @@ class DeepTerminalEvents:
                 f"{name.upper()} endpoint={endpoint} error={payload.get('error')}"
             )
             return
-        if name == "serving":
-            ready = "YES" if payload.get("ready") else "NO"
+        if name == "prepare_stage":
             self.console.print(
-                "SERVING "
-                f"ready={ready} "
-                f"scanned={_number(payload.get('scanned'))} "
-                f"inserted={_number(payload.get('inserted'))} "
-                f"updated={_number(payload.get('updated'))} "
-                f"unchanged={_number(payload.get('unchanged'))}"
-            )
-            return
-        if name == "serving_error":
-            self.console.print(
-                f"SERVING DEGRADED error={payload.get('error')} • Deep collection continues"
+                f"STAGE master={_number(payload.get('master_staged'))}"
             )
             return
 
@@ -237,6 +196,7 @@ class DeepTerminalEvents:
                 "DEEP "
                 f"claimed={_number(payload.get('companies_claimed'))} "
                 f"finished={_number(payload.get('companies_finished'))} "
+                f"in_flight={_number(payload.get('companies_in_flight'))} "
                 f"retry={_number(payload.get('companies_retry_wait'))}"
             )
 
@@ -251,7 +211,7 @@ class DeepTerminalEvents:
             )
             self.live.start()
         else:
-            self.live.update(renderable, refresh=True)
+            self.live.update(renderable, refresh=False)
 
     def _render(self):
         if self.command == "prepare":
@@ -264,7 +224,7 @@ class DeepTerminalEvents:
                         (
                             "Phase",
                             _state(self.state["phase"]),
-                            "Progress",
+                            "Legacy Deep",
                             _styled(f"{pct:,.2f}%", "bold white"),
                         ),
                         (
@@ -272,6 +232,12 @@ class DeepTerminalEvents:
                             _styled(f"{rows_scanned:,}/{rows_total:,}", "bold white"),
                             "Changed",
                             _priority_count(self.state.get("rows_changed"), "magenta"),
+                        ),
+                        (
+                            "Master staged",
+                            _priority_count(self.state.get("master_staged"), "green"),
+                            "Target",
+                            _styled("dbd_company_deep", "dim"),
                         ),
                     ]
                 ),
@@ -288,8 +254,7 @@ class DeepTerminalEvents:
             f"{elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}",
             style="dim",
         )
-        header.append(" • Cycle ", style="dim")
-        header.append(str(self.state["cycle"]), style="bold white")
+
         collector = Panel(
             _grid(
                 [
@@ -300,10 +265,13 @@ class DeepTerminalEvents:
                         _styled(f"{self.state.get('rate_per_second', '-')} req/s", "cyan"),
                     ),
                     (
-                        "Buffer",
-                        _styled(self.state.get("buffer_size", "-"), "cyan"),
                         "Limit",
                         _styled(_limit(self.state.get("company_limit")), "bold white"),
+                        "Mode",
+                        _styled(
+                            "CONTINUOUS" if self.state.get("continuous") else "DRAIN",
+                            "cyan",
+                        ),
                     ),
                     (
                         "Claimed",
@@ -312,30 +280,19 @@ class DeepTerminalEvents:
                         _priority_count(self.state.get("companies_finished"), "green"),
                     ),
                     (
-                        "Source",
-                        _queue_source(self.state.get("queue_source", "IDLE")),
-                        "Runtime",
-                        _priority_count(self.state.get("runtime"), "blue"),
+                        "In flight",
+                        _priority_count(self.state.get("companies_in_flight"), "cyan"),
+                        "Retry wait",
+                        _priority_count(self.state.get("companies_retry_wait"), "yellow"),
                     ),
                 ]
             ),
             title="Collector",
         )
-        runtime = Panel(
+
+        session = Panel(
             _grid(
                 [
-                    (
-                        "Promoted",
-                        _priority_count(self.state.get("master_promoted"), "blue"),
-                        "Adopted",
-                        _priority_count(self.state.get("deep_adopted"), "blue"),
-                    ),
-                    (
-                        "ACTIVE refresh",
-                        _priority_count(self.state.get("active_refreshed"), "magenta"),
-                        "Retry wait",
-                        _priority_count(self.state.get("companies_retry_wait"), "yellow"),
-                    ),
                     (
                         "Endpoint done",
                         _priority_count(self.state.get("endpoints_done"), "green"),
@@ -352,58 +309,16 @@ class DeepTerminalEvents:
             ),
             title="Session",
         )
-        serving_ready = self.state.get("serving_ready")
-        if self.state.get("serving_last_error"):
-            serving_status = "DEGRADED"
-        elif serving_ready is True:
-            serving_status = "READY"
-        elif serving_ready is False:
-            serving_status = "NOT INITIALIZED"
-        else:
-            serving_status = "WAITING"
-        serving = Panel(
-            _grid(
-                [
-                    (
-                        "Status",
-                        _state(serving_status),
-                        "Target",
-                        _styled("dbd_master_deep", "dim"),
-                    ),
-                    (
-                        "Scanned",
-                        _styled(_number(self.state.get("serving_scanned")), "bold white"),
-                        "Inserted",
-                        _priority_count(self.state.get("serving_inserted"), "green"),
-                    ),
-                    (
-                        "Updated",
-                        _priority_count(self.state.get("serving_updated"), "magenta"),
-                        "Unchanged",
-                        _styled(_number(self.state.get("serving_unchanged")), "dim"),
-                    ),
-                    (
-                        "Missing identity",
-                        _priority_count(self.state.get("serving_missing_identity"), "bold red"),
-                        "Normalize errors",
-                        _priority_count(self.state.get("serving_normalization_error"), "yellow"),
-                    ),
-                ]
-            ),
-            title="Serving Projection",
-        )
+
         footer = Text()
         if self.state["phase"] == "IDLE":
             footer.append("IDLE", style="dim")
-            footer.append(" • waiting for work", style="dim")
+            footer.append(" • waiting for prepared Deep work", style="dim")
         else:
             footer.append("ACTIVE", style="cyan")
-            footer.append(" • ", style="dim")
-            footer.append_text(_queue_source(self.state.get("queue_source", "RUNTIME")))
+            footer.append(" • direct dbd_company_deep claim", style="dim")
         footer.append(" • Ctrl+C graceful shutdown", style="dim")
-        if self.state.get("serving_last_error"):
-            footer.append(" • SERVING DEGRADED", style="bold yellow")
-        return Group(Panel(header, title="DBD DEEP"), collector, runtime, serving, footer)
+        return Group(Panel(header, title="DBD DEEP"), collector, session, footer)
 
     def close(self) -> None:
         if self.live is not None:
@@ -516,6 +431,12 @@ class DeepPresenter:
                             _styled(_number(result["rows_scanned"]), "bold white"),
                             "Rows changed",
                             _priority_count(result["rows_changed"], "magenta"),
+                        ),
+                        (
+                            "Master staged",
+                            _priority_count(result.get("master_staged"), "green"),
+                            "Master waiting",
+                            _priority_count(summary["master"], "yellow"),
                         ),
                         (
                             "Recovered",
