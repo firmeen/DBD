@@ -501,6 +501,7 @@ def _upsert_many(
     """
 
     parameters = []
+    unique_rows: dict[tuple[Any, ...], tuple[Any, ...]] = {}
     for row in rows:
         key_values = tuple(
             _production_value(row.get(column)) for column in key_columns
@@ -514,10 +515,22 @@ def _upsert_many(
             raise SqlServerWriteError(
                 f"{table_name} missing natural-key value(s): {', '.join(missing)}"
             )
+        all_values = tuple(
+            _production_value(row.get(column)) for column in columns
+        )
+        previous = unique_rows.get(key_values)
+        if previous is not None:
+            if previous != all_values:
+                raise SqlServerWriteError(
+                    f"{table_name} contains conflicting rows for natural key "
+                    + "/".join(str(value) for value in key_values)
+                )
+            continue
+        unique_rows[key_values] = all_values
         parameters.append(
             tuple(_production_value(row.get(column)) for column in update_columns)
             + key_values
-            + tuple(_production_value(row.get(column)) for column in columns)
+            + all_values
         )
 
     cur = conn.cursor()
@@ -525,7 +538,7 @@ def _upsert_many(
         cur.executemany(statement, parameters)
     finally:
         cur.close()
-    return len(rows)
+    return len(parameters)
 
 
 class ProductionSqlServerRepository:
