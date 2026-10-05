@@ -1,4 +1,6 @@
 from decimal import Decimal
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -145,3 +147,103 @@ def test_deep_payload_preserves_exact_json_numeric_type():
 
     assert encoded == '{"amount":12345678901234567890.123456789}'
     assert '"12345678901234567890.123456789"' not in encoded
+
+
+class _RollingRefillRepo:
+    def __init__(self, runtime_sizes: list[int]) -> None:
+        self.engine = object()
+        self.runtime_size = AsyncMock(side_effect=runtime_sizes)
+        self.refill = AsyncMock(
+            return_value={
+                "runtime": 32,
+                "adopted": 0,
+                "promoted": 16,
+                "refreshed": 0,
+                "refresh_scanned": False,
+            }
+        )
+
+
+@pytest.mark.asyncio
+async def test_rolling_prefetch_refills_at_low_water_without_running_serving() -> None:
+    repo = _RollingRefillRepo([17, 16])
+    collector = DeepCollector(
+        repository=repo,
+        concurrency=8,
+        rate_per_second=15,
+        http_retries=3,
+        buffer_size=32,
+        continuous=True,
+    )
+    collector._reconcile_serving = AsyncMock()
+
+    above_watermark = await collector._refill(prefetch=True)
+
+    assert collector._refill_low_watermark == 16
+    assert above_watermark["runtime"] == 17
+    repo.refill.assert_not_awaited()
+    collector._reconcile_serving.assert_not_awaited()
+
+    at_watermark = await collector._refill(prefetch=True)
+
+    assert at_watermark["runtime"] == 32
+    repo.refill.assert_awaited_once_with(32, include_refresh=True)
+    assert collector.stats.master_promoted == 16
+    assert collector._cycle == 1
+    collector._reconcile_serving.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_refill_loop_coalesces_completion_signal_into_prefetch() -> None:
+    repo = SimpleNamespace(engine=object())
+    collector = DeepCollector(
+        repository=repo,
+        concurrency=8,
+        rate_per_second=15,
+        http_retries=3,
+        buffer_size=32,
+        continuous=True,
+    )
+
+    async def refill_once(*, prefetch: bool = False):
+        assert prefetch is True
+        collector._stop.set()
+        return {
+            "runtime": 32,
+            "adopted": 0,
+            "promoted": 0,
+            "refreshed": 0,
+            "refresh_scanned": False,
+        }
+
+    collector._refill = AsyncMock(side_effect=refill_once)
+    collector._request_prefetch()
+    collector._request_prefetch()
+
+    await collector._refill_loop()
+
+    collector._refill.assert_awaited_once_with(prefetch=True)
+
+
+@pytest.mark.asyncio
+async def test_serving_loop_runs_independently_of_refill_lock() -> None:
+    repo = SimpleNamespace(engine=object())
+    collector = DeepCollector(
+        repository=repo,
+        concurrency=8,
+        rate_per_second=15,
+        http_retries=3,
+        buffer_size=32,
+        continuous=True,
+    )
+
+    async def project_once(*, force: bool = False):
+        assert force is False
+        assert not collector._refill_lock.locked()
+        collector._stop.set()
+
+    collector._reconcile_serving = AsyncMock(side_effect=project_once)
+
+    await collector._serving_loop()
+
+    collector._reconcile_serving.assert_awaited_once_with()
