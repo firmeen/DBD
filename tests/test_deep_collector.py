@@ -175,15 +175,11 @@ async def test_rolling_prefetch_refills_at_low_water_without_running_serving() -
         buffer_size=32,
         continuous=True,
     )
-    collector._reconcile_serving = AsyncMock()
-
     above_watermark = await collector._refill(prefetch=True)
 
     assert collector._refill_low_watermark == 16
     assert above_watermark["runtime"] == 17
     repo.refill.assert_not_awaited()
-    collector._reconcile_serving.assert_not_awaited()
-
     at_watermark = await collector._refill(prefetch=True)
 
     assert at_watermark["runtime"] == 32
@@ -225,8 +221,7 @@ async def test_refill_loop_coalesces_completion_signal_into_prefetch() -> None:
     collector._refill.assert_awaited_once_with(prefetch=True)
 
 
-@pytest.mark.asyncio
-async def test_serving_loop_runs_independently_of_refill_lock() -> None:
+def test_collector_hot_path_has_no_serving_projector() -> None:
     repo = SimpleNamespace(engine=object())
     collector = DeepCollector(
         repository=repo,
@@ -237,13 +232,6 @@ async def test_serving_loop_runs_independently_of_refill_lock() -> None:
         continuous=True,
     )
 
-    async def project_once(*, force: bool = False):
-        assert force is False
-        assert not collector._refill_lock.locked()
-        collector._stop.set()
-
-    collector._reconcile_serving = AsyncMock(side_effect=project_once)
-
-    await collector._serving_loop()
-
-    collector._reconcile_serving.assert_awaited_once_with()
+    assert not hasattr(collector, "_serving")
+    assert not hasattr(collector, "_serving_loop")
+    assert not hasattr(collector, "_reconcile_serving")
