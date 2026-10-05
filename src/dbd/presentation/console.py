@@ -146,6 +146,27 @@ class TerminalPresenter:
         if self.json_mode:
             self.json(dict(info))
             return
+        if "server" in info:
+            self.key_values(
+                "DBD · DATABASE CONNECTION",
+                (
+                    ("status", "CONNECTED"),
+                    ("backend", "SQL SERVER"),
+                    ("server", info.get("server", "--")),
+                    ("database", info.get("database", "--")),
+                    ("login", info.get("login", "--")),
+                    (
+                        "schema",
+                        f"{info.get('schema', '--')} "
+                        f"{_int(info.get('managed_tables'))}/{_int(info.get('expected_tables'))}",
+                    ),
+                    ("select", _bool(info.get("select"))),
+                    ("insert", _bool(info.get("insert"))),
+                    ("update", _bool(info.get("update"))),
+                    ("version", info.get("version", "--")),
+                ),
+            )
+            return
         self.key_values(
             "DBD · DATABASE CONNECTION",
             (
