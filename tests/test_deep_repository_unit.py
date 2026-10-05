@@ -147,3 +147,21 @@ async def test_direct_claim_creates_exactly_one_running_lease_from_deep() -> Non
     assert "NOT EXISTS" in direct_select
     assert "INSERT INTO dbd_deep_runtime" in lease_insert
     assert "'RUNNING'" in lease_insert
+
+
+@pytest.mark.asyncio
+async def test_repository_forwards_explicit_pool_size(monkeypatch) -> None:
+    engine = SimpleNamespace(dispose=AsyncMock())
+    calls: list[int | None] = []
+
+    def fake_engine(*, pool_size: int | None = None):
+        calls.append(pool_size)
+        return engine
+
+    monkeypatch.setattr("dbd.deep.repository.create_deep_engine", fake_engine)
+
+    repo = DeepRepository(pool_size=10)
+    assert calls == [10]
+
+    await repo.close()
+    engine.dispose.assert_awaited_once()
