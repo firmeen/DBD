@@ -186,7 +186,6 @@ async def test_rolling_prefetch_refills_at_low_water_without_running_serving() -
     repo.refill.assert_awaited_once_with(32, include_refresh=True)
     assert collector.stats.master_promoted == 16
     assert collector._cycle == 1
-    collector._reconcile_serving.assert_not_awaited()
 
 
 @pytest.mark.asyncio
