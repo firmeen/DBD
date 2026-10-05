@@ -457,6 +457,8 @@ def _production_value(value: Any) -> Any:
     if isinstance(value, str):
         cleaned = value.replace("\x00", "")
         return None if not cleaned.strip() else cleaned
+    if isinstance(value, date) and not isinstance(value, datetime):
+        return datetime.combine(value, datetime_time.min)
     return value
 
 
@@ -772,7 +774,7 @@ class ProductionSqlServerRepository:
                     continue
 
                 industry_id, existing_updated, existing_payload = existing
-                incoming_updated = row.get("source_updated_at")
+                incoming_updated = _production_value(row.get("source_updated_at"))
                 incoming_payload = _production_value(row.get("payload"))
                 if existing_payload != incoming_payload:
                     if reject_conflicts:
