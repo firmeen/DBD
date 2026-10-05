@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 from decimal import Decimal
 from io import StringIO
 
@@ -8,7 +11,7 @@ import pytest
 
 from dbd.contracts.master_deep import serving_row_hash
 from dbd.deep.catalog import ACTIVE_ENDPOINT_MASK, BASE_REQUIRED_MASK
-from dbd.deep.serving import ServingProjectionError, flatten_complete_row
+from dbd.deep.serving import ServingProjectionError, _run, flatten_complete_row
 from dbd.pipelines.sqlserver_sync import classify_batch
 from dbd.presentation.master_deep import MasterDeepTerminal
 
@@ -249,3 +252,43 @@ def test_master_deep_terminal_error_render_includes_exception() -> None:
     output = stream.getvalue()
     assert "NoSuchColumnError: column_name" in output
     assert "Error" in output
+
+
+@pytest.mark.asyncio
+async def test_continuous_serving_uses_independent_bounded_cycles(monkeypatch) -> None:
+    projector = SimpleNamespace(
+        _emit=lambda *args, **kwargs: None,
+        table_exists=AsyncMock(return_value=True),
+        validate_schema=AsyncMock(),
+        project_incremental=AsyncMock(return_value={
+            "ready": True,
+            "scanned": 32,
+            "inserted": 32,
+            "updated": 0,
+            "unchanged": 0,
+            "missing_identity": 0,
+            "normalization_error": 0,
+            "errors": [],
+        }),
+        close=AsyncMock(),
+    )
+    monkeypatch.setattr("dbd.deep.serving.ServingProjector", lambda event=None: projector)
+
+    async def stop_after_cycle(_seconds: float) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr("dbd.deep.serving.asyncio.sleep", stop_after_cycle)
+    args = SimpleNamespace(
+        ensure=False,
+        backfill=False,
+        continuous=True,
+        batch_size=32,
+        limit=None,
+        interval_seconds=10.0,
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        await _run(args)
+
+    projector.project_incremental.assert_awaited_once_with(limit=32)
+    projector.close.assert_awaited_once()
