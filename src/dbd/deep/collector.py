@@ -175,6 +175,11 @@ class DeepCollector:
         self._stats_lock = asyncio.Lock()
         self._claim_lock = asyncio.Lock()
         self._refill_lock = asyncio.Lock()
+        self._refill_requested = asyncio.Event()
+        self._refill_low_watermark = max(
+            self.concurrency,
+            self.buffer_size // 2,
+        )
         self._idle_lock = asyncio.Lock()
         self._idle_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
@@ -229,7 +234,7 @@ class DeepCollector:
             await self._bump(companies_claimed=1)
             return row
 
-    async def _refill(self) -> dict[str, int]:
+    async def _refill(self, *, prefetch: bool = False) -> dict[str, int]:
         async with self._refill_lock:
             # When many workers observe an empty queue together, only the
             # first worker in an idle window performs the expensive
@@ -258,6 +263,21 @@ class DeepCollector:
                 # Do not promote/reopen more companies than a --limit run can
                 # actually process; this keeps canary runs minimally invasive.
                 target = min(target, remaining)
+
+            if prefetch:
+                current = await self.repo.runtime_size()
+                threshold = min(
+                    self._refill_low_watermark,
+                    max(0, target - 1),
+                )
+                if current > threshold:
+                    return {
+                        "runtime": current,
+                        "adopted": 0,
+                        "promoted": 0,
+                        "refreshed": 0,
+                        "refresh_scanned": False,
+                    }
 
             now = time.monotonic()
             include_refresh = now >= self._next_refresh_scan_at
@@ -302,8 +322,31 @@ class DeepCollector:
                 queue_source=self._queue_source,
                 **result,
             )
-            await self._reconcile_serving()
             return result
+
+    def _request_prefetch(self) -> None:
+        if not self._stop.is_set():
+            self._refill_requested.set()
+
+    async def _refill_loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._refill_requested.wait(),
+                    timeout=1.0,
+                )
+            except TimeoutError:
+                continue
+            self._refill_requested.clear()
+            await self._refill(prefetch=True)
+
+    async def _serving_loop(self) -> None:
+        while not self._stop.is_set():
+            await self._reconcile_serving()
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
+            except TimeoutError:
+                pass
 
     async def _reconcile_serving(self, *, force: bool = False) -> None:
         now = time.monotonic()
@@ -699,6 +742,7 @@ class DeepCollector:
 
             try:
                 await self._process_company(company, client)
+                self._request_prefetch()
             except (DbdAuthError, DbdForbiddenError):
                 raise
             except asyncio.CancelledError:
@@ -723,6 +767,7 @@ class DeepCollector:
                     jp_no=company["jp_no"],
                     error=f"{type(exc).__name__}: {exc}",
                 )
+                self._request_prefetch()
 
     async def _monitor_lock(self, lock_conn) -> None:
         while not self._stop.is_set():
@@ -792,6 +837,8 @@ class DeepCollector:
 
                     async with asyncio.TaskGroup() as group:
                         group.create_task(self._monitor_lock(lock_conn))
+                        group.create_task(self._refill_loop())
+                        group.create_task(self._serving_loop())
                         for worker_no in range(1, self.concurrency + 1):
                             group.create_task(self._worker(worker_no, client))
 
