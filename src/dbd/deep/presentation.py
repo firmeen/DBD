@@ -26,6 +26,11 @@ def _limit(value: Any) -> str:
     return "∞" if value is None else _number(value)
 
 
+def _duration(seconds: float | int | None) -> str:
+    total = max(0, int(float(seconds or 0)))
+    return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
+
+
 def _styled(value: Any, style: str | None) -> Text:
     return Text(str(value), style=style)
 
@@ -54,7 +59,7 @@ def _state(value: Any) -> Text:
             "PREPARE",
             "AUTH",
             "RECOVER",
-            "REFILL",
+            "STAGE MASTER",
         )
     ):
         style = "cyan"
@@ -70,18 +75,6 @@ def _priority_count(value: Any, positive_style: str, *, zero_style: str = "dim")
     except (TypeError, ValueError):
         active = bool(value)
     return _styled(label, positive_style if active else zero_style)
-
-
-def _queue_source(value: Any) -> Text:
-    label = str(value or "IDLE")
-    normalized = label.upper()
-    if normalized == "IDLE":
-        return _styled(label, "dim")
-    if "REFRESH" in normalized:
-        return _styled(label, "magenta")
-    if "MASTER" in normalized or "NEW" in normalized or "PROMOT" in normalized:
-        return _styled(label, "blue")
-    return _styled(label, "cyan")
 
 
 def _grid(rows: list[tuple[str, Any, str, Any]]) -> Table:
@@ -112,50 +105,76 @@ class DeepTerminalEvents:
         isatty = getattr(self.stream, "isatty", None)
         self.interactive = bool(isatty and isatty())
         self.started_at = time.monotonic()
+        self.step_started_at = self.started_at
+        self.last_commit_at: float | None = None
         self.last_plain_progress = 0.0
+        self.last_live_update = 0.0
         self.live: Live | None = None
         self.state: dict[str, Any] = {
             "phase": "STARTING",
-            "cycle": 0,
-            "queue_source": "IDLE",
-            "companies_claimed": 0,
-            "companies_finished": 0,
-            "companies_retry_wait": 0,
-            "master_promoted": 0,
-            "deep_adopted": 0,
-            "active_refreshed": 0,
-            "endpoints_done": 0,
-            "endpoints_not_available": 0,
-            "endpoints_failed": 0,
-            "runtime_recovered": 0,
-            "runtime": 0,
-            "concurrency": "-",
-            "rate_per_second": "-",
-            "buffer_size": "-",
-            "company_limit": None,
-            "continuous": False,
-            "idle_seconds": None,
+            "prepare_step": "-",
+            "legacy_scope": "CHECKING",
+            "legacy_action": "-",
+            "batch": 0,
+            "batch_rows": 0,
+            "batches_committed": 0,
+            "master_staged": 0,
+            "rows_per_second": 0.0,
+            "batch_elapsed_seconds": 0.0,
+            "batch_rows_per_second": 0.0,
             "rows_total": 0,
             "rows_scanned": 0,
             "rows_changed": 0,
-            "serving_ready": None,
-            "serving_scanned": 0,
-            "serving_inserted": 0,
-            "serving_updated": 0,
-            "serving_unchanged": 0,
-            "serving_missing_identity": 0,
-            "serving_normalization_error": 0,
-            "serving_last_error": None,
+            "runtime_recovered": 0,
+            "companies_claimed": 0,
+            "companies_finished": 0,
+            "companies_in_flight": 0,
+            "companies_retry_wait": 0,
+            "endpoints_done": 0,
+            "endpoints_not_available": 0,
+            "endpoints_failed": 0,
+            "concurrency": "-",
+            "rate_per_second": "-",
+            "company_limit": None,
+            "continuous": False,
+            "idle_seconds": None,
         }
 
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
+        now = time.monotonic()
+
         if name == "phase":
             self.state["phase"] = payload.get("phase", self.state["phase"])
-        elif name in {"started", "progress", "cycle", "prepare_progress"}:
+        elif name == "prepare_scope":
             self.state.update(payload)
-            if name == "started" or (
-                name == "cycle" and payload.get("queue_source") != "IDLE"
-            ):
+        elif name == "prepare_step":
+            self.state["prepare_step"] = payload.get(
+                "step",
+                self.state["prepare_step"],
+            )
+            self.state["batch"] = payload.get("batch", self.state["batch"])
+            self.state["batch_rows"] = payload.get(
+                "batch_rows",
+                self.state["batch_rows"],
+            )
+            self.step_started_at = now
+        elif name == "prepare_stage":
+            self.state.update(payload)
+            self.state["batches_committed"] = payload.get(
+                "batch",
+                self.state["batches_committed"],
+            )
+            self.state["prepare_step"] = "COMMITTED"
+            self.last_commit_at = now
+            self.step_started_at = now
+        elif name == "prepare_ready":
+            self.state.update(payload)
+            self.state["phase"] = "READY"
+            self.state["prepare_step"] = "READY"
+            self.step_started_at = now
+        elif name in {"started", "progress", "prepare_progress"}:
+            self.state.update(payload)
+            if name == "started":
                 self.state["phase"] = "RUNNING"
         elif name == "idle":
             self.state.update(payload)
@@ -164,20 +183,13 @@ class DeepTerminalEvents:
             self.state["last_event"] = name.upper()
             self.state["last_error"] = payload.get("error")
             self.state["last_endpoint"] = payload.get("endpoint")
-        elif name == "serving":
-            self.state["serving_ready"] = bool(payload.get("ready"))
-            self.state["serving_scanned"] = payload.get("scanned", 0)
-            self.state["serving_inserted"] = payload.get("inserted", 0)
-            self.state["serving_updated"] = payload.get("updated", 0)
-            self.state["serving_unchanged"] = payload.get("unchanged", 0)
-            self.state["serving_missing_identity"] = payload.get("missing_identity", 0)
-            self.state["serving_normalization_error"] = payload.get("normalization_error", 0)
-            self.state["serving_last_error"] = None
-        elif name == "serving_error":
-            self.state["serving_last_error"] = payload.get("error")
+        elif name == "heartbeat":
+            pass
 
         if self.interactive:
-            self._refresh_live()
+            if self.live is None or now - self.last_live_update >= 0.5:
+                self._refresh_live()
+                self.last_live_update = now
         else:
             self._plain_event(name, payload)
 
@@ -185,39 +197,34 @@ class DeepTerminalEvents:
         if name == "phase":
             self.console.print(f"PHASE {payload.get('phase')}")
             return
-        if name == "idle":
+        if name == "prepare_stage":
             self.console.print(
-                f"IDLE cycle={self.state['cycle']} "
-                f"next_check={float(payload.get('idle_seconds') or 0):g}s"
+                "STAGED "
+                f"batch={_number(payload.get('batch'))} "
+                f"rows={_number(payload.get('batch_rows'))} "
+                f"total={_number(payload.get('master_staged'))} "
+                f"last={float(payload.get('batch_rows_per_second') or 0):,.0f} rows/s "
+                f"avg={float(payload.get('rows_per_second') or 0):,.0f} rows/s"
             )
             return
-        if name == "cycle":
+        if name == "prepare_ready":
             self.console.print(
-                f"CYCLE {self.state['cycle']} "
-                f"source={self.state['queue_source']} "
-                f"runtime={_number(payload.get('runtime'))}"
+                "READY "
+                f"staged={_number(payload.get('master_staged'))} "
+                f"batches={_number(payload.get('batch'))}"
+            )
+            return
+        if name in {"prepare_scope", "prepare_step", "heartbeat"}:
+            return
+        if name == "idle":
+            self.console.print(
+                f"IDLE next_check={float(payload.get('idle_seconds') or 0):g}s"
             )
             return
         if name in {"retry_wait", "worker_error"}:
             endpoint = payload.get("endpoint") or "-"
             self.console.print(
                 f"{name.upper()} endpoint={endpoint} error={payload.get('error')}"
-            )
-            return
-        if name == "serving":
-            ready = "YES" if payload.get("ready") else "NO"
-            self.console.print(
-                "SERVING "
-                f"ready={ready} "
-                f"scanned={_number(payload.get('scanned'))} "
-                f"inserted={_number(payload.get('inserted'))} "
-                f"updated={_number(payload.get('updated'))} "
-                f"unchanged={_number(payload.get('unchanged'))}"
-            )
-            return
-        if name == "serving_error":
-            self.console.print(
-                f"SERVING DEGRADED error={payload.get('error')} • Deep collection continues"
             )
             return
 
@@ -227,7 +234,7 @@ class DeepTerminalEvents:
         self.last_plain_progress = now
         if name == "prepare_progress":
             self.console.print(
-                "PREPARE "
+                "LEGACY "
                 f"{_number(payload.get('rows_scanned'))}/"
                 f"{_number(payload.get('rows_total'))} "
                 f"changed={_number(payload.get('rows_changed'))}"
@@ -237,6 +244,7 @@ class DeepTerminalEvents:
                 "DEEP "
                 f"claimed={_number(payload.get('companies_claimed'))} "
                 f"finished={_number(payload.get('companies_finished'))} "
+                f"in_flight={_number(payload.get('companies_in_flight'))} "
                 f"retry={_number(payload.get('companies_retry_wait'))}"
             )
 
@@ -251,27 +259,50 @@ class DeepTerminalEvents:
             )
             self.live.start()
         else:
-            self.live.update(renderable, refresh=True)
+            self.live.update(renderable, refresh=False)
 
     def _render(self):
         if self.command == "prepare":
-            rows_total = int(self.state.get("rows_total") or 0)
-            rows_scanned = int(self.state.get("rows_scanned") or 0)
-            pct = 100.0 if rows_total == 0 else rows_scanned / rows_total * 100.0
+            now = time.monotonic()
+            elapsed = now - self.started_at
+            step_elapsed = now - self.step_started_at
+            batch = int(self.state.get("batch") or 0)
+            batch_rows = int(self.state.get("batch_rows") or 0)
+            staged = int(self.state.get("master_staged") or 0)
+            last_rate = float(
+                self.state.get("batch_rows_per_second") or 0
+            )
+            avg_rate = float(self.state.get("rows_per_second") or 0)
+
             return Panel(
                 _grid(
                     [
                         (
                             "Phase",
                             _state(self.state["phase"]),
-                            "Progress",
-                            _styled(f"{pct:,.2f}%", "bold white"),
+                            "Elapsed",
+                            _styled(_duration(elapsed), "dim"),
                         ),
                         (
-                            "Scanned",
-                            _styled(f"{rows_scanned:,}/{rows_total:,}", "bold white"),
-                            "Changed",
-                            _priority_count(self.state.get("rows_changed"), "magenta"),
+                            "Step",
+                            _styled(self.state.get("prepare_step", "-"), "cyan"),
+                            "Step time",
+                            _styled(f"{step_elapsed:,.1f}s", "bold white"),
+                        ),
+                        (
+                            "Batch",
+                            _styled(
+                                f"{batch:,} × {batch_rows:,}",
+                                "bold white",
+                            ),
+                            "Staged",
+                            _priority_count(staged, "green"),
+                        ),
+                        (
+                            "Last",
+                            _styled(f"{last_rate:,.0f} rows/s", "cyan"),
+                            "Average",
+                            _styled(f"{avg_rate:,.0f} rows/s", "cyan"),
                         ),
                     ]
                 ),
@@ -288,8 +319,7 @@ class DeepTerminalEvents:
             f"{elapsed // 3600:02d}:{elapsed % 3600 // 60:02d}:{elapsed % 60:02d}",
             style="dim",
         )
-        header.append(" • Cycle ", style="dim")
-        header.append(str(self.state["cycle"]), style="bold white")
+
         collector = Panel(
             _grid(
                 [
@@ -300,10 +330,13 @@ class DeepTerminalEvents:
                         _styled(f"{self.state.get('rate_per_second', '-')} req/s", "cyan"),
                     ),
                     (
-                        "Buffer",
-                        _styled(self.state.get("buffer_size", "-"), "cyan"),
                         "Limit",
                         _styled(_limit(self.state.get("company_limit")), "bold white"),
+                        "Mode",
+                        _styled(
+                            "CONTINUOUS" if self.state.get("continuous") else "DRAIN",
+                            "cyan",
+                        ),
                     ),
                     (
                         "Claimed",
@@ -312,30 +345,19 @@ class DeepTerminalEvents:
                         _priority_count(self.state.get("companies_finished"), "green"),
                     ),
                     (
-                        "Source",
-                        _queue_source(self.state.get("queue_source", "IDLE")),
-                        "Runtime",
-                        _priority_count(self.state.get("runtime"), "blue"),
+                        "In flight",
+                        _priority_count(self.state.get("companies_in_flight"), "cyan"),
+                        "Retry wait",
+                        _priority_count(self.state.get("companies_retry_wait"), "yellow"),
                     ),
                 ]
             ),
             title="Collector",
         )
-        runtime = Panel(
+
+        session = Panel(
             _grid(
                 [
-                    (
-                        "Promoted",
-                        _priority_count(self.state.get("master_promoted"), "blue"),
-                        "Adopted",
-                        _priority_count(self.state.get("deep_adopted"), "blue"),
-                    ),
-                    (
-                        "ACTIVE refresh",
-                        _priority_count(self.state.get("active_refreshed"), "magenta"),
-                        "Retry wait",
-                        _priority_count(self.state.get("companies_retry_wait"), "yellow"),
-                    ),
                     (
                         "Endpoint done",
                         _priority_count(self.state.get("endpoints_done"), "green"),
@@ -352,58 +374,16 @@ class DeepTerminalEvents:
             ),
             title="Session",
         )
-        serving_ready = self.state.get("serving_ready")
-        if self.state.get("serving_last_error"):
-            serving_status = "DEGRADED"
-        elif serving_ready is True:
-            serving_status = "READY"
-        elif serving_ready is False:
-            serving_status = "NOT INITIALIZED"
-        else:
-            serving_status = "WAITING"
-        serving = Panel(
-            _grid(
-                [
-                    (
-                        "Status",
-                        _state(serving_status),
-                        "Target",
-                        _styled("dbd_master_deep", "dim"),
-                    ),
-                    (
-                        "Scanned",
-                        _styled(_number(self.state.get("serving_scanned")), "bold white"),
-                        "Inserted",
-                        _priority_count(self.state.get("serving_inserted"), "green"),
-                    ),
-                    (
-                        "Updated",
-                        _priority_count(self.state.get("serving_updated"), "magenta"),
-                        "Unchanged",
-                        _styled(_number(self.state.get("serving_unchanged")), "dim"),
-                    ),
-                    (
-                        "Missing identity",
-                        _priority_count(self.state.get("serving_missing_identity"), "bold red"),
-                        "Normalize errors",
-                        _priority_count(self.state.get("serving_normalization_error"), "yellow"),
-                    ),
-                ]
-            ),
-            title="Serving Projection",
-        )
+
         footer = Text()
         if self.state["phase"] == "IDLE":
             footer.append("IDLE", style="dim")
-            footer.append(" • waiting for work", style="dim")
+            footer.append(" • waiting for prepared Deep work", style="dim")
         else:
             footer.append("ACTIVE", style="cyan")
-            footer.append(" • ", style="dim")
-            footer.append_text(_queue_source(self.state.get("queue_source", "RUNTIME")))
+            footer.append(" • direct dbd_company_deep claim", style="dim")
         footer.append(" • Ctrl+C graceful shutdown", style="dim")
-        if self.state.get("serving_last_error"):
-            footer.append(" • SERVING DEGRADED", style="bold yellow")
-        return Group(Panel(header, title="DBD DEEP"), collector, runtime, serving, footer)
+        return Group(Panel(header, title="DBD DEEP"), collector, session, footer)
 
     def close(self) -> None:
         if self.live is not None:
@@ -518,6 +498,12 @@ class DeepPresenter:
                             _priority_count(result["rows_changed"], "magenta"),
                         ),
                         (
+                            "Master staged",
+                            _priority_count(result.get("master_staged"), "green"),
+                            "Master waiting",
+                            _priority_count(summary["master"], "yellow"),
+                        ),
+                        (
                             "Recovered",
                             _priority_count(result["runtime_recovered"], "blue"),
                             "Overlap",
@@ -576,10 +562,10 @@ class DeepPresenter:
                             _priority_count(result["companies_finished"], "green"),
                         ),
                         (
-                            "Promoted",
-                            _priority_count(result["master_promoted"], "blue"),
-                            "ACTIVE refresh",
-                            _priority_count(result.get("active_refreshed"), "magenta"),
+                            "In flight",
+                            _priority_count(result["companies_in_flight"], "cyan"),
+                            "Retry wait",
+                            _priority_count(result["companies_retry_wait"], "yellow"),
                         ),
                         (
                             "HTTP requests",
@@ -590,8 +576,8 @@ class DeepPresenter:
                         (
                             "429",
                             _priority_count(result["rate_limit_hits"], "yellow"),
-                            "Cycles",
-                            _styled(_number(result.get("cycle")), "dim"),
+                            "Recovered",
+                            _priority_count(result["runtime_recovered"], "blue"),
                         ),
                     ]
                 ),

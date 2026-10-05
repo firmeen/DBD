@@ -170,10 +170,16 @@ def deep_model():
         _drop_model()
 
 
-def _insert_promotion_master(cur, *, jp_type_code="7", year="2568"):
+def _insert_promotion_master(
+    cur,
+    *,
+    jp_type_code="7",
+    jp_no="9000000000001",
+    year="2568",
+):
     # Distinct values catch positional/alias mistakes across every copied field.
     values = {
-        "jp_type_code": jp_type_code, "jp_no": "9000000000001",
+        "jp_type_code": jp_type_code, "jp_no": jp_no,
         "jp_name": "บริษัท ทดสอบ", "jp_name_e": "Promotion Co",
         "jp_stat_code": "1", "jp_stat_desc": "Active", "jp_type_desc": "Limited",
         "address": "123 Test Road", "pv_code": "10", "pv_desc": "Bangkok",
@@ -206,13 +212,13 @@ def _assert_promoted_columns(row, expected):
 
 
 @pytest.fixture
-async def promotion_repo():
+async def staging_repo():
     repo = DeepRepository()
     warnings = []
 
     def capture_warnings(conn, cursor, statement, parameters, context, executemany):
         if statement.lstrip().startswith("INSERT INTO dbd_company_deep"):
-            # Inspect this statement's diagnostics BEFORE DELETE/seed/COMMIT
+            # Inspect this statement's diagnostics before DELETE/COMMIT
             # can clear them. A separate cursor preserves the DML result.
             diagnostics = conn.connection.cursor()
             try:
@@ -233,15 +239,15 @@ async def promotion_repo():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("year", [None, "", "   ", "2568,2567"])
-async def test_promotion_copies_all_columns_and_seeds_runtime_without_warnings(promotion_repo, year):
-    repo, warnings = promotion_repo
+async def test_staging_copies_all_columns_without_prefilling_runtime(staging_repo, year):
+    repo, warnings = staging_repo
     with connect() as conn, conn.cursor() as cur:
         expected = _insert_promotion_master(cur, year=year)
         # Same registration number, different type: only the selected key moves.
         other = _insert_promotion_master(cur, jp_type_code="8", year=year)
         conn.commit()
 
-    assert await repo.promote_master(1) == 1
+    assert await repo.stage_master_batch(1) == 1
     assert warnings == [[]]
     with connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM dbd_company_deep")
@@ -258,27 +264,25 @@ async def test_promotion_copies_all_columns_and_seeds_runtime_without_warnings(p
         remaining = cur.fetchall()
         assert len(remaining) == 1
         _assert_promoted_columns(remaining[0], other)
-        cur.execute("SELECT jp_type_code,jp_no,status,attempts,last_error FROM dbd_deep_runtime")
-        assert cur.fetchall() == [{
-            "jp_type_code": "7", "jp_no": expected["jp_no"],
-            "status": "PENDING", "attempts": 0, "last_error": None,
-        }]
+        cur.execute("SELECT COUNT(*) n FROM dbd_deep_runtime")
+        assert cur.fetchone()["n"] == 0
 
-    assert await repo.promote_master(1) == 1
-    assert await repo.promote_master(1) == 0
+    assert await repo.stage_master_batch(1) == 1
+    assert await repo.stage_master_batch(1) == 0
     assert warnings == [[], []]
     with connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT COUNT(*) n FROM dbd_company_master")
         assert cur.fetchone()["n"] == 0
-        for table in ("dbd_company_deep", "dbd_deep_runtime"):
-            cur.execute(f"SELECT COUNT(*) n FROM {table}")
-            assert cur.fetchone()["n"] == 2
+        cur.execute("SELECT COUNT(*) n FROM dbd_company_deep")
+        assert cur.fetchone()["n"] == 2
+        cur.execute("SELECT COUNT(*) n FROM dbd_deep_runtime")
+        assert cur.fetchone()["n"] == 0
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("terminal,existing_runtime", [(False, False), (False, True), (True, False)])
-async def test_promotion_duplicate_preserves_checkpoints_and_runtime(promotion_repo, terminal, existing_runtime):
-    repo, warnings = promotion_repo
+async def test_staging_duplicate_preserves_checkpoints_and_runtime(staging_repo, terminal, existing_runtime):
+    repo, warnings = staging_repo
     with connect() as conn, conn.cursor() as cur:
         expected = _insert_promotion_master(cur)
         cur.execute(
@@ -313,8 +317,8 @@ async def test_promotion_duplicate_preserves_checkpoints_and_runtime(promotion_r
             runtime_before = cur.fetchone()
         conn.commit()
 
-    assert await repo.promote_master(1) == 1
-    # The duplicate runtime INSERT IGNORE may warn; the Deep UPSERT must not.
+    assert await repo.stage_master_batch(1) == 1
+    # Staging updates Master fields but never materializes runtime work.
     assert warnings == [[]]
     with connect() as conn, conn.cursor() as cur:
         cur.execute("SELECT * FROM dbd_company_deep")
@@ -329,31 +333,27 @@ async def test_promotion_duplicate_preserves_checkpoints_and_runtime(promotion_r
         runtime = cur.fetchall()
         if existing_runtime:
             assert runtime == [runtime_before]
-        elif terminal:
-            assert not runtime
         else:
-            assert len(runtime) == 1
-            assert runtime[0]["status"] == "PENDING"
-            assert runtime[0]["attempts"] == 0
+            assert not runtime
 
 
 @pytest.mark.asyncio
-async def test_promotion_rolls_back_deep_insert_and_master_delete_if_seed_fails(promotion_repo):
-    repo, warnings = promotion_repo
+async def test_staging_rolls_back_deep_insert_if_master_delete_fails(staging_repo):
+    repo, warnings = staging_repo
     with connect() as conn, conn.cursor() as cur:
         expected = _insert_promotion_master(cur)
         conn.commit()
 
-    def fail_seed(conn, cursor, statement, parameters, context, executemany):
-        if statement.lstrip().startswith("INSERT IGNORE INTO dbd_deep_runtime"):
-            raise RuntimeError("injected runtime seed failure")
+    def fail_delete(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("DELETE FROM dbd_company_master"):
+            raise RuntimeError("injected master delete failure")
 
-    event.listen(repo.engine.sync_engine, "before_cursor_execute", fail_seed)
+    event.listen(repo.engine.sync_engine, "before_cursor_execute", fail_delete)
     try:
-        with pytest.raises(RuntimeError, match="injected runtime seed failure"):
-            await repo.promote_master(1)
+        with pytest.raises(RuntimeError, match="injected master delete failure"):
+            await repo.stage_master_batch(1)
     finally:
-        event.remove(repo.engine.sync_engine, "before_cursor_execute", fail_seed)
+        event.remove(repo.engine.sync_engine, "before_cursor_execute", fail_delete)
 
     assert warnings == [[]]
     with connect() as conn, conn.cursor() as cur:
@@ -361,12 +361,111 @@ async def test_promotion_rolls_back_deep_insert_and_master_delete_if_seed_fails(
         rows = cur.fetchall()
         assert len(rows) == 1
         _assert_promoted_columns(rows[0], expected)
-        for table in ("dbd_company_deep", "dbd_deep_runtime"):
-            cur.execute(f"SELECT COUNT(*) n FROM {table}")
-            assert cur.fetchone()["n"] == 0
+        cur.execute("SELECT COUNT(*) n FROM dbd_company_deep")
+        assert cur.fetchone()["n"] == 0
+        cur.execute("SELECT COUNT(*) n FROM dbd_deep_runtime")
+        assert cur.fetchone()["n"] == 0
     # A later explicit retry starts from the intact Master row.
-    assert await repo.promote_master(1) == 1
+    assert await repo.stage_master_batch(1) == 1
     assert warnings == [[], []]
+
+
+@pytest.mark.asyncio
+async def test_prepare_stages_complete_master_workset_then_direct_claims_one_lease_each() -> None:
+    bootstrap = DeepBootstrap()
+    try:
+        await bootstrap.ensure_model()
+    finally:
+        await bootstrap.close()
+
+    with connect() as conn, conn.cursor() as cur:
+        for suffix in range(1, 4):
+            _insert_promotion_master(
+                cur,
+                jp_no=f"900000000000{suffix}",
+            )
+        conn.commit()
+
+    repo = DeepRepository()
+    try:
+        result = await repo.prepare_for_collection(batch_size=500)
+
+        assert result["master_staged"] == 3
+        assert await repo.master_size() == 0
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) n FROM dbd_company_deep")
+            assert cur.fetchone()["n"] == 3
+            cur.execute("SELECT COUNT(*) n FROM dbd_deep_runtime")
+            assert cur.fetchone()["n"] == 0
+
+        first = await repo.claim()
+        second = await repo.claim()
+
+        assert first is not None
+        assert second is not None
+        assert first["jp_no"] != second["jp_no"]
+        assert first["attempts"] == 1
+        assert second["attempts"] == 1
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT jp_no,status,attempts "
+                "FROM dbd_deep_runtime ORDER BY jp_no"
+            )
+            leases = cur.fetchall()
+        assert len(leases) == 2
+        assert {row["status"] for row in leases} == {"RUNNING"}
+        assert {row["attempts"] for row in leases} == {1}
+
+        third = await repo.claim()
+        assert third is not None
+        assert third["jp_no"] not in {first["jp_no"], second["jp_no"]}
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) n FROM dbd_deep_runtime "
+                "WHERE status='RUNNING'"
+            )
+            assert cur.fetchone()["n"] == 3
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_prepare_is_rerunnable_after_new_discovery_without_runtime_prefill() -> None:
+    bootstrap = DeepBootstrap()
+    try:
+        await bootstrap.ensure_model()
+    finally:
+        await bootstrap.close()
+
+    with connect() as conn, conn.cursor() as cur:
+        _insert_promotion_master(cur, jp_no="9000000000011")
+        conn.commit()
+
+    repo = DeepRepository()
+    try:
+        first = await repo.prepare_for_collection(batch_size=500)
+        assert first["master_staged"] == 1
+
+        with connect() as conn, conn.cursor() as cur:
+            _insert_promotion_master(cur, jp_no="9000000000012")
+            conn.commit()
+
+        second = await repo.prepare_for_collection(batch_size=500)
+
+        assert second["already_prepared"] is True
+        assert second["master_staged"] == 1
+        assert await repo.master_size() == 0
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) n FROM dbd_company_deep")
+            assert cur.fetchone()["n"] == 2
+            cur.execute("SELECT COUNT(*) n FROM dbd_deep_runtime")
+            assert cur.fetchone()["n"] == 0
+    finally:
+        await repo.close()
 
 
 @pytest.mark.asyncio

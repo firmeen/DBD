@@ -56,33 +56,55 @@ async def _status(json_mode: bool, coverage: bool) -> int:
     return 1 if summary["overlap"] else 0
 
 
+async def _prepare_heartbeat(
+    events: DeepTerminalEvents,
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.5)
+        except TimeoutError:
+            events("heartbeat", {})
+
+
 async def _prepare(batch_size: int, json_mode: bool) -> int:
     repo = DeepRepository()
     events = None if json_mode else DeepTerminalEvents("prepare")
+    heartbeat_stop = asyncio.Event()
+    heartbeat_task: asyncio.Task[None] | None = None
+    summary = None
+
     try:
         if events is not None:
+            heartbeat_task = asyncio.create_task(
+                _prepare_heartbeat(events, heartbeat_stop)
+            )
             events("phase", {"phase": "PREFLIGHT"})
-        await repo.preflight(
-            require_runtime=False,
-            require_prepared=False,
-            check_indexes=True,
-        )
+
         async with repo.manager_lock() as lock_conn:
-            if events is not None:
-                events("phase", {"phase": "PREPARE"})
-            result = await repo.prepare_active_scope(
+            result = await repo.prepare_for_collection(
                 batch_size=batch_size,
                 event=events,
                 lock_conn=lock_conn,
             )
-        summary = await repo.status_summary(include_coverage=False)
+
+        # Preserve the existing JSON contract when explicitly requested.
+        # Interactive prepare already proved readiness with cheap EXISTS checks,
+        # so it does not scan Deep again just to print a second summary.
+        if json_mode:
+            summary = await repo.status_summary(include_coverage=False)
     finally:
+        heartbeat_stop.set()
+        if heartbeat_task is not None:
+            await heartbeat_task
         if events is not None:
             events.close()
         await repo.close()
 
-    DeepPresenter(json_mode=json_mode).prepare(result, summary)
-    return 1 if summary["overlap"] else 0
+    if json_mode:
+        DeepPresenter(json_mode=True).prepare(result, summary)
+        return 1 if summary["overlap"] else 0
+    return 0
 
 
 async def _retry(limit: int | None, json_mode: bool) -> int:
@@ -104,15 +126,20 @@ async def _retry(limit: int | None, json_mode: bool) -> int:
     return 0
 
 
+def _collector_pool_size(concurrency: int) -> int:
+    requested = max(settings.db_pool_size, int(concurrency) + 2)
+    cap = max(settings.db_pool_size, settings.dbd_fleet_db_connections_max)
+    return min(requested, cap)
+
+
 async def _collect(args) -> int:
-    repo = DeepRepository()
+    repo = DeepRepository(pool_size=_collector_pool_size(args.concurrency))
     events = None if args.json else DeepTerminalEvents("collect")
     collector = DeepCollector(
         repository=repo,
         concurrency=args.concurrency,
         rate_per_second=args.rate,
         http_retries=args.http_retries,
-        buffer_size=args.buffer_size,
         company_limit=args.limit,
         continuous=args.continuous,
         idle_seconds=args.idle_seconds,
@@ -132,7 +159,7 @@ async def _collect(args) -> int:
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="dbd-deep",
-        description="Standalone seven-endpoint DBD Master/Deep collector",
+        description="Standalone seven-endpoint DBD Deep collector",
     )
     parser.add_argument(
         "--version",
@@ -143,19 +170,19 @@ def parse_args(argv: list[str] | None = None):
 
     prepare = sub.add_parser(
         "prepare",
-        help="One-time adoption of builder-created Deep rows into the seven-endpoint runtime",
+        help="Normalize Deep scope and bulk-stage all discovered Master companies before collection",
     )
     prepare.add_argument(
         "--batch-size",
         type=_positive_int,
         default=5000,
-        help="Primary-key migration batch size; bounded to 500..20000 internally",
+        help="Preparation batch size; Deep normalization is bounded to 500..20000 and Master staging to 5000",
     )
     prepare.add_argument("--json", action="store_true")
 
     collect = sub.add_parser(
         "collect",
-        help="Resume Deep rows, promote Master, then refresh stale ACTIVE companies",
+        help="Claim prepared Deep companies directly and collect unresolved endpoints",
     )
     collect.add_argument(
         "--concurrency",
@@ -172,11 +199,6 @@ def parse_args(argv: list[str] | None = None):
         "--http-retries",
         type=_non_negative_int,
         default=settings.dbd_http_retries,
-    )
-    collect.add_argument(
-        "--buffer-size",
-        type=_positive_int,
-        help="Bounded runtime working set; default=max(32, concurrency*4)",
     )
     collect.add_argument(
         "--limit",
@@ -209,7 +231,7 @@ def parse_args(argv: list[str] | None = None):
 
     retry = sub.add_parser(
         "retry",
-        help="Reopen terminal Deep failures; bounded collect refill schedules them later",
+        help="Reopen terminal Deep failures for direct Deep claiming",
     )
     retry.add_argument("--limit", type=_positive_int)
     retry.add_argument("--json", action="store_true")

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Awaitable, Callable, TypeVar
@@ -133,13 +134,8 @@ class DeepTransientDatabaseError(RuntimeError):
     """Transient MySQL failure after repository-local retries were exhausted."""
 
 
-def create_deep_engine() -> AsyncEngine:
-    """Dedicated pool for the standalone collector.
-
-    It deliberately does not import the legacy worker repository or campaign
-    scheduler. pool_pre_ping + transaction retries make dead MySQL connections
-    replaceable without turning a transient DB disconnect into endpoint failure.
-    """
+def create_deep_engine(*, pool_size: int | None = None) -> AsyncEngine:
+    """Dedicated MySQL pool for one Deep process."""
     return create_async_engine(
         URL.create(
             "mysql+asyncmy",
@@ -149,7 +145,7 @@ def create_deep_engine() -> AsyncEngine:
             port=settings.db_port,
             database=settings.db_name,
         ),
-        pool_size=max(2, settings.db_pool_size),
+        pool_size=max(2, int(pool_size or settings.db_pool_size)),
         max_overflow=0,
         pool_pre_ping=True,
         isolation_level="READ COMMITTED",
@@ -211,8 +207,13 @@ def _status_case(required_expr: str = "required_mask") -> str:
 
 
 class DeepRepository:
-    def __init__(self, engine: AsyncEngine | None = None) -> None:
-        self.engine = engine or create_deep_engine()
+    def __init__(
+        self,
+        engine: AsyncEngine | None = None,
+        *,
+        pool_size: int | None = None,
+    ) -> None:
+        self.engine = engine or create_deep_engine(pool_size=pool_size)
         self._owns_engine = engine is None
 
     async def close(self) -> None:
@@ -282,6 +283,8 @@ class DeepRepository:
         return bool(await self._table_columns(table_name))
 
     async def ensure_runtime_table(self) -> None:
+        if await self.table_exists(RUNTIME_TABLE):
+            return
         async with self.engine.begin() as conn:
             await conn.execute(text(_RUNTIME_DDL))
 
@@ -463,6 +466,8 @@ class DeepRepository:
                       ON d.jp_type_code=r.jp_type_code
                      AND d.jp_no=r.jp_no
                     WHERE d.jp_no IS NULL
+                       OR d.deep_completed_at IS NOT NULL
+                       OR d.deep_status='COMPLETE'
                     """
                 )
             )
@@ -542,14 +547,30 @@ class DeepRepository:
         )
 
         if await self.is_prepared():
-            await self.assert_invariants()
+            if event is not None:
+                event(
+                    "prepare_scope",
+                    {
+                        "legacy_scope": "READY",
+                        "legacy_action": "SKIPPED",
+                    },
+                )
             return {
                 "already_prepared": True,
                 "rows_total": 0,
                 "rows_scanned": 0,
                 "rows_changed": 0,
-                "runtime_recovered": await self.recover_runtime(),
+                "runtime_recovered": 0,
             }
+
+        if event is not None:
+            event(
+                "prepare_scope",
+                {
+                    "legacy_scope": "LEGACY",
+                    "legacy_action": "NORMALIZING",
+                },
+            )
 
         async with self.engine.connect() as conn:
             rows_total = int(
@@ -912,19 +933,158 @@ class DeepRepository:
                 )
 
         if event is not None:
-            event("phase", {"phase": "VERIFY"})
-        await self.assert_invariants()
+            event("phase", {"phase": "FINALIZE LEGACY"})
+        await self.assert_no_overlap()
         if lock_conn is not None:
             await self.assert_manager_lock(lock_conn)
         await self._mark_prepared()
-        runtime_recovered = await self.recover_runtime()
         return {
             "already_prepared": False,
             "rows_total": rows_total,
             "rows_scanned": scanned,
             "rows_changed": changed,
+            "runtime_recovered": 0,
+        }
+
+    async def prepare_for_collection(
+        self,
+        *,
+        batch_size: int = 5000,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
+        lock_conn: AsyncConnection | None = None,
+    ) -> dict[str, int | bool | float]:
+        """Prepare the Deep workset without scanning endpoint JSON payloads.
+
+        Legacy normalization is one-time. Normal reruns stage Master rows into
+        Deep in small atomic batches, then perform only lightweight readiness
+        checks. Runtime rows remain lease/retry state, never a prefilled queue.
+        """
+        result = await self.prepare_active_scope(
+            batch_size=batch_size,
+            event=event,
+            lock_conn=lock_conn,
+        )
+
+        if event is not None:
+            event("phase", {"phase": "STAGE MASTER"})
+
+        stage_batch_size = max(100, min(int(batch_size), 5000))
+        master_staged = 0
+        batches_committed = 0
+        stage_started = time.monotonic()
+
+        while True:
+            batch_no = batches_committed + 1
+            batch_started = time.monotonic()
+            staged = await self.stage_master_batch(
+                stage_batch_size,
+                event=event,
+                batch_no=batch_no,
+            )
+            batch_elapsed = time.monotonic() - batch_started
+            if staged == 0:
+                break
+
+            batches_committed += 1
+            master_staged += staged
+            elapsed = max(0.001, time.monotonic() - stage_started)
+
+            if lock_conn is not None:
+                await self.assert_manager_lock(lock_conn)
+            if event is not None:
+                event(
+                    "prepare_stage",
+                    {
+                        "batch": batches_committed,
+                        "batch_rows": staged,
+                        "master_staged": master_staged,
+                        "rows_per_second": master_staged / elapsed,
+                        "batch_elapsed_seconds": batch_elapsed,
+                        "batch_rows_per_second": staged / max(0.001, batch_elapsed),
+                    },
+                )
+
+        if event is not None:
+            event("phase", {"phase": "VERIFY READY"})
+            event(
+                "prepare_step",
+                {
+                    "step": "MASTER EMPTY CHECK",
+                    "batch": batches_committed,
+                },
+            )
+        await self.assert_master_empty()
+
+        if event is not None:
+            event(
+                "prepare_step",
+                {
+                    "step": "OVERLAP CHECK",
+                    "batch": batches_committed,
+                },
+            )
+        await self.assert_no_overlap()
+
+        if event is not None:
+            event(
+                "prepare_step",
+                {
+                    "step": "RECOVER RUNTIME",
+                    "batch": batches_committed,
+                },
+            )
+        runtime_recovered = await self.recover_runtime()
+
+        elapsed = time.monotonic() - stage_started
+        if event is not None:
+            event(
+                "prepare_ready",
+                {
+                    "batch": batches_committed,
+                    "master_staged": master_staged,
+                    "runtime_recovered": runtime_recovered,
+                    "stage_elapsed_seconds": elapsed,
+                },
+            )
+
+        return {
+            **result,
+            "master_staged": master_staged,
+            "batches_committed": batches_committed,
+            "stage_elapsed_seconds": elapsed,
             "runtime_recovered": runtime_recovered,
         }
+
+    async def master_size(self) -> int:
+        async with self.engine.connect() as conn:
+            value = (
+                await conn.execute(text(f"SELECT COUNT(*) FROM {MASTER_TABLE}"))
+            ).scalar_one()
+        return int(value or 0)
+
+    async def assert_master_empty(self) -> None:
+        async with self.engine.connect() as conn:
+            has_master = int(
+                (
+                    await conn.execute(
+                        text(
+                            f"""
+                            SELECT EXISTS(
+                                SELECT 1
+                                FROM {MASTER_TABLE}
+                                LIMIT 1
+                            )
+                            """
+                        )
+                    )
+                ).scalar_one()
+                or 0
+            )
+        if has_master:
+            raise RuntimeError(
+                "dbd_company_master still contains unstaged companies; "
+                "run dbd-deep prepare before collect"
+            )
 
     async def assert_no_overlap(self) -> None:
         async with self.engine.connect() as conn:
@@ -999,53 +1159,6 @@ class DeepRepository:
             ).scalar_one()
         return int(value or 0)
 
-    async def seed_existing_deep(self, limit: int) -> int:
-        if limit <= 0:
-            return 0
-
-        async def op(conn: AsyncConnection) -> int:
-            result = await conn.execute(
-                text(
-                    f"""
-                    INSERT IGNORE INTO {RUNTIME_TABLE} (
-                        jp_type_code,
-                        jp_no,
-                        status,
-                        attempts,
-                        available_at,
-                        last_error
-                    )
-                    SELECT
-                        d.jp_type_code,
-                        d.jp_no,
-                        'PENDING',
-                        0,
-                        UTC_TIMESTAMP(6),
-                        NULL
-                    FROM {DEEP_TABLE} d
-                    LEFT JOIN {RUNTIME_TABLE} r
-                      ON r.jp_type_code=d.jp_type_code
-                     AND r.jp_no=d.jp_no
-                    WHERE d.deep_completed_at IS NULL
-                      AND d.deep_status IN ('PENDING','COLLECTING')
-                      AND r.jp_no IS NULL
-                    ORDER BY
-                        d.deep_completed_at,
-                        d.deep_status,
-                        d.jp_type_code,
-                        d.jp_no
-                    LIMIT :limit
-                    """
-                ),
-                {"limit": int(limit)},
-            )
-            return int(result.rowcount or 0)
-
-        # The persisted prepared status is the hot-path scheduling truth.
-        # This avoids re-evaluating bitwise completion expressions across Deep
-        # during every bounded refill.
-        return await self._transaction(op, attempts=1)
-
     async def next_runtime_delay(self) -> float | None:
         async with self.engine.connect() as conn:
             row = (
@@ -1092,42 +1205,111 @@ class DeepRepository:
             params[f"n{index}"] = jp_no
         return "(" + " OR ".join(clauses) + ")", params
 
-    async def promote_master(self, limit: int) -> int:
+    async def stage_master_batch(
+        self,
+        limit: int,
+        *,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
+        batch_no: int = 0,
+    ) -> int:
+        """Move one primary-key range from Master to Deep atomically.
+
+        Only the batch boundary crosses the Python/MySQL boundary. The actual
+        rows stay inside MySQL for INSERT ... SELECT and range DELETE.
+        """
         if limit <= 0:
             return 0
 
         async def op(conn: AsyncConnection) -> int:
-            selected = (
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "FIND BOUNDARY",
+                        "batch": batch_no,
+                        "batch_rows": int(limit),
+                    },
+                )
+
+            boundary = (
                 await conn.execute(
                     text(
                         f"""
-                        SELECT jp_type_code, jp_no
-                        FROM {MASTER_TABLE}
-                        ORDER BY last_seen_at DESC, jp_type_code, jp_no
-                        LIMIT :limit
-                        FOR UPDATE SKIP LOCKED
+                        SELECT
+                            jp_type_code,
+                            jp_no,
+                            UTC_TIMESTAMP(6) AS batch_cutoff
+                        FROM {MASTER_TABLE} FORCE INDEX (PRIMARY)
+                        ORDER BY jp_type_code, jp_no
+                        LIMIT :offset, 1
                         """
                     ),
-                    {"limit": int(limit)},
+                    {"offset": int(limit) - 1},
                 )
-            ).mappings().all()
-            keys = [
-                (str(row["jp_type_code"]), str(row["jp_no"]))
-                for row in selected
-            ]
-            if not keys:
+            ).mappings().first()
+
+            if boundary is None:
+                boundary = (
+                    await conn.execute(
+                        text(
+                            f"""
+                            SELECT
+                                jp_type_code,
+                                jp_no,
+                                UTC_TIMESTAMP(6) AS batch_cutoff
+                            FROM {MASTER_TABLE} FORCE INDEX (PRIMARY)
+                            ORDER BY jp_type_code DESC, jp_no DESC
+                            LIMIT 1
+                            """
+                        )
+                    )
+                ).mappings().first()
+
+            if boundary is None:
                 return 0
 
-            predicate, params = self._key_predicate(keys)
-            master_predicate, _ = self._key_predicate(keys, alias="m")
-            deep_predicate, _ = self._key_predicate(keys, alias="d")
+            end_type = str(boundary["jp_type_code"])
+            end_no = str(boundary["jp_no"])
+            params = {
+                "end_type": end_type,
+                "end_no": end_no,
+                "batch_cutoff": boundary["batch_cutoff"],
+            }
+            range_predicate = """
+                (
+                    m.jp_type_code < :end_type
+                    OR (
+                        m.jp_type_code=:end_type
+                        AND m.jp_no<=:end_no
+                    )
+                )
+                AND m.updated_at <= :batch_cutoff
+            """
+            delete_predicate = """
+                (
+                    jp_type_code < :end_type
+                    OR (
+                        jp_type_code=:end_type
+                        AND jp_no<=:end_no
+                    )
+                )
+                AND updated_at <= :batch_cutoff
+            """
             financial_required = (
                 f"CASE WHEN NULLIF(TRIM(m.submit_fin_year),'') IS NULL "
                 f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
             )
 
-            # Alias the incoming SELECT row so MySQL does not generate a
-            # VALUES(column) deprecation warning for every updated field.
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "UPSERT RANGE",
+                        "batch": batch_no,
+                        "batch_rows": int(limit),
+                    },
+                )
+
             await conn.execute(
                 text(
                     f"""
@@ -1210,8 +1392,9 @@ class DeepRepository:
                             'PENDING' AS deep_status,
                             JSON_OBJECT() AS endpoint_meta,
                             UTC_TIMESTAMP(6) AS deep_started_at
-                        FROM {MASTER_TABLE} m
-                        WHERE {master_predicate}
+                        FROM {MASTER_TABLE} m FORCE INDEX (PRIMARY)
+                        WHERE {range_predicate}
+                        ORDER BY m.jp_type_code, m.jp_no
                     ) AS new
                     ON DUPLICATE KEY UPDATE
                         jp_name=new.jp_name,
@@ -1248,49 +1431,41 @@ class DeepRepository:
                 params,
             )
 
-            await conn.execute(
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "DELETE RANGE",
+                        "batch": batch_no,
+                        "batch_rows": int(limit),
+                    },
+                )
+
+            deleted = await conn.execute(
                 text(
                     f"""
                     DELETE FROM {MASTER_TABLE}
-                    WHERE {predicate}
+                    WHERE {delete_predicate}
                     """
                 ),
                 params,
             )
+            staged = int(deleted.rowcount or 0)
 
-            runtime_result = await conn.execute(
-                text(
-                    f"""
-                    INSERT IGNORE INTO {RUNTIME_TABLE} (
-                        jp_type_code,
-                        jp_no,
-                        status,
-                        attempts,
-                        available_at,
-                        last_error
-                    )
-                    SELECT
-                        d.jp_type_code,
-                        d.jp_no,
-                        'PENDING',
-                        0,
-                        UTC_TIMESTAMP(6),
-                        NULL
-                    FROM {DEEP_TABLE} d
-                    WHERE {deep_predicate}
-                      AND (
-                        ((d.done_mask | d.not_available_mask | d.failed_mask)
-                          & d.required_mask) <> d.required_mask
-                      )
-                    """
-                ),
-                params,
-            )
-            return max(len(keys), int(runtime_result.rowcount or 0))
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "COMMIT",
+                        "batch": batch_no,
+                        "batch_rows": staged,
+                    },
+                )
+            return staged
 
-        # Selected Master keys are chosen inside this transaction. On ambiguous
-        # COMMIT, fail the collector and let restart recovery inspect durable
-        # MASTER/DEEP state instead of selecting a different batch on retry.
+        # Every batch is one transaction. A crash before COMMIT rolls back both
+        # writes. The cutoff keeps Master rows changed after boundary selection
+        # for a later batch instead of deleting a concurrent Discovery update.
         return await self._transaction(op, attempts=1)
 
     @staticmethod
@@ -1396,57 +1571,17 @@ class DeepRepository:
             )
             return len(selected)
 
-        # A crash after commit but before runtime seeding is safe: the reopened
-        # rows are ordinary unresolved Deep work and seed_existing_deep() will
-        # adopt them on the next bounded refill.
+        # A crash after commit is safe: reopened rows remain ordinary
+        # unresolved Deep work and direct claiming will pick them later.
         return await self._transaction(op, attempts=1)
 
-    async def refill(
-        self,
-        target: int,
-        *,
-        include_refresh: bool = True,
-    ) -> dict[str, int]:
-        target = max(1, int(target))
-        current = await self.runtime_size()
-        if current >= target:
-            return {
-                "runtime": current,
-                "adopted": 0,
-                "promoted": 0,
-                "refreshed": 0,
-                "refresh_scanned": False,
-            }
-
-        capacity = target - current
-        adopted = await self.seed_existing_deep(capacity)
-        current += adopted
-
-        promoted = 0
-        if current < target:
-            promoted = await self.promote_master(target - current)
-            current = await self.runtime_size()
-
-        refreshed = 0
-        refresh_scanned = current < target and include_refresh
-        if refresh_scanned:
-            reopened = await self.reopen_stale_active(target - current)
-            if reopened:
-                # Reuse the existing bounded runtime queue rather than
-                # materializing a second refresh scheduler.
-                await self.seed_existing_deep(min(reopened, target - current))
-                current = await self.runtime_size()
-                refreshed = reopened
-
-        return {
-            "runtime": current,
-            "adopted": adopted,
-            "promoted": promoted,
-            "refreshed": refreshed,
-            "refresh_scanned": refresh_scanned,
-        }
-
     async def claim(self) -> dict[str, Any] | None:
+        """Claim one company without a prefilled runtime queue.
+
+        Durable RETRY_WAIT/recovered PENDING rows are resumed first. Otherwise
+        claim directly from incomplete Deep and create exactly one RUNNING
+        runtime lease for the selected company.
+        """
         async def op(conn: AsyncConnection):
             row = (
                 await conn.execute(
@@ -1468,7 +1603,60 @@ class DeepRepository:
                          AND d.jp_no=r.jp_no
                         WHERE r.status IN ('PENDING','RETRY_WAIT')
                           AND r.available_at <= UTC_TIMESTAMP(6)
+                          AND d.deep_completed_at IS NULL
+                          AND d.deep_status IN ('PENDING','COLLECTING')
                         ORDER BY r.available_at, r.updated_at, r.jp_type_code, r.jp_no
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                        """
+                    )
+                )
+            ).mappings().first()
+
+            if row is not None:
+                await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {RUNTIME_TABLE}
+                        SET status='RUNNING',
+                            attempts=attempts+1,
+                            last_error=NULL
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        """
+                    ),
+                    {
+                        "jp_type_code": row["jp_type_code"],
+                        "jp_no": row["jp_no"],
+                    },
+                )
+                result = dict(row)
+                result["attempts"] = int(result["attempts"] or 0) + 1
+                return result
+
+            row = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            d.jp_type_code,
+                            d.jp_no,
+                            d.submit_fin_year,
+                            d.required_mask,
+                            d.done_mask,
+                            d.not_available_mask,
+                            d.failed_mask,
+                            d.deep_status
+                        FROM {DEEP_TABLE} d
+                        WHERE d.deep_completed_at IS NULL
+                          AND d.deep_status IN ('PENDING','COLLECTING')
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM {RUNTIME_TABLE} r
+                              WHERE r.jp_type_code=d.jp_type_code
+                                AND r.jp_no=d.jp_no
+                          )
+                        ORDER BY d.deep_status, d.jp_type_code, d.jp_no
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
                         """
@@ -1481,12 +1669,22 @@ class DeepRepository:
             await conn.execute(
                 text(
                     f"""
-                    UPDATE {RUNTIME_TABLE}
-                    SET status='RUNNING',
-                        attempts=attempts+1,
-                        last_error=NULL
-                    WHERE jp_type_code=:jp_type_code
-                      AND jp_no=:jp_no
+                    INSERT INTO {RUNTIME_TABLE} (
+                        jp_type_code,
+                        jp_no,
+                        status,
+                        attempts,
+                        available_at,
+                        last_error
+                    )
+                    VALUES (
+                        :jp_type_code,
+                        :jp_no,
+                        'RUNNING',
+                        1,
+                        UTC_TIMESTAMP(6),
+                        NULL
+                    )
                     """
                 ),
                 {
@@ -1495,11 +1693,11 @@ class DeepRepository:
                 },
             )
             result = dict(row)
-            result["attempts"] = int(result["attempts"] or 0) + 1
+            result["attempts"] = 1
             return result
 
-        # An ambiguous RUNNING claim must not be retried against another row.
-        # A process restart safely recovers every stranded RUNNING row.
+        # A claim transaction is intentionally never replayed after an
+        # ambiguous COMMIT; restart recovery safely reopens stranded RUNNING.
         return await self._transaction(op, attempts=1)
 
     async def finish_runtime(self, jp_type_code: str, jp_no: str) -> None:
@@ -2018,10 +2216,8 @@ class DeepRepository:
     ) -> int:
         """Reopen failed active-scope rows without materializing runtime work.
 
-        Failed bits are cleared in bounded transactions. The normal collector
-        refill path later seeds these reopened PENDING/COLLECTING rows into the
-        bounded runtime working set, preserving the single runtime-buffer
-        invariant even when the failed population is very large.
+        Failed bits are cleared in bounded transactions. Direct Deep claiming
+        picks these reopened PENDING/COLLECTING rows on the next collector pass.
         """
         batch_size = max(50, min(int(batch_size), 2000))
         remaining = None if limit is None else max(1, int(limit))
@@ -2088,8 +2284,8 @@ class DeepRepository:
                     key_params,
                 )
                 # Terminal rows normally have no runtime row. Remove any stale
-                # one from an interrupted older run rather than enqueueing the
-                # whole retry population here; bounded refill owns scheduling.
+                # lease from an interrupted older run; direct Deep claiming
+                # will pick the reopened row when it is ready.
                 await conn.execute(
                     text(
                         f"""
