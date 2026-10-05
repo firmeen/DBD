@@ -12,13 +12,11 @@ from ...contracts.master_deep import (
     mssql_create_table_sql,
     ordered_values,
 )
-from .engine import _pymssql, check_connection, connection, transaction as sqlserver_transaction
-from .schema import (
-    MANAGED_TABLES,
-    TABLE_COLUMNS,
-    ensure_schema as ensure_production_schema,
-    validate_schema as validate_production_schema,
-)
+from .engine import _pymssql, check_connection, connection
+from .engine import transaction as sqlserver_transaction
+from .schema import MANAGED_TABLES, TABLE_COLUMNS
+from .schema import ensure_schema as ensure_production_schema
+from .schema import validate_schema as validate_production_schema
 
 TARGET_TABLE = "dbo.DBD_MASTER_DEEP"
 
