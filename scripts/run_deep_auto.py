@@ -12,6 +12,10 @@ from pathlib import Path
 # ============================================================
 
 RETRY_DELAY_SECONDS = 50
+SERVING_BATCH_SIZE = 32
+SERVING_INTERVAL_SECONDS = 10.0
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SERVING_LOG_PATH = PROJECT_ROOT / "logs" / "deep-serving.log"
 
 CANARY_COMMAND = [
     "collect",
@@ -74,6 +78,50 @@ def find_dbd_deep() -> str:
 
 
 DBD_DEEP = find_dbd_deep()
+
+
+def start_serving_sidecar() -> tuple[subprocess.Popen, object]:
+    SERVING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    log_file = SERVING_LOG_PATH.open("a", encoding="utf-8")
+    command = [
+        sys.executable,
+        "-m",
+        "dbd.deep.serving",
+        "--continuous",
+        "--batch-size",
+        str(SERVING_BATCH_SIZE),
+        "--interval-seconds",
+        str(SERVING_INTERVAL_SECONDS),
+    ]
+    creationflags = (
+        subprocess.CREATE_NEW_PROCESS_GROUP
+        if sys.platform == "win32"
+        else 0
+    )
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.DEVNULL,
+        stdout=log_file,
+        stderr=subprocess.STDOUT,
+        shell=False,
+        creationflags=creationflags,
+    )
+    return process, log_file
+
+
+def stop_serving_sidecar(process: subprocess.Popen, log_file: object) -> None:
+    try:
+        if process.poll() is None:
+            process.terminate()
+            try:
+                process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+    finally:
+        close = getattr(log_file, "close", None)
+        if close is not None:
+            close()
 
 
 def run_dbd_deep(arguments: list[str]) -> int:
@@ -165,7 +213,11 @@ def main() -> int:
     print(
         "Policy   : "
         "LONG RUN failure -> CANARY -> "
-        "20s retry until PASS -> LONG RUN"
+        f"{RETRY_DELAY_SECONDS}s retry until PASS -> LONG RUN"
+    )
+    print(
+        "Serving  : isolated sidecar process; "
+        "failure never stops Deep collection"
     )
     print(
         "Ctrl+C   : stop everything; "
@@ -180,9 +232,21 @@ def main() -> int:
             f"• concurrency=8 • rate=15 • buffer=32"
         )
 
-        return_code = run_dbd_deep(
-            LONG_RUN_COMMAND
+        serving_process, serving_log = start_serving_sidecar()
+        print(
+            f"Serving  : PID {serving_process.pid} "
+            f"• batch={SERVING_BATCH_SIZE} "
+            f"• interval={SERVING_INTERVAL_SECONDS:g}s"
         )
+        print(f"Serving log: {SERVING_LOG_PATH}")
+        print()
+
+        try:
+            return_code = run_dbd_deep(
+                LONG_RUN_COMMAND
+            )
+        finally:
+            stop_serving_sidecar(serving_process, serving_log)
 
         # ----------------------------------------------------
         # LONG RUN EXITED
