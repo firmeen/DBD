@@ -38,7 +38,7 @@ waiting population
 dbd_company_deep
 authoritative Deep row + 7 endpoint state
     │
-    ├── dbd_deep_runtime   bounded temporary work only
+    ├── dbd_deep_runtime   active lease / retry state only
     │
     └── COMPLETE rows only
              │
@@ -62,7 +62,7 @@ Key invariants:
 - SQL Server synchronization is INSERT + UPDATE + SKIP by `row_hash`; target-only rows are reported and are not automatically deleted;
 - `TIPDataIntelligence.dbo.DBD_COMPANY` is outside this serving pipeline.
 
-Normal collector scheduling priority remains unresolved Deep work → waiting Master companies → stale ACTIVE COMPLETE refresh → idle. The runtime table is bounded temporary work, not a permanent company registry.
+Standalone Deep separates preparation from collection. `dbd-deep prepare` bulk-stages waiting Master companies into `dbd_company_deep`; `dbd-deep collect` then claims unresolved Deep rows directly. The collector does not promote Master rows, scan stale ACTIVE rows, or run serving projection in its hot path. `dbd_deep_runtime` stores only active lease/retry state, not a prefilled work buffer.
 
 ### Standalone presentation boundary
 
