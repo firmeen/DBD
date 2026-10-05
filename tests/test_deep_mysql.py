@@ -170,10 +170,16 @@ def deep_model():
         _drop_model()
 
 
-def _insert_promotion_master(cur, *, jp_type_code="7", year="2568"):
+def _insert_promotion_master(
+    cur,
+    *,
+    jp_type_code="7",
+    jp_no="9000000000001",
+    year="2568",
+):
     # Distinct values catch positional/alias mistakes across every copied field.
     values = {
-        "jp_type_code": jp_type_code, "jp_no": "9000000000001",
+        "jp_type_code": jp_type_code, "jp_no": jp_no,
         "jp_name": "บริษัท ทดสอบ", "jp_name_e": "Promotion Co",
         "jp_stat_code": "1", "jp_stat_desc": "Active", "jp_type_desc": "Limited",
         "address": "123 Test Road", "pv_code": "10", "pv_desc": "Bangkok",
@@ -362,6 +368,98 @@ async def test_staging_rolls_back_deep_insert_if_master_delete_fails(staging_rep
     # A later explicit retry starts from the intact Master row.
     assert await repo.stage_master_batch(1) == 1
     assert warnings == [[], []]
+
+
+@pytest.mark.asyncio
+async def test_prepare_stages_complete_master_workset_then_direct_claims_one_lease_each() -> None:
+    bootstrap = DeepBootstrap()
+    try:
+        await bootstrap.ensure_model()
+    finally:
+        await bootstrap.close()
+
+    with connect() as conn, conn.cursor() as cur:
+        for suffix in range(1, 4):
+            _insert_promotion_master(
+                cur,
+                jp_no=f"900000000000{suffix}",
+            )
+        conn.commit()
+
+    repo = DeepRepository()
+    try:
+        result = await repo.prepare_for_collection(batch_size=500)
+
+        assert result["master_staged"] == 3
+        assert await repo.master_size() == 0
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) n FROM dbd_company_deep")
+            assert cur.fetchone()["n"] == 3
+            cur.execute("SELECT COUNT(*) n FROM dbd_deep_runtime")
+            assert cur.fetchone()["n"] == 0
+
+        first = await repo.claim()
+        second = await repo.claim()
+
+        assert first is not None
+        assert second is not None
+        assert first["jp_no"] != second["jp_no"]
+        assert first["attempts"] == 1
+        assert second["attempts"] == 1
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT jp_no,status,attempts "
+                "FROM dbd_deep_runtime ORDER BY jp_no"
+            )
+            leases = cur.fetchall()
+        assert len(leases) == 2
+        assert {row["status"] for row in leases} == {"RUNNING"}
+        assert {row["attempts"] for row in leases} == {1}
+
+        await repo.finish_runtime(str(first["jp_type_code"]), str(first["jp_no"]))
+        third = await repo.claim()
+        assert third is not None
+        assert third["jp_no"] not in {first["jp_no"], second["jp_no"]}
+    finally:
+        await repo.close()
+
+
+@pytest.mark.asyncio
+async def test_prepare_is_rerunnable_after_new_discovery_without_runtime_prefill() -> None:
+    bootstrap = DeepBootstrap()
+    try:
+        await bootstrap.ensure_model()
+    finally:
+        await bootstrap.close()
+
+    with connect() as conn, conn.cursor() as cur:
+        _insert_promotion_master(cur, jp_no="9000000000011")
+        conn.commit()
+
+    repo = DeepRepository()
+    try:
+        first = await repo.prepare_for_collection(batch_size=500)
+        assert first["master_staged"] == 1
+
+        with connect() as conn, conn.cursor() as cur:
+            _insert_promotion_master(cur, jp_no="9000000000012")
+            conn.commit()
+
+        second = await repo.prepare_for_collection(batch_size=500)
+
+        assert second["already_prepared"] is True
+        assert second["master_staged"] == 1
+        assert await repo.master_size() == 0
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) n FROM dbd_company_deep")
+            assert cur.fetchone()["n"] == 2
+            cur.execute("SELECT COUNT(*) n FROM dbd_deep_runtime")
+            assert cur.fetchone()["n"] == 0
+    finally:
+        await repo.close()
 
 
 @pytest.mark.asyncio
