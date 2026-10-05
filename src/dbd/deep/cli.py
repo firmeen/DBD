@@ -56,17 +56,36 @@ async def _status(json_mode: bool, coverage: bool) -> int:
     return 1 if summary["overlap"] else 0
 
 
+async def _prepare_heartbeat(
+    events: DeepTerminalEvents,
+    stop: asyncio.Event,
+) -> None:
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timeout=0.5)
+        except TimeoutError:
+            events("heartbeat", {})
+
+
 async def _prepare(batch_size: int, json_mode: bool) -> int:
     repo = DeepRepository()
     events = None if json_mode else DeepTerminalEvents("prepare")
+    heartbeat_stop = asyncio.Event()
+    heartbeat_task: asyncio.Task[None] | None = None
+
     try:
         if events is not None:
+            heartbeat_task = asyncio.create_task(
+                _prepare_heartbeat(events, heartbeat_stop)
+            )
             events("phase", {"phase": "PREFLIGHT"})
+
         await repo.preflight(
             require_runtime=False,
             require_prepared=False,
             check_indexes=True,
         )
+
         async with repo.manager_lock() as lock_conn:
             if events is not None:
                 events("phase", {"phase": "PREPARE"})
@@ -75,8 +94,12 @@ async def _prepare(batch_size: int, json_mode: bool) -> int:
                 event=events,
                 lock_conn=lock_conn,
             )
+
         summary = await repo.status_summary(include_coverage=False)
     finally:
+        heartbeat_stop.set()
+        if heartbeat_task is not None:
+            await heartbeat_task
         if events is not None:
             events.close()
         await repo.close()
