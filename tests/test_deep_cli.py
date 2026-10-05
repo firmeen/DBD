@@ -6,7 +6,7 @@ from io import StringIO
 import pytest
 
 from dbd.deep._version import __version__ as deep_version
-from dbd.deep.cli import parse_args
+from dbd.deep.cli import _collector_pool_size, parse_args
 from dbd.deep.presentation import DeepPresenter, DeepTerminalEvents
 
 
@@ -135,3 +135,18 @@ def test_collect_terminal_has_no_buffer_cycle_or_serving_panel() -> None:
     assert "Cycle" not in output
     assert "Serving Projection" not in output
     assert "In flight" in output
+
+
+def test_collector_pool_reserves_worker_and_control_capacity(monkeypatch) -> None:
+    fake_settings = type(
+        "FakeSettings",
+        (),
+        {
+            "db_pool_size": 8,
+            "dbd_fleet_db_connections_max": 96,
+        },
+    )()
+    monkeypatch.setattr("dbd.deep.cli.settings", fake_settings)
+
+    assert _collector_pool_size(8) == 10
+    assert _collector_pool_size(200) == 96
