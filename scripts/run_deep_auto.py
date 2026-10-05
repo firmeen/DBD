@@ -80,38 +80,51 @@ def find_dbd_deep() -> str:
 DBD_DEEP = find_dbd_deep()
 
 
-def start_serving_sidecar() -> tuple[subprocess.Popen, object]:
-    SERVING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    log_file = SERVING_LOG_PATH.open("a", encoding="utf-8")
-    command = [
-        sys.executable,
-        "-m",
-        "dbd.deep.serving",
-        "--continuous",
-        "--batch-size",
-        str(SERVING_BATCH_SIZE),
-        "--interval-seconds",
-        str(SERVING_INTERVAL_SECONDS),
-    ]
-    creationflags = (
-        subprocess.CREATE_NEW_PROCESS_GROUP
-        if sys.platform == "win32"
-        else 0
-    )
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=log_file,
-        stderr=subprocess.STDOUT,
-        shell=False,
-        creationflags=creationflags,
-    )
-    return process, log_file
-
-
-def stop_serving_sidecar(process: subprocess.Popen, log_file: object) -> None:
+def start_serving_sidecar() -> tuple[subprocess.Popen | None, object | None]:
+    log_file = None
     try:
-        if process.poll() is None:
+        SERVING_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        log_file = SERVING_LOG_PATH.open("a", encoding="utf-8")
+        command = [
+            sys.executable,
+            "-m",
+            "dbd.deep.serving",
+            "--continuous",
+            "--batch-size",
+            str(SERVING_BATCH_SIZE),
+            "--interval-seconds",
+            str(SERVING_INTERVAL_SECONDS),
+        ]
+        creationflags = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            if sys.platform == "win32"
+            else 0
+        )
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            shell=False,
+            creationflags=creationflags,
+        )
+        return process, log_file
+    except Exception as exc:
+        if log_file is not None:
+            log_file.close()
+        print(
+            f"WARNING: serving sidecar did not start: {type(exc).__name__}: {exc}",
+            flush=True,
+        )
+        return None, None
+
+
+def stop_serving_sidecar(
+    process: subprocess.Popen | None,
+    log_file: object | None,
+) -> None:
+    try:
+        if process is not None and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=10)
@@ -233,13 +246,14 @@ def main() -> int:
         )
 
         serving_process, serving_log = start_serving_sidecar()
-        print(
-            f"Serving  : PID {serving_process.pid} "
-            f"• batch={SERVING_BATCH_SIZE} "
-            f"• interval={SERVING_INTERVAL_SECONDS:g}s"
-        )
-        print(f"Serving log: {SERVING_LOG_PATH}")
-        print()
+        if serving_process is not None:
+            print(
+                f"Serving  : PID {serving_process.pid} "
+                f"• batch={SERVING_BATCH_SIZE} "
+                f"• interval={SERVING_INTERVAL_SECONDS:g}s"
+            )
+            print(f"Serving log: {SERVING_LOG_PATH}")
+            print()
 
         try:
             return_code = run_dbd_deep(
