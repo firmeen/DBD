@@ -215,3 +215,50 @@ def test_cutover_mysql_source_functions_contain_no_data_mutation_sql() -> None:
     ).upper()
     for forbidden in ("UPDATE ", "DELETE ", "TRUNCATE ", "DROP ", "INSERT "):
         assert forbidden not in source
+
+
+def test_profile_nested_field_absence_preserves_master_fallback() -> None:
+    row = _source_row()
+    row["jp_stat_desc"] = "MASTER STATUS"
+    row["profile_data"]["jpStatus"] = {"unrelated": "value"}
+
+    company = transform_company(
+        row,
+        published_at=datetime(2026, 10, 5, 9, 0, 0),
+    )
+
+    assert company["status_description"] == "MASTER STATUS"
+
+    row["profile_data"]["jpStatus"] = {"jpStatDesc": ""}
+    company = transform_company(
+        row,
+        published_at=datetime(2026, 10, 5, 9, 0, 0),
+    )
+    assert company["status_description"] is None
+
+
+def test_malformed_transformation_root_is_not_silently_treated_as_empty() -> None:
+    row = _source_row()
+    row["transformations_data"] = {"renamedCollections": []}
+
+    with pytest.raises(Exception, match="expected direction collections"):
+        transform_events(
+            row,
+            published_at=datetime(2026, 10, 5, 9, 0, 0),
+        )
+
+
+def test_industry_optional_scope_blanks_clean_to_null() -> None:
+    row = _source_row()
+    row["industry_benchmark_data"]["businessSizeCode"] = ""
+    row["industry_benchmark_data"]["locationType"] = ""
+    row["industry_benchmark_data"]["locationNo"] = ""
+
+    industry = transform_industries(
+        row,
+        published_at=datetime(2026, 10, 5, 9, 0, 0),
+    )[0]
+
+    assert industry["business_size_code"] is None
+    assert industry["location_type"] is None
+    assert industry["location_no"] is None
