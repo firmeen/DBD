@@ -1037,14 +1037,13 @@ def run_generation1_cutover(
             stats["financial"] += len(financial_rows)
             stats["industries_written"] += len(industry_rows)
             stats["committee_rows"] += sum(
-                len(item[2]) for item in prepared
+                1 for relation in relation_rows
+                if relation.get("relation_type") == "COMMITTEE"
             )
             stats["committee_sign_rows"] += sum(
-                sum(1 for row in item[2] if row.get("relation_type") == "COMMITTEE_SIGN")
-                for item in prepared
+                1 for relation in relation_rows
+                if relation.get("relation_type") == "COMMITTEE_SIGN"
             )
-            # committee_rows should describe COMMITTEE rows only.
-            stats["committee_rows"] -= stats["committee_sign_rows"]
             stats["batches"] += 1
             elapsed = max(0.001, time.monotonic() - started)
             stats["rate"] = stats["companies"] / elapsed
