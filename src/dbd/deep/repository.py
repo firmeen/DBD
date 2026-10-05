@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any, Awaitable, Callable, TypeVar
@@ -544,13 +545,20 @@ class DeepRepository:
         )
 
         if await self.is_prepared():
-            await self.assert_invariants()
+            if event is not None:
+                event(
+                    "prepare_scope",
+                    {
+                        "legacy_scope": "READY",
+                        "legacy_action": "SKIPPED",
+                    },
+                )
             return {
                 "already_prepared": True,
                 "rows_total": 0,
                 "rows_scanned": 0,
                 "rows_changed": 0,
-                "runtime_recovered": await self.recover_runtime(),
+                "runtime_recovered": 0,
             }
 
         async with self.engine.connect() as conn:
@@ -914,18 +922,17 @@ class DeepRepository:
                 )
 
         if event is not None:
-            event("phase", {"phase": "VERIFY"})
-        await self.assert_invariants()
+            event("phase", {"phase": "FINALIZE LEGACY"})
+        await self.assert_no_overlap()
         if lock_conn is not None:
             await self.assert_manager_lock(lock_conn)
         await self._mark_prepared()
-        runtime_recovered = await self.recover_runtime()
         return {
             "already_prepared": False,
             "rows_total": rows_total,
             "rows_scanned": scanned,
             "rows_changed": changed,
-            "runtime_recovered": runtime_recovered,
+            "runtime_recovered": 0,
         }
 
     async def prepare_for_collection(
@@ -934,12 +941,12 @@ class DeepRepository:
         batch_size: int = 5000,
         event: Callable[[str, dict[str, Any]], None] | None = None,
         lock_conn: AsyncConnection | None = None,
-    ) -> dict[str, int | bool]:
-        """Prepare a complete Deep workset before HTTP collection.
+    ) -> dict[str, int | bool | float]:
+        """Prepare the Deep workset without scanning endpoint JSON payloads.
 
-        Legacy Deep normalization remains one-time, but Master -> Deep staging
-        is rerunnable after every Discovery pass. Staging never materializes a
-        runtime queue; dbd_deep_runtime is reserved for active leases/retries.
+        Legacy normalization is one-time. Normal reruns stage Master rows into
+        Deep in small atomic batches, then perform only lightweight readiness
+        checks. Runtime rows remain lease/retry state, never a prefilled queue.
         """
         result = await self.prepare_active_scope(
             batch_size=batch_size,
@@ -952,26 +959,84 @@ class DeepRepository:
 
         stage_batch_size = max(100, min(int(batch_size), 2000))
         master_staged = 0
+        batches_committed = 0
+        stage_started = time.monotonic()
+
         while True:
-            staged = await self.stage_master_batch(stage_batch_size)
+            batch_no = batches_committed + 1
+            staged = await self.stage_master_batch(
+                stage_batch_size,
+                event=event,
+                batch_no=batch_no,
+            )
             if staged == 0:
                 break
+
+            batches_committed += 1
             master_staged += staged
+            elapsed = max(0.001, time.monotonic() - stage_started)
+
             if lock_conn is not None:
                 await self.assert_manager_lock(lock_conn)
             if event is not None:
                 event(
                     "prepare_stage",
                     {
+                        "batch": batches_committed,
+                        "batch_rows": staged,
                         "master_staged": master_staged,
+                        "rows_per_second": master_staged / elapsed,
                     },
                 )
 
-        await self.assert_invariants()
+        if event is not None:
+            event("phase", {"phase": "VERIFY READY"})
+            event(
+                "prepare_step",
+                {
+                    "step": "MASTER EMPTY CHECK",
+                    "batch": batches_committed,
+                },
+            )
+        await self.assert_master_empty()
+
+        if event is not None:
+            event(
+                "prepare_step",
+                {
+                    "step": "OVERLAP CHECK",
+                    "batch": batches_committed,
+                },
+            )
+        await self.assert_no_overlap()
+
+        if event is not None:
+            event(
+                "prepare_step",
+                {
+                    "step": "RECOVER RUNTIME",
+                    "batch": batches_committed,
+                },
+            )
         runtime_recovered = await self.recover_runtime()
+
+        elapsed = time.monotonic() - stage_started
+        if event is not None:
+            event(
+                "prepare_ready",
+                {
+                    "batch": batches_committed,
+                    "master_staged": master_staged,
+                    "runtime_recovered": runtime_recovered,
+                    "stage_elapsed_seconds": elapsed,
+                },
+            )
+
         return {
             **result,
             "master_staged": master_staged,
+            "batches_committed": batches_committed,
+            "stage_elapsed_seconds": elapsed,
             "runtime_recovered": runtime_recovered,
         }
 
@@ -1125,11 +1190,44 @@ class DeepRepository:
             params[f"n{index}"] = jp_no
         return "(" + " OR ".join(clauses) + ")", params
 
-    async def stage_master_batch(self, limit: int) -> int:
+    @staticmethod
+    def _tuple_key_predicate(
+        keys: list[tuple[str, str]],
+        *,
+        alias: str = "",
+    ) -> tuple[str, dict[str, object]]:
+        prefix = f"{alias}." if alias else ""
+        tuples = []
+        params: dict[str, object] = {}
+        for index, (jp_type_code, jp_no) in enumerate(keys):
+            tuples.append(f"(:t{index}, :n{index})")
+            params[f"t{index}"] = jp_type_code
+            params[f"n{index}"] = jp_no
+        return (
+            f"({prefix}jp_type_code, {prefix}jp_no) IN "
+            f"({', '.join(tuples)})",
+            params,
+        )
+
+    async def stage_master_batch(
+        self,
+        limit: int,
+        *,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
+        batch_no: int = 0,
+    ) -> int:
         if limit <= 0:
             return 0
 
         async def op(conn: AsyncConnection) -> int:
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "SELECT KEYS",
+                        "batch": batch_no,
+                    },
+                )
             selected = (
                 await conn.execute(
                     text(
@@ -1151,12 +1249,22 @@ class DeepRepository:
             if not keys:
                 return 0
 
-            predicate, params = self._key_predicate(keys)
-            master_predicate, _ = self._key_predicate(keys, alias="m")
+            predicate, params = self._tuple_key_predicate(keys)
+            master_predicate, _ = self._tuple_key_predicate(keys, alias="m")
             financial_required = (
                 f"CASE WHEN NULLIF(TRIM(m.submit_fin_year),'') IS NULL "
                 f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
             )
+
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "UPSERT DEEP",
+                        "batch": batch_no,
+                        "batch_rows": len(keys),
+                    },
+                )
 
             # Alias the incoming SELECT row so MySQL does not generate a
             # VALUES(column) deprecation warning for every updated field.
@@ -1280,6 +1388,16 @@ class DeepRepository:
                 params,
             )
 
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "DELETE MASTER",
+                        "batch": batch_no,
+                        "batch_rows": len(keys),
+                    },
+                )
+
             await conn.execute(
                 text(
                     f"""
@@ -1290,6 +1408,15 @@ class DeepRepository:
                 params,
             )
 
+            if event is not None:
+                event(
+                    "prepare_step",
+                    {
+                        "step": "COMMIT",
+                        "batch": batch_no,
+                        "batch_rows": len(keys),
+                    },
+                )
             return len(keys)
 
         # Selected Master keys are chosen inside this transaction. On ambiguous
