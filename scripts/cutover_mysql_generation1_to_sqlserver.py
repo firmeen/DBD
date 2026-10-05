@@ -12,6 +12,13 @@ from rich.text import Text
 from dbd.cutover import run_generation1_cutover
 
 
+def _batch_size(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1 or parsed > 2000:
+        raise argparse.ArgumentTypeError("must be between 1 and 2000")
+    return parsed
+
+
 class CutoverTerminal:
     def __init__(self) -> None:
         self.console = Console()
@@ -113,7 +120,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--batch-size",
-        type=int,
+        type=_batch_size,
         default=500,
         help="Companies per SQL Server transaction (default: 500, max: 2000)",
     )
