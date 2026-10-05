@@ -19,6 +19,7 @@ from dbd.cutover import (
     transform_industries,
     transform_relations,
 )
+from dbd.core.exceptions import ContractError
 
 
 def _source_row() -> dict:
@@ -241,7 +242,7 @@ def test_malformed_transformation_root_is_not_silently_treated_as_empty() -> Non
     row = _source_row()
     row["transformations_data"] = {"renamedCollections": []}
 
-    with pytest.raises(Exception, match="expected direction collections"):
+    with pytest.raises(ContractError, match="expected direction collections"):
         transform_events(
             row,
             published_at=datetime(2026, 10, 5, 9, 0, 0),
