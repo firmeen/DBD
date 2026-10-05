@@ -197,28 +197,14 @@ class DeepTerminalEvents:
         if name == "phase":
             self.console.print(f"PHASE {payload.get('phase')}")
             return
-        if name == "prepare_scope":
-            self.console.print(
-                "LEGACY "
-                f"scope={payload.get('legacy_scope')} "
-                f"action={payload.get('legacy_action')}"
-            )
-            return
-        if name == "prepare_step":
-            self.console.print(
-                "PREPARE "
-                f"batch={_number(payload.get('batch'))} "
-                f"step={payload.get('step')} "
-                f"rows={_number(payload.get('batch_rows'))}"
-            )
-            return
         if name == "prepare_stage":
             self.console.print(
                 "STAGED "
                 f"batch={_number(payload.get('batch'))} "
                 f"rows={_number(payload.get('batch_rows'))} "
                 f"total={_number(payload.get('master_staged'))} "
-                f"rate={float(payload.get('rows_per_second') or 0):,.0f} rows/s"
+                f"last={float(payload.get('batch_rows_per_second') or 0):,.0f} rows/s "
+                f"avg={float(payload.get('rows_per_second') or 0):,.0f} rows/s"
             )
             return
         if name == "prepare_ready":
@@ -227,6 +213,8 @@ class DeepTerminalEvents:
                 f"staged={_number(payload.get('master_staged'))} "
                 f"batches={_number(payload.get('batch'))}"
             )
+            return
+        if name in {"prepare_scope", "prepare_step", "heartbeat"}:
             return
         if name == "idle":
             self.console.print(
@@ -239,8 +227,6 @@ class DeepTerminalEvents:
                 f"{name.upper()} endpoint={endpoint} error={payload.get('error')}"
             )
             return
-        if name == "heartbeat":
-            return
 
         now = time.monotonic()
         if name not in {"progress", "prepare_progress"} or now - self.last_plain_progress < 2.0:
@@ -248,7 +234,7 @@ class DeepTerminalEvents:
         self.last_plain_progress = now
         if name == "prepare_progress":
             self.console.print(
-                "LEGACY PREPARE "
+                "LEGACY "
                 f"{_number(payload.get('rows_scanned'))}/"
                 f"{_number(payload.get('rows_total'))} "
                 f"changed={_number(payload.get('rows_changed'))}"
@@ -280,115 +266,48 @@ class DeepTerminalEvents:
             now = time.monotonic()
             elapsed = now - self.started_at
             step_elapsed = now - self.step_started_at
-            last_commit_age = (
-                None
-                if self.last_commit_at is None
-                else max(0.0, now - self.last_commit_at)
+            batch = int(self.state.get("batch") or 0)
+            batch_rows = int(self.state.get("batch_rows") or 0)
+            staged = int(self.state.get("master_staged") or 0)
+            last_rate = float(
+                self.state.get("batch_rows_per_second") or 0
             )
+            avg_rate = float(self.state.get("rows_per_second") or 0)
 
-            header = Text()
-            header.append(f"DBD DEEP PREPARE v{__version__}", style="bold white")
-            header.append(" • ", style="dim")
-            header.append_text(_state(self.state["phase"]))
-            header.append(" • ", style="dim")
-            header.append(_duration(elapsed), style="dim")
-
-            work = Panel(
+            return Panel(
                 _grid(
                     [
                         (
                             "Phase",
                             _state(self.state["phase"]),
-                            "Current step",
+                            "Elapsed",
+                            _styled(_duration(elapsed), "dim"),
+                        ),
+                        (
+                            "Step",
                             _styled(self.state.get("prepare_step", "-"), "cyan"),
+                            "Step time",
+                            _styled(f"{step_elapsed:,.1f}s", "bold white"),
                         ),
                         (
                             "Batch",
-                            _styled(_number(self.state.get("batch")), "bold white"),
-                            "Batch rows",
-                            _styled(_number(self.state.get("batch_rows")), "bold white"),
-                        ),
-                        (
-                            "Step elapsed",
-                            _styled(_duration(step_elapsed), "bold white"),
-                            "Legacy scope",
                             _styled(
-                                self.state.get("legacy_scope", "CHECKING"),
-                                "green"
-                                if self.state.get("legacy_scope") == "READY"
-                                else "yellow",
-                            ),
-                        ),
-                    ]
-                ),
-                title="Current Work",
-            )
-
-            commit_label = (
-                "-"
-                if last_commit_age is None
-                else f"{last_commit_age:,.1f}s ago"
-            )
-            progress = Panel(
-                _grid(
-                    [
-                        (
-                            "Master staged",
-                            _priority_count(self.state.get("master_staged"), "green"),
-                            "Committed batches",
-                            _priority_count(
-                                self.state.get("batches_committed"),
-                                "blue",
-                            ),
-                        ),
-                        (
-                            "Average",
-                            _styled(
-                                f"{float(self.state.get('rows_per_second') or 0):,.0f} rows/s",
-                                "cyan",
-                            ),
-                            "Last batch",
-                            _styled(
-                                f"{float(self.state.get('batch_elapsed_seconds') or 0):,.2f}s",
+                                f"{batch:,} × {batch_rows:,}",
                                 "bold white",
                             ),
+                            "Staged",
+                            _priority_count(staged, "green"),
                         ),
                         (
-                            "Batch speed",
-                            _styled(
-                                f"{float(self.state.get('batch_rows_per_second') or 0):,.0f} rows/s",
-                                "cyan",
-                            ),
-                            "Last commit",
-                            _styled(commit_label, "dim"),
-                        ),
-                        (
-                            "Legacy scanned",
-                            _styled(
-                                f"{_number(self.state.get('rows_scanned'))}/"
-                                f"{_number(self.state.get('rows_total'))}",
-                                "dim",
-                            ),
-                            "Legacy action",
-                            _styled(self.state.get("legacy_action", "-"), "dim"),
+                            "Last",
+                            _styled(f"{last_rate:,.0f} rows/s", "cyan"),
+                            "Average",
+                            _styled(f"{avg_rate:,.0f} rows/s", "cyan"),
                         ),
                     ]
                 ),
-                title="Progress",
+                title=f"DBD DEEP PREPARE v{__version__}",
             )
-
-            footer = Text()
-            if self.state["phase"] == "READY":
-                footer.append("READY", style="bold green")
-                footer.append(" • dbd_company_deep ready for collection", style="dim")
-            else:
-                footer.append("ACTIVE", style="cyan")
-                footer.append(
-                    " • dbd_company_master → dbd_company_deep",
-                    style="dim",
-                )
-            footer.append(" • Ctrl+C safe between committed batches", style="dim")
-            return Group(Panel(header, title="DBD DEEP"), work, progress, footer)
 
         elapsed = int(time.monotonic() - self.started_at)
         header = Text()
