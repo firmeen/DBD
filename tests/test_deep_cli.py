@@ -6,7 +6,7 @@ from io import StringIO
 import pytest
 
 from dbd.deep._version import __version__ as deep_version
-from dbd.deep.cli import parse_args
+from dbd.deep.cli import _collector_pool_size, parse_args
 from dbd.deep.presentation import DeepPresenter, DeepTerminalEvents
 
 
@@ -129,25 +129,46 @@ def test_live_state_returns_to_running_when_cycle_finds_work() -> None:
     assert events.state["phase"] == "RUNNING"
 
 
-def test_serving_events_are_visible_without_changing_collector_state() -> None:
+def test_collector_pool_reserves_control_capacity(monkeypatch) -> None:
+    fake_settings = type(
+        "FakeSettings",
+        (),
+        {
+            "db_pool_size": 8,
+            "dbd_fleet_db_connections_max": 96,
+        },
+    )()
+    monkeypatch.setattr("dbd.deep.cli.settings", fake_settings)
+
+    assert _collector_pool_size(8) == 10
+    assert _collector_pool_size(200) == 96
+
+
+def test_collect_terminal_does_not_render_serving_panel() -> None:
     stream = StringIO()
     events = DeepTerminalEvents("collect", stream=stream)
-    events(
-        "serving",
-        {
-            "ready": True,
-            "scanned": 32,
-            "inserted": 20,
-            "updated": 4,
-            "unchanged": 8,
-            "missing_identity": 0,
-            "normalization_error": 0,
-        },
-    )
-    assert events.state["serving_ready"] is True
-    assert events.state["serving_inserted"] == 20
-    assert "SERVING ready=YES" in stream.getvalue()
 
-    events("serving_error", {"error": "database unavailable"})
-    assert events.state["serving_last_error"] == "database unavailable"
-    assert "SERVING DEGRADED" in stream.getvalue()
+    events.console.print(events._render())
+
+    output = stream.getvalue()
+    assert "Serving Projection" not in output
+    assert "Collector" in output
+
+
+def test_live_updates_do_not_force_terminal_refresh() -> None:
+    stream = StringIO()
+    events = DeepTerminalEvents("collect", stream=stream)
+
+    class FakeLive:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def update(self, renderable, *, refresh):
+            self.calls.append((renderable, refresh))
+
+    fake = FakeLive()
+    events.live = fake
+    events._refresh_live()
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0][1] is False
