@@ -120,6 +120,8 @@ class DeepTerminalEvents:
             "batches_committed": 0,
             "master_staged": 0,
             "rows_per_second": 0.0,
+            "batch_elapsed_seconds": 0.0,
+            "batch_rows_per_second": 0.0,
             "rows_total": 0,
             "rows_scanned": 0,
             "rows_changed": 0,
@@ -343,6 +345,18 @@ class DeepTerminalEvents:
                             "Average",
                             _styled(
                                 f"{float(self.state.get('rows_per_second') or 0):,.0f} rows/s",
+                                "cyan",
+                            ),
+                            "Last batch",
+                            _styled(
+                                f"{float(self.state.get('batch_elapsed_seconds') or 0):,.2f}s",
+                                "bold white",
+                            ),
+                        ),
+                        (
+                            "Batch speed",
+                            _styled(
+                                f"{float(self.state.get('batch_rows_per_second') or 0):,.0f} rows/s",
                                 "cyan",
                             ),
                             "Last commit",
