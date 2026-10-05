@@ -966,18 +966,20 @@ class DeepRepository:
         if event is not None:
             event("phase", {"phase": "STAGE MASTER"})
 
-        stage_batch_size = max(100, min(int(batch_size), 2000))
+        stage_batch_size = max(100, min(int(batch_size), 5000))
         master_staged = 0
         batches_committed = 0
         stage_started = time.monotonic()
 
         while True:
             batch_no = batches_committed + 1
+            batch_started = time.monotonic()
             staged = await self.stage_master_batch(
                 stage_batch_size,
                 event=event,
                 batch_no=batch_no,
             )
+            batch_elapsed = time.monotonic() - batch_started
             if staged == 0:
                 break
 
@@ -995,6 +997,8 @@ class DeepRepository:
                         "batch_rows": staged,
                         "master_staged": master_staged,
                         "rows_per_second": master_staged / elapsed,
+                        "batch_elapsed_seconds": batch_elapsed,
+                        "batch_rows_per_second": staged / max(0.001, batch_elapsed),
                     },
                 )
 
@@ -1242,8 +1246,8 @@ class DeepRepository:
                     text(
                         f"""
                         SELECT jp_type_code, jp_no
-                        FROM {MASTER_TABLE}
-                        ORDER BY last_seen_at DESC, jp_type_code, jp_no
+                        FROM {MASTER_TABLE} FORCE INDEX (PRIMARY)
+                        ORDER BY jp_type_code, jp_no
                         LIMIT :limit
                         FOR UPDATE SKIP LOCKED
                         """
