@@ -1383,9 +1383,8 @@ class DeepRepository:
             )
             return len(selected)
 
-        # A crash after commit but before runtime seeding is safe: the reopened
-        # rows are ordinary unresolved Deep work and seed_existing_deep() will
-        # adopt them on the next bounded refill.
+        # A crash after commit is safe: reopened rows remain ordinary
+        # unresolved Deep work and direct claiming will pick them later.
         return await self._transaction(op, attempts=1)
 
     async def claim(self) -> dict[str, Any] | None:
