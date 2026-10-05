@@ -104,8 +104,14 @@ async def _retry(limit: int | None, json_mode: bool) -> int:
     return 0
 
 
+def _collector_pool_size(concurrency: int) -> int:
+    requested = max(settings.db_pool_size, int(concurrency) + 2)
+    cap = max(settings.db_pool_size, settings.dbd_fleet_db_connections_max)
+    return min(requested, cap)
+
+
 async def _collect(args) -> int:
-    repo = DeepRepository()
+    repo = DeepRepository(pool_size=_collector_pool_size(args.concurrency))
     events = None if args.json else DeepTerminalEvents("collect")
     collector = DeepCollector(
         repository=repo,
