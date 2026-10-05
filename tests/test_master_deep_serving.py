@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 from decimal import Decimal
 from io import StringIO
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
