@@ -670,18 +670,87 @@ class ProductionSqlServerRepository:
         )
 
     def upsert_industries(self, conn, rows: list[dict[str, Any]]) -> int:
-        return _upsert_many(
-            conn,
-            table_name="dbo.DBD_INDUSTRY",
-            rows=rows,
-            key_columns=(
-                "submit_objective_code",
-                "fiscal_year",
-                "business_size_code",
-                "location_type",
-                "location_no",
-            ),
+        if not rows:
+            return 0
+        columns = _table_write_columns("dbo.DBD_INDUSTRY")
+        key_columns = (
+            "submit_objective_code",
+            "fiscal_year",
+            "business_size_code",
+            "location_type",
+            "location_no",
         )
+        update_columns = tuple(
+            column
+            for column in columns
+            if column not in key_columns and column != "first_seen_generation"
+        )
+        select_sql = """
+            SELECT industry_id,source_updated_at,payload
+            FROM dbo.DBD_INDUSTRY WITH (UPDLOCK,HOLDLOCK)
+            WHERE submit_objective_code=%s
+              AND fiscal_year=%s
+              AND business_size_code=%s
+              AND location_type=%s
+              AND location_no=%s
+        """
+        update_sql = (
+            "UPDATE dbo.DBD_INDUSTRY SET "
+            + ", ".join(f"[{column}]=%s" for column in update_columns)
+            + " WHERE industry_id=%s"
+        )
+        insert_sql = (
+            "INSERT INTO dbo.DBD_INDUSTRY ("
+            + ", ".join(f"[{column}]" for column in columns)
+            + ") VALUES ("
+            + ", ".join(["%s"] * len(columns))
+            + ")"
+        )
+
+        cur = conn.cursor()
+        try:
+            for row in rows:
+                key = tuple(_production_value(row.get(column)) for column in key_columns)
+                if any(value is None for value in key):
+                    raise SqlServerWriteError(
+                        "dbo.DBD_INDUSTRY natural key cannot contain NULL"
+                    )
+                cur.execute(select_sql, key)
+                existing = cur.fetchone()
+                if existing is None:
+                    cur.execute(
+                        insert_sql,
+                        tuple(_production_value(row.get(column)) for column in columns),
+                    )
+                    continue
+
+                industry_id, existing_updated, existing_payload = existing
+                incoming_updated = row.get("source_updated_at")
+                incoming_payload = _production_value(row.get("payload"))
+                if existing_payload != incoming_payload:
+                    if (
+                        existing_updated is not None
+                        and incoming_updated is not None
+                        and incoming_updated < existing_updated
+                    ):
+                        continue
+                    if incoming_updated == existing_updated:
+                        raise SqlServerWriteError(
+                            "Conflicting industry benchmark payload for the same "
+                            "natural key and source_updated_at"
+                        )
+
+                cur.execute(
+                    update_sql,
+                    tuple(
+                        _production_value(row.get(column))
+                        for column in update_columns
+                    )
+                    + (int(industry_id),),
+                )
+        finally:
+            cur.close()
+        return len(rows)
 
     def count_generation_one(self) -> int:
         with connection() as conn:
