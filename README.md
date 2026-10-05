@@ -157,7 +157,7 @@ dbd-deep collect --limit 20 --concurrency 4 --rate 5 --http-retries 3
 | [DBD Remote Client](docs/DBD_REMOTE_CLIENT.md) | คู่มือฝั่ง Client ตั้งแต่ clone repo ถึงต่อ VS Code/DBeaver |
 | [DBD Remote Server](docs/DBD_REMOTE_SERVER.md) | คู่มือฝั่ง Server สำหรับ MySQL + cloudflared + gateway |
 | [DBD Remote Gateway](docs/DBD_REMOTE_GATEWAY.md) | ภาพรวม architecture และเลือกคู่มือ Client/Server |
-| [Standalone Deep quick start](docs/DEEP_QUICKSTART.md) | ใช้ `dbd-deep`, serving projection และ SQL Server sync แบบ step-by-step |
+| [Standalone Deep quick start](docs/DEEP_QUICKSTART.md) | ใช้ `dbd-deep prepare` + direct Deep collect และ downstream export แบบแยกขั้น |
 | [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md) | Canary, production campaign, status, stop และ resume |
 
 ---
@@ -215,7 +215,9 @@ Standalone Deep ใช้ MySQL เป็น durable state โดยตรงแ
 ```text
 Discovery
 → dbd_company_master
+→ dbd-deep prepare
 → dbd_company_deep
+→ dbd-deep collect
 → 7 endpoints
 → COMPLETE
 ```
@@ -232,10 +234,10 @@ dbd-deep retry
 รันต่อเนื่อง:
 
 ```powershell
-dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --buffer-size 32 --idle-seconds 5
+dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --idle-seconds 5
 ```
 
-เมื่อ Deep row เป็น `COMPLETE` สามารถ project เป็นตารางอ่านง่าย `dbd_master_deep`:
+เมื่อ Deep row เป็น `COMPLETE` สามารถสั่ง downstream projection ไป `dbd_master_deep` แบบ explicit ได้; `prepare`/`collect` ไม่เรียกขั้นนี้เอง:
 
 ```powershell
 python -m dbd.deep.serving --ensure --backfill --batch-size 100 --limit 100
