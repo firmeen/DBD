@@ -133,12 +133,12 @@ class DeepTransientDatabaseError(RuntimeError):
     """Transient MySQL failure after repository-local retries were exhausted."""
 
 
-def create_deep_engine() -> AsyncEngine:
-    """Dedicated pool for the standalone collector.
+def create_deep_engine(*, pool_size: int | None = None) -> AsyncEngine:
+    """Dedicated MySQL engine for one Deep runtime role.
 
-    It deliberately does not import the legacy worker repository or campaign
-    scheduler. pool_pre_ping + transaction retries make dead MySQL connections
-    replaceable without turning a transient DB disconnect into endpoint failure.
+    Collector and Serving may run in separate processes with independent pools.
+    pool_pre_ping + transaction retries make dead MySQL connections replaceable
+    without turning a transient DB disconnect into endpoint failure.
     """
     return create_async_engine(
         URL.create(
@@ -149,7 +149,7 @@ def create_deep_engine() -> AsyncEngine:
             port=settings.db_port,
             database=settings.db_name,
         ),
-        pool_size=max(2, settings.db_pool_size),
+        pool_size=max(2, int(pool_size or settings.db_pool_size)),
         max_overflow=0,
         pool_pre_ping=True,
         isolation_level="READ COMMITTED",
@@ -211,8 +211,13 @@ def _status_case(required_expr: str = "required_mask") -> str:
 
 
 class DeepRepository:
-    def __init__(self, engine: AsyncEngine | None = None) -> None:
-        self.engine = engine or create_deep_engine()
+    def __init__(
+        self,
+        engine: AsyncEngine | None = None,
+        *,
+        pool_size: int | None = None,
+    ) -> None:
+        self.engine = engine or create_deep_engine(pool_size=pool_size)
         self._owns_engine = engine is None
 
     async def close(self) -> None:
