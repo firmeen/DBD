@@ -72,6 +72,7 @@ async def _prepare(batch_size: int, json_mode: bool) -> int:
     events = None if json_mode else DeepTerminalEvents("prepare")
     heartbeat_stop = asyncio.Event()
     heartbeat_task: asyncio.Task[None] | None = None
+    summary = None
 
     try:
         if events is not None:
@@ -80,22 +81,18 @@ async def _prepare(batch_size: int, json_mode: bool) -> int:
             )
             events("phase", {"phase": "PREFLIGHT"})
 
-        await repo.preflight(
-            require_runtime=False,
-            require_prepared=False,
-            check_indexes=True,
-        )
-
         async with repo.manager_lock() as lock_conn:
-            if events is not None:
-                events("phase", {"phase": "PREPARE"})
             result = await repo.prepare_for_collection(
                 batch_size=batch_size,
                 event=events,
                 lock_conn=lock_conn,
             )
 
-        summary = await repo.status_summary(include_coverage=False)
+        # Preserve the existing JSON contract when explicitly requested.
+        # Interactive prepare already proved readiness with cheap EXISTS checks,
+        # so it does not scan Deep again just to print a second summary.
+        if json_mode:
+            summary = await repo.status_summary(include_coverage=False)
     finally:
         heartbeat_stop.set()
         if heartbeat_task is not None:
@@ -104,8 +101,10 @@ async def _prepare(batch_size: int, json_mode: bool) -> int:
             events.close()
         await repo.close()
 
-    DeepPresenter(json_mode=json_mode).prepare(result, summary)
-    return 1 if summary["overlap"] else 0
+    if json_mode:
+        DeepPresenter(json_mode=True).prepare(result, summary)
+        return 1 if summary["overlap"] else 0
+    return 0
 
 
 async def _retry(limit: int | None, json_mode: bool) -> int:
