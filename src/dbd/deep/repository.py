@@ -463,6 +463,8 @@ class DeepRepository:
                       ON d.jp_type_code=r.jp_type_code
                      AND d.jp_no=r.jp_no
                     WHERE d.jp_no IS NULL
+                       OR d.deep_completed_at IS NOT NULL
+                       OR d.deep_status='COMPLETE'
                     """
                 )
             )
@@ -926,6 +928,67 @@ class DeepRepository:
             "runtime_recovered": runtime_recovered,
         }
 
+    async def prepare_for_collection(
+        self,
+        *,
+        batch_size: int = 5000,
+        event: Callable[[str, dict[str, Any]], None] | None = None,
+        lock_conn: AsyncConnection | None = None,
+    ) -> dict[str, int | bool]:
+        """Prepare a complete Deep workset before HTTP collection.
+
+        Legacy Deep normalization remains one-time, but Master -> Deep staging
+        is rerunnable after every Discovery pass. Staging never materializes a
+        runtime queue; dbd_deep_runtime is reserved for active leases/retries.
+        """
+        result = await self.prepare_active_scope(
+            batch_size=batch_size,
+            event=event,
+            lock_conn=lock_conn,
+        )
+
+        if event is not None:
+            event("phase", {"phase": "STAGE MASTER"})
+
+        stage_batch_size = max(100, min(int(batch_size), 2000))
+        master_staged = 0
+        while True:
+            staged = await self.stage_master_batch(stage_batch_size)
+            if staged == 0:
+                break
+            master_staged += staged
+            if lock_conn is not None:
+                await self.assert_manager_lock(lock_conn)
+            if event is not None:
+                event(
+                    "prepare_stage",
+                    {
+                        "master_staged": master_staged,
+                    },
+                )
+
+        await self.assert_invariants()
+        runtime_recovered = await self.recover_runtime()
+        return {
+            **result,
+            "master_staged": master_staged,
+            "runtime_recovered": runtime_recovered,
+        }
+
+    async def master_size(self) -> int:
+        async with self.engine.connect() as conn:
+            value = (
+                await conn.execute(text(f"SELECT COUNT(*) FROM {MASTER_TABLE}"))
+            ).scalar_one()
+        return int(value or 0)
+
+    async def assert_master_empty(self) -> None:
+        if await self.master_size():
+            raise RuntimeError(
+                "dbd_company_master still contains unstaged companies; "
+                "run dbd-deep prepare before collect"
+            )
+
     async def assert_no_overlap(self) -> None:
         async with self.engine.connect() as conn:
             overlap = int(
@@ -999,53 +1062,6 @@ class DeepRepository:
             ).scalar_one()
         return int(value or 0)
 
-    async def seed_existing_deep(self, limit: int) -> int:
-        if limit <= 0:
-            return 0
-
-        async def op(conn: AsyncConnection) -> int:
-            result = await conn.execute(
-                text(
-                    f"""
-                    INSERT IGNORE INTO {RUNTIME_TABLE} (
-                        jp_type_code,
-                        jp_no,
-                        status,
-                        attempts,
-                        available_at,
-                        last_error
-                    )
-                    SELECT
-                        d.jp_type_code,
-                        d.jp_no,
-                        'PENDING',
-                        0,
-                        UTC_TIMESTAMP(6),
-                        NULL
-                    FROM {DEEP_TABLE} d
-                    LEFT JOIN {RUNTIME_TABLE} r
-                      ON r.jp_type_code=d.jp_type_code
-                     AND r.jp_no=d.jp_no
-                    WHERE d.deep_completed_at IS NULL
-                      AND d.deep_status IN ('PENDING','COLLECTING')
-                      AND r.jp_no IS NULL
-                    ORDER BY
-                        d.deep_completed_at,
-                        d.deep_status,
-                        d.jp_type_code,
-                        d.jp_no
-                    LIMIT :limit
-                    """
-                ),
-                {"limit": int(limit)},
-            )
-            return int(result.rowcount or 0)
-
-        # The persisted prepared status is the hot-path scheduling truth.
-        # This avoids re-evaluating bitwise completion expressions across Deep
-        # during every bounded refill.
-        return await self._transaction(op, attempts=1)
-
     async def next_runtime_delay(self) -> float | None:
         async with self.engine.connect() as conn:
             row = (
@@ -1092,7 +1108,7 @@ class DeepRepository:
             params[f"n{index}"] = jp_no
         return "(" + " OR ".join(clauses) + ")", params
 
-    async def promote_master(self, limit: int) -> int:
+    async def stage_master_batch(self, limit: int) -> int:
         if limit <= 0:
             return 0
 
@@ -1120,7 +1136,6 @@ class DeepRepository:
 
             predicate, params = self._key_predicate(keys)
             master_predicate, _ = self._key_predicate(keys, alias="m")
-            deep_predicate, _ = self._key_predicate(keys, alias="d")
             financial_required = (
                 f"CASE WHEN NULLIF(TRIM(m.submit_fin_year),'') IS NULL "
                 f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
@@ -1258,39 +1273,11 @@ class DeepRepository:
                 params,
             )
 
-            runtime_result = await conn.execute(
-                text(
-                    f"""
-                    INSERT IGNORE INTO {RUNTIME_TABLE} (
-                        jp_type_code,
-                        jp_no,
-                        status,
-                        attempts,
-                        available_at,
-                        last_error
-                    )
-                    SELECT
-                        d.jp_type_code,
-                        d.jp_no,
-                        'PENDING',
-                        0,
-                        UTC_TIMESTAMP(6),
-                        NULL
-                    FROM {DEEP_TABLE} d
-                    WHERE {deep_predicate}
-                      AND (
-                        ((d.done_mask | d.not_available_mask | d.failed_mask)
-                          & d.required_mask) <> d.required_mask
-                      )
-                    """
-                ),
-                params,
-            )
-            return max(len(keys), int(runtime_result.rowcount or 0))
+            return len(keys)
 
         # Selected Master keys are chosen inside this transaction. On ambiguous
-        # COMMIT, fail the collector and let restart recovery inspect durable
-        # MASTER/DEEP state instead of selecting a different batch on retry.
+        # COMMIT, stop preparation and let the operator rerun it. The atomic
+        # insert/update + delete preserves the MASTER XOR DEEP invariant.
         return await self._transaction(op, attempts=1)
 
     @staticmethod
@@ -1401,52 +1388,13 @@ class DeepRepository:
         # adopt them on the next bounded refill.
         return await self._transaction(op, attempts=1)
 
-    async def refill(
-        self,
-        target: int,
-        *,
-        include_refresh: bool = True,
-    ) -> dict[str, int]:
-        target = max(1, int(target))
-        current = await self.runtime_size()
-        if current >= target:
-            return {
-                "runtime": current,
-                "adopted": 0,
-                "promoted": 0,
-                "refreshed": 0,
-                "refresh_scanned": False,
-            }
-
-        capacity = target - current
-        adopted = await self.seed_existing_deep(capacity)
-        current += adopted
-
-        promoted = 0
-        if current < target:
-            promoted = await self.promote_master(target - current)
-            current = await self.runtime_size()
-
-        refreshed = 0
-        refresh_scanned = current < target and include_refresh
-        if refresh_scanned:
-            reopened = await self.reopen_stale_active(target - current)
-            if reopened:
-                # Reuse the existing bounded runtime queue rather than
-                # materializing a second refresh scheduler.
-                await self.seed_existing_deep(min(reopened, target - current))
-                current = await self.runtime_size()
-                refreshed = reopened
-
-        return {
-            "runtime": current,
-            "adopted": adopted,
-            "promoted": promoted,
-            "refreshed": refreshed,
-            "refresh_scanned": refresh_scanned,
-        }
-
     async def claim(self) -> dict[str, Any] | None:
+        """Claim one company without a prefilled runtime queue.
+
+        Durable RETRY_WAIT/recovered PENDING rows are resumed first. Otherwise
+        claim directly from incomplete Deep and create exactly one RUNNING
+        runtime lease for the selected company.
+        """
         async def op(conn: AsyncConnection):
             row = (
                 await conn.execute(
@@ -1468,7 +1416,58 @@ class DeepRepository:
                          AND d.jp_no=r.jp_no
                         WHERE r.status IN ('PENDING','RETRY_WAIT')
                           AND r.available_at <= UTC_TIMESTAMP(6)
+                          AND d.deep_completed_at IS NULL
+                          AND d.deep_status IN ('PENDING','COLLECTING')
                         ORDER BY r.available_at, r.updated_at, r.jp_type_code, r.jp_no
+                        LIMIT 1
+                        FOR UPDATE SKIP LOCKED
+                        """
+                    )
+                )
+            ).mappings().first()
+
+            if row is not None:
+                await conn.execute(
+                    text(
+                        f"""
+                        UPDATE {RUNTIME_TABLE}
+                        SET status='RUNNING',
+                            attempts=attempts+1,
+                            last_error=NULL
+                        WHERE jp_type_code=:jp_type_code
+                          AND jp_no=:jp_no
+                        """
+                    ),
+                    {
+                        "jp_type_code": row["jp_type_code"],
+                        "jp_no": row["jp_no"],
+                    },
+                )
+                result = dict(row)
+                result["attempts"] = int(result["attempts"] or 0) + 1
+                return result
+
+            row = (
+                await conn.execute(
+                    text(
+                        f"""
+                        SELECT
+                            d.jp_type_code,
+                            d.jp_no,
+                            d.submit_fin_year,
+                            d.required_mask,
+                            d.done_mask,
+                            d.not_available_mask,
+                            d.failed_mask,
+                            d.deep_status
+                        FROM {DEEP_TABLE} d
+                        LEFT JOIN {RUNTIME_TABLE} r
+                          ON r.jp_type_code=d.jp_type_code
+                         AND r.jp_no=d.jp_no
+                        WHERE d.deep_completed_at IS NULL
+                          AND d.deep_status IN ('PENDING','COLLECTING')
+                          AND r.jp_no IS NULL
+                        ORDER BY d.deep_status, d.jp_type_code, d.jp_no
                         LIMIT 1
                         FOR UPDATE SKIP LOCKED
                         """
@@ -1481,12 +1480,22 @@ class DeepRepository:
             await conn.execute(
                 text(
                     f"""
-                    UPDATE {RUNTIME_TABLE}
-                    SET status='RUNNING',
-                        attempts=attempts+1,
-                        last_error=NULL
-                    WHERE jp_type_code=:jp_type_code
-                      AND jp_no=:jp_no
+                    INSERT INTO {RUNTIME_TABLE} (
+                        jp_type_code,
+                        jp_no,
+                        status,
+                        attempts,
+                        available_at,
+                        last_error
+                    )
+                    VALUES (
+                        :jp_type_code,
+                        :jp_no,
+                        'RUNNING',
+                        1,
+                        UTC_TIMESTAMP(6),
+                        NULL
+                    )
                     """
                 ),
                 {
@@ -1495,11 +1504,11 @@ class DeepRepository:
                 },
             )
             result = dict(row)
-            result["attempts"] = int(result["attempts"] or 0) + 1
+            result["attempts"] = 1
             return result
 
-        # An ambiguous RUNNING claim must not be retried against another row.
-        # A process restart safely recovers every stranded RUNNING row.
+        # A claim transaction is intentionally never replayed after an
+        # ambiguous COMMIT; restart recovery safely reopens stranded RUNNING.
         return await self._transaction(op, attempts=1)
 
     async def finish_runtime(self, jp_type_code: str, jp_no: str) -> None:
@@ -2018,10 +2027,8 @@ class DeepRepository:
     ) -> int:
         """Reopen failed active-scope rows without materializing runtime work.
 
-        Failed bits are cleared in bounded transactions. The normal collector
-        refill path later seeds these reopened PENDING/COLLECTING rows into the
-        bounded runtime working set, preserving the single runtime-buffer
-        invariant even when the failed population is very large.
+        Failed bits are cleared in bounded transactions. Direct Deep claiming
+        picks these reopened PENDING/COLLECTING rows on the next collector pass.
         """
         batch_size = max(50, min(int(batch_size), 2000))
         remaining = None if limit is None else max(1, int(limit))
@@ -2088,8 +2095,8 @@ class DeepRepository:
                     key_params,
                 )
                 # Terminal rows normally have no runtime row. Remove any stale
-                # one from an interrupted older run rather than enqueueing the
-                # whole retry population here; bounded refill owns scheduling.
+                # lease from an interrupted older run; direct Deep claiming
+                # will pick the reopened row when it is ready.
                 await conn.execute(
                     text(
                         f"""
