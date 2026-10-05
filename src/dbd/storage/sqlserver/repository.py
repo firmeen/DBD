@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import time
+from contextlib import contextmanager
 from datetime import date, datetime
 from datetime import time as datetime_time
-from contextlib import contextmanager
 from typing import Any, Iterable, Iterator
 
 from ...contracts.master_deep import (
