@@ -77,14 +77,14 @@ async def test_global_availability_failure_does_not_change_fleet_pacer():
 
 
 
-async def test_distinct_endpoint_availability_can_escalate_global_without_rate_change():
+async def test_distinct_endpoint_availability_can_escalate_global_without_rate_change(monkeypatch):
     controller = EndpointRateController(
         60,
         endpoint_rates={"profile": 30, "committees": 20},
         circuit_failure_threshold=2,
         global_pressure_endpoint_threshold=2,
     )
-    controller._breaker._pressure_gate_seconds = 0
+    monkeypatch.setattr(type(controller._breaker), "_pressure_gate_seconds", property(lambda _self: 0.0))
 
     await controller.availability_failure("profile")
     await controller.availability_failure("committees")
