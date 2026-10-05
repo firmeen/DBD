@@ -172,3 +172,34 @@ def test_live_updates_do_not_force_terminal_refresh() -> None:
 
     assert len(fake.calls) == 1
     assert fake.calls[0][1] is False
+
+
+def test_interactive_progress_builds_at_most_two_ui_snapshots_per_second(monkeypatch) -> None:
+    stream = StringIO()
+    events = DeepTerminalEvents("collect", stream=stream)
+
+    class FakeLive:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def update(self, renderable, *, refresh):
+            self.calls.append((renderable, refresh))
+
+    fake = FakeLive()
+    events.interactive = True
+    events.live = fake
+    events.last_live_update = 100.0
+    clock = iter([100.1, 100.2, 100.7])
+    monkeypatch.setattr("dbd.deep.presentation.time.monotonic", lambda: next(clock))
+
+    payload = {
+        "companies_claimed": 1,
+        "companies_finished": 1,
+        "companies_retry_wait": 0,
+    }
+    events("progress", payload)
+    events("progress", payload)
+    events("progress", payload)
+
+    assert len(fake.calls) == 1
+    assert fake.calls[0][1] is False
