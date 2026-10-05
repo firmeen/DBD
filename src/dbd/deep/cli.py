@@ -70,7 +70,7 @@ async def _prepare(batch_size: int, json_mode: bool) -> int:
         async with repo.manager_lock() as lock_conn:
             if events is not None:
                 events("phase", {"phase": "PREPARE"})
-            result = await repo.prepare_active_scope(
+            result = await repo.prepare_for_collection(
                 batch_size=batch_size,
                 event=events,
                 lock_conn=lock_conn,
@@ -112,7 +112,6 @@ async def _collect(args) -> int:
         concurrency=args.concurrency,
         rate_per_second=args.rate,
         http_retries=args.http_retries,
-        buffer_size=args.buffer_size,
         company_limit=args.limit,
         continuous=args.continuous,
         idle_seconds=args.idle_seconds,
@@ -132,7 +131,7 @@ async def _collect(args) -> int:
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="dbd-deep",
-        description="Standalone seven-endpoint DBD Master/Deep collector",
+        description="Standalone seven-endpoint DBD Deep collector",
     )
     parser.add_argument(
         "--version",
@@ -143,19 +142,19 @@ def parse_args(argv: list[str] | None = None):
 
     prepare = sub.add_parser(
         "prepare",
-        help="One-time adoption of builder-created Deep rows into the seven-endpoint runtime",
+        help="Normalize Deep scope and bulk-stage all discovered Master companies before collection",
     )
     prepare.add_argument(
         "--batch-size",
         type=_positive_int,
         default=5000,
-        help="Primary-key migration batch size; bounded to 500..20000 internally",
+        help="Preparation batch size; Deep normalization is bounded to 500..20000 and Master staging to 2000",
     )
     prepare.add_argument("--json", action="store_true")
 
     collect = sub.add_parser(
         "collect",
-        help="Resume Deep rows, promote Master, then refresh stale ACTIVE companies",
+        help="Claim prepared Deep companies directly and collect unresolved endpoints",
     )
     collect.add_argument(
         "--concurrency",
@@ -172,11 +171,6 @@ def parse_args(argv: list[str] | None = None):
         "--http-retries",
         type=_non_negative_int,
         default=settings.dbd_http_retries,
-    )
-    collect.add_argument(
-        "--buffer-size",
-        type=_positive_int,
-        help="Bounded runtime working set; default=max(32, concurrency*4)",
     )
     collect.add_argument(
         "--limit",
@@ -209,7 +203,7 @@ def parse_args(argv: list[str] | None = None):
 
     retry = sub.add_parser(
         "retry",
-        help="Reopen terminal Deep failures; bounded collect refill schedules them later",
+        help="Reopen terminal Deep failures for direct Deep claiming",
     )
     retry.add_argument("--limit", type=_positive_int)
     retry.add_argument("--json", action="store_true")
