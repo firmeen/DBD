@@ -283,6 +283,8 @@ class DeepRepository:
         return bool(await self._table_columns(table_name))
 
     async def ensure_runtime_table(self) -> None:
+        if await self.table_exists(RUNTIME_TABLE):
+            return
         async with self.engine.begin() as conn:
             await conn.execute(text(_RUNTIME_DDL))
 
@@ -1203,25 +1205,6 @@ class DeepRepository:
             params[f"n{index}"] = jp_no
         return "(" + " OR ".join(clauses) + ")", params
 
-    @staticmethod
-    def _tuple_key_predicate(
-        keys: list[tuple[str, str]],
-        *,
-        alias: str = "",
-    ) -> tuple[str, dict[str, object]]:
-        prefix = f"{alias}." if alias else ""
-        tuples = []
-        params: dict[str, object] = {}
-        for index, (jp_type_code, jp_no) in enumerate(keys):
-            tuples.append(f"(:t{index}, :n{index})")
-            params[f"t{index}"] = jp_type_code
-            params[f"n{index}"] = jp_no
-        return (
-            f"({prefix}jp_type_code, {prefix}jp_no) IN "
-            f"({', '.join(tuples)})",
-            params,
-        )
-
     async def stage_master_batch(
         self,
         limit: int,
@@ -1229,6 +1212,11 @@ class DeepRepository:
         event: Callable[[str, dict[str, Any]], None] | None = None,
         batch_no: int = 0,
     ) -> int:
+        """Move one primary-key range from Master to Deep atomically.
+
+        Only the batch boundary crosses the Python/MySQL boundary. The actual
+        rows stay inside MySQL for INSERT ... SELECT and range DELETE.
+        """
         if limit <= 0:
             return 0
 
@@ -1237,33 +1225,67 @@ class DeepRepository:
                 event(
                     "prepare_step",
                     {
-                        "step": "SELECT KEYS",
+                        "step": "FIND BOUNDARY",
                         "batch": batch_no,
+                        "batch_rows": int(limit),
                     },
                 )
-            selected = (
+
+            boundary = (
                 await conn.execute(
                     text(
                         f"""
                         SELECT jp_type_code, jp_no
                         FROM {MASTER_TABLE} FORCE INDEX (PRIMARY)
                         ORDER BY jp_type_code, jp_no
-                        LIMIT :limit
-                        FOR UPDATE SKIP LOCKED
+                        LIMIT :offset, 1
                         """
                     ),
-                    {"limit": int(limit)},
+                    {"offset": int(limit) - 1},
                 )
-            ).mappings().all()
-            keys = [
-                (str(row["jp_type_code"]), str(row["jp_no"]))
-                for row in selected
-            ]
-            if not keys:
+            ).mappings().first()
+
+            if boundary is None:
+                boundary = (
+                    await conn.execute(
+                        text(
+                            f"""
+                            SELECT jp_type_code, jp_no
+                            FROM {MASTER_TABLE} FORCE INDEX (PRIMARY)
+                            ORDER BY jp_type_code DESC, jp_no DESC
+                            LIMIT 1
+                            """
+                        )
+                    )
+                ).mappings().first()
+
+            if boundary is None:
                 return 0
 
-            predicate, params = self._tuple_key_predicate(keys)
-            master_predicate, _ = self._tuple_key_predicate(keys, alias="m")
+            end_type = str(boundary["jp_type_code"])
+            end_no = str(boundary["jp_no"])
+            params = {
+                "end_type": end_type,
+                "end_no": end_no,
+            }
+            range_predicate = """
+                (
+                    m.jp_type_code < :end_type
+                    OR (
+                        m.jp_type_code=:end_type
+                        AND m.jp_no<=:end_no
+                    )
+                )
+            """
+            delete_predicate = """
+                (
+                    jp_type_code < :end_type
+                    OR (
+                        jp_type_code=:end_type
+                        AND jp_no<=:end_no
+                    )
+                )
+            """
             financial_required = (
                 f"CASE WHEN NULLIF(TRIM(m.submit_fin_year),'') IS NULL "
                 f"THEN {BASE_REQUIRED_MASK} ELSE {ACTIVE_ENDPOINT_MASK} END"
@@ -1273,14 +1295,12 @@ class DeepRepository:
                 event(
                     "prepare_step",
                     {
-                        "step": "UPSERT DEEP",
+                        "step": "UPSERT RANGE",
                         "batch": batch_no,
-                        "batch_rows": len(keys),
+                        "batch_rows": int(limit),
                     },
                 )
 
-            # Alias the incoming SELECT row so MySQL does not generate a
-            # VALUES(column) deprecation warning for every updated field.
             await conn.execute(
                 text(
                     f"""
@@ -1363,8 +1383,9 @@ class DeepRepository:
                             'PENDING' AS deep_status,
                             JSON_OBJECT() AS endpoint_meta,
                             UTC_TIMESTAMP(6) AS deep_started_at
-                        FROM {MASTER_TABLE} m
-                        WHERE {master_predicate}
+                        FROM {MASTER_TABLE} m FORCE INDEX (PRIMARY)
+                        WHERE {range_predicate}
+                        ORDER BY m.jp_type_code, m.jp_no
                     ) AS new
                     ON DUPLICATE KEY UPDATE
                         jp_name=new.jp_name,
@@ -1405,21 +1426,22 @@ class DeepRepository:
                 event(
                     "prepare_step",
                     {
-                        "step": "DELETE MASTER",
+                        "step": "DELETE RANGE",
                         "batch": batch_no,
-                        "batch_rows": len(keys),
+                        "batch_rows": int(limit),
                     },
                 )
 
-            await conn.execute(
+            deleted = await conn.execute(
                 text(
                     f"""
                     DELETE FROM {MASTER_TABLE}
-                    WHERE {predicate}
+                    WHERE {delete_predicate}
                     """
                 ),
                 params,
             )
+            staged = int(deleted.rowcount or 0)
 
             if event is not None:
                 event(
@@ -1427,14 +1449,14 @@ class DeepRepository:
                     {
                         "step": "COMMIT",
                         "batch": batch_no,
-                        "batch_rows": len(keys),
+                        "batch_rows": staged,
                     },
                 )
-            return len(keys)
+            return staged
 
-        # Selected Master keys are chosen inside this transaction. On ambiguous
-        # COMMIT, stop preparation and let the operator rerun it. The atomic
-        # insert/update + delete preserves the MASTER XOR DEEP invariant.
+        # Every batch is one transaction. A crash before COMMIT rolls back both
+        # the Deep upsert and Master delete; committed batches resume naturally
+        # because their Master rows are already gone.
         return await self._transaction(op, attempts=1)
 
     @staticmethod
