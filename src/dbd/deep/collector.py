@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import time
 from dataclasses import asdict, dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -36,7 +35,6 @@ from .http import (
     FixedRateDbdClient,
 )
 from .repository import DeepRepository, DeepTransientDatabaseError
-from .serving import ServingProjector
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
@@ -57,14 +55,12 @@ def _normalize_resource(endpoint: str, payload: object):
 class CollectorStats:
     companies_claimed: int = 0
     companies_finished: int = 0
+    companies_in_flight: int = 0
     companies_retry_wait: int = 0
     endpoints_done: int = 0
     endpoints_not_available: int = 0
     endpoints_failed: int = 0
     runtime_recovered: int = 0
-    master_promoted: int = 0
-    deep_adopted: int = 0
-    active_refreshed: int = 0
 
 
 def _json_payload(value: object) -> str:
@@ -139,7 +135,6 @@ class DeepCollector:
         concurrency: int,
         rate_per_second: float,
         http_retries: int,
-        buffer_size: int | None = None,
         company_limit: int | None = None,
         continuous: bool = False,
         idle_seconds: float = 5.0,
@@ -160,12 +155,6 @@ class DeepCollector:
         self.concurrency = int(concurrency)
         self.rate_per_second = float(rate_per_second)
         self.http_retries = int(http_retries)
-        self.buffer_size = max(
-            self.concurrency,
-            int(buffer_size or max(32, self.concurrency * 4)),
-        )
-        if self.buffer_size > 10000:
-            raise ValueError("buffer_size must be <= 10000")
         self.company_limit = company_limit
         self.continuous = bool(continuous)
         self.idle_seconds = float(idle_seconds)
@@ -174,27 +163,8 @@ class DeepCollector:
         self.stats = CollectorStats()
         self._stats_lock = asyncio.Lock()
         self._claim_lock = asyncio.Lock()
-        self._refill_lock = asyncio.Lock()
-        self._refill_requested = asyncio.Event()
-        self._refill_low_watermark = max(
-            self.concurrency,
-            self.buffer_size // 2,
-        )
-        self._idle_lock = asyncio.Lock()
-        self._idle_task: asyncio.Task[None] | None = None
         self._stop = asyncio.Event()
         self._specs: tuple[EndpointSpec, ...] = ()
-        self._cycle = 0
-        self._queue_source = "IDLE"
-        self._empty_until = 0.0
-        self._next_refresh_scan_at = 0.0
-        # Endpoint freshness horizons are measured in hours. Discovery may be
-        # polled every few seconds, but an empty exact stale scan should not be
-        # repeated at that same cadence across a multi-million COMPLETE set.
-        self._refresh_scan_seconds = max(60.0, self.idle_seconds)
-        self._serving = ServingProjector(self.repo.engine)
-        self._next_serving_projection_at = 0.0
-        self._serving_timeout_seconds = 5.0
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -205,12 +175,7 @@ class DeepCollector:
             for key, value in increments.items():
                 setattr(self.stats, key, int(getattr(self.stats, key)) + int(value))
             snapshot = asdict(self.stats)
-        self._emit(
-            "progress",
-            cycle=self._cycle,
-            queue_source=self._queue_source,
-            **snapshot,
-        )
+        self._emit("progress", **snapshot)
 
     async def _remaining_budget(self) -> int | None:
         if self.company_limit is None:
@@ -231,178 +196,8 @@ class DeepCollector:
             if row is None:
                 return None
 
-            await self._bump(companies_claimed=1)
+            await self._bump(companies_claimed=1, companies_in_flight=1)
             return row
-
-    async def _refill(self, *, prefetch: bool = False) -> dict[str, int]:
-        async with self._refill_lock:
-            # When many workers observe an empty queue together, only the
-            # first worker in an idle window performs the expensive
-            # unresolved/Master/stale scan. Others reuse the empty result.
-            if self.continuous and time.monotonic() < self._empty_until:
-                return {
-                    "runtime": 0,
-                    "adopted": 0,
-                    "promoted": 0,
-                    "refreshed": 0,
-                    "refresh_scanned": False,
-                }
-
-            remaining = await self._remaining_budget()
-            if remaining == 0:
-                return {
-                    "runtime": await self.repo.runtime_size(),
-                    "adopted": 0,
-                    "promoted": 0,
-                    "refreshed": 0,
-                    "refresh_scanned": False,
-                }
-
-            target = self.buffer_size
-            if remaining is not None:
-                # Do not promote/reopen more companies than a --limit run can
-                # actually process; this keeps canary runs minimally invasive.
-                target = min(target, remaining)
-
-            if prefetch:
-                current = await self.repo.runtime_size()
-                threshold = min(
-                    self._refill_low_watermark,
-                    max(0, target - 1),
-                )
-                if current > threshold:
-                    return {
-                        "runtime": current,
-                        "adopted": 0,
-                        "promoted": 0,
-                        "refreshed": 0,
-                        "refresh_scanned": False,
-                    }
-
-            now = time.monotonic()
-            include_refresh = now >= self._next_refresh_scan_at
-            result = await self.repo.refill(
-                max(1, target),
-                include_refresh=include_refresh,
-            )
-            sources = []
-            if result["adopted"]:
-                sources.append("UNRESOLVED")
-                await self._bump(deep_adopted=result["adopted"])
-            if result["promoted"]:
-                sources.append("NEW COMPANY")
-                await self._bump(master_promoted=result["promoted"])
-            if result.get("refreshed"):
-                sources.append("ACTIVE REFRESH")
-                await self._bump(active_refreshed=result["refreshed"])
-
-            self._cycle += 1
-            if len(sources) > 1:
-                self._queue_source = "MIXED"
-            elif sources:
-                self._queue_source = sources[0]
-            elif int(result["runtime"]) > 0:
-                self._queue_source = "RUNTIME"
-            else:
-                self._queue_source = "IDLE"
-
-            if self.continuous and result.get("refresh_scanned") and not result.get("refreshed"):
-                self._next_refresh_scan_at = (
-                    time.monotonic() + self._refresh_scan_seconds
-                )
-
-            if int(result["runtime"]) == 0 and self.continuous:
-                self._empty_until = time.monotonic() + self.idle_seconds
-            else:
-                self._empty_until = 0.0
-
-            self._emit(
-                "cycle",
-                cycle=self._cycle,
-                queue_source=self._queue_source,
-                **result,
-            )
-            return result
-
-    def _request_prefetch(self) -> None:
-        if not self._stop.is_set():
-            self._refill_requested.set()
-
-    async def _refill_loop(self) -> None:
-        while not self._stop.is_set():
-            try:
-                await asyncio.wait_for(
-                    self._refill_requested.wait(),
-                    timeout=1.0,
-                )
-            except TimeoutError:
-                continue
-            self._refill_requested.clear()
-            await self._refill(prefetch=True)
-
-    async def _serving_loop(self) -> None:
-        while not self._stop.is_set():
-            await self._reconcile_serving()
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=1.0)
-            except TimeoutError:
-                pass
-
-    async def _reconcile_serving(self, *, force: bool = False) -> None:
-        now = time.monotonic()
-        if not force and now < self._next_serving_projection_at:
-            return
-        self._next_serving_projection_at = now + 10.0
-        try:
-            async with asyncio.timeout(self._serving_timeout_seconds):
-                result = await self._serving.project_incremental(
-                    limit=max(1, min(self.buffer_size, 100))
-                )
-        except asyncio.CancelledError:
-            raise
-        except TimeoutError:
-            self._next_serving_projection_at = time.monotonic() + 60.0
-            self._emit(
-                "serving_error",
-                error=(
-                    "TimeoutError: serving projection exceeded "
-                    f"{self._serving_timeout_seconds:.0f}s; Deep collection continues"
-                ),
-            )
-            return
-        except Exception as exc:
-            self._next_serving_projection_at = time.monotonic() + 30.0
-            self._emit(
-                "serving_error",
-                error=f"{type(exc).__name__}: {exc}",
-            )
-            return
-        if not result.get("ready"):
-            self._next_serving_projection_at = time.monotonic() + 60.0
-            self._emit("serving", **result)
-            return
-        if int(result.get("scanned") or 0) == 0:
-            self._next_serving_projection_at = time.monotonic() + 60.0
-        self._emit("serving", **result)
-
-    async def _idle_wait(self) -> None:
-        await asyncio.sleep(self.idle_seconds)
-        await self._reconcile_serving()
-
-    async def _idle_cycle(self) -> None:
-        async with self._idle_lock:
-            task = self._idle_task
-            if task is None or task.done():
-                self._queue_source = "IDLE"
-                self._emit(
-                    "idle",
-                    cycle=self._cycle,
-                    idle_seconds=self.idle_seconds,
-                    queue_source=self._queue_source,
-                )
-                task = asyncio.create_task(self._idle_wait())
-                self._idle_task = task
-        await task
 
     @staticmethod
     def _request_for(
@@ -726,32 +521,33 @@ class DeepCollector:
                     self._stop.set()
                     return
 
-                refill = await self._refill()
-                company = await self._claim()
-                if company is None:
-                    runtime = int(refill["runtime"])
-                    if runtime == 0:
-                        if not self.continuous:
-                            self._stop.set()
-                            return
-                        await self._idle_cycle()
-                        continue
-                    delay = await self.repo.next_runtime_delay()
-                    await asyncio.sleep(delay if delay is not None else 0.5)
+                delay = await self.repo.next_runtime_delay()
+                if delay is not None:
+                    await asyncio.sleep(delay)
                     continue
+
+                if not self.continuous:
+                    self._stop.set()
+                    return
+
+                self._emit(
+                    "idle",
+                    idle_seconds=self.idle_seconds,
+                )
+                await asyncio.sleep(self.idle_seconds)
+                continue
 
             try:
                 await self._process_company(company, client)
-                self._request_prefetch()
+                await self._bump(companies_in_flight=-1)
             except (DbdAuthError, DbdForbiddenError):
                 raise
             except asyncio.CancelledError:
                 raise
             except DeepTransientDatabaseError as exc:
-                # Endpoint payload writes are idempotent, so an exhausted
-                # transient DB failure can safely return the company to durable
-                # retry state. Programming/schema errors are intentionally not
-                # caught here and stop the collector.
+                # Endpoint payload writes are idempotent. An exhausted
+                # transient DB failure returns only this leased company to
+                # durable RETRY_WAIT; other workers continue claiming Deep.
                 delay = _retry_delay(int(company["attempts"]))
                 await self.repo.retry_wait(
                     str(company["jp_type_code"]),
@@ -759,7 +555,10 @@ class DeepCollector:
                     delay_seconds=delay,
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                await self._bump(companies_retry_wait=1)
+                await self._bump(
+                    companies_retry_wait=1,
+                    companies_in_flight=-1,
+                )
                 self._emit(
                     "worker_error",
                     worker=worker_no,
@@ -767,7 +566,6 @@ class DeepCollector:
                     jp_no=company["jp_no"],
                     error=f"{type(exc).__name__}: {exc}",
                 )
-                self._request_prefetch()
 
     async def _monitor_lock(self, lock_conn) -> None:
         while not self._stop.is_set():
@@ -789,74 +587,39 @@ class DeepCollector:
             self._emit("phase", phase="RECOVER")
             self.stats.runtime_recovered = await self.repo.recover_runtime()
             await self.repo.assert_no_overlap()
+            await self.repo.assert_master_empty()
 
-            self._emit("phase", phase="REFILL")
-            refill = await self._refill()
-
-            # Continuous mode may start before Discovery has produced work.
-            # Keep the manager lock, but do not open/authenticate the HTTP client
-            # until a bounded refill actually produces runtime work.
-            while int(refill["runtime"]) == 0 and self.continuous:
-                remaining = await self._remaining_budget()
-                if remaining == 0:
-                    self._stop.set()
-                    break
-                self._emit("phase", phase="IDLE")
-                await self._idle_cycle()
-                await self.repo.assert_manager_lock(lock_conn)
-                refill = await self._refill()
-
-            if int(refill["runtime"]) == 0:
-                self._emit("phase", phase="IDLE")
-                result = {
-                    **asdict(self.stats),
-                    "http_requests": 0,
-                    "http_retries": 0,
-                    "rate_limit_hits": 0,
-                    "configured_rate": self.rate_per_second,
-                }
-            else:
-                self._emit("phase", phase="AUTH")
-                async with FixedRateDbdClient(
+            self._emit("phase", phase="AUTH")
+            async with FixedRateDbdClient(
+                concurrency=self.concurrency,
+                rate_per_second=self.rate_per_second,
+                max_retries=self.http_retries,
+            ) as client:
+                self._emit(
+                    "started",
                     concurrency=self.concurrency,
                     rate_per_second=self.rate_per_second,
-                    max_retries=self.http_retries,
-                ) as client:
-                    self._emit(
-                        "started",
-                        concurrency=self.concurrency,
-                        rate_per_second=self.rate_per_second,
-                        buffer_size=self.buffer_size,
-                        company_limit=self.company_limit,
-                        continuous=self.continuous,
-                        idle_seconds=self.idle_seconds,
-                        active_endpoints=list(ACTIVE_ENDPOINTS),
-                        **asdict(self.stats),
-                    )
-                    self._emit("phase", phase="RUNNING")
+                    company_limit=self.company_limit,
+                    continuous=self.continuous,
+                    idle_seconds=self.idle_seconds,
+                    active_endpoints=list(ACTIVE_ENDPOINTS),
+                    **asdict(self.stats),
+                )
+                self._emit("phase", phase="RUNNING")
 
-                    async with asyncio.TaskGroup() as group:
-                        group.create_task(self._monitor_lock(lock_conn))
-                        group.create_task(self._refill_loop())
-                        group.create_task(self._serving_loop())
-                        for worker_no in range(1, self.concurrency + 1):
-                            group.create_task(self._worker(worker_no, client))
+                async with asyncio.TaskGroup() as group:
+                    group.create_task(self._monitor_lock(lock_conn))
+                    for worker_no in range(1, self.concurrency + 1):
+                        group.create_task(self._worker(worker_no, client))
 
-                    result = {
-                        **asdict(self.stats),
-                        "http_requests": client.requests_made,
-                        "http_retries": client.retries_made,
-                        "rate_limit_hits": client.rate_limit_hits,
-                        "configured_rate": client.rate_per_second,
-                    }
+                result = {
+                    **asdict(self.stats),
+                    "http_requests": client.requests_made,
+                    "http_retries": client.retries_made,
+                    "rate_limit_hits": client.rate_limit_hits,
+                    "configured_rate": client.rate_per_second,
+                }
 
-            # Derived output must not make the HTTP/runtime transaction fail,
-            # but a final bounded pass prevents short one-shot/--limit runs
-            # from exiting before the normal serving throttle opens again.
-            await self._reconcile_serving(force=True)
-
-        result["cycle"] = self._cycle
-        result["queue_source"] = self._queue_source
         result["continuous"] = self.continuous
         result["status"] = await self.repo.status_summary(include_coverage=False)
         return result
