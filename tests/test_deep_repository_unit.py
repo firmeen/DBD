@@ -137,3 +137,21 @@ async def test_refill_can_poll_new_work_without_repeating_stale_scan() -> None:
         "refresh_scanned": False,
     }
     assert not any(name == "refresh" for name, _ in repo.events)
+
+
+@pytest.mark.asyncio
+async def test_repository_forwards_explicit_pool_size(monkeypatch) -> None:
+    engine = SimpleNamespace(dispose=AsyncMock())
+    calls: list[int | None] = []
+
+    def fake_engine(*, pool_size: int | None = None):
+        calls.append(pool_size)
+        return engine
+
+    monkeypatch.setattr("dbd.deep.repository.create_deep_engine", fake_engine)
+
+    repo = DeepRepository(pool_size=10)
+    assert calls == [10]
+
+    await repo.close()
+    engine.dispose.assert_awaited_once()
