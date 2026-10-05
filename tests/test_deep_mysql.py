@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime, timedelta
+from decimal import Decimal
 from uuid import uuid4
 
 import pytest
+from sqlalchemy import event
 
 import dbd.pipelines.discovery as discovery_pipeline
 from dbd.client.endpoints.search import SearchFilters
 from dbd.deep.bootstrap import DeepBootstrap
-from dbd.deep.catalog import BASE_REQUIRED_MASK, ENDPOINT_BITS, INACTIVE_ENDPOINTS
+from dbd.deep.catalog import ACTIVE_ENDPOINT_MASK, BASE_REQUIRED_MASK, ENDPOINT_BITS, INACTIVE_ENDPOINTS
 from dbd.deep.repository import DeepRepository
 from dbd.pipelines.discovery import _drain_bucket
 from dbd.storage.mysql.engine import connect
@@ -166,6 +168,205 @@ def deep_model():
         yield
     finally:
         _drop_model()
+
+
+def _insert_promotion_master(cur, *, jp_type_code="7", year="2568"):
+    # Distinct values catch positional/alias mistakes across every copied field.
+    values = {
+        "jp_type_code": jp_type_code, "jp_no": "9000000000001",
+        "jp_name": "บริษัท ทดสอบ", "jp_name_e": "Promotion Co",
+        "jp_stat_code": "1", "jp_stat_desc": "Active", "jp_type_desc": "Limited",
+        "address": "123 Test Road", "pv_code": "10", "pv_desc": "Bangkok",
+        "ampur_code": "1001", "ampur_desc": "District",
+        "tumbon_code": "100101", "tumbon_desc": "Subdistrict", "zip_code": "10200",
+        "business_size_code": "S", "business_type_code": "62010",
+        "business_type_desc": "Software", "setup_obj_code": "62011",
+        "setup_obj_desc": "Setup", "submit_obj_code": "62012", "submit_obj_desc": "Submit",
+        "cap_amt": Decimal("1001.01"), "paid_amt": Decimal("1002.02"),
+        "total_asset": Decimal("1003.03"), "total_equity": Decimal("1004.04"),
+        "total_income": Decimal("1005.05"), "net_profit": Decimal("-1006.06"),
+        "submit_fin_year": year, "master_data": json.dumps({"sentinel": "incoming"}),
+    }
+    columns = ",".join(f"`{column}`" for column in values)
+    placeholders = ",".join(["%s"] * len(values))
+    cur.execute(
+        f"INSERT INTO dbd_company_master ({columns},first_seen_at,last_seen_at) "
+        f"VALUES ({placeholders},'2026-01-01','2026-01-02')",
+        tuple(values.values()),
+    )
+    return values
+
+
+def _assert_promoted_columns(row, expected):
+    for column, value in expected.items():
+        if column == "master_data":
+            assert json.loads(row[column]) == json.loads(value)
+        else:
+            assert row[column] == value, column
+
+
+@pytest.fixture
+async def promotion_repo():
+    repo = DeepRepository()
+    warnings = []
+
+    def capture_warnings(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("INSERT INTO dbd_company_deep"):
+            # Inspect this statement's diagnostics BEFORE DELETE/seed/COMMIT
+            # can clear them. A separate cursor preserves the DML result.
+            diagnostics = conn.connection.cursor()
+            try:
+                diagnostics.execute("SHOW WARNINGS")
+                warnings.append(list(diagnostics.fetchall()))
+            finally:
+                diagnostics.close()
+
+    try:
+        await repo.ensure_runtime_table()
+        event.listen(repo.engine.sync_engine, "after_cursor_execute", capture_warnings)
+        yield repo, warnings
+    finally:
+        if event.contains(repo.engine.sync_engine, "after_cursor_execute", capture_warnings):
+            event.remove(repo.engine.sync_engine, "after_cursor_execute", capture_warnings)
+        await repo.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("year", [None, "", "   ", "2568,2567"])
+async def test_promotion_copies_all_columns_and_seeds_runtime_without_warnings(promotion_repo, year):
+    repo, warnings = promotion_repo
+    with connect() as conn, conn.cursor() as cur:
+        expected = _insert_promotion_master(cur, year=year)
+        # Same registration number, different type: only the selected key moves.
+        other = _insert_promotion_master(cur, jp_type_code="8", year=year)
+        conn.commit()
+
+    assert await repo.promote_master(1) == 1
+    assert warnings == [[]]
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM dbd_company_deep")
+        rows = cur.fetchall()
+        assert len(rows) == 1
+        row = rows[0]
+        _assert_promoted_columns(row, expected)
+        assert row["required_mask"] == (ACTIVE_ENDPOINT_MASK if year and year.strip() else BASE_REQUIRED_MASK)
+        assert (row["done_mask"], row["not_available_mask"], row["failed_mask"]) == (0, 0, 0)
+        assert row["deep_status"] == "PENDING"
+        assert json.loads(row["endpoint_meta"]) == {}
+        assert row["deep_started_at"] is not None
+        cur.execute("SELECT * FROM dbd_company_master")
+        remaining = cur.fetchall()
+        assert len(remaining) == 1
+        _assert_promoted_columns(remaining[0], other)
+        cur.execute("SELECT jp_type_code,jp_no,status,attempts,last_error FROM dbd_deep_runtime")
+        assert cur.fetchall() == [{
+            "jp_type_code": "7", "jp_no": expected["jp_no"],
+            "status": "PENDING", "attempts": 0, "last_error": None,
+        }]
+
+    assert await repo.promote_master(1) == 1
+    assert await repo.promote_master(1) == 0
+    assert warnings == [[], []]
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT COUNT(*) n FROM dbd_company_master")
+        assert cur.fetchone()["n"] == 0
+        for table in ("dbd_company_deep", "dbd_deep_runtime"):
+            cur.execute(f"SELECT COUNT(*) n FROM {table}")
+            assert cur.fetchone()["n"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("terminal,existing_runtime", [(False, False), (False, True), (True, False)])
+async def test_promotion_duplicate_preserves_checkpoints_and_runtime(promotion_repo, terminal, existing_runtime):
+    repo, warnings = promotion_repo
+    with connect() as conn, conn.cursor() as cur:
+        expected = _insert_promotion_master(cur)
+        cur.execute(
+            """
+            INSERT INTO dbd_company_deep (
+                jp_type_code,jp_no,master_data,required_mask,
+                done_mask,not_available_mask,failed_mask,deep_status,
+                endpoint_meta,profile_data,financial_statements_data,
+                last_endpoint,last_http_status,last_error,last_error_at,
+                deep_started_at,last_request_at,deep_completed_at
+            ) VALUES (
+                '7',%s,JSON_OBJECT('sentinel','old'),%s,%s,2,4,%s,
+                JSON_OBJECT('profile',JSON_OBJECT('status','done')),
+                JSON_OBJECT('sentinel','profile'),JSON_OBJECT('sentinel','financial'),
+                'financial_statements',502,'keep error','2026-01-03',
+                '2026-01-01','2026-01-02','2026-01-03'
+            )
+            """,
+            (expected["jp_no"], BASE_REQUIRED_MASK,
+             ACTIVE_ENDPOINT_MASK & ~6 if terminal else 1, "PARTIAL" if terminal else "COLLECTING"),
+        )
+        cur.execute("SELECT * FROM dbd_company_deep")
+        before = cur.fetchone()
+        runtime_before = None
+        if existing_runtime:
+            cur.execute(
+                "INSERT INTO dbd_deep_runtime (jp_type_code,jp_no,status,attempts,available_at,last_error) "
+                "VALUES ('7',%s,'RETRY_WAIT',3,'2099-01-01','keep retry')",
+                (expected["jp_no"],),
+            )
+            cur.execute("SELECT * FROM dbd_deep_runtime")
+            runtime_before = cur.fetchone()
+        conn.commit()
+
+    assert await repo.promote_master(1) == 1
+    # The duplicate runtime INSERT IGNORE may warn; the Deep UPSERT must not.
+    assert warnings == [[]]
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM dbd_company_deep")
+        after = cur.fetchone()
+        _assert_promoted_columns(after, expected)
+        assert after["required_mask"] == ACTIVE_ENDPOINT_MASK
+        preserved = set(before) - set(expected) - {"required_mask", "updated_at"}
+        assert {key: after[key] for key in preserved} == {key: before[key] for key in preserved}
+        cur.execute("SELECT COUNT(*) n FROM dbd_company_master")
+        assert cur.fetchone()["n"] == 0
+        cur.execute("SELECT * FROM dbd_deep_runtime")
+        runtime = cur.fetchall()
+        if existing_runtime:
+            assert runtime == [runtime_before]
+        elif terminal:
+            assert runtime == []
+        else:
+            assert len(runtime) == 1
+            assert runtime[0]["status"] == "PENDING"
+            assert runtime[0]["attempts"] == 0
+
+
+@pytest.mark.asyncio
+async def test_promotion_rolls_back_deep_insert_and_master_delete_if_seed_fails(promotion_repo):
+    repo, warnings = promotion_repo
+    with connect() as conn, conn.cursor() as cur:
+        expected = _insert_promotion_master(cur)
+        conn.commit()
+
+    def fail_seed(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().startswith("INSERT IGNORE INTO dbd_deep_runtime"):
+            raise RuntimeError("injected runtime seed failure")
+
+    event.listen(repo.engine.sync_engine, "before_cursor_execute", fail_seed)
+    try:
+        with pytest.raises(RuntimeError, match="injected runtime seed failure"):
+            await repo.promote_master(1)
+    finally:
+        event.remove(repo.engine.sync_engine, "before_cursor_execute", fail_seed)
+
+    assert warnings == [[]]
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM dbd_company_master")
+        rows = cur.fetchall()
+        assert len(rows) == 1
+        _assert_promoted_columns(rows[0], expected)
+        for table in ("dbd_company_deep", "dbd_deep_runtime"):
+            cur.execute(f"SELECT COUNT(*) n FROM {table}")
+            assert cur.fetchone()["n"] == 0
+    # A later explicit retry starts from the intact Master row.
+    assert await repo.promote_master(1) == 1
+    assert warnings == [[], []]
 
 
 @pytest.mark.asyncio

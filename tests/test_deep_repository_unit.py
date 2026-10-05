@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import re
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
 import pytest
 
 from dbd.deep.repository import DeepRepository
@@ -77,6 +81,46 @@ async def test_refill_does_not_reopen_stale_when_higher_priority_fills_buffer() 
     assert result["promoted"] == 2
     assert result["refreshed"] == 0
     assert not any(name == "refresh" for name, _ in repo.events)
+
+
+@pytest.mark.asyncio
+async def test_promotion_sql_uses_incoming_alias_and_one_atomic_attempt() -> None:
+    selected = SimpleNamespace(
+        mappings=lambda: SimpleNamespace(
+            all=lambda: [{"jp_type_code": "7", "jp_no": "9000000000001"}]
+        )
+    )
+    conn = SimpleNamespace(execute=AsyncMock(side_effect=[
+        selected, SimpleNamespace(), SimpleNamespace(), SimpleNamespace(rowcount=1),
+    ]))
+
+    async def transaction(operation, *, attempts):
+        assert attempts == 1  # Never replay an ambiguous promotion commit.
+        return await operation(conn)
+
+    repo = object.__new__(DeepRepository)
+    repo._transaction = AsyncMock(side_effect=transaction)
+    assert await repo.promote_master(1) == 1
+
+    calls = conn.execute.call_args_list
+    selection, promotion, deletion, seed = [str(call.args[0]) for call in calls]
+    assert "FOR UPDATE SKIP LOCKED" in selection
+    assert calls[0].args[1] == {"limit": 1}
+    assert re.search(r"SELECT\s+\*\s+FROM\s*\(", promotion)
+    assert ") AS new" in promotion
+    assert not re.search(r"\bVALUES\s*\(", promotion, re.IGNORECASE)
+    assert "DELETE FROM dbd_company_master" in deletion
+    assert "INSERT IGNORE INTO dbd_deep_runtime" in seed
+    assert all(call.args[1] == {"t0": "7", "n0": "9000000000001"} for call in calls[1:])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("limit", [0, -1])
+async def test_promotion_nonpositive_limit_does_not_start_transaction(limit) -> None:
+    repo = object.__new__(DeepRepository)
+    repo._transaction = AsyncMock()
+    assert await repo.promote_master(limit) == 0
+    repo._transaction.assert_not_awaited()
 
 
 @pytest.mark.asyncio
