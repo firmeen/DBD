@@ -189,7 +189,7 @@ def test_interactive_progress_builds_at_most_two_ui_snapshots_per_second(monkeyp
     events.interactive = True
     events.live = fake
     events.last_live_update = 100.0
-    clock = iter([100.1, 100.2, 100.7])
+    clock = iter([100.1, 100.2, 100.7, 100.7])
     monkeypatch.setattr("dbd.deep.presentation.time.monotonic", lambda: next(clock))
 
     payload = {
