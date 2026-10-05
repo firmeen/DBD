@@ -543,6 +543,52 @@ def _validate_constraints(cur, table_name: str) -> None:
             f"{table_name} missing required constraint(s): {', '.join(missing)}"
         )
 
+    if table_name in FOREIGN_KEYS:
+        expected_name, expected_column, expected_target, expected_target_column = (
+            FOREIGN_KEYS[table_name]
+        )
+        target_schema, target_table = expected_target.split(".", 1)
+        cur.execute(
+            """
+            SELECT
+                fk.name,
+                pc.name,
+                rs.name,
+                rt.name,
+                rc.name,
+                fk.delete_referential_action_desc
+            FROM sys.foreign_keys fk
+            JOIN sys.foreign_key_columns fkc
+              ON fkc.constraint_object_id=fk.object_id
+            JOIN sys.columns pc
+              ON pc.object_id=fkc.parent_object_id
+             AND pc.column_id=fkc.parent_column_id
+            JOIN sys.tables rt
+              ON rt.object_id=fkc.referenced_object_id
+            JOIN sys.schemas rs
+              ON rs.schema_id=rt.schema_id
+            JOIN sys.columns rc
+              ON rc.object_id=fkc.referenced_object_id
+             AND rc.column_id=fkc.referenced_column_id
+            WHERE fk.parent_object_id=OBJECT_ID(%s)
+              AND fk.name=%s
+            """,
+            (table_name, expected_name),
+        )
+        row = cur.fetchone()
+        expected = (
+            expected_name,
+            expected_column,
+            target_schema,
+            target_table,
+            expected_target_column,
+            "NO_ACTION",
+        )
+        if row is None or tuple(str(value) for value in row) != expected:
+            raise SqlServerSchemaError(
+                f"{table_name} foreign key {expected_name} does not match contract"
+            )
+
 
 def validate_schema(conn) -> dict[str, object]:
     cur = conn.cursor()
