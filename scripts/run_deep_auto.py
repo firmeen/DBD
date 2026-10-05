@@ -27,7 +27,6 @@ LONG_RUN_COMMAND = [
     "--concurrency", "8",
     "--rate", "15",
     "--http-retries", "3",
-    "--buffer-size", "32",
     "--idle-seconds", "5",
 ]
 
@@ -165,7 +164,7 @@ def main() -> int:
     print(
         "Policy   : "
         "LONG RUN failure -> CANARY -> "
-        "20s retry until PASS -> LONG RUN"
+        f"{RETRY_DELAY_SECONDS}s retry until PASS -> LONG RUN"
     )
     print(
         "Ctrl+C   : stop everything; "
@@ -177,7 +176,7 @@ def main() -> int:
 
         log(
             f"START LONG RUN #{restart_count} "
-            f"• concurrency=8 • rate=15 • buffer=32"
+            f"• concurrency=8 • rate=15 • direct Deep claim"
         )
 
         return_code = run_dbd_deep(
