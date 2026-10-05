@@ -54,7 +54,7 @@ def _state(value: Any) -> Text:
             "PREPARE",
             "AUTH",
             "RECOVER",
-            "REFILL",
+            "STAGE MASTER",
         )
     ):
         style = "cyan"
@@ -70,18 +70,6 @@ def _priority_count(value: Any, positive_style: str, *, zero_style: str = "dim")
     except (TypeError, ValueError):
         active = bool(value)
     return _styled(label, positive_style if active else zero_style)
-
-
-def _queue_source(value: Any) -> Text:
-    label = str(value or "IDLE")
-    normalized = label.upper()
-    if normalized == "IDLE":
-        return _styled(label, "dim")
-    if "REFRESH" in normalized:
-        return _styled(label, "magenta")
-    if "MASTER" in normalized or "NEW" in normalized or "PROMOT" in normalized:
-        return _styled(label, "blue")
-    return _styled(label, "cyan")
 
 
 def _grid(rows: list[tuple[str, Any, str, Any]]) -> Table:
@@ -497,10 +485,10 @@ class DeepPresenter:
                             _priority_count(result["companies_finished"], "green"),
                         ),
                         (
-                            "Promoted",
-                            _priority_count(result["master_promoted"], "blue"),
-                            "ACTIVE refresh",
-                            _priority_count(result.get("active_refreshed"), "magenta"),
+                            "In flight",
+                            _priority_count(result["companies_in_flight"], "cyan"),
+                            "Retry wait",
+                            _priority_count(result["companies_retry_wait"], "yellow"),
                         ),
                         (
                             "HTTP requests",
@@ -511,8 +499,8 @@ class DeepPresenter:
                         (
                             "429",
                             _priority_count(result["rate_limit_hits"], "yellow"),
-                            "Cycles",
-                            _styled(_number(result.get("cycle")), "dim"),
+                            "Recovered",
+                            _priority_count(result["runtime_recovered"], "blue"),
                         ),
                     ]
                 ),
