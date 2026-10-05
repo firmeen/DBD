@@ -504,14 +504,21 @@ def _upsert_many(
 
     parameters = []
     for row in rows:
-        missing = [column for column in key_columns if row.get(column) is None]
+        key_values = tuple(
+            _production_value(row.get(column)) for column in key_columns
+        )
+        missing = [
+            column
+            for column, value in zip(key_columns, key_values, strict=True)
+            if value is None
+        ]
         if missing:
             raise SqlServerWriteError(
                 f"{table_name} missing natural-key value(s): {', '.join(missing)}"
             )
         parameters.append(
             tuple(_production_value(row.get(column)) for column in update_columns)
-            + tuple(_production_value(row.get(column)) for column in key_columns)
+            + key_values
             + tuple(_production_value(row.get(column)) for column in columns)
         )
 
