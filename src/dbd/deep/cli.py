@@ -177,7 +177,7 @@ def parse_args(argv: list[str] | None = None):
         "--batch-size",
         type=_positive_int,
         default=5000,
-        help="Preparation batch size; Deep normalization is bounded to 500..20000 and Master staging to 2000",
+        help="Preparation batch size; Deep normalization is bounded to 500..20000 and Master staging to 5000",
     )
     prepare.add_argument("--json", action="store_true")
 
