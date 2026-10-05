@@ -19,8 +19,8 @@ def _pymssql():
         import pymssql  # type: ignore
     except ImportError as exc:
         raise SqlServerDependencyError(
-            "SQL Server sync requires pymssql. Install pymssql in the active environment "
-            "before invoking dbd.pipelines.sqlserver_sync."
+            "SQL Server production storage requires pymssql. "
+            "Install the dbd-data production dependencies before running database commands."
         ) from exc
     return pymssql
 
@@ -39,7 +39,7 @@ def validate_sqlserver_settings() -> None:
         )
     if settings.mssql_database != "TIPDataIntelligence":
         raise SqlServerConfigurationError(
-            "MSSQL_DATABASE must be 'TIPDataIntelligence' for this pipeline"
+            "MSSQL_DATABASE must be 'TIPDataIntelligence' for production storage"
         )
 
 
@@ -74,15 +74,28 @@ def connection():
             pass
 
 
+@contextmanager
+def transaction():
+    """One explicit SQL Server transaction shared by multiple storage writes."""
+    with connection() as conn:
+        try:
+            yield conn
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+
+
 def check_connection() -> dict[str, object]:
     with connection() as conn:
         cur = conn.cursor()
         try:
-            cur.execute("SELECT DB_NAME(), SUSER_SNAME(), @@VERSION")
-            database, login, version = cur.fetchone()
+            cur.execute("SELECT @@SERVERNAME, DB_NAME(), SUSER_SNAME(), @@VERSION")
+            server, database, login, version = cur.fetchone()
         finally:
             cur.close()
     return {
+        "server": server,
         "database": database,
         "login": login,
         "version": str(version).splitlines()[0],
