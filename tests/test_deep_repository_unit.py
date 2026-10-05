@@ -144,6 +144,6 @@ async def test_direct_claim_creates_exactly_one_running_lease_from_deep() -> Non
     direct_select = str(conn.execute.call_args_list[1].args[0])
     lease_insert = str(conn.execute.call_args_list[2].args[0])
     assert "FROM dbd_company_deep d" in direct_select
-    assert "r.jp_no IS NULL" in direct_select
+    assert "NOT EXISTS" in direct_select
     assert "INSERT INTO dbd_deep_runtime" in lease_insert
     assert "'RUNNING'" in lease_insert
