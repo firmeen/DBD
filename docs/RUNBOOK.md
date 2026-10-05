@@ -16,12 +16,14 @@ dbd-deep --version
 dbd-deep status
 ```
 
-2. ถ้า `dbd-deep status` แสดงว่ายังไม่ prepared สำหรับ seven-endpoint runtime ให้ทำ explicit adoption:
+2. หลัง Discovery ทุกครั้ง ให้ stage Master ทั้งหมดเข้า Deep ก่อน collect:
 
 ```powershell
 dbd-deep prepare
 dbd-deep status
 ```
+
+ก่อน collect ค่า `Master waiting` ควรเป็น `0`
 
 3. เริ่ม collection ด้วย bounded canary:
 
@@ -32,10 +34,10 @@ dbd-deep collect --limit 20 --concurrency 4 --rate 5 --http-retries 3
 4. เมื่อ canary ผ่านจึงรันต่อเนื่องด้วยค่าที่พิสูจน์บนเครื่องจริงแล้ว เช่น:
 
 ```powershell
-dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --buffer-size 32 --idle-seconds 5
+dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --idle-seconds 5
 ```
 
-5. Serving output เป็นขั้น derived แยกจาก endpoint commit. เริ่มด้วย canary:
+5. Serving output เป็น explicit downstream step แยกจาก `dbd-deep prepare/collect` โดยสิ้นเชิง. เริ่มด้วย canary:
 
 ```powershell
 python -m dbd.deep.serving --ensure --backfill --batch-size 100 --limit 100
