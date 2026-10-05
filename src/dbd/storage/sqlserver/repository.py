@@ -669,7 +669,13 @@ class ProductionSqlServerRepository:
             key_columns=("company_id", "fiscal_year"),
         )
 
-    def upsert_industries(self, conn, rows: list[dict[str, Any]]) -> int:
+    def upsert_industries(
+        self,
+        conn,
+        rows: list[dict[str, Any]],
+        *,
+        reject_conflicts: bool = False,
+    ) -> int:
         if not rows:
             return 0
         columns = _table_write_columns("dbo.DBD_INDUSTRY")
@@ -690,9 +696,9 @@ class ProductionSqlServerRepository:
             FROM dbo.DBD_INDUSTRY WITH (UPDLOCK,HOLDLOCK)
             WHERE submit_objective_code=%s
               AND fiscal_year=%s
-              AND business_size_code=%s
-              AND location_type=%s
-              AND location_no=%s
+              AND (business_size_code=%s OR (business_size_code IS NULL AND %s IS NULL))
+              AND (location_type=%s OR (location_type IS NULL AND %s IS NULL))
+              AND (location_no=%s OR (location_no IS NULL AND %s IS NULL))
         """
         update_sql = (
             "UPDATE dbo.DBD_INDUSTRY SET "
@@ -711,11 +717,23 @@ class ProductionSqlServerRepository:
         try:
             for row in rows:
                 key = tuple(_production_value(row.get(column)) for column in key_columns)
-                if any(value is None for value in key):
+                if key[0] is None or key[1] is None:
                     raise SqlServerWriteError(
-                        "dbo.DBD_INDUSTRY natural key cannot contain NULL"
+                        "dbo.DBD_INDUSTRY requires submit_objective_code and fiscal_year"
                     )
-                cur.execute(select_sql, key)
+                cur.execute(
+                    select_sql,
+                    (
+                        key[0],
+                        key[1],
+                        key[2],
+                        key[2],
+                        key[3],
+                        key[3],
+                        key[4],
+                        key[4],
+                    ),
+                )
                 existing = cur.fetchone()
                 if existing is None:
                     cur.execute(
@@ -728,6 +746,11 @@ class ProductionSqlServerRepository:
                 incoming_updated = row.get("source_updated_at")
                 incoming_payload = _production_value(row.get("payload"))
                 if existing_payload != incoming_payload:
+                    if reject_conflicts:
+                        raise SqlServerWriteError(
+                            "Conflicting industry benchmark payload for the same "
+                            "Generation 1 natural key"
+                        )
                     if (
                         existing_updated is not None
                         and incoming_updated is not None
