@@ -731,14 +731,22 @@ def main():
 
             presenter.package_about(package_environment_snapshot())
         elif args.command == "migrate":
-            from ..storage.mysql.migrations import migrate
+            from ..storage.sqlserver.repository import ProductionSqlServerRepository
 
-            migrate()
-            presenter.command_result("DBD · MIGRATION", {"status": "current"})
+            result = ProductionSqlServerRepository().ensure_schema()
+            presenter.command_result(
+                "DBD · SQL SERVER MIGRATION",
+                {
+                    "status": result["status"],
+                    "managed_tables": result["managed_tables"],
+                    "created": len(result["created"]),
+                    "altered": len(result["altered"]),
+                },
+            )
         elif args.command == "check-db":
-            from .legacy import check_db_info
+            from ..storage.sqlserver.repository import ProductionSqlServerRepository
 
-            presenter.check_db(check_db_info())
+            presenter.check_db(ProductionSqlServerRepository().check_database())
         elif args.command == "master-status":
             from ..storage.mysql.engine import connect
 
