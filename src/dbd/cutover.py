@@ -164,8 +164,31 @@ def canonical_json(value: Any) -> str | None:
     )
 
 
+_NESTED_PROFILE_FIELDS = {
+    "jp_stat_desc": ("jpStatus", "jpStatDesc"),
+    "jp_type_desc": ("jpType", "jpTypeDesc"),
+    "pv_desc": ("locationProvince", "pvDesc"),
+    "business_type_desc": ("businessType", "businessTypeDesc"),
+    "setup_obj_desc": ("setupObjType", "objDesc"),
+    "setup_obj_grp_code": ("setupObjType", "objGrpCode"),
+    "setup_obj_grp_desc": ("setupObjType", "objGrpDesc"),
+    "submit_obj_desc": ("submitObjType", "objDesc"),
+    "ampur_desc": ("locationAmpur", "ampurDesc"),
+    "tumbon_desc": ("locationTumbon", "tumbonDesc"),
+}
+
+
 def _profile_or_fallback(profile, field: str, fallback: object) -> object:
-    if profile is not None and field in profile.present_fields:
+    if profile is None:
+        return fallback
+    nested = _NESTED_PROFILE_FIELDS.get(field)
+    if nested is not None:
+        container, key = nested
+        source = profile.facts.get(container)
+        if isinstance(source, dict) and key in source:
+            return getattr(profile, field)
+        return fallback
+    if field in profile.present_fields:
         return getattr(profile, field)
     return fallback
 
@@ -670,15 +693,9 @@ def transform_industries(
             "fiscal_year": _required_text(
                 benchmark.fiscal_year, "industry fiscal_year"
             ),
-            "business_size_code": _required_text(
-                benchmark.business_size_code, "industry business_size_code"
-            ),
-            "location_type": _required_text(
-                benchmark.location_type, "industry location_type"
-            ),
-            "location_no": _required_text(
-                benchmark.location_no, "industry location_no"
-            ),
+            "business_size_code": _clean_text(benchmark.business_size_code),
+            "location_type": _clean_text(benchmark.location_type),
+            "location_no": _clean_text(benchmark.location_no),
             "submit_financial_count": _integer(benchmark.submit_fin_cnt),
             "profit_company_count": _integer(benchmark.profit_cnt),
             "loss_company_count": _integer(benchmark.loss_cnt),
@@ -798,7 +815,25 @@ def source_fence() -> Iterator[Any]:
                     pass
 
 
-def source_batches(*, batch_size: int) -> Iterator[list[dict[str, Any]]]:
+def _assert_source_fence(conn) -> None:
+    conn.ping(reconnect=False)
+    for suffix in (":dbd-api-manager", ":dbd-deep-collector"):
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT IS_USED_LOCK(CONCAT(DATABASE(), %s)) = CONNECTION_ID() AS owned",
+                (suffix,),
+            )
+            if int(cur.fetchone()["owned"] or 0) != 1:
+                raise CutoverSafetyError(
+                    "Generation 1 source fence was lost; cutover stopped"
+                )
+
+
+def source_batches(
+    conn,
+    *,
+    batch_size: int,
+) -> Iterator[list[dict[str, Any]]]:
     if batch_size < 1 or batch_size > 2000:
         raise ValueError("batch_size must be between 1 and 2000")
     last_type: str | None = None
@@ -806,7 +841,8 @@ def source_batches(*, batch_size: int) -> Iterator[list[dict[str, Any]]]:
     columns = ", ".join(f"`{column}`" for column in SOURCE_COLUMNS)
 
     while True:
-        with mysql_connection() as conn, conn.cursor() as cur:
+        _assert_source_fence(conn)
+        with conn.cursor() as cur:
             if last_type is None:
                 cur.execute(
                     f"""
@@ -967,7 +1003,7 @@ def run_generation1_cutover(
         if event is not None:
             event("started", dict(stats))
 
-        for source_rows_batch in source_batches(batch_size=batch_size):
+        for source_rows_batch in source_batches(fence_conn, batch_size=batch_size):
             prepared: list[
                 tuple[
                     tuple[str, str],
@@ -1026,7 +1062,9 @@ def run_generation1_cutover(
                 repository.upsert_relations(target_conn, relation_rows)
                 repository.upsert_events(target_conn, event_rows)
                 repository.upsert_financials(target_conn, financial_rows)
-                repository.upsert_industries(target_conn, industry_rows)
+                repository.upsert_industries(
+                    target_conn, industry_rows, reject_conflicts=True
+                )
 
             stats["companies"] += len(prepared)
             stats["profile_mapped_companies"] += sum(
