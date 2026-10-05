@@ -218,7 +218,7 @@ async def staging_repo():
 
     def capture_warnings(conn, cursor, statement, parameters, context, executemany):
         if statement.lstrip().startswith("INSERT INTO dbd_company_deep"):
-            # Inspect this statement's diagnostics BEFORE DELETE/seed/COMMIT
+            # Inspect this statement's diagnostics before DELETE/COMMIT
             # can clear them. A separate cursor preserves the DML result.
             diagnostics = conn.connection.cursor()
             try:
@@ -239,7 +239,7 @@ async def staging_repo():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("year", [None, "", "   ", "2568,2567"])
-async def test_staging_copies_all_columns_and_seeds_runtime_without_warnings(staging_repo, year):
+async def test_staging_copies_all_columns_without_prefilling_runtime(staging_repo, year):
     repo, warnings = staging_repo
     with connect() as conn, conn.cursor() as cur:
         expected = _insert_promotion_master(cur, year=year)
@@ -418,10 +418,16 @@ async def test_prepare_stages_complete_master_workset_then_direct_claims_one_lea
         assert {row["status"] for row in leases} == {"RUNNING"}
         assert {row["attempts"] for row in leases} == {1}
 
-        await repo.finish_runtime(str(first["jp_type_code"]), str(first["jp_no"]))
         third = await repo.claim()
         assert third is not None
         assert third["jp_no"] not in {first["jp_no"], second["jp_no"]}
+
+        with connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT COUNT(*) n FROM dbd_deep_runtime "
+                "WHERE status='RUNNING'"
+            )
+            assert cur.fetchone()["n"] == 3
     finally:
         await repo.close()
 
