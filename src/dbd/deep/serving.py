@@ -276,7 +276,7 @@ class ServingProjector:
         *,
         event: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
-        self.engine = engine or create_deep_engine()
+        self.engine = engine or create_deep_engine(pool_size=2)
         self._owns_engine = engine is None
         self.event = event
 
@@ -740,10 +740,29 @@ async def _run(
                 batch_size=args.batch_size,
                 limit=args.limit,
             )
-        projector._emit("phase", phase="INCREMENTAL RECONCILE")
-        return await projector.project_incremental(
-            limit=args.limit or args.batch_size,
-        )
+
+        if not args.continuous:
+            projector._emit("phase", phase="INCREMENTAL RECONCILE")
+            return await projector.project_incremental(
+                limit=args.limit or args.batch_size,
+            )
+
+        projector._emit("phase", phase="CONTINUOUS INCREMENTAL")
+        last_result: dict[str, Any] = {
+            "ready": True,
+            "scanned": 0,
+            "inserted": 0,
+            "updated": 0,
+            "unchanged": 0,
+            "missing_identity": 0,
+            "normalization_error": 0,
+            "errors": [],
+        }
+        while True:
+            last_result = await projector.project_incremental(
+                limit=args.batch_size,
+            )
+            await asyncio.sleep(args.interval_seconds)
     finally:
         await projector.close()
 
@@ -754,7 +773,19 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--backfill", action="store_true")
     parser.add_argument("--batch-size", type=int, default=1000)
     parser.add_argument("--limit", type=int)
+    parser.add_argument("--continuous", action="store_true")
+    parser.add_argument("--interval-seconds", type=float, default=10.0)
     args = parser.parse_args(argv)
+    if args.batch_size < 1 or args.batch_size > 20000:
+        parser.error("--batch-size must be between 1 and 20000")
+    if args.limit is not None and args.limit < 1:
+        parser.error("--limit must be positive")
+    if args.continuous and args.backfill:
+        parser.error("--continuous cannot be combined with --backfill")
+    if args.continuous and args.limit is not None:
+        parser.error("--continuous uses --batch-size per cycle; do not combine it with --limit")
+    if args.interval_seconds < 0.5 or args.interval_seconds > 3600:
+        parser.error("--interval-seconds must be between 0.5 and 3600")
 
     terminal = MasterDeepTerminal("serving")
     terminal(
