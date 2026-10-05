@@ -569,6 +569,17 @@ class ProductionSqlServerRepository:
                 create_table, alter_schema, can_select, can_insert, can_update = cur.fetchone()
             finally:
                 cur.close()
+        required_dml = {
+            "SELECT": bool(can_select),
+            "INSERT": bool(can_insert),
+            "UPDATE": bool(can_update),
+        }
+        missing_dml = [name for name, allowed in required_dml.items() if not allowed]
+        if missing_dml:
+            raise SqlServerSchemaError(
+                "SQL Server production login is missing required DML permission(s): "
+                + ", ".join(missing_dml)
+            )
         return {
             **info,
             "schema": schema["status"],
@@ -576,9 +587,9 @@ class ProductionSqlServerRepository:
             "expected_tables": len(MANAGED_TABLES),
             "create_table": bool(create_table),
             "alter_schema": bool(alter_schema),
-            "select": bool(can_select),
-            "insert": bool(can_insert),
-            "update": bool(can_update),
+            "select": required_dml["SELECT"],
+            "insert": required_dml["INSERT"],
+            "update": required_dml["UPDATE"],
         }
 
     def max_generation(self, conn=None) -> int | None:
