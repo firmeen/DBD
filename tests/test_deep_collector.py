@@ -95,12 +95,12 @@ def test_core_bits_remain_stable_and_extended_bits_do_not_overlap() -> None:
 def test_endpoint_order_is_deterministic_for_both_phases() -> None:
     assert tuple(spec.key for spec in static_endpoint_specs("core")) == (
         "profile",
-        "financial_submissions",
-        "financial_statements",
-        "industry_benchmark",
         "committees",
         "committee_signs",
         "transformations",
+        "financial_submissions",
+        "financial_statements",
+        "industry_benchmark",
     )
     assert set(CORE_ENDPOINTS) == {
         "profile",
