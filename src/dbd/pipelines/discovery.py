@@ -801,7 +801,14 @@ async def run(
     ) as client:
         provinces = await fetch_provinces(client)
         if not seeds:
-            seeds = await province_seeds(client)
+            seeds = sorted(
+                {
+                    f"0{str(province).zfill(2)}"
+                    for province in provinces
+                    if str(province).strip()
+                }
+                | set(EXTRA_PREFIX_SEEDS)
+            )
 
         queue = deque(
             (SearchFilters(keyword=seed, search_type=search_type), None)
@@ -912,6 +919,13 @@ async def run(
                     f"{filters.key()}: pages={min(offset + len(chunk), len(page_numbers))}/"
                     f"{len(page_numbers)} companies={companies_written:,}"
                 )
+
+    if queue:
+        progress_line.close()
+        raise ContractError(
+            "Discovery stopped before all in-memory partitions were drained; "
+            "persisted rows remain safe but generation coverage is incomplete"
+        )
 
     progress_line.close(
         message=(
