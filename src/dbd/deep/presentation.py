@@ -112,19 +112,7 @@ class DeepTerminalEvents:
         self.live: Live | None = None
         self.state: dict[str, Any] = {
             "phase": "STARTING",
-            "prepare_step": "-",
-            "legacy_scope": "CHECKING",
-            "legacy_action": "-",
-            "batch": 0,
-            "batch_rows": 0,
-            "batches_committed": 0,
-            "master_staged": 0,
-            "rows_per_second": 0.0,
-            "batch_elapsed_seconds": 0.0,
-            "batch_rows_per_second": 0.0,
-            "rows_total": 0,
-            "rows_scanned": 0,
-            "rows_changed": 0,
+            "rows_prepared": 0,
             "leases_recovered": 0,
             "generation": "-",
             "scope": "-",
@@ -283,17 +271,7 @@ class DeepTerminalEvents:
 
     def _render(self):
         if self.command == "prepare":
-            now = time.monotonic()
-            elapsed = now - self.started_at
-            step_elapsed = now - self.step_started_at
-            batch = int(self.state.get("batch") or 0)
-            batch_rows = int(self.state.get("batch_rows") or 0)
-            staged = int(self.state.get("master_staged") or 0)
-            last_rate = float(
-                self.state.get("batch_rows_per_second") or 0
-            )
-            avg_rate = float(self.state.get("rows_per_second") or 0)
-
+            elapsed = time.monotonic() - self.started_at
             return Panel(
                 _grid(
                     [
@@ -304,25 +282,16 @@ class DeepTerminalEvents:
                             _styled(_duration(elapsed), "dim"),
                         ),
                         (
-                            "Step",
-                            _styled(self.state.get("prepare_step", "-"), "cyan"),
-                            "Step time",
-                            _styled(f"{step_elapsed:,.1f}s", "bold white"),
+                            "Generation",
+                            _styled(self.state.get("generation", "-"), "bold white"),
+                            "Scope",
+                            _styled(str(self.state.get("scope") or "-").upper(), "cyan"),
                         ),
                         (
-                            "Batch",
-                            _styled(
-                                f"{batch:,} × {batch_rows:,}",
-                                "bold white",
-                            ),
-                            "Staged",
-                            _priority_count(staged, "green"),
-                        ),
-                        (
-                            "Last",
-                            _styled(f"{last_rate:,.0f} rows/s", "cyan"),
-                            "Average",
-                            _styled(f"{avg_rate:,.0f} rows/s", "cyan"),
+                            "Prepared",
+                            _priority_count(self.state.get("rows_prepared"), "green"),
+                            "",
+                            "",
                         ),
                     ]
                 ),
