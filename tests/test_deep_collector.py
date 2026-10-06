@@ -3,7 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from decimal import Decimal
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -298,3 +298,28 @@ async def test_company_limit_stops_direct_claim_without_prefetch() -> None:
     assert collector.stats.companies_claimed == 2
     assert collector.stats.companies_in_flight == 0
     assert collector._stop.is_set()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_company_best_effort_releases_owned_claim() -> None:
+    collector = _collector()
+    collector._release_sync = Mock()
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    class Client:
+        async def fetch(self, *_args, **_kwargs):
+            started.set()
+            await blocked.wait()
+            raise AssertionError("cancelled request unexpectedly resumed")
+
+    task = asyncio.create_task(
+        collector._process_company(_company("0107556000001"), Client())
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    collector._release_sync.assert_called_once()
