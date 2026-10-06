@@ -417,12 +417,14 @@ def _finalize_batch(
     *,
     generation: int,
     batch_size: int,
+    company_id: int | None = None,
 ) -> int:
     with repository.transaction() as conn:
         return repository.finalize_generation(
             conn,
             generation=int(generation),
             batch_size=int(batch_size),
+            company_id=company_id,
         )
 
 
@@ -521,43 +523,48 @@ async def fetch_company(
         )
         repo.assert_manager_lock(lock_conn)
 
-    collection = await collect(
-        generation=generation,
-        phase=phase,
-        concurrency=concurrency,
-        rate=rate,
-        http_retries=http_retries,
-        company_id=company_id,
-        repository=repo,
-        event=event,
-    )
-    company_state = await asyncio.to_thread(repo.company_state, company_id)
-    if company_state is None:
-        raise RuntimeError(f"company_id={company_id} disappeared after collection")
-
-    selected_unresolved = (
-        int(company_state["required_mask"])
-        & phase_mask(phase)
-        & ~(
-            int(company_state["done_mask"])
-            | int(company_state["not_available_mask"])
-            | int(company_state["failed_mask"])
+        collection = await _guard_application_lock(
+            repo,
+            lock_conn,
+            collect(
+                generation=generation,
+                phase=phase,
+                concurrency=concurrency,
+                rate=rate,
+                http_retries=http_retries,
+                company_id=company_id,
+                repository=repo,
+                event=event,
+            ),
         )
-    )
-    if not has_active_generation and selected_unresolved == 0:
-        def finalize_one() -> int:
-            with repo.transaction() as conn:
-                return repo.finalize_generation(
-                    conn,
-                    generation=generation,
-                    batch_size=1,
-                    company_id=company_id,
-                )
+        repo.assert_manager_lock(lock_conn)
+        company_state = await asyncio.to_thread(repo.company_state, company_id)
+        if company_state is None:
+            raise RuntimeError(
+                f"company_id={company_id} disappeared after collection"
+            )
 
-        await asyncio.to_thread(finalize_one)
-        refreshed = await asyncio.to_thread(repo.company_state, company_id)
-        if refreshed is not None:
-            company_state = refreshed
+        selected_unresolved = (
+            int(company_state["required_mask"])
+            & phase_mask(phase)
+            & ~(
+                int(company_state["done_mask"])
+                | int(company_state["not_available_mask"])
+                | int(company_state["failed_mask"])
+            )
+        )
+        if not has_active_generation and selected_unresolved == 0:
+            await asyncio.to_thread(
+                _finalize_batch,
+                repo,
+                generation=generation,
+                batch_size=1,
+                company_id=company_id,
+            )
+            repo.assert_manager_lock(lock_conn)
+            refreshed = await asyncio.to_thread(repo.company_state, company_id)
+            if refreshed is not None:
+                company_state = refreshed
 
     return FetchCompanyResult(
         company_id=int(company_id),
