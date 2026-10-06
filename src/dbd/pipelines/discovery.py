@@ -24,11 +24,8 @@ from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
     DiscoveryLeaseLost,
     claim_buckets,
-    discovery_summary,
-    heartbeat_bucket_claims,
     pending_buckets,
     release_bucket_claim,
-    release_bucket_claims,
     update_bucket,
     upsert_bucket,
 )
