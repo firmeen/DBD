@@ -708,18 +708,19 @@ def _normalize_direct_rows(
     *,
     published_at: datetime,
 ) -> tuple[list[dict], int]:
+    profiles, rejections = _normalize_rows(rows)
+    rejected = {int(item["row_index"]) for item in rejections}
     valid: list[dict] = []
-    invalid = 0
-    for raw in rows:
-        try:
-            profile = normalize(raw)
-        except ContractError:
-            invalid += 1
+    profile_index = 0
+    for row_index, raw in enumerate(rows):
+        if row_index in rejected:
             continue
+        profile = profiles[profile_index]
+        profile_index += 1
         valid.append(
             _discovery_company_row(profile, raw, published_at=published_at)
         )
-    return valid, invalid
+    return valid, len(rejections)
 
 
 def _persist_direct_batch(
