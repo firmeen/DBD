@@ -259,6 +259,16 @@ def test_payload_preserves_decimal_as_json_number() -> None:
     assert '"12345678901234567890.123456789"' not in encoded
 
 
+
+def test_payload_json_is_canonical_and_strips_nul() -> None:
+    encoded = _json_payload(
+        {
+            "z": "A\x00B",
+            "a": Decimal("1.25"),
+        }
+    )
+    assert encoded == '{"a":1.25,"z":"AB"}'
+
 def test_collector_has_no_second_queue_or_serving_scheduler() -> None:
     collector = _collector()
     assert not hasattr(collector, "buffer_size")
