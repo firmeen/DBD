@@ -932,6 +932,7 @@ def test_retry_skips_currently_owned_claims() -> None:
     )
     sql = " ".join(cursor.executions[-1][0].split())
     assert "lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME()" in sql
+    assert "READPAST" not in sql
 
 
 def test_phase_status_is_derived_from_phase_masks_not_global_collect_status(monkeypatch) -> None:

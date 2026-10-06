@@ -1913,7 +1913,7 @@ class ProductionSqlServerRepository:
                 DECLARE @updated TABLE (company_id BIGINT NOT NULL);
                 ;WITH target AS (
                     SELECT {top}*
-                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,ROWLOCK)
                     WHERE {where}
                     ORDER BY company_id
                 )
