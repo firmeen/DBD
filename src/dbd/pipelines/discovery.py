@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import time
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
@@ -46,6 +47,7 @@ class DiscoveryResult:
     pages_fetched: int
     companies_written: int
     requests_made: int
+    invalid_rows: int = 0
 
 
 @dataclass
@@ -630,6 +632,133 @@ async def _run_work(
     return DiscoveryResult(buckets_processed, pages_fetched, companies_written, client.requests_made)
 
 
+
+def _canonical_company_payload(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )
+
+
+def _discovery_company_row(profile, raw: dict, *, published_at: datetime) -> dict:
+    mapping = {
+        "jp_name": "company_name_th",
+        "jp_name_e": "company_name_en",
+        "jp_search_name": "company_search_name",
+        "jp_stat_code": "status_code",
+        "jp_stat_desc": "status_description",
+        "jp_type_desc": "juristic_type_description",
+        "reg_date": "registration_date",
+        "stat_change_date": "status_change_date",
+        "update_date": "dbd_update_date",
+        "address": "address_th",
+        "address_e": "address_en",
+        "pv_code": "province_code",
+        "pv_desc": "province_name",
+        "ampur_code": "district_code",
+        "ampur_desc": "district_name",
+        "tumbon_code": "subdistrict_code",
+        "tumbon_desc": "subdistrict_name",
+        "zip_code": "postal_code",
+        "business_size_code": "business_size_code",
+        "business_type_code": "business_type_code",
+        "business_type_desc": "business_type_description",
+        "setup_obj_code": "setup_objective_code",
+        "setup_obj_desc": "setup_objective_description",
+        "setup_obj_grp_code": "setup_objective_group_code",
+        "setup_obj_grp_desc": "setup_objective_group_description",
+        "setup_obj_name_keyin": "setup_objective_keyin",
+        "submit_obj_code": "submit_objective_code",
+        "submit_obj_desc": "submit_objective_description",
+        "submit_obj_name_keyin": "submit_objective_keyin",
+        "cap_amt": "registered_capital",
+        "paid_amt": "paid_capital",
+        "total_asset": "total_assets_latest",
+        "total_equity": "total_equity_latest",
+        "total_income": "total_income_latest",
+        "net_profit": "net_profit_latest",
+    }
+    result = {
+        "juristic_type_code": profile.jp_type_code,
+        "registration_no": profile.jp_no,
+        "master_payload": _canonical_company_payload(raw),
+        "published_at": published_at,
+    }
+    for field, column in mapping.items():
+        if field in profile.present_fields:
+            result[column] = getattr(profile, field)
+    if "submit_fin_year" in profile.present_fields:
+        from ..deep.catalog import latest_fiscal_year
+
+        result["latest_fiscal_year"] = latest_fiscal_year(profile.submit_fin_year)
+    if "update_date" in profile.present_fields:
+        result["source_updated_at"] = profile.update_date
+    return result
+
+
+def _normalize_direct_rows(
+    rows: list[dict],
+    *,
+    published_at: datetime,
+) -> tuple[list[dict], int]:
+    valid: list[dict] = []
+    invalid = 0
+    for raw in rows:
+        try:
+            profile = normalize(raw)
+        except ContractError:
+            invalid += 1
+            continue
+        valid.append(
+            _discovery_company_row(profile, raw, published_at=published_at)
+        )
+    return valid, invalid
+
+
+def _persist_direct_batch(
+    repository,
+    rows: list[dict],
+    *,
+    generation: int,
+    refresh_mask: int,
+) -> dict[str, int]:
+    if not rows:
+        return {"inserted": 0, "updated": 0, "refresh_reopened": 0}
+    with repository.transaction() as conn:
+        return repository.upsert_discovered_companies(
+            conn,
+            rows,
+            generation=generation,
+            refresh_mask=refresh_mask,
+        )
+
+
+async def _direct_page(
+    client: AsyncDbdClient,
+    filters: SearchFilters,
+    page_no: int,
+) -> tuple[object, datetime]:
+    requested = _now()
+    data = await client.post(
+        SEARCH_PATH,
+        filters.payload(page=page_no),
+        referer=SEARCH_REFERER,
+        timeout=settings.dbd_count_timeout_seconds if page_no == 1 else None,
+        rate_key="search",
+    )
+    page = parse_search_response(data)
+    if page.current_page != page_no:
+        raise ContractError(
+            f"Search returned page {page.current_page} for requested page {page_no}"
+        )
+    if not page.rows and page.total_items > 0:
+        raise ContractError(f"Search page {page_no} is empty for a non-empty partition")
+    return data, requested
+
+
 async def run(
     seeds: list[str],
     *,
@@ -640,76 +769,171 @@ async def run(
     verbose: bool = True,
     health=None,
     distributed: bool = False,
+    generation: int | None = None,
+    refresh_mask: int = 0,
+    repository=None,
 ) -> DiscoveryResult:
-    if distributed and not settings.dbd_redis_url:
-        raise ValueError("Distributed discovery requires DBD_REDIS_URL")
-    stop = asyncio.Event()
-    owner_label = os.environ.get("DBD_WORKER_ID") or "discovery"
-    owner = f"{owner_label}-{uuid4().hex}"
-    progress_line = ProgressLine("DISCOVERY", interval=0.75, enabled=verbose)
+    """Direct v0.6 Search traversal into SQL Server DBD_COMPANY.
+
+    Split/page state is intentionally transient. A crash restarts Search
+    traversal; natural-key SQL Server upserts make repeated pages safe.
+    """
+    if distributed:
+        raise ValueError(
+            "--distributed is a legacy MySQL discovery mode and is not supported "
+            "by the v0.6 direct SQL Server discovery path"
+        )
+    if generation is None:
+        raise ValueError("v0.6 direct discovery requires an explicit generation")
+
+    from ..storage.sqlserver.repository import ProductionSqlServerRepository
+
+    repo = repository or ProductionSqlServerRepository()
     global_rate = settings.dbd_rate_per_second if rate is None else rate
+    progress_line = ProgressLine("DISCOVERY", interval=0.75, enabled=verbose)
+
+    buckets_processed = 0
+    pages_fetched = 0
+    companies_written = 0
+    invalid_rows = 0
 
     async with AsyncDbdClient(
         concurrency=concurrency,
         rate_per_second=global_rate,
         endpoint_rates={"search": global_rate},
-        redis_url=settings.dbd_redis_url if distributed else None,
+        redis_url=None,
         redis_key=settings.dbd_redis_rate_key,
     ) as client:
+        provinces = await fetch_provinces(client)
+        if not seeds:
+            seeds = await province_seeds(client)
 
-        async def monitor_health():
-            while not stop.is_set():
-                if health is not None:
-                    await asyncio.to_thread(health)
-                if distributed:
-                    await asyncio.to_thread(
-                        heartbeat_bucket_claims, owner, settings.dbd_lease_seconds
+        queue = deque(
+            (SearchFilters(keyword=seed, search_type=search_type), None)
+            for seed in seeds
+        )
+        limit = None if max_buckets is None else int(max_buckets)
+
+        while queue:
+            if limit is not None and buckets_processed >= limit:
+                break
+            filters, prefetched = queue.popleft()
+            if health is not None:
+                await asyncio.to_thread(health)
+
+            if prefetched is None:
+                data, _requested = await _direct_page(client, filters, 1)
+                page = parse_search_response(data)
+                pages_fetched += 1
+            else:
+                data, page = prefetched
+
+            buckets_processed += 1
+            if page.total_items == 0:
+                continue
+
+            if page.total_items > MAX_ROWS_PER_QUERY:
+                children = _children_for(filters, provinces)
+                if not children:
+                    progress_line.close()
+                    raise ContractError(
+                        f"{page.total_items} rows exceeds the "
+                        f"{MAX_ROWS_PER_QUERY} ceiling and no split dimension remains"
                     )
-                try:
-                    await asyncio.wait_for(stop.wait(), min(10, settings.dbd_lease_seconds / 3))
-                except TimeoutError:
-                    pass
 
-        async def work():
-            try:
-                return await _run_work(
-                    client,
-                    seeds,
-                    search_type,
-                    max_buckets,
-                    distributed=distributed,
-                    owner=owner,
-                    progress_line=progress_line,
+                counted_children = []
+                child_total = 0
+                for child in children:
+                    child_data, _requested = await _direct_page(client, child, 1)
+                    child_page = parse_search_response(child_data)
+                    pages_fetched += 1
+                    child_total += int(child_page.total_items)
+                    counted_children.append((child, (child_data, child_page)))
+                if child_total != int(page.total_items):
+                    progress_line.close()
+                    raise ContractError(
+                        "Discovery partition is not lossless: "
+                        f"parent={page.total_items:,}, children={child_total:,}"
+                    )
+                queue.extend(counted_children)
+                progress_line.event(
+                    f"{filters.key()}: {page.total_items:,} rows -> "
+                    f"{len(children)} lossless child partitions"
                 )
-            finally:
-                stop.set()
+                continue
 
-        try:
-            async with asyncio.TaskGroup() as group:
-                group.create_task(monitor_health())
-                task = group.create_task(work())
-        finally:
-            if distributed:
-                await asyncio.to_thread(release_bucket_claims, owner)
+            page_numbers = list(range(1, int(page.total_pages) + 1))
+            page_chunk = max(
+                1,
+                min(
+                    len(page_numbers),
+                    max(1, int(concurrency or settings.dbd_concurrency)) * 2,
+                ),
+            )
+            first_data = data
+            for offset in range(0, len(page_numbers), page_chunk):
+                chunk = page_numbers[offset : offset + page_chunk]
+                tasks = []
+                for page_no in chunk:
+                    if page_no == 1:
+                        tasks.append(None)
+                    else:
+                        tasks.append(
+                            asyncio.create_task(
+                                _direct_page(client, filters, page_no)
+                            )
+                        )
 
-    result = task.result()
-    status = discovery_summary()
+                company_rows: list[dict] = []
+                for page_no, task in zip(chunk, tasks, strict=True):
+                    if page_no == 1:
+                        page_data = first_data
+                        page_obj = page
+                    else:
+                        assert task is not None
+                        page_data, _requested = await task
+                        page_obj = parse_search_response(page_data)
+                        pages_fetched += 1
+                    normalized, rejected = _normalize_direct_rows(
+                        page_obj.rows,
+                        published_at=_now(),
+                    )
+                    invalid_rows += rejected
+                    company_rows.extend(normalized)
+
+                write_size = max(1, int(settings.dbd_write_batch_size))
+                for write_offset in range(0, len(company_rows), write_size):
+                    batch = company_rows[write_offset : write_offset + write_size]
+                    result = await asyncio.to_thread(
+                        _persist_direct_batch,
+                        repo,
+                        batch,
+                        generation=int(generation),
+                        refresh_mask=int(refresh_mask),
+                    )
+                    companies_written += int(result["inserted"]) + int(result["updated"])
+
+                progress_line.event(
+                    f"{filters.key()}: pages={min(offset + len(chunk), len(page_numbers))}/"
+                    f"{len(page_numbers)} companies={companies_written:,}"
+                )
+
     progress_line.close(
         message=(
-            f"Discovery: companies={int(status.get('unique_companies') or 0):,} "
-            f"pages_done={int(status.get('pages_done') or 0):,} "
-            f"open_buckets={int(status.get('buckets_open') or 0):,}"
+            f"Discovery: partitions={buckets_processed:,} "
+            f"pages={pages_fetched:,} companies={companies_written:,} "
+            f"invalid={invalid_rows:,}"
         )
     )
-    blockers = []
-    if int(status.get("buckets_failed") or 0):
-        blockers.append(f"{status['buckets_failed']} failed bucket(s)")
-    if int(status.get("pages_partial") or 0):
-        blockers.append(f"{status['pages_partial']} partial page(s)")
-    if int(status.get("unresolved_rejections") or 0):
-        blockers.append(f"{status['unresolved_rejections']} quarantined row(s)")
-    if int(status.get("partitions_lossy") or 0):
-        blockers.append(f"{status['partitions_lossy']} lossy partition(s)")
-    if blockers and max_buckets is None:
-        raise ContractError("Discovery incomplete: " + ", ".join(blockers))
-    return result
+    if invalid_rows and max_buckets is None:
+        raise ContractError(
+            f"Discovery encountered {invalid_rows:,} contract-invalid company row(s); "
+            "generation cannot be finalized"
+        )
+    return DiscoveryResult(
+        buckets_processed=buckets_processed,
+        pages_fetched=pages_fetched,
+        companies_written=companies_written,
+        requests_made=client.requests_made,
+        invalid_rows=invalid_rows,
+    )
