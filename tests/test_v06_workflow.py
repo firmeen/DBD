@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from contextlib import contextmanager
 from types import SimpleNamespace
 
@@ -227,3 +228,74 @@ async def test_cycle_loop_is_simple_foreground_repetition(monkeypatch) -> None:
 
     assert result.status == "COMPLETE"
     assert calls == ["extended"]
+
+
+@pytest.mark.asyncio
+async def test_cycle_reports_complete_with_terminal_failures(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=1)
+
+    async def fake_discovery_run(*_args, **_kwargs):
+        return DiscoveryResult(1, 1, 10, 1, 0)
+
+    async def fake_collect(**_kwargs):
+        return {
+            "companies_claimed": 0,
+            "companies_finished": 0,
+            "endpoints_failed": 0,
+        }
+
+    async def verified_with_failures(**kwargs):
+        return VerifyResult(
+            generation=kwargs["generation"],
+            phase=kwargs["phase"],
+            status="COMPLETE_WITH_FAILURES",
+            details={
+                "ok": True,
+                "status": "COMPLETE_WITH_FAILURES",
+                "terminal_failures": 2,
+            },
+        )
+
+    monkeypatch.setattr(workflow.discovery, "run", fake_discovery_run)
+    monkeypatch.setattr(workflow, "collect", fake_collect)
+    monkeypatch.setattr(workflow, "verify", verified_with_failures)
+
+    result = await workflow.cycle_run(
+        phase="core",
+        repository=repo,
+        verbose=False,
+    )
+
+    assert result.status == "COMPLETE_WITH_FAILURES"
+    assert result.collection["companies_claimed"] == 0
+    assert repo.finalize_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_interrupted_cycle_never_finalizes_generation(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=1)
+    started = asyncio.Event()
+    blocked = asyncio.Event()
+
+    async def blocked_discovery(*_args, **_kwargs):
+        started.set()
+        await blocked.wait()
+        raise AssertionError("cancelled discovery unexpectedly resumed")
+
+    monkeypatch.setattr(workflow.discovery, "run", blocked_discovery)
+
+    task = asyncio.create_task(
+        workflow.cycle_run(
+            phase="core",
+            repository=repo,
+            verbose=False,
+        )
+    )
+    await started.wait()
+    task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert repo.prepared == 0
+    assert repo.finalize_calls == 0
