@@ -187,7 +187,7 @@ def static_endpoint_specs(phase: str) -> tuple[EndpointSpec, ...]:
                 required_rule=rule,
             )
         )
-    return tuple(sorted(specs, key=lambda item: item.sequence_no))
+    return tuple(specs)
 
 
 def latest_fiscal_year(value: object) -> str | None:
