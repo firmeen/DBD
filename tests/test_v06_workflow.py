@@ -7,6 +7,7 @@ from types import SimpleNamespace
 import pytest
 
 import dbd.workflow as workflow
+from dbd.contracts.identity import parse_code
 from dbd.pipelines.discovery import DiscoveryResult
 from dbd.workflow import VerifyResult
 
@@ -28,6 +29,8 @@ class _WorkflowRepo:
         self.prepared = 0
         self.recovered = 0
         self.lock_checks = 0
+        self.discovered_generations = []
+        self.finalize_company_ids = []
 
     def generation_state(self):
         last_seen = self.active or self.finalized
@@ -68,6 +71,36 @@ class _WorkflowRepo:
     def transaction(self):
         yield self
 
+    def upsert_discovered_companies(self, _conn, _rows, *, generation, **_kwargs):
+        self.discovered_generations.append(generation)
+        return {"inserted": 1, "updated": 0, "refresh_reopened": 0}
+
+    def company_ids(self, _conn, identities):
+        identity = list(identities)[0]
+        return {identity: 42}
+
+    def company_state(self, _company_id):
+        return {
+            "company_id": 42,
+            "juristic_type_code": "7",
+            "registration_no": "0107556000051",
+            "latest_fiscal_year": None,
+            "required_mask": 113,
+            "done_mask": 113,
+            "not_available_mask": 0,
+            "failed_mask": 0,
+            "collect_status": "COMPLETE",
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "retry_at": None,
+            "dataset_generation": self.finalized,
+            "first_seen_generation": self.finalized,
+            "last_seen_generation": self.finalized,
+            "last_endpoint": "transformations",
+            "last_http_status": 200,
+            "last_error": None,
+        }
+
     def prepare_companies(self, _conn, **_kwargs):
         self.prepared += 1
         return 10
@@ -77,7 +110,8 @@ class _WorkflowRepo:
         return 0
 
     def finalize_generation(self, _conn, *, generation, batch_size, company_id=None):
-        del generation, batch_size, company_id
+        del generation, batch_size
+        self.finalize_company_ids.append(company_id)
         self.finalize_calls += 1
         return 10 if self.finalize_calls == 1 else 0
 
@@ -299,3 +333,37 @@ async def test_interrupted_cycle_never_finalizes_generation(monkeypatch) -> None
 
     assert repo.prepared == 0
     assert repo.finalize_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_fetch_company_reuses_finalized_generation_and_shared_collect(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=5, active=None, unresolved=0)
+    calls = []
+
+    async def fake_collect(**kwargs):
+        calls.append(
+            (
+                kwargs["generation"],
+                kwargs["phase"],
+                kwargs["company_id"],
+            )
+        )
+        return {
+            "companies_claimed": 1,
+            "companies_finished": 1,
+            "endpoints_failed": 0,
+        }
+
+    monkeypatch.setattr(workflow, "collect", fake_collect)
+
+    result = await workflow.fetch_company(
+        parse_code("70107556000051"),
+        phase="core",
+        repository=repo,
+    )
+
+    assert result.generation == 5
+    assert result.company_id == 42
+    assert repo.discovered_generations == [5]
+    assert calls == [(5, "core", 42)]
+    assert repo.finalize_company_ids == [42]
