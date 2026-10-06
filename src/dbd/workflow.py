@@ -707,8 +707,13 @@ async def cycle_run(
             phase=phase,
             repository=repo,
         )
+        final_ok = bool(final_verification.details["ok"]) and not int(
+            final_verification.details.get("unfinished_rows") or 0
+        )
         status_value = (
-            "COMPLETE_WITH_FAILURES"
+            "FAILED"
+            if not final_ok
+            else "COMPLETE_WITH_FAILURES"
             if int(final_verification.details["terminal_failures"] or 0)
             else "COMPLETE"
         )
