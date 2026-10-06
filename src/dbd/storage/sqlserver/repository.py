@@ -494,6 +494,7 @@ _COMPANY_STATE_COLUMNS = (
     "lease_owner",
     "lease_expires_at",
     "retry_at",
+    "endpoint_meta",
 )
 
 
@@ -631,12 +632,19 @@ _STATEMENT_COLUMNS = (
 )
 
 
-def _collect_status_sql() -> str:
-    return """
-        CASE
+def _collect_status_sql(*, include_lease: bool = True) -> str:
+    lease_clause = (
+        """
           WHEN lease_owner IS NOT NULL
            AND lease_expires_at > SYSUTCDATETIME()
             THEN N'COLLECTING'
+        """
+        if include_lease
+        else ""
+    )
+    return f"""
+        CASE
+          {lease_clause}
           WHEN (required_mask & ~(done_mask | not_available_mask | failed_mask)) <> 0
            AND retry_at > SYSUTCDATETIME()
             THEN N'RETRY_WAIT'
@@ -1535,7 +1543,7 @@ class ProductionSqlServerRepository:
                 UPDATE dbo.DBD_COMPANY
                 SET lease_owner=NULL,
                     lease_expires_at=NULL,
-                    collect_status={_collect_status_sql()}
+                    collect_status={_collect_status_sql(include_lease=False)}
                 WHERE company_id=%s
                   AND lease_owner=%s
                   AND last_seen_generation=%s
@@ -1553,7 +1561,7 @@ class ProductionSqlServerRepository:
                 UPDATE dbo.DBD_COMPANY
                 SET lease_owner=NULL,
                     lease_expires_at=NULL,
-                    collect_status={_collect_status_sql()}
+                    collect_status={_collect_status_sql(include_lease=False)}
                 WHERE lease_owner IS NOT NULL
                   AND lease_expires_at <= SYSUTCDATETIME()
                 """
