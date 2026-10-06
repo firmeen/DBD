@@ -368,3 +368,275 @@ def test_sqlserver_transaction_rolls_back_whole_batch(monkeypatch) -> None:
 
     assert conn.commits == 0
     assert conn.rollbacks == 1
+
+
+class _SequenceCursor:
+    def __init__(self, fetchone_values=None, *, rowcount=1) -> None:
+        self.fetchone_values = list(fetchone_values or [])
+        self.rowcount = rowcount
+        self.executions = []
+        self.executemany_calls = []
+
+    def execute(self, sql, params=None) -> None:
+        self.executions.append((str(sql), params))
+
+    def executemany(self, sql, params) -> None:
+        self.executemany_calls.append((str(sql), list(params)))
+
+    def fetchone(self):
+        return self.fetchone_values.pop(0) if self.fetchone_values else None
+
+    def fetchall(self):
+        return []
+
+    def close(self) -> None:
+        pass
+
+
+def test_generation_state_resumes_partial_finalization(monkeypatch) -> None:
+    cursor = _SequenceCursor([(5, 5), (17,)])
+    conn = _CaptureConnection(cursor)
+
+    @contextmanager
+    def fake_connection():
+        yield conn
+
+    monkeypatch.setattr(repository_module, "connection", fake_connection)
+    state = ProductionSqlServerRepository().generation_state()
+
+    assert state["finalized_generation"] == 5
+    assert state["last_seen_generation"] == 5
+    assert state["active_generation"] == 5
+    assert state["unfinished_rows"] == 17
+    assert state["next_generation"] == 5
+
+
+def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -> None:
+    first_cursor = _SequenceCursor([(42, 4)])
+    repo = ProductionSqlServerRepository()
+    repo.upsert_discovered_companies(
+        _CaptureConnection(first_cursor),
+        [
+            {
+                "juristic_type_code": "7",
+                "registration_no": "0107556000051",
+                "company_name_th": "A",
+            }
+        ],
+        generation=5,
+        refresh_mask=1,
+    )
+    first_update = first_cursor.executions[-1][0]
+    assert "done_mask=(done_mask & ~%s)" in first_update
+    assert "not_available_mask=(not_available_mask & ~%s)" in first_update
+    assert "failed_mask=(failed_mask & ~%s)" in first_update
+
+    rerun_cursor = _SequenceCursor([(42, 5)])
+    repo.upsert_discovered_companies(
+        _CaptureConnection(rerun_cursor),
+        [
+            {
+                "juristic_type_code": "7",
+                "registration_no": "0107556000051",
+                "company_name_th": "A",
+            }
+        ],
+        generation=5,
+        refresh_mask=1,
+    )
+    rerun_update = rerun_cursor.executions[-1][0]
+    assert "done_mask=(done_mask & ~%s)" not in rerun_update
+    assert "not_available_mask=(not_available_mask & ~%s)" not in rerun_update
+    assert "failed_mask=(failed_mask & ~%s)" not in rerun_update
+
+
+def test_prepare_preserves_existing_outcome_masks() -> None:
+    cursor = _SequenceCursor(rowcount=4)
+    ProductionSqlServerRepository().prepare_companies(
+        _CaptureConnection(cursor),
+        generation=2,
+        core_mask=127,
+        base_mask=113,
+        financial_mask=14,
+        extended_mask=1920,
+        phase="core",
+    )
+    sql = cursor.executions[-1][0]
+    assert "required_mask=" in sql
+    assert "done_mask=" not in sql
+    assert "not_available_mask=" not in sql
+    assert "failed_mask=" not in sql
+
+
+def test_atomic_claim_uses_sqlserver_skip_locked_semantics_and_unique_token() -> None:
+    row = (
+        42,
+        "7",
+        "0107556000051",
+        "2568",
+        127,
+        0,
+        0,
+        0,
+        "COLLECTING",
+        "token-from-output",
+        None,
+        2,
+        None,
+    )
+    first = _SequenceCursor([row])
+    second = _SequenceCursor([row])
+    repo = ProductionSqlServerRepository()
+
+    repo.claim_company(
+        _CaptureConnection(first),
+        generation=2,
+        phase_mask=127,
+        lease_seconds=300,
+        worker_prefix="host:1",
+    )
+    repo.claim_company(
+        _CaptureConnection(second),
+        generation=2,
+        phase_mask=127,
+        lease_seconds=300,
+        worker_prefix="host:1",
+    )
+
+    first_sql, first_params = first.executions[-1]
+    second_sql, second_params = second.executions[-1]
+    assert "UPDLOCK,READPAST,ROWLOCK" in first_sql.replace(" ", "")
+    assert "OUTPUT" in first_sql
+    assert first_params[3].startswith("host:1:")
+    assert second_params[3].startswith("host:1:")
+    assert first_params[3] != second_params[3]
+
+
+def test_lease_renewal_fences_on_claim_token_and_generation() -> None:
+    cursor = _SequenceCursor(rowcount=1)
+    ProductionSqlServerRepository().renew_company_lease(
+        _CaptureConnection(cursor),
+        company_id=42,
+        claim_token="claim-A",
+        claim_generation=5,
+        lease_seconds=300,
+    )
+    sql, params = cursor.executions[-1]
+    assert "lease_owner=%s" in sql
+    assert "last_seen_generation=%s" in sql
+    assert "lease_expires_at > SYSUTCDATETIME()" in sql
+    assert params == (300, 42, "claim-A", 5)
+
+
+def test_stale_claimed_company_state_is_rejected() -> None:
+    cursor = _SequenceCursor([None])
+    with pytest.raises(repository_module.SqlServerLeaseLost):
+        ProductionSqlServerRepository().claimed_company_state(
+            _CaptureConnection(cursor),
+            company_id=42,
+            claim_token="old-token",
+            claim_generation=4,
+        )
+
+
+def test_retry_reopens_failed_bits_without_resetting_done_or_not_available() -> None:
+    cursor = _SequenceCursor(rowcount=3)
+    ProductionSqlServerRepository().retry_failed(
+        _CaptureConnection(cursor),
+        phase_mask=127,
+        generation=2,
+    )
+    sql = cursor.executions[-1][0]
+    assert "failed_mask=(failed_mask & ~%s)" in sql
+    assert "done_mask=" not in sql
+    assert "not_available_mask=" not in sql
+
+
+def test_relation_reconciliation_soft_retires_without_delete(monkeypatch) -> None:
+    cursor = _SequenceCursor(rowcount=1)
+    conn = _CaptureConnection(cursor)
+    repo = ProductionSqlServerRepository()
+
+    monkeypatch.setattr(repo, "upsert_relations", lambda _conn, rows: len(rows))
+    written = repo.reconcile_relations(
+        conn,
+        company_id=42,
+        relation_type="COMMITTEE",
+        rows=[
+            {
+                "source_key": "1",
+                "first_seen_generation": 5,
+                "last_seen_generation": 5,
+                "published_at": "now",
+            }
+        ],
+        generation=5,
+    )
+
+    sql = cursor.executions[-1][0].upper()
+    assert written == 1
+    assert "SET IS_CURRENT=0" in " ".join(sql.split())
+    assert "DELETE" not in sql
+    assert "RELATION_TYPE=%S" in sql
+
+
+def test_financial_submission_merge_never_updates_statement_columns() -> None:
+    cursor = _SequenceCursor([(99,)])
+    ProductionSqlServerRepository().merge_financial_submissions(
+        _CaptureConnection(cursor),
+        company_id=42,
+        generation=5,
+        rows=[
+            {
+                "fiscal_year": "2568",
+                "accounting_date": "2568-12-31",
+                "submission_payload": "{}",
+                "published_at": "now",
+            }
+        ],
+    )
+    update_sql = cursor.executions[-1][0]
+    assert "accounting_date" in update_sql
+    assert "submission_payload" in update_sql
+    assert "statement_payload" not in update_sql
+    assert "statement_items" not in update_sql
+    assert "current_ratio" not in update_sql
+
+
+def test_financial_statement_merge_never_updates_submission_columns() -> None:
+    cursor = _SequenceCursor([(99,)])
+    ProductionSqlServerRepository().merge_financial_statements(
+        _CaptureConnection(cursor),
+        company_id=42,
+        generation=5,
+        rows=[
+            {
+                "fiscal_year": "2568",
+                "current_ratio": 1.25,
+                "statement_payload": "{}",
+                "published_at": "now",
+            }
+        ],
+    )
+    update_sql = cursor.executions[-1][0]
+    assert "current_ratio" in update_sql
+    assert "statement_payload" in update_sql
+    assert "submission_payload" not in update_sql
+    assert "submission_date" not in update_sql
+    assert "accounting_code" not in update_sql
+
+
+def test_partial_generation_finalize_is_bounded_and_targeted() -> None:
+    cursor = _SequenceCursor(rowcount=500)
+    count = ProductionSqlServerRepository().finalize_generation(
+        _CaptureConnection(cursor),
+        generation=5,
+        batch_size=500,
+    )
+    sql, params = cursor.executions[-1]
+    assert count == 500
+    assert "TOP (500)" in sql
+    assert "last_seen_generation=%s" in sql
+    assert "dataset_generation < %s" in sql
+    assert "SET dataset_generation=%s" in sql
+    assert params == (5, 5, 5)
