@@ -956,7 +956,7 @@ async def run(
             f"invalid={invalid_rows:,}"
         )
     )
-    if invalid_rows and max_buckets is None:
+    if invalid_rows:
         raise ContractError(
             f"Discovery encountered {invalid_rows:,} contract-invalid company row(s); "
             "generation cannot be finalized"
