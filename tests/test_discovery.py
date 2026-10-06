@@ -288,6 +288,44 @@ async def test_direct_discovery_splits_oversized_partition_and_reconciles_counts
     assert len(persisted) == len(discovery.JP_TYPES)
 
 
+
+@pytest.mark.asyncio
+async def test_bounded_direct_discovery_reports_incomplete_coverage(monkeypatch) -> None:
+    persisted = []
+
+    async def direct_page(_client, filters, page_no):
+        assert page_no == 1
+        data = {
+            "meta": {"currentPage": 1, "totalItems": 1, "totalPages": 1},
+            "contents": [
+                {
+                    "jpTypeCode": "7",
+                    "jpNo": "0107556000051",
+                    "jpName": filters.keyword,
+                }
+            ],
+        }
+        return data, discovery._now()
+
+    def persist(_repo, rows, *, generation, refresh_mask):
+        persisted.extend(rows)
+        return {"inserted": len(rows), "updated": 0, "refresh_reopened": 0}
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+    monkeypatch.setattr(discovery, "_persist_direct_batch", persist)
+
+    with pytest.raises(ContractError, match="coverage is incomplete"):
+        await discovery.run(
+            ["010", "011"],
+            generation=2,
+            max_buckets=1,
+            repository=object(),
+            verbose=False,
+        )
+
+    assert len(persisted) == 1
+
 def test_fully_partitioned_search_has_no_silent_fallback_split() -> None:
     filters = SearchFilters(
         keyword="010",
