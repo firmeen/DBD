@@ -497,6 +497,7 @@ async def fetch_company(
 
     with repo.manager_lock() as lock_conn:
         state = repo.generation_state()
+        has_active_generation = state["active_generation"] is not None
         generation = int(
             state["active_generation"]
             or state["finalized_generation"]
@@ -508,7 +509,7 @@ async def fetch_company(
             repo,
             company,
             generation=generation,
-            finalize_new=state["active_generation"] is None,
+            finalize_new=False,
         )
         repo.assert_manager_lock(lock_conn)
         await asyncio.to_thread(
@@ -533,6 +534,31 @@ async def fetch_company(
     company_state = await asyncio.to_thread(repo.company_state, company_id)
     if company_state is None:
         raise RuntimeError(f"company_id={company_id} disappeared after collection")
+
+    selected_unresolved = (
+        int(company_state["required_mask"])
+        & phase_mask(phase)
+        & ~(
+            int(company_state["done_mask"])
+            | int(company_state["not_available_mask"])
+            | int(company_state["failed_mask"])
+        )
+    )
+    if not has_active_generation and selected_unresolved == 0:
+        def finalize_one() -> int:
+            with repo.transaction() as conn:
+                return repo.finalize_generation(
+                    conn,
+                    generation=generation,
+                    batch_size=1,
+                    company_id=company_id,
+                )
+
+        await asyncio.to_thread(finalize_one)
+        refreshed = await asyncio.to_thread(repo.company_state, company_id)
+        if refreshed is not None:
+            company_state = refreshed
+
     return FetchCompanyResult(
         company_id=int(company_id),
         registration_no=company.jp_no,
