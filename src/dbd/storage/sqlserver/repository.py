@@ -1189,10 +1189,11 @@ class ProductionSqlServerRepository:
         *,
         generation: int,
         refresh_mask: int = 0,
+        finalize_new: bool = False,
     ) -> dict[str, int]:
-        """Upsert Search observations without overwriting collector-owned state."""
-        if generation < 2:
-            raise SqlServerWriteError("Normal v0.6 discovery generation must be >= 2")
+        """Upsert observations without overwriting collector-owned state."""
+        if generation < 1:
+            raise SqlServerWriteError("v0.6 generation must be positive")
         inserted = updated = refresh_reopened = 0
         cur = conn.cursor()
         try:
@@ -1251,7 +1252,7 @@ class ProductionSqlServerRepository:
                         0,
                         0,
                         "DISCOVERED",
-                        max(1, generation - 1),
+                        generation if finalize_new else max(1, generation - 1),
                         generation,
                         generation,
                     ]
@@ -1996,6 +1997,79 @@ class ProductionSqlServerRepository:
             return int(cur.rowcount or 0)
         finally:
             cur.close()
+
+
+    def company_state(self, company_id: int) -> dict[str, Any] | None:
+        with connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                      company_id,juristic_type_code,registration_no,
+                      latest_fiscal_year,required_mask,done_mask,
+                      not_available_mask,failed_mask,collect_status,
+                      lease_owner,lease_expires_at,retry_at,
+                      dataset_generation,first_seen_generation,last_seen_generation,
+                      last_endpoint,last_http_status,last_error
+                    FROM dbo.DBD_COMPANY
+                    WHERE company_id=%s
+                    """,
+                    (int(company_id),),
+                )
+                row = cur.fetchone()
+            finally:
+                cur.close()
+        if row is None:
+            return None
+        names = (
+            "company_id",
+            "juristic_type_code",
+            "registration_no",
+            "latest_fiscal_year",
+            "required_mask",
+            "done_mask",
+            "not_available_mask",
+            "failed_mask",
+            "collect_status",
+            "lease_owner",
+            "lease_expires_at",
+            "retry_at",
+            "dataset_generation",
+            "first_seen_generation",
+            "last_seen_generation",
+            "last_endpoint",
+            "last_http_status",
+            "last_error",
+        )
+        return dict(zip(names, row, strict=True))
+
+    def coverage_summary(self, *, generation: int | None = None) -> dict[str, int]:
+        predicate = ""
+        params: tuple[Any, ...] = ()
+        if generation is not None:
+            predicate = " WHERE last_seen_generation=%s"
+            params = (int(generation),)
+        with connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f"SELECT COUNT(*) FROM dbo.DBD_COMPANY{predicate}",
+                    params,
+                )
+                companies = int(cur.fetchone()[0] or 0)
+                child = {}
+                for table, key in (
+                    ("dbo.DBD_COMPANY_RELATION", "relations"),
+                    ("dbo.DBD_COMPANY_EVENT", "events"),
+                    ("dbo.DBD_FINANCIAL", "financials"),
+                    ("dbo.DBD_INDUSTRY", "industries"),
+                ):
+                    cur.execute(f"SELECT COUNT(*) FROM {table}")
+                    child[key] = int(cur.fetchone()[0] or 0)
+            finally:
+                cur.close()
+        return {"companies": companies, **child}
 
     def count_generation_one(self) -> int:
         with connection() as conn:
