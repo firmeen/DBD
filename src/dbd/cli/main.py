@@ -40,6 +40,26 @@ def positive_rate(value):
     return value
 
 
+def interval_seconds(value):
+    raw = str(value).strip().lower()
+    multiplier = 1.0
+    if raw.endswith("h"):
+        multiplier = 3600.0
+        raw = raw[:-1]
+    elif raw.endswith("m"):
+        multiplier = 60.0
+        raw = raw[:-1]
+    elif raw.endswith("s"):
+        raw = raw[:-1]
+    try:
+        seconds = float(raw) * multiplier
+    except ValueError:
+        raise argparse.ArgumentTypeError("use seconds or a suffix such as 30m or 6h") from None
+    if seconds <= 0 or not __import__("math").isfinite(seconds):
+        raise argparse.ArgumentTypeError("interval must be positive")
+    return seconds
+
+
 def parts(value):
     selected = list(dict.fromkeys(p.strip() for p in value.split(",") if p.strip()))
     try:
@@ -655,48 +675,54 @@ def main():
     )
     campaign_stop.add_argument("run_id", type=positive)
 
-    for name in ("fetch-company", "bulk"):
-        p = _add_output_options(sub.add_parser(name))
-        p.add_argument("--only", type=parts)
-        p.add_argument("--fiscal-year")
-        p.add_argument(
-            "--scheduler-mode",
-            choices=("legacy", "fabric_v2"),
-            default="legacy",
-            help="Durable scheduler backend for a newly-created run",
-        )
-        p.add_argument(
-            "--force-refresh",
-            action="store_true",
-            help="Refresh every selected resource on a new fabric_v2 run",
-        )
-        p.add_argument("--concurrency", type=positive)
-        p.add_argument("--rate", type=positive_rate)
-        p.add_argument(
-            "--endpoint-rates",
-            type=endpoint_rate_map,
-            help="Optional adaptive targets such as profile=20,industry_benchmark=8",
-        )
-        p.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
-        if name == "fetch-company":
-            p.add_argument("company_code")
-        else:
-            source = p.add_mutually_exclusive_group()
-            source.add_argument("--file")
-            source.add_argument("--master", action="store_true")
-            source.add_argument("--run-id", type=positive)
-            p.add_argument("--limit", type=positive, help="Maximum task claims in this invocation")
-            p.add_argument("--enqueue-only", action="store_true")
-            p.add_argument(
-                "--distributed",
-                action="store_true",
-                help="Join an existing run from multiple processes using the Redis shared rate cap",
-            )
-            p.add_argument(
-                "--all-statuses",
-                action="store_true",
-                help="Include struck-off, liquidated and dissolved companies (default: operating only)",
-            )
+    fetch = _add_output_options(
+        sub.add_parser("fetch-company", help="Collect one company through the v0.6 SQL Server workflow")
+    )
+    fetch.add_argument("company_code")
+    fetch.add_argument("--phase", choices=("core", "extended"), default="core")
+    fetch.add_argument("--concurrency", type=positive)
+    fetch.add_argument("--rate", type=positive_rate)
+    fetch.add_argument("--http-retries", type=non_negative)
+    fetch.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+
+    p = _add_output_options(sub.add_parser("bulk"))
+    p.add_argument("--only", type=parts)
+    p.add_argument("--fiscal-year")
+    p.add_argument(
+        "--scheduler-mode",
+        choices=("legacy", "fabric_v2"),
+        default="legacy",
+        help="Durable scheduler backend for a newly-created legacy run",
+    )
+    p.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help="Refresh every selected resource on a new legacy fabric_v2 run",
+    )
+    p.add_argument("--concurrency", type=positive)
+    p.add_argument("--rate", type=positive_rate)
+    p.add_argument(
+        "--endpoint-rates",
+        type=endpoint_rate_map,
+        help="Optional adaptive targets for the legacy bulk path",
+    )
+    p.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+    source = p.add_mutually_exclusive_group()
+    source.add_argument("--file")
+    source.add_argument("--master", action="store_true")
+    source.add_argument("--run-id", type=positive)
+    p.add_argument("--limit", type=positive, help="Maximum task claims in this invocation")
+    p.add_argument("--enqueue-only", action="store_true")
+    p.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Join an existing legacy run using the Redis shared rate cap",
+    )
+    p.add_argument(
+        "--all-statuses",
+        action="store_true",
+        help="Include struck-off, liquidated and dissolved companies (default: operating only)",
+    )
     for name in ("bulk-status", "bulk-retry"):
         p = _add_output_options(sub.add_parser(name))
         p.add_argument("run_id", type=positive, nargs="?" if name.endswith("status") else None)
@@ -706,20 +732,56 @@ def main():
     legacy.add_argument("--run-id", type=positive)
     legacy.add_argument("--limit", type=positive)
     disc = _add_output_options(
-        sub.add_parser("discover", help="Discover companies with durable per-page checkpoints")
+        sub.add_parser("discover", help="Discover companies directly into SQL Server DBD_COMPANY")
     )
     disc.add_argument("seeds", nargs="*")
     disc.add_argument("--seed-file")
     disc.add_argument("--type", default="")
+    disc.add_argument("--phase", choices=("core", "extended"), default="core")
+    disc.add_argument("--refresh", action="store_true")
     disc.add_argument("--concurrency", type=positive)
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
     disc.add_argument(
         "--distributed",
         action="store_true",
-        help="Claim buckets across processes with Redis-shared Search pacing",
+        help="Legacy flag; v0.6 direct SQL Server discovery rejects distributed bucket mode",
     )
     disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+
+    cycle = sub.add_parser("cycle", help="Run the v0.6 SQL Server production workflow")
+    cycle_sub = cycle.add_subparsers(dest="cycle_command", required=True)
+    cycle_run_parser = _add_output_options(
+        cycle_sub.add_parser("run", help="Run one discover/prepare/collect/verify/finalize cycle")
+    )
+    cycle_run_parser.add_argument("seeds", nargs="*")
+    cycle_run_parser.add_argument("--seed-file")
+    cycle_run_parser.add_argument("--type", default="")
+    cycle_run_parser.add_argument("--phase", choices=("core", "extended"), default="core")
+    cycle_run_parser.add_argument("--refresh", action="store_true")
+    cycle_run_parser.add_argument("--concurrency", type=positive)
+    cycle_run_parser.add_argument("--rate", type=positive_rate)
+    cycle_run_parser.add_argument("--http-retries", type=non_negative)
+    cycle_run_parser.add_argument("--max-buckets", type=positive)
+
+    cycle_loop_parser = _add_output_options(
+        cycle_sub.add_parser("loop", help="Repeat complete foreground v0.6 cycles")
+    )
+    cycle_loop_parser.add_argument("seeds", nargs="*")
+    cycle_loop_parser.add_argument("--seed-file")
+    cycle_loop_parser.add_argument("--type", default="")
+    cycle_loop_parser.add_argument("--phase", choices=("core", "extended"), default="core")
+    cycle_loop_parser.add_argument("--refresh", action="store_true")
+    cycle_loop_parser.add_argument("--concurrency", type=positive)
+    cycle_loop_parser.add_argument("--rate", type=positive_rate)
+    cycle_loop_parser.add_argument("--http-retries", type=non_negative)
+    cycle_loop_parser.add_argument("--max-buckets", type=positive)
+    cycle_loop_parser.add_argument("--interval", type=interval_seconds, default=21600.0)
+
+    cycle_status_parser = _add_output_options(
+        cycle_sub.add_parser("status", help="Read durable v0.6 cycle state without mutation")
+    )
+    cycle_status_parser.add_argument("--phase", choices=("core", "extended"), default="core")
     args = parser.parse_args()
     presenter = TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
@@ -782,9 +844,37 @@ def main():
                     asyncio.run(worker_command(args, presenter=presenter))
             else:
                 asyncio.run(worker_command(args, presenter=presenter))
-        elif args.command in ("bulk", "fetch-company"):
+        elif args.command == "fetch-company":
+            from dataclasses import asdict
+
+            from ..workflow import fetch_company
+
             configure(args.metrics_port)
-            if args.command == "bulk" and args.distributed:
+            parsed = parse_code(args.company_code)
+            result = asyncio.run(
+                fetch_company(
+                    parsed,
+                    phase=args.phase,
+                    concurrency=args.concurrency,
+                    rate=args.rate,
+                    http_retries=args.http_retries,
+                )
+            )
+            presenter.command_result(
+                "DBD · FETCH COMPANY",
+                {
+                    "status": result.status,
+                    "generation": result.generation,
+                    "phase": result.phase,
+                    "company_id": result.company_id,
+                    "juristic_type_code": result.juristic_type_code,
+                    "registration_no": result.registration_no,
+                    "collection": asdict(result)["collection"],
+                },
+            )
+        elif args.command == "bulk":
+            configure(args.metrics_port)
+            if args.distributed:
                 if args.run_id is None or args.master or args.file or args.enqueue_only:
                     raise ValueError("--distributed requires an existing --run-id and cannot build a run")
                 if not settings.dbd_redis_url:
@@ -824,51 +914,111 @@ def main():
 
             presenter.discovery_status(discovery_summary())
         elif args.command == "discover":
-            from ..pipelines import discovery
+            from ..workflow import discover
 
+            if args.distributed:
+                raise ValueError(
+                    "--distributed is legacy-only; v0.6 direct discovery uses SQL Server and no bucket runtime"
+                )
             seeds = list(args.seeds)
             if args.seed_file:
                 with open(args.seed_file, encoding="utf-8-sig") as handle:
-                    seeds.extend(s.strip() for s in handle if s.strip() and not s.lstrip().startswith("#"))
+                    seeds.extend(
+                        s.strip()
+                        for s in handle
+                        if s.strip() and not s.lstrip().startswith("#")
+                    )
             if any(len(seed) < 3 for seed in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
             configure(args.metrics_port)
-            if args.distributed:
-                if not settings.dbd_redis_url:
-                    raise ValueError("--distributed discovery requires DBD_REDIS_URL")
-                result = asyncio.run(
-                    discovery.run(
-                        seeds,
-                        search_type=args.type,
-                        concurrency=args.concurrency,
-                        rate=args.rate,
-                        max_buckets=args.max_buckets,
-                        verbose=not bool(getattr(args, "json", False)),
-                        distributed=True,
-                    )
+            generation, result = asyncio.run(
+                discover(
+                    seeds,
+                    phase=args.phase,
+                    refresh=args.refresh,
+                    search_type=args.type,
+                    concurrency=args.concurrency,
+                    rate=args.rate,
+                    max_buckets=args.max_buckets,
+                    verbose=not bool(getattr(args, "json", False)),
                 )
-            else:
-                with manager_lock() as conn:
-                    result = asyncio.run(
-                        discovery.run(
-                            seeds,
-                            search_type=args.type,
-                            concurrency=args.concurrency,
-                            rate=args.rate,
-                            max_buckets=args.max_buckets,
-                            verbose=not bool(getattr(args, "json", False)),
-                            health=lambda: assert_manager_lock(conn),
-                        )
-                    )
+            )
             presenter.command_result(
                 "DBD · DISCOVERY RESULT",
                 {
-                    "buckets": result.buckets_processed,
+                    "generation": generation,
+                    "phase": args.phase,
+                    "partitions": result.buckets_processed,
                     "pages": result.pages_fetched,
                     "companies": result.companies_written,
+                    "invalid_rows": result.invalid_rows,
                     "requests": result.requests_made,
                 },
             )
+        elif args.command == "cycle":
+            from dataclasses import asdict
+
+            from ..workflow import cycle_loop, cycle_run, status
+
+            if args.cycle_command == "status":
+                current = asyncio.run(status(phase=args.phase, coverage=False))
+                payload = asdict(current)
+                presenter.command_result(
+                    "DBD · CYCLE STATUS",
+                    {
+                        "generation": payload["generation"],
+                        "phase": payload["phase"],
+                        "finalized_generation": payload["generation_state"].get("finalized_generation"),
+                        "active_generation": payload["generation_state"].get("active_generation"),
+                        **payload["summary"],
+                    },
+                )
+            else:
+                seeds = list(args.seeds)
+                if args.seed_file:
+                    with open(args.seed_file, encoding="utf-8-sig") as handle:
+                        seeds.extend(
+                            s.strip()
+                            for s in handle
+                            if s.strip() and not s.lstrip().startswith("#")
+                        )
+                if any(len(seed) < 3 for seed in seeds):
+                    raise ValueError("Search keywords must contain at least 3 characters")
+                common = {
+                    "phase": args.phase,
+                    "refresh": args.refresh,
+                    "seeds": seeds,
+                    "search_type": args.type,
+                    "concurrency": args.concurrency,
+                    "rate": args.rate,
+                    "http_retries": args.http_retries,
+                    "max_buckets": args.max_buckets,
+                    "verbose": not bool(getattr(args, "json", False)),
+                }
+                if args.cycle_command == "run":
+                    result = asyncio.run(cycle_run(**common))
+                else:
+                    result = asyncio.run(
+                        cycle_loop(
+                            interval_seconds=args.interval,
+                            **common,
+                        )
+                    )
+                payload = asdict(result)
+                presenter.command_result(
+                    "DBD · CYCLE RESULT",
+                    {
+                        "status": payload["status"],
+                        "generation": payload["generation"],
+                        "phase": payload["phase"],
+                        "resumed": payload["resumed"],
+                        "finalized_rows": payload["finalized_rows"],
+                        "companies_claimed": payload["collection"].get("companies_claimed", 0),
+                        "companies_finished": payload["collection"].get("companies_finished", 0),
+                        "endpoint_failed": payload["collection"].get("endpoints_failed", 0),
+                        "terminal_failures": payload["verification"].get("terminal_failures", 0),
+                    },
+                )
     except KeyboardInterrupt:
         presenter.message("Interrupted. Durable checkpoints remain recoverable.", kind="warning")
         raise SystemExit(130) from None
