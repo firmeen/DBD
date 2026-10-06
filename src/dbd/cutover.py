@@ -8,8 +8,11 @@ from decimal import Decimal
 from typing import Any, Callable, Iterator
 
 from .contracts.common import money
-from .contracts.company import normalize as normalize_profile
-from .contracts.company import normalize_committee_signs, normalize_committees
+from .contracts.company import (
+    normalize as normalize_profile,
+    normalize_committee_signs,
+    normalize_committees,
+)
 from .contracts.financial import (
     normalize_benchmark,
     normalize_statements,
