@@ -225,7 +225,19 @@ def test_check_database_names_missing_child_table_permission(monkeypatch) -> Non
         ProductionSqlServerRepository().check_database()
 
 
-def test_schema_rejects_disabled_or_filtered_index(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("disabled", "filtered", "filter_definition"),
+    (
+        (True, False, None),
+        (False, True, "[collect_status] IS NOT NULL"),
+    ),
+)
+def test_schema_rejects_disabled_or_filtered_index(
+    monkeypatch,
+    disabled: bool,
+    filtered: bool,
+    filter_definition: str | None,
+) -> None:
     table_name = "dbo.DBD_COMPANY"
     pk_name, pk_column = PRIMARY_KEYS[table_name]
     actual = {
@@ -237,7 +249,13 @@ def test_schema_rejects_disabled_or_filtered_index(monkeypatch) -> None:
     }
     target_name = INDEXES[table_name][0][0]
     unique, columns, _disabled, _filtered, _definition = actual[target_name]
-    actual[target_name] = (unique, columns, True, False, None)
+    actual[target_name] = (
+        unique,
+        columns,
+        disabled,
+        filtered,
+        filter_definition,
+    )
 
     monkeypatch.setattr(schema_module, "_index_rows", lambda _cur, _table: actual)
 
@@ -271,6 +289,44 @@ def test_schema_rejects_disabled_or_untrusted_check_constraint(
     target_name = JSON_CHECKS[table_name][0][0]
     definition, _disabled, _not_trusted = checks[target_name]
     checks[target_name] = (definition, disabled, not_trusted)
+
+    monkeypatch.setattr(
+        schema_module,
+        "_constraint_names",
+        lambda _cur, _table: required_names,
+    )
+    monkeypatch.setattr(
+        schema_module,
+        "_check_constraint_rows",
+        lambda _cur, _table: checks,
+    )
+
+    with pytest.raises(schema_module.SqlServerSchemaError, match=target_name):
+        schema_module._validate_constraints(object(), table_name)
+
+
+def test_schema_rejects_wrong_check_definition(monkeypatch) -> None:
+    table_name = "dbo.DBD_COMPANY"
+    required_names = {PRIMARY_KEYS[table_name][0]}
+    checks = {}
+    for name, column in JSON_CHECKS[table_name]:
+        required_names.add(name)
+        checks[name] = (
+            f"([{column}] IS NULL OR ISJSON([{column}]) = 1)",
+            False,
+            False,
+        )
+    for name, expression in EXTRA_CHECKS[table_name]:
+        required_names.add(name)
+        checks[name] = (expression, False, False)
+
+    target_name = JSON_CHECKS[table_name][0][0]
+    _definition, disabled, not_trusted = checks[target_name]
+    checks[target_name] = (
+        "([master_payload] IS NULL OR ISJSON([master_payload]) = 0)",
+        disabled,
+        not_trusted,
+    )
 
     monkeypatch.setattr(
         schema_module,
