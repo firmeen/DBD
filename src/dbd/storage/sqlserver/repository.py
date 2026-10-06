@@ -1343,9 +1343,12 @@ class ProductionSqlServerRepository:
                 UPDATE dbo.DBD_COMPANY
                 SET required_mask={required},
                     collect_status=CASE
+                        WHEN lease_owner IS NOT NULL
+                         AND lease_expires_at > SYSUTCDATETIME()
+                            THEN N'COLLECTING'
                         WHEN ({required} & ~(done_mask | not_available_mask | failed_mask)) <> 0
                             THEN N'PENDING'
-                        ELSE {_collect_status_sql()}
+                        ELSE {_collect_status_sql(include_lease=False)}
                     END,
                     collection_completed_at=CASE
                         WHEN ({required} & ~(done_mask | not_available_mask | failed_mask)) <> 0
@@ -1827,7 +1830,12 @@ class ProductionSqlServerRepository:
                 SET failed_mask=(failed_mask & ~%s),
                     retry_at=NULL,
                     collection_completed_at=NULL,
-                    collect_status=N'PENDING'
+                    collect_status=CASE
+                        WHEN lease_owner IS NOT NULL
+                         AND lease_expires_at > SYSUTCDATETIME()
+                            THEN N'COLLECTING'
+                        ELSE N'PENDING'
+                    END
                 """,
                 tuple(params + [int(phase_mask)]),
             )
