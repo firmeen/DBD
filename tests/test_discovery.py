@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from dbd.client.endpoints.search import SearchFilters
@@ -189,9 +191,14 @@ class _DirectClient:
     async def __aexit__(self, *_args):
         return None
 
-    async def get(self, path, **_kwargs):
+    async def fetch(self, method, path, **_kwargs):
+        assert method == "GET"
         assert path == "/api/v1/commons/provinces"
-        return [{"pvCode": "10"}]
+        self.requests_made += 1
+        return SimpleNamespace(
+            data=[{"pvCode": "10"}],
+            requested_at=discovery._now(),
+        )
 
 
 @pytest.mark.asyncio
@@ -217,7 +224,7 @@ async def test_direct_discovery_persists_valid_rows_without_mysql_runtime(monkey
         assert refresh_mask == 0
         return {"inserted": len(rows), "updated": 0, "refresh_reopened": 0}
 
-    monkeypatch.setattr(discovery, "AsyncDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
     monkeypatch.setattr(discovery, "_direct_page", direct_page)
     monkeypatch.setattr(discovery, "_persist_direct_batch", persist)
     monkeypatch.setattr(
@@ -270,7 +277,7 @@ async def test_direct_discovery_splits_oversized_partition_and_reconciles_counts
         persisted.extend(rows)
         return {"inserted": len(rows), "updated": 0, "refresh_reopened": 0}
 
-    monkeypatch.setattr(discovery, "AsyncDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
     monkeypatch.setattr(discovery, "_direct_page", direct_page)
     monkeypatch.setattr(discovery, "_persist_direct_batch", persist)
 
@@ -311,7 +318,7 @@ async def test_bounded_direct_discovery_reports_incomplete_coverage(monkeypatch)
         persisted.extend(rows)
         return {"inserted": len(rows), "updated": 0, "refresh_reopened": 0}
 
-    monkeypatch.setattr(discovery, "AsyncDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
     monkeypatch.setattr(discovery, "_direct_page", direct_page)
     monkeypatch.setattr(discovery, "_persist_direct_batch", persist)
 
