@@ -1141,6 +1141,20 @@ class DeepCollector:
                 company_id=company["company_id"],
                 status=company.get("collect_status"),
             )
+        except asyncio.CancelledError:
+            # Ctrl+C / TaskGroup cancellation is not a business failure. Release
+            # only this still-owned claim so committed endpoint progress remains
+            # immediately reclaimable; a lost generation/token simply no-ops.
+            if not lease_lost.is_set():
+                try:
+                    await asyncio.shield(
+                        asyncio.to_thread(self._release_sync, company)
+                    )
+                except Exception:
+                    # Lease expiry is the durable fallback if SQL Server is also
+                    # unavailable during shutdown.
+                    pass
+            raise
         finally:
             lease_stop.set()
             await heartbeat
