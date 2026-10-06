@@ -125,7 +125,9 @@ class DeepTerminalEvents:
             "rows_total": 0,
             "rows_scanned": 0,
             "rows_changed": 0,
-            "runtime_recovered": 0,
+            "leases_recovered": 0,
+            "generation": "-",
+            "scope": "-",
             "companies_claimed": 0,
             "companies_finished": 0,
             "companies_in_flight": 0,
@@ -143,8 +145,17 @@ class DeepTerminalEvents:
     def __call__(self, name: str, payload: dict[str, Any]) -> None:
         now = time.monotonic()
 
-        if name == "phase":
+        if name in {"phase", "phase_started"}:
             self.state["phase"] = payload.get("phase", self.state["phase"])
+            self.state.update(
+                {
+                    key: value
+                    for key, value in payload.items()
+                    if key in {"generation", "scope"}
+                }
+            )
+        elif name == "phase_completed":
+            self.state.update(payload)
         elif name == "prepare_scope":
             self.state.update(payload)
         elif name == "prepare_step":
@@ -176,12 +187,18 @@ class DeepTerminalEvents:
             self.state.update(payload)
             if name == "started":
                 self.state["phase"] = "RUNNING"
-        elif name == "idle":
+        elif name in {"idle", "cycle_waiting"}:
             self.state.update(payload)
             self.state["phase"] = "IDLE"
-        elif name in {"retry_wait", "worker_error"}:
+        elif name in {
+            "retry_wait",
+            "worker_error",
+            "endpoint_retry",
+            "endpoint_failed",
+            "warning",
+        }:
             self.state["last_event"] = name.upper()
-            self.state["last_error"] = payload.get("error")
+            self.state["last_error"] = payload.get("error") or payload.get("message")
             self.state["last_endpoint"] = payload.get("endpoint")
         elif name == "heartbeat":
             pass
@@ -194,8 +211,12 @@ class DeepTerminalEvents:
             self._plain_event(name, payload)
 
     def _plain_event(self, name: str, payload: Mapping[str, Any]) -> None:
-        if name == "phase":
-            self.console.print(f"PHASE {payload.get('phase')}")
+        if name in {"phase", "phase_started"}:
+            generation = payload.get("generation")
+            suffix = f" generation={generation}" if generation is not None else ""
+            self.console.print(f"PHASE {payload.get('phase')}{suffix}")
+            return
+        if name == "phase_completed":
             return
         if name == "prepare_stage":
             self.console.print(
@@ -216,12 +237,11 @@ class DeepTerminalEvents:
             return
         if name in {"prepare_scope", "prepare_step", "heartbeat"}:
             return
-        if name == "idle":
-            self.console.print(
-                f"IDLE next_check={float(payload.get('idle_seconds') or 0):g}s"
-            )
+        if name in {"idle", "cycle_waiting"}:
+            delay = payload.get("idle_seconds", payload.get("interval_seconds", 0))
+            self.console.print(f"IDLE next_check={float(delay or 0):g}s")
             return
-        if name in {"retry_wait", "worker_error"}:
+        if name in {"retry_wait", "worker_error", "endpoint_retry", "endpoint_failed", "warning"}:
             endpoint = payload.get("endpoint") or "-"
             self.console.print(
                 f"{name.upper()} endpoint={endpoint} error={payload.get('error')}"
@@ -367,8 +387,8 @@ class DeepTerminalEvents:
                     (
                         "Endpoint failed",
                         _priority_count(self.state.get("endpoints_failed"), "bold red"),
-                        "Recovered",
-                        _priority_count(self.state.get("runtime_recovered"), "blue"),
+                        "Recovered leases",
+                        _priority_count(self.state.get("leases_recovered"), "cyan"),
                     ),
                 ]
             ),
@@ -378,10 +398,10 @@ class DeepTerminalEvents:
         footer = Text()
         if self.state["phase"] == "IDLE":
             footer.append("IDLE", style="dim")
-            footer.append(" • waiting for prepared Deep work", style="dim")
+            footer.append(" • waiting for SQL Server claimable work", style="dim")
         else:
             footer.append("ACTIVE", style="cyan")
-            footer.append(" • direct dbd_company_deep claim", style="dim")
+            footer.append(" • direct DBD_COMPANY claim", style="dim")
         footer.append(" • Ctrl+C graceful shutdown", style="dim")
         return Group(Panel(header, title="DBD DEEP"), collector, session, footer)
 
@@ -405,112 +425,104 @@ class DeepPresenter:
         self.stream.write(json.dumps(payload, ensure_ascii=False, indent=2, default=str) + "\n")
         self.stream.flush()
 
-    def status(self, summary: Mapping[str, Any]) -> None:
+    def status(self, payload: Mapping[str, Any]) -> None:
         if self.json_mode:
-            self.json(dict(summary))
+            self.json(dict(payload))
             return
-        deep = summary["deep"]
-        runtime = summary["runtime"]
+        summary = payload["summary"]
+        generation_state = payload.get("generation_state") or {}
         self.console.print(
             Panel(
                 _grid(
                     [
                         (
-                            "Prepared",
-                            _styled(
-                                "YES" if summary["prepared"] else "NO",
-                                "bold green" if summary["prepared"] else "bold yellow",
-                            ),
-                            "Runtime",
-                            _state("READY" if summary["runtime_exists"] else "MISSING"),
+                            "Generation",
+                            _styled(payload.get("generation", "-"), "bold white"),
+                            "Phase",
+                            _styled(str(payload.get("phase") or "-").upper(), "cyan"),
                         ),
                         (
-                            "Master waiting",
-                            _priority_count(summary["master"], "blue"),
-                            "Deep total",
-                            _styled(_number(deep["total"]), "bold white"),
+                            "Finalized",
+                            _styled(generation_state.get("finalized_generation", "-"), "dim"),
+                            "Active",
+                            _styled(generation_state.get("active_generation", "-"), "cyan"),
+                        ),
+                        (
+                            "Total",
+                            _styled(_number(summary.get("total")), "bold white"),
+                            "Pending",
+                            _priority_count(summary.get("pending"), "yellow"),
+                        ),
+                        (
+                            "Collecting",
+                            _priority_count(summary.get("collecting"), "cyan"),
+                            "Retry wait",
+                            _priority_count(summary.get("retry_wait"), "yellow"),
                         ),
                         (
                             "Complete",
-                            _priority_count(deep["complete"], "green"),
+                            _priority_count(summary.get("complete"), "green"),
+                            "Partial",
+                            _priority_count(summary.get("partial"), "yellow"),
+                        ),
+                        (
+                            "Failed",
+                            _priority_count(summary.get("failed"), "bold red"),
                             "Unresolved",
-                            _priority_count(deep["unresolved"], "yellow"),
+                            _priority_count(summary.get("unresolved"), "yellow"),
                         ),
                         (
-                            "Runtime pending",
-                            _priority_count(runtime["pending"], "blue"),
-                            "Running",
-                            _priority_count(runtime["running"], "cyan"),
-                        ),
-                        (
-                            "Retry wait",
-                            _priority_count(runtime["retry_wait"], "yellow"),
-                            "Overlap",
-                            _styled(
-                                "YES" if summary["overlap"] else "0",
-                                "bold red" if summary["overlap"] else "green",
-                            ),
+                            "Active leases",
+                            _priority_count(summary.get("active_leases"), "cyan"),
+                            "Expired leases",
+                            _priority_count(summary.get("expired_leases"), "bold red"),
                         ),
                     ]
                 ),
                 title=f"DBD DEEP STATUS v{__version__}",
             )
         )
-        coverage = summary.get("coverage") or {}
+        coverage = payload.get("coverage")
         if coverage:
-            table = Table(title="Endpoint Coverage")
-            table.add_column("Endpoint")
-            table.add_column("Data", justify="right")
-            table.add_column("Done", justify="right")
-            table.add_column("N/A", justify="right")
-            table.add_column("Failed", justify="right")
-            for endpoint, row in coverage.items():
-                table.add_row(
-                    endpoint,
-                    _styled(_number(row["data_rows"]), "bold white"),
-                    _priority_count(row["done"], "green"),
-                    _styled(_number(row["not_available"]), "dim"),
-                    _priority_count(row["failed"], "bold red"),
+            self.console.print(
+                Panel(
+                    _grid(
+                        [
+                            ("Companies", _number(coverage.get("companies")), "Relations", _number(coverage.get("relations"))),
+                            ("Events", _number(coverage.get("events")), "Financials", _number(coverage.get("financials"))),
+                            ("Industries", _number(coverage.get("industries")), "", ""),
+                        ]
+                    ),
+                    title="Five-table coverage",
                 )
-            self.console.print(table)
+            )
 
-    def prepare(self, result: Mapping[str, Any], summary: Mapping[str, Any]) -> None:
+    def prepare(self, result: Mapping[str, Any], status: Mapping[str, Any]) -> None:
         if self.json_mode:
-            self.json({"prepare": dict(result), "status": dict(summary)})
+            self.json({"prepare": dict(result), "status": dict(status)})
             return
+        summary = status["summary"]
         self.console.print(
             Panel(
                 _grid(
                     [
                         (
-                            "Already prepared",
-                            _styled(
-                                "YES" if result["already_prepared"] else "NO",
-                                "green" if result["already_prepared"] else "yellow",
-                            ),
-                            "Rows total",
-                            _styled(_number(result["rows_total"]), "bold white"),
+                            "Generation",
+                            _styled(result.get("generation", "-"), "bold white"),
+                            "Phase",
+                            _styled(str(result.get("phase") or "-").upper(), "cyan"),
                         ),
                         (
-                            "Rows scanned",
-                            _styled(_number(result["rows_scanned"]), "bold white"),
-                            "Rows changed",
-                            _priority_count(result["rows_changed"], "magenta"),
+                            "Prepared",
+                            _priority_count(result.get("rows_prepared"), "green"),
+                            "Pending",
+                            _priority_count(summary.get("pending"), "yellow"),
                         ),
                         (
-                            "Master staged",
-                            _priority_count(result.get("master_staged"), "green"),
-                            "Master waiting",
-                            _priority_count(summary["master"], "yellow"),
-                        ),
-                        (
-                            "Recovered",
-                            _priority_count(result["runtime_recovered"], "blue"),
-                            "Overlap",
-                            _styled(
-                                "YES" if summary["overlap"] else "0",
-                                "bold red" if summary["overlap"] else "green",
-                            ),
+                            "Complete",
+                            _priority_count(summary.get("complete"), "green"),
+                            "Unresolved",
+                            _priority_count(summary.get("unresolved"), "yellow"),
                         ),
                     ]
                 ),
@@ -518,28 +530,32 @@ class DeepPresenter:
             )
         )
 
-    def retry(self, count: int, summary: Mapping[str, Any]) -> None:
+    def retry(self, result: Mapping[str, Any], status: Mapping[str, Any]) -> None:
         if self.json_mode:
-            self.json({"requeued": count, "status": dict(summary)})
+            self.json({"retry": dict(result), "status": dict(status)})
             return
+        summary = status["summary"]
         self.console.print(
             Panel(
                 _grid(
                     [
                         (
-                            "Reopened",
-                            _priority_count(count, "blue"),
-                            "Runtime",
-                            _priority_count(summary["runtime"]["total"], "blue"),
+                            "Generation",
+                            _styled(result.get("generation", "-"), "bold white"),
+                            "Phase",
+                            _styled(str(result.get("phase") or "-").upper(), "cyan"),
                         ),
                         (
+                            "Reopened",
+                            _priority_count(result.get("reopened"), "yellow"),
                             "Unresolved",
-                            _priority_count(summary["deep"]["unresolved"], "yellow"),
-                            "Overlap",
-                            _styled(
-                                "YES" if summary["overlap"] else "0",
-                                "bold red" if summary["overlap"] else "green",
-                            ),
+                            _priority_count(summary.get("unresolved"), "yellow"),
+                        ),
+                        (
+                            "Failed",
+                            _priority_count(summary.get("failed"), "bold red"),
+                            "Retry wait",
+                            _priority_count(summary.get("retry_wait"), "yellow"),
                         ),
                     ]
                 ),
@@ -556,28 +572,46 @@ class DeepPresenter:
                 _grid(
                     [
                         (
+                            "Generation",
+                            _styled(result.get("generation", "-"), "bold white"),
+                            "Phase",
+                            _styled(str(result.get("phase") or "-").upper(), "cyan"),
+                        ),
+                        (
                             "Claimed",
-                            _priority_count(result["companies_claimed"], "blue"),
+                            _priority_count(result.get("companies_claimed"), "cyan"),
                             "Finished",
-                            _priority_count(result["companies_finished"], "green"),
+                            _priority_count(result.get("companies_finished"), "green"),
                         ),
                         (
                             "In flight",
-                            _priority_count(result["companies_in_flight"], "cyan"),
+                            _priority_count(result.get("companies_in_flight"), "cyan"),
                             "Retry wait",
-                            _priority_count(result["companies_retry_wait"], "yellow"),
+                            _priority_count(result.get("companies_retry_wait"), "yellow"),
+                        ),
+                        (
+                            "Endpoint done",
+                            _priority_count(result.get("endpoints_done"), "green"),
+                            "N/A",
+                            _styled(_number(result.get("endpoints_not_available")), "dim"),
+                        ),
+                        (
+                            "Endpoint failed",
+                            _priority_count(result.get("endpoints_failed"), "bold red"),
+                            "Recovered leases",
+                            _priority_count(result.get("leases_recovered"), "cyan"),
                         ),
                         (
                             "HTTP requests",
-                            _priority_count(result["http_requests"], "cyan"),
-                            "Retries",
-                            _priority_count(result["http_retries"], "yellow"),
+                            _priority_count(result.get("http_requests"), "cyan"),
+                            "HTTP retries",
+                            _priority_count(result.get("http_retries"), "yellow"),
                         ),
                         (
                             "429",
-                            _priority_count(result["rate_limit_hits"], "yellow"),
-                            "Recovered",
-                            _priority_count(result["runtime_recovered"], "blue"),
+                            _priority_count(result.get("rate_limit_hits"), "yellow"),
+                            "Configured rate",
+                            _styled(f"{result.get('configured_rate', '-')} req/s", "cyan"),
                         ),
                     ]
                 ),
