@@ -42,7 +42,8 @@ class _WorkflowRepo:
             "next_generation": self.active or self.finalized + 1,
         }
 
-    def status_summary(self, **_kwargs):
+    def status_summary(self, **kwargs):
+        self.last_status_phase_mask = kwargs.get("phase_mask")
         return {
             "total": 10,
             "discovered": 0,
@@ -287,6 +288,7 @@ async def test_cycle_reports_complete_with_terminal_failures(monkeypatch) -> Non
                 "ok": True,
                 "status": "COMPLETE_WITH_FAILURES",
                 "terminal_failures": 2,
+                "global_terminal_failures": 2,
             },
         )
 
@@ -411,3 +413,68 @@ async def test_cycle_fails_if_rows_remain_unfinalized_after_bounded_finalize(mon
 
     assert result.status == "FAILED"
     assert result.verification["unfinished_rows"] == 1
+
+
+def test_cycle_generation_uses_global_unresolved_work_not_requested_phase() -> None:
+    repo = _WorkflowRepo(finalized=5, active=None, unresolved=3)
+    assert workflow._cycle_generation(repo, phase="extended") == (5, True)
+    assert repo.last_status_phase_mask is None
+
+
+@pytest.mark.asyncio
+async def test_cycle_rejects_scoped_discovery_inputs() -> None:
+    with pytest.raises(ValueError, match="full-universe discovery"):
+        await workflow.cycle_run(
+            phase="core",
+            seeds=["010"],
+            repository=_WorkflowRepo(),
+            verbose=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_fetch_company_does_not_finalize_when_other_required_scope_is_unresolved(
+    monkeypatch,
+) -> None:
+    repo = _WorkflowRepo(finalized=5, active=None, unresolved=0)
+
+    def company_state(_company_id):
+        return {
+            "company_id": 42,
+            "juristic_type_code": "7",
+            "registration_no": "0107556000051",
+            "latest_fiscal_year": None,
+            "required_mask": 2047,
+            "done_mask": 1920,
+            "not_available_mask": 0,
+            "failed_mask": 0,
+            "collect_status": "PENDING",
+            "lease_owner": None,
+            "lease_expires_at": None,
+            "retry_at": None,
+            "dataset_generation": 4,
+            "first_seen_generation": 5,
+            "last_seen_generation": 5,
+            "last_endpoint": "capital_history",
+            "last_http_status": 200,
+            "last_error": None,
+        }
+
+    repo.company_state = company_state
+
+    async def fake_collect(**_kwargs):
+        return {
+            "companies_claimed": 1,
+            "companies_finished": 1,
+            "endpoints_failed": 0,
+        }
+
+    monkeypatch.setattr(workflow, "collect", fake_collect)
+    result = await workflow.fetch_company(
+        parse_code("70107556000051"),
+        phase="extended",
+        repository=repo,
+    )
+
+    assert result.status == "PENDING"
+    assert repo.finalize_company_ids == []

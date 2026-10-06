@@ -1,3 +1,5 @@
+import asyncio
+from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
@@ -380,3 +382,66 @@ async def test_v06_direct_discovery_rejects_legacy_distributed_mode() -> None:
             repository=object(),
             verbose=False,
         )
+
+
+def test_direct_discovery_payload_preserves_decimal_as_json_number() -> None:
+    encoded = discovery._canonical_company_payload(
+        {"amount": Decimal("123.4500"), "name": "A\x00B"}
+    )
+    assert '"amount":123.4500' in encoded
+    assert '"amount":"123.4500"' not in encoded
+    assert "\x00" not in encoded
+
+
+def test_discovery_nested_container_without_nested_key_does_not_emit_null_field() -> None:
+    profile = discovery.normalize(
+        {
+            "jpNo": "0107556000051",
+            "jpTypeCode": "7",
+            "jpStatus": {},
+        }
+    )
+    row = discovery._discovery_company_row(
+        profile,
+        {"jpNo": "0107556000051", "jpTypeCode": "7", "jpStatus": {}},
+        published_at=discovery._now(),
+    )
+    assert "status_description" not in row
+
+
+@pytest.mark.asyncio
+async def test_direct_discovery_cancels_sibling_page_tasks_after_failure(monkeypatch) -> None:
+    cancelled = asyncio.Event()
+
+    async def direct_page(_client, _filters, page_no):
+        if page_no == 1:
+            return (
+                {
+                    "meta": {"currentPage": 1, "totalItems": 3, "totalPages": 3},
+                    "contents": [
+                        {"jpTypeCode": "7", "jpNo": "0107556000051", "jpName": "A"}
+                    ],
+                },
+                discovery._now(),
+            )
+        if page_no == 2:
+            await asyncio.sleep(0)
+            raise RuntimeError("page 2 failed")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+
+    with pytest.raises(RuntimeError, match="page 2 failed"):
+        await discovery.run(
+            ["010"],
+            generation=2,
+            repository=object(),
+            verbose=False,
+        )
+
+    assert cancelled.is_set()

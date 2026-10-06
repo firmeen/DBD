@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock
 import pytest
 
 from dbd.contracts.company import normalize as normalize_profile
+from dbd.contracts.financial import normalize_statements
 from dbd.deep.catalog import (
     ACTIVE_ENDPOINT_MASK,
     ALL_ENDPOINT_MASK,
@@ -25,7 +26,12 @@ from dbd.deep.catalog import (
     required_mask,
     static_endpoint_specs,
 )
-from dbd.deep.collector import DeepCollector, _json_payload, _profile_values
+from dbd.deep.collector import (
+    DeepCollector,
+    _json_payload,
+    _profile_values,
+    _statement_rows,
+)
 from dbd.deep.http import DeepNotAvailable, DeepPermanentHttpError, DeepTransientHttpError
 from dbd.storage.sqlserver.repository import SqlServerLeaseLost
 
@@ -191,6 +197,27 @@ def test_profile_present_fields_preserve_absent_and_allow_explicit_null() -> Non
     values = _profile_values(explicit, {}, published_at=SimpleNamespace())
     assert "email" in values and values["email"] is None
     assert "latest_fiscal_year" in values and values["latest_fiscal_year"] is None
+
+    nested_absent = normalize_profile(
+        {
+            "jpNo": "0107556000051",
+            "jpTypeCode": "7",
+            "jpStatus": {},
+        }
+    )
+    values = _profile_values(nested_absent, {}, published_at=SimpleNamespace())
+    assert "status_description" not in values
+
+    nested_null = normalize_profile(
+        {
+            "jpNo": "0107556000051",
+            "jpTypeCode": "7",
+            "jpStatus": {"jpStatDesc": None},
+        }
+    )
+    values = _profile_values(nested_null, {}, published_at=SimpleNamespace())
+    assert "status_description" in values
+    assert values["status_description"] is None
 
 
 def test_profile_fiscal_year_change_reopens_only_financial_bits() -> None:
@@ -394,6 +421,9 @@ class _OutcomeRepo:
     def renew_company_lease(self, _conn, **_kwargs):
         self.renewed += 1
 
+    def company_state(self, _company_id):
+        return dict(self.state)
+
 
 def _outcome_company(required_mask: int) -> dict:
     company = _company("0107556000001")
@@ -541,3 +571,98 @@ async def test_lease_heartbeat_renews_and_stops_on_lost_fence(monkeypatch) -> No
 
     assert renewals == 1
     assert lost.is_set()
+
+
+@pytest.mark.asyncio
+async def test_profile_identity_conflict_fences_remaining_company_endpoints() -> None:
+    profile_bit = ENDPOINT_BITS["profile"]
+    committee_bit = ENDPOINT_BITS["committees"]
+    company = _outcome_company(profile_bit | committee_bit)
+    repo = _OutcomeRepo(company)
+    collector = _collector(repo)
+    collector._specs = tuple(
+        spec
+        for spec in static_endpoint_specs("core")
+        if spec.key in {"profile", "committees"}
+    )
+    calls = 0
+
+    class Client:
+        async def fetch(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return SimpleNamespace(
+                data={"jpNo": "0107556999999", "jpTypeCode": "7"},
+                status=200,
+                requested_at=None,
+            )
+
+    await collector._process_company(company, Client())
+
+    assert calls == 1
+    assert repo.state["failed_mask"] & profile_bit
+    assert repo.state["failed_mask"] & committee_bit
+    assert repo.state["collect_status"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_mapping_contract_failure_isolated_as_terminal_endpoint_failure() -> None:
+    bit = ENDPOINT_BITS["committee_signs"]
+    company = _outcome_company(bit)
+    repo = _OutcomeRepo(company)
+    collector = _collector(repo)
+    collector._specs = tuple(
+        spec for spec in static_endpoint_specs("core") if spec.key == "committee_signs"
+    )
+
+    class Client:
+        async def fetch(self, *_args, **_kwargs):
+            return SimpleNamespace(
+                data=[{"signSeq": "not-an-int", "signDescription": "bad"}],
+                status=200,
+                requested_at=None,
+            )
+
+    await collector._process_company(company, Client())
+
+    assert repo.state["failed_mask"] == bit
+    assert repo.relations == []
+    assert repo.state["collect_status"] == "FAILED"
+
+
+def test_conflicting_financial_statement_rows_for_same_year_are_rejected() -> None:
+    raw = {
+        "finStatementDailyDtos": [
+            {"fiscalYear": "2568", "currentRatio": 1},
+            {"fiscalYear": "2568", "currentRatio": 2},
+        ]
+    }
+    normalized = normalize_statements(raw)
+    with pytest.raises(Exception, match="Conflicting financial statements"):
+        _statement_rows(
+            normalized,
+            raw,
+            published_at=SimpleNamespace(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_transient_sql_call_retries_with_existing_repository_classifier(monkeypatch) -> None:
+    class Repo(_DirectClaimRepo):
+        @staticmethod
+        def is_transient_error(exc):
+            return isinstance(exc, OSError)
+
+    collector = _collector(Repo())
+    monkeypatch.setattr(asyncio, "sleep", AsyncMock())
+    attempts = 0
+
+    def flaky():
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise OSError("temporary SQL connection")
+        return "ok"
+
+    assert await collector._db_call(flaky) == "ok"
+    assert attempts == 3

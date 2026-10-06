@@ -394,7 +394,7 @@ class _SequenceCursor:
 
 
 def test_generation_state_resumes_partial_finalization(monkeypatch) -> None:
-    cursor = _SequenceCursor([(5, 5), (17,)])
+    cursor = _SequenceCursor([(5, 5), (0,), (17,)])
     conn = _CaptureConnection(cursor)
 
     @contextmanager
@@ -412,7 +412,7 @@ def test_generation_state_resumes_partial_finalization(monkeypatch) -> None:
 
 
 def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -> None:
-    first_cursor = _SequenceCursor([(42, 4)])
+    first_cursor = _SequenceCursor([(42, 4, None, None)])
     repo = ProductionSqlServerRepository()
     repo.upsert_discovered_companies(
         _CaptureConnection(first_cursor),
@@ -424,6 +424,7 @@ def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -
             }
         ],
         generation=5,
+        financial_mask=14,
         refresh_mask=1,
     )
     first_update = first_cursor.executions[-1][0]
@@ -431,7 +432,7 @@ def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -
     assert "not_available_mask=(not_available_mask & ~%s)" in first_update
     assert "failed_mask=(failed_mask & ~%s)" in first_update
 
-    rerun_cursor = _SequenceCursor([(42, 5)])
+    rerun_cursor = _SequenceCursor([(42, 5, None, None)])
     repo.upsert_discovered_companies(
         _CaptureConnection(rerun_cursor),
         [
@@ -442,6 +443,7 @@ def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -
             }
         ],
         generation=5,
+        financial_mask=14,
         refresh_mask=1,
     )
     rerun_update = rerun_cursor.executions[-1][0]
@@ -764,3 +766,216 @@ def test_financial_statement_first_insert_contains_no_submission_owned_columns()
     assert "statement_payload" in insert_sql
     assert "submission_payload" not in insert_sql
     assert "accounting_date" not in insert_sql
+
+
+def test_generation_state_rejects_impossible_global_ordering(monkeypatch) -> None:
+    cursor = _SequenceCursor([(7, 6), (1,)])
+    conn = _CaptureConnection(cursor)
+
+    @contextmanager
+    def fake_connection():
+        yield conn
+
+    monkeypatch.setattr(repository_module, "connection", fake_connection)
+    with pytest.raises(SqlServerWriteError, match="impossible generation"):
+        ProductionSqlServerRepository().generation_state()
+
+
+def test_discovery_preserves_profile_owned_columns_after_profile_collection() -> None:
+    cursor = _SequenceCursor([(42, 4, "{}", "2567")])
+    repo = ProductionSqlServerRepository()
+    repo.upsert_discovered_companies(
+        _CaptureConnection(cursor),
+        [
+            {
+                "juristic_type_code": "7",
+                "registration_no": "0107556000051",
+                "company_name_th": "Search name",
+                "address_th": "Search address",
+                "master_payload": "{}",
+                "published_at": "now",
+            }
+        ],
+        generation=5,
+        financial_mask=14,
+    )
+    sql, _params = cursor.executions[-1]
+    assert "[master_payload]=%s" in sql
+    assert "[published_at]=%s" in sql
+    assert "[company_name_th]=%s" not in sql
+    assert "[address_th]=%s" not in sql
+
+
+def test_discovery_fiscal_change_reopens_financial_scope_once() -> None:
+    cursor = _SequenceCursor([(42, 4, "{}", "2567")])
+    ProductionSqlServerRepository().upsert_discovered_companies(
+        _CaptureConnection(cursor),
+        [
+            {
+                "juristic_type_code": "7",
+                "registration_no": "0107556000051",
+                "latest_fiscal_year": "2568",
+                "master_payload": "{}",
+            }
+        ],
+        generation=5,
+        financial_mask=14,
+    )
+    sql, params = cursor.executions[-1]
+    compact = " ".join(sql.split())
+    assert "required_mask=(required_mask | %s)" in compact
+    assert "done_mask=(done_mask & ~%s)" in compact
+    assert "not_available_mask=(not_available_mask & ~%s)" in compact
+    assert "failed_mask=(failed_mask & ~%s)" in compact
+    assert params.count(14) >= 4
+
+    rerun = _SequenceCursor([(42, 5, "{}", "2568")])
+    ProductionSqlServerRepository().upsert_discovered_companies(
+        _CaptureConnection(rerun),
+        [
+            {
+                "juristic_type_code": "7",
+                "registration_no": "0107556000051",
+                "latest_fiscal_year": "2568",
+                "master_payload": "{}",
+            }
+        ],
+        generation=5,
+        financial_mask=14,
+    )
+    rerun_sql = rerun.executions[-1][0]
+    assert "done_mask=(done_mask & ~%s)" not in rerun_sql
+
+
+def test_discovery_explicit_empty_fiscal_scope_removes_financial_required_bits() -> None:
+    cursor = _SequenceCursor([(42, 4, "{}", "2568")])
+    ProductionSqlServerRepository().upsert_discovered_companies(
+        _CaptureConnection(cursor),
+        [
+            {
+                "juristic_type_code": "7",
+                "registration_no": "0107556000051",
+                "latest_fiscal_year": None,
+                "master_payload": "{}",
+            }
+        ],
+        generation=5,
+        financial_mask=14,
+    )
+    sql, _params = cursor.executions[-1]
+    assert "required_mask=(required_mask & ~%s)" in " ".join(sql.split())
+
+
+def test_prepare_rebuilds_core_financial_scope_and_batches() -> None:
+    cursor = _SequenceCursor(rowcount=500)
+    ProductionSqlServerRepository().prepare_companies(
+        _CaptureConnection(cursor),
+        generation=5,
+        core_mask=127,
+        base_mask=113,
+        financial_mask=14,
+        extended_mask=1920,
+        phase="core",
+        limit=500,
+    )
+    sql = cursor.executions[-1][0]
+    compact = " ".join(sql.split())
+    assert "TOP (500)" in compact
+    assert "(required_mask & ~127)" in compact
+    assert "required_mask <>" in compact
+    assert "done_mask=" not in sql
+
+
+def test_extended_prepare_seeds_core_scope_for_newly_discovered_rows() -> None:
+    cursor = _SequenceCursor(rowcount=1)
+    ProductionSqlServerRepository().prepare_companies(
+        _CaptureConnection(cursor),
+        generation=5,
+        core_mask=127,
+        base_mask=113,
+        financial_mask=14,
+        extended_mask=1920,
+        phase="extended",
+        limit=500,
+    )
+    sql = " ".join(cursor.executions[-1][0].split())
+    assert "CASE WHEN required_mask=0" in sql
+    assert "| 1920" in sql
+
+
+def test_retry_skips_currently_owned_claims() -> None:
+    cursor = _SequenceCursor(rowcount=1)
+    ProductionSqlServerRepository().retry_failed(
+        _CaptureConnection(cursor),
+        phase_mask=127,
+        generation=5,
+        limit=500,
+    )
+    sql = " ".join(cursor.executions[-1][0].split())
+    assert "lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME()" in sql
+
+
+def test_phase_status_is_derived_from_phase_masks_not_global_collect_status(monkeypatch) -> None:
+    cursor = _SequenceCursor([(10, 0, 1, 2, 1, 5, 1, 0, 4, 2, 0)])
+    conn = _CaptureConnection(cursor)
+
+    @contextmanager
+    def fake_connection():
+        yield conn
+
+    monkeypatch.setattr(repository_module, "connection", fake_connection)
+    result = ProductionSqlServerRepository().status_summary(
+        phase_mask=127,
+        generation=5,
+    )
+    sql = cursor.executions[-1][0]
+    assert "collect_status=" not in sql
+    assert "(required_mask & 127)" in sql
+    assert result["unresolved"] == 4
+
+
+def test_verify_generation_blocks_global_unresolved_work(monkeypatch) -> None:
+    cursor = _SequenceCursor(
+        [
+            (0, 0, 1, 0, 0, 0, 0, 0, 1),
+            (0,),
+            (0,),
+            (0,),
+            (0,),
+        ]
+    )
+    conn = _CaptureConnection(cursor)
+
+    @contextmanager
+    def fake_connection():
+        yield conn
+
+    monkeypatch.setattr(repository_module, "connection", fake_connection)
+    result = ProductionSqlServerRepository().verify_generation(
+        generation=5,
+        phase_mask=1920,
+    )
+    assert result["global_unresolved"] == 1
+    assert result["ok"] is False
+
+
+def test_industry_conflict_without_source_timestamp_cannot_regress_dated_row() -> None:
+    cursor = _SequenceCursor([(99, "2026-01-01", '{"value":1}')])
+    with pytest.raises(SqlServerWriteError, match="no source_updated_at"):
+        ProductionSqlServerRepository().upsert_industries(
+            _CaptureConnection(cursor),
+            [
+                {
+                    "submit_objective_code": "62010",
+                    "fiscal_year": "2568",
+                    "business_size_code": None,
+                    "location_type": None,
+                    "location_no": None,
+                    "payload": '{"value":2}',
+                    "source_updated_at": None,
+                    "first_seen_generation": 5,
+                    "last_seen_generation": 5,
+                    "published_at": "now",
+                }
+            ],
+        )
