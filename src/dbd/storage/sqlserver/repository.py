@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from datetime import date, datetime
 from datetime import time as datetime_time
 from typing import Any, Iterable, Iterator
+from uuid import uuid4
 
 from ...contracts.master_deep import (
     SERVING_COLUMNS,
@@ -27,6 +28,14 @@ class SqlServerSchemaError(RuntimeError):
 
 class SqlServerWriteError(RuntimeError):
     pass
+
+
+class SqlServerLeaseLost(SqlServerWriteError):
+    """A stale or superseded company claim attempted to mutate durable state."""
+
+
+class SqlServerApplicationLockError(SqlServerWriteError):
+    """The v0.6 SQL Server application lock could not be acquired or was lost."""
 
 
 def _sanitize_value(value: Any) -> tuple[Any, int]:
@@ -488,6 +497,162 @@ _COMPANY_STATE_COLUMNS = (
 )
 
 
+
+_DISCOVERY_COMPANY_COLUMNS = frozenset(
+    {
+        "company_name_th",
+        "company_name_en",
+        "company_search_name",
+        "status_code",
+        "status_description",
+        "juristic_type_description",
+        "registration_date",
+        "status_change_date",
+        "dbd_update_date",
+        "address_th",
+        "address_en",
+        "province_code",
+        "province_name",
+        "district_code",
+        "district_name",
+        "subdistrict_code",
+        "subdistrict_name",
+        "postal_code",
+        "business_size_code",
+        "business_type_code",
+        "business_type_description",
+        "setup_objective_code",
+        "setup_objective_description",
+        "setup_objective_group_code",
+        "setup_objective_group_description",
+        "setup_objective_keyin",
+        "submit_objective_code",
+        "submit_objective_description",
+        "submit_objective_keyin",
+        "registered_capital",
+        "paid_capital",
+        "latest_fiscal_year",
+        "total_assets_latest",
+        "total_equity_latest",
+        "total_income_latest",
+        "net_profit_latest",
+        "master_payload",
+        "source_updated_at",
+        "published_at",
+    }
+)
+
+_PROFILE_COMPANY_COLUMNS = frozenset(
+    {
+        "company_name_th",
+        "company_name_en",
+        "company_search_name",
+        "status_code",
+        "status_description",
+        "juristic_type_description",
+        "registration_date",
+        "status_change_date",
+        "dbd_update_date",
+        "address_th",
+        "address_en",
+        "province_code",
+        "province_name",
+        "district_code",
+        "district_name",
+        "subdistrict_code",
+        "subdistrict_name",
+        "postal_code",
+        "phone_no",
+        "email",
+        "website_1",
+        "website_2",
+        "website_3",
+        "website_4",
+        "business_size_code",
+        "business_type_code",
+        "business_type_description",
+        "setup_objective_code",
+        "setup_objective_description",
+        "setup_objective_group_code",
+        "setup_objective_group_description",
+        "setup_objective_keyin",
+        "submit_objective_code",
+        "submit_objective_description",
+        "submit_objective_keyin",
+        "registered_capital",
+        "paid_capital",
+        "share_quantity",
+        "share_volume",
+        "latest_fiscal_year",
+        "total_assets_latest",
+        "total_equity_latest",
+        "total_income_latest",
+        "net_profit_latest",
+        "profile_payload",
+        "source_updated_at",
+        "published_at",
+    }
+)
+
+_SUBMISSION_COLUMNS = (
+    "accounting_date",
+    "submission_date",
+    "accounting_code",
+    "auditor_code",
+    "submission_status_code",
+    "submission_updated_at",
+    "submission_payload",
+)
+
+_STATEMENT_COLUMNS = (
+    "fiscal_year_end_date",
+    "submit_objective_code",
+    "business_size_code",
+    "business_size_description",
+    "current_ratio",
+    "debt_to_asset",
+    "debt_to_equity",
+    "debt_to_capital",
+    "total_asset_to_equity",
+    "total_asset_turnover",
+    "inventory_turnover",
+    "account_receivable_turnover",
+    "account_payable_turnover",
+    "gross_profit_margin",
+    "operating_profit_margin",
+    "net_profit_margin",
+    "return_on_asset",
+    "return_on_equity",
+    "earning_per_share",
+    "cost_to_income",
+    "statement_items",
+    "statement_updated_at",
+    "statement_payload",
+)
+
+
+def _collect_status_sql() -> str:
+    return """
+        CASE
+          WHEN lease_owner IS NOT NULL
+           AND lease_expires_at > SYSUTCDATETIME()
+            THEN N'COLLECTING'
+          WHEN (required_mask & ~(done_mask | not_available_mask | failed_mask)) <> 0
+           AND retry_at > SYSUTCDATETIME()
+            THEN N'RETRY_WAIT'
+          WHEN (required_mask & ~(done_mask | not_available_mask | failed_mask)) <> 0
+            THEN N'PENDING'
+          WHEN required_mask = 0
+            THEN N'DISCOVERED'
+          WHEN (failed_mask & required_mask) = 0
+            THEN N'COMPLETE'
+          WHEN (failed_mask & required_mask) = required_mask
+            THEN N'FAILED'
+          ELSE N'PARTIAL'
+        END
+    """
+
+
 def _table_write_columns(table_name: str) -> tuple[str, ...]:
     return tuple(
         column.name
@@ -895,6 +1060,934 @@ class ProductionSqlServerRepository:
         finally:
             cur.close()
         return len(rows)
+
+
+    @contextmanager
+    def manager_lock(
+        self,
+        resource: str = "TIPDI:DBD:v0.6:cycle",
+    ) -> Iterator[Any]:
+        """Hold one session-scoped SQL Server application lock for global v0.6 mutation."""
+        with connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    DECLARE @result int;
+                    EXEC @result = sys.sp_getapplock
+                        @Resource=%s,
+                        @LockMode=N'Exclusive',
+                        @LockOwner=N'Session',
+                        @LockTimeout=0;
+                    SELECT @result;
+                    """,
+                    (resource,),
+                )
+                result = int(cur.fetchone()[0])
+                if result < 0:
+                    raise SqlServerApplicationLockError(
+                        f"Another v0.6 mutation already owns SQL Server application lock {resource!r}"
+                    )
+            finally:
+                cur.close()
+
+            try:
+                yield conn
+            finally:
+                try:
+                    cur = conn.cursor()
+                    try:
+                        cur.execute(
+                            """
+                            EXEC sys.sp_releaseapplock
+                                @Resource=%s,
+                                @LockOwner=N'Session';
+                            """,
+                            (resource,),
+                        )
+                    finally:
+                        cur.close()
+                except Exception:
+                    pass
+
+    def assert_manager_lock(
+        self,
+        conn,
+        resource: str = "TIPDI:DBD:v0.6:cycle",
+    ) -> None:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT APPLOCK_MODE(N'public', %s, N'Session')",
+                (resource,),
+            )
+            mode = cur.fetchone()[0]
+        finally:
+            cur.close()
+        if str(mode or "").upper() not in {"EXCLUSIVE", "X"}:
+            raise SqlServerApplicationLockError(
+                f"SQL Server application lock {resource!r} was lost"
+            )
+
+    def generation_state(self, conn=None) -> dict[str, int | None]:
+        if conn is None:
+            with connection() as owned:
+                return self.generation_state(owned)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT
+                    COALESCE(MAX(dataset_generation),0),
+                    COALESCE(MAX(last_seen_generation),0)
+                FROM dbo.DBD_COMPANY
+                """
+            )
+            finalized_max, seen_max = (int(value or 0) for value in cur.fetchone())
+            candidate = max(finalized_max, seen_max)
+            unfinished = 0
+            if candidate > 0:
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM dbo.DBD_COMPANY
+                    WHERE last_seen_generation=%s
+                      AND dataset_generation < %s
+                    """,
+                    (candidate, candidate),
+                )
+                unfinished = int(cur.fetchone()[0] or 0)
+        finally:
+            cur.close()
+
+        active = candidate if unfinished else None
+        next_generation = (
+            active
+            if active is not None
+            else max(2, finalized_max + 1)
+        )
+        return {
+            "finalized_generation": finalized_max or None,
+            "last_seen_generation": seen_max or None,
+            "active_generation": active,
+            "unfinished_rows": unfinished,
+            "next_generation": next_generation,
+        }
+
+    def upsert_discovered_companies(
+        self,
+        conn,
+        rows: list[dict[str, Any]],
+        *,
+        generation: int,
+        refresh_mask: int = 0,
+    ) -> dict[str, int]:
+        """Upsert Search observations without overwriting collector-owned state."""
+        if generation < 2:
+            raise SqlServerWriteError("Normal v0.6 discovery generation must be >= 2")
+        inserted = updated = refresh_reopened = 0
+        cur = conn.cursor()
+        try:
+            for row in rows:
+                jp_type = _production_identity(
+                    row.get("juristic_type_code"),
+                    "juristic_type_code",
+                )
+                jp_no = _production_identity(
+                    row.get("registration_no"),
+                    "registration_no",
+                )
+                unknown = sorted(
+                    set(row)
+                    - _DISCOVERY_COMPANY_COLUMNS
+                    - {"juristic_type_code", "registration_no"}
+                )
+                if unknown:
+                    raise SqlServerWriteError(
+                        "Unsupported discovery company field(s): " + ", ".join(unknown)
+                    )
+                cur.execute(
+                    """
+                    SELECT company_id,last_seen_generation
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,HOLDLOCK)
+                    WHERE juristic_type_code=%s AND registration_no=%s
+                    """,
+                    (jp_type, jp_no),
+                )
+                existing = cur.fetchone()
+                values = {
+                    key: _production_value(value)
+                    for key, value in row.items()
+                    if key in _DISCOVERY_COMPANY_COLUMNS
+                }
+                if existing is None:
+                    columns = [
+                        "juristic_type_code",
+                        "registration_no",
+                        *values.keys(),
+                        "required_mask",
+                        "done_mask",
+                        "not_available_mask",
+                        "failed_mask",
+                        "collect_status",
+                        "dataset_generation",
+                        "first_seen_generation",
+                        "last_seen_generation",
+                    ]
+                    params = [
+                        jp_type,
+                        jp_no,
+                        *values.values(),
+                        0,
+                        0,
+                        0,
+                        0,
+                        "DISCOVERED",
+                        max(1, generation - 1),
+                        generation,
+                        generation,
+                    ]
+                    cur.execute(
+                        "INSERT INTO dbo.DBD_COMPANY ("
+                        + ",".join(f"[{column}]" for column in columns)
+                        + ") VALUES ("
+                        + ",".join(["%s"] * len(columns))
+                        + ")",
+                        tuple(params),
+                    )
+                    inserted += 1
+                    continue
+
+                _company_id, old_generation = existing
+                old_generation = int(old_generation or 0)
+                if old_generation > generation:
+                    raise SqlServerWriteError(
+                        f"Discovery generation regression for {jp_type}/{jp_no}: "
+                        f"row={old_generation}, incoming={generation}"
+                    )
+                first_observation = old_generation < generation
+                assignments = [f"[{column}]=%s" for column in values]
+                params = list(values.values())
+                if first_observation and refresh_mask:
+                    assignments.extend(
+                        [
+                            "done_mask=(done_mask & ~%s)",
+                            "not_available_mask=(not_available_mask & ~%s)",
+                            "failed_mask=(failed_mask & ~%s)",
+                            "retry_at=NULL",
+                            "collection_completed_at=NULL",
+                        ]
+                    )
+                    params.extend(
+                        [int(refresh_mask), int(refresh_mask), int(refresh_mask)]
+                    )
+                    refresh_reopened += 1
+                assignments.append("last_seen_generation=%s")
+                params.append(int(generation))
+                if first_observation and refresh_mask:
+                    assignments.append("collect_status=N'PENDING'")
+                cur.execute(
+                    "UPDATE dbo.DBD_COMPANY SET "
+                    + ",".join(assignments)
+                    + " WHERE juristic_type_code=%s AND registration_no=%s",
+                    tuple(params + [jp_type, jp_no]),
+                )
+                updated += 1
+        finally:
+            cur.close()
+        return {
+            "inserted": inserted,
+            "updated": updated,
+            "refresh_reopened": refresh_reopened,
+        }
+
+    def prepare_companies(
+        self,
+        conn,
+        *,
+        generation: int,
+        core_mask: int,
+        base_mask: int,
+        financial_mask: int,
+        extended_mask: int,
+        phase: str,
+        company_id: int | None = None,
+    ) -> int:
+        if phase not in {"core", "extended"}:
+            raise ValueError("phase must be core or extended")
+        predicate = "last_seen_generation=%s"
+        params: list[Any] = [int(generation)]
+        if company_id is not None:
+            predicate += " AND company_id=%s"
+            params.append(int(company_id))
+        if phase == "core":
+            required = (
+                f"(required_mask | {int(base_mask)} | "
+                f"CASE WHEN latest_fiscal_year IS NULL THEN 0 ELSE {int(financial_mask)} END)"
+            )
+        else:
+            required = f"(required_mask | {int(extended_mask)})"
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                UPDATE dbo.DBD_COMPANY
+                SET required_mask={required},
+                    collect_status=CASE
+                        WHEN ({required} & ~(done_mask | not_available_mask | failed_mask)) <> 0
+                            THEN N'PENDING'
+                        ELSE {_collect_status_sql()}
+                    END,
+                    collection_completed_at=CASE
+                        WHEN ({required} & ~(done_mask | not_available_mask | failed_mask)) <> 0
+                            THEN NULL
+                        ELSE collection_completed_at
+                    END
+                WHERE {predicate}
+                """,
+                tuple(params),
+            )
+            return int(cur.rowcount or 0)
+        finally:
+            cur.close()
+
+    def claim_company(
+        self,
+        conn,
+        *,
+        generation: int,
+        phase_mask: int,
+        lease_seconds: int,
+        worker_prefix: str,
+        company_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        token = f"{worker_prefix}:{uuid4().hex}"
+        company_filter = ""
+        params: list[Any] = [
+            int(generation),
+            int(phase_mask),
+            int(phase_mask),
+        ]
+        if company_id is not None:
+            company_filter = " AND company_id=%s"
+            params.append(int(company_id))
+        params.extend([token, int(lease_seconds)])
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                ;WITH candidate AS (
+                    SELECT TOP (1) *
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
+                    WHERE last_seen_generation=%s
+                      AND (required_mask & %s) <> 0
+                      AND ((required_mask & %s)
+                           & ~(done_mask | not_available_mask | failed_mask)) <> 0
+                      AND (retry_at IS NULL OR retry_at <= SYSUTCDATETIME())
+                      AND (lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME())
+                      {company_filter}
+                    ORDER BY
+                      CASE WHEN retry_at IS NULL THEN 0 ELSE 1 END,
+                      retry_at,
+                      company_id
+                )
+                UPDATE candidate
+                SET lease_owner=%s,
+                    lease_expires_at=DATEADD(second,%s,SYSUTCDATETIME()),
+                    collect_status=N'COLLECTING',
+                    collection_started_at=COALESCE(
+                        collection_started_at,SYSUTCDATETIME()
+                    ),
+                    retry_at=NULL
+                OUTPUT
+                    inserted.company_id,
+                    inserted.juristic_type_code,
+                    inserted.registration_no,
+                    inserted.latest_fiscal_year,
+                    inserted.required_mask,
+                    inserted.done_mask,
+                    inserted.not_available_mask,
+                    inserted.failed_mask,
+                    inserted.collect_status,
+                    inserted.lease_owner,
+                    inserted.lease_expires_at,
+                    inserted.last_seen_generation,
+                    inserted.endpoint_meta;
+                """,
+                tuple(params),
+            )
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        if row is None:
+            return None
+        keys = (
+            "company_id",
+            "juristic_type_code",
+            "registration_no",
+            "latest_fiscal_year",
+            "required_mask",
+            "done_mask",
+            "not_available_mask",
+            "failed_mask",
+            "collect_status",
+            "lease_owner",
+            "lease_expires_at",
+            "last_seen_generation",
+            "endpoint_meta",
+        )
+        return dict(zip(keys, row, strict=True))
+
+    def renew_company_lease(
+        self,
+        conn,
+        *,
+        company_id: int,
+        claim_token: str,
+        claim_generation: int,
+        lease_seconds: int,
+    ) -> None:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE dbo.DBD_COMPANY
+                SET lease_expires_at=DATEADD(second,%s,SYSUTCDATETIME())
+                WHERE company_id=%s
+                  AND lease_owner=%s
+                  AND last_seen_generation=%s
+                  AND lease_expires_at > SYSUTCDATETIME()
+                """,
+                (
+                    int(lease_seconds),
+                    int(company_id),
+                    claim_token,
+                    int(claim_generation),
+                ),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise SqlServerLeaseLost(
+                    f"Lease lost for company_id={company_id}"
+                )
+        finally:
+            cur.close()
+
+    def update_company_state_owned(
+        self,
+        conn,
+        *,
+        company_id: int,
+        claim_token: str,
+        claim_generation: int,
+        values: dict[str, Any],
+    ) -> None:
+        unknown = sorted(set(values) - set(_COMPANY_STATE_COLUMNS))
+        if unknown:
+            raise SqlServerWriteError(
+                "Unsupported DBD_COMPANY state field(s): " + ", ".join(unknown)
+            )
+        columns = tuple(
+            column for column in _COMPANY_STATE_COLUMNS if column in values
+        )
+        assignments = [f"[{column}]=%s" for column in columns]
+        params = [_production_value(values[column]) for column in columns]
+        if not assignments:
+            assignments.append("collect_status=collect_status")
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE dbo.DBD_COMPANY WITH (UPDLOCK) SET "
+                + ",".join(assignments)
+                + """
+                  WHERE company_id=%s
+                    AND lease_owner=%s
+                    AND last_seen_generation=%s
+                    AND lease_expires_at > SYSUTCDATETIME()
+                """,
+                tuple(
+                    params
+                    + [
+                        int(company_id),
+                        claim_token,
+                        int(claim_generation),
+                    ]
+                ),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise SqlServerLeaseLost(
+                    f"Stale claim rejected for company_id={company_id}"
+                )
+        finally:
+            cur.close()
+
+    def release_company_lease(
+        self,
+        conn,
+        *,
+        company_id: int,
+        claim_token: str,
+        claim_generation: int,
+    ) -> None:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                UPDATE dbo.DBD_COMPANY
+                SET lease_owner=NULL,
+                    lease_expires_at=NULL,
+                    collect_status={_collect_status_sql()}
+                WHERE company_id=%s
+                  AND lease_owner=%s
+                  AND last_seen_generation=%s
+                """,
+                (int(company_id), claim_token, int(claim_generation)),
+            )
+        finally:
+            cur.close()
+
+    def recover_expired_leases(self, conn) -> int:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                UPDATE dbo.DBD_COMPANY
+                SET lease_owner=NULL,
+                    lease_expires_at=NULL,
+                    collect_status={_collect_status_sql()}
+                WHERE lease_owner IS NOT NULL
+                  AND lease_expires_at <= SYSUTCDATETIME()
+                """
+            )
+            return int(cur.rowcount or 0)
+        finally:
+            cur.close()
+
+    def update_company_profile(
+        self,
+        conn,
+        company_id: int,
+        values: dict[str, Any],
+    ) -> None:
+        unknown = sorted(set(values) - _PROFILE_COMPANY_COLUMNS)
+        if unknown:
+            raise SqlServerWriteError(
+                "Unsupported profile company field(s): " + ", ".join(unknown)
+            )
+        if not values:
+            return
+        columns = tuple(
+            column for column in _PROFILE_COMPANY_COLUMNS if column in values
+        )
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "UPDATE dbo.DBD_COMPANY SET "
+                + ",".join(f"[{column}]=%s" for column in columns)
+                + " WHERE company_id=%s",
+                tuple(_production_value(values[column]) for column in columns)
+                + (int(company_id),),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise SqlServerWriteError(
+                    f"Unable to update profile for company_id={company_id}"
+                )
+        finally:
+            cur.close()
+
+    def reconcile_relations(
+        self,
+        conn,
+        *,
+        company_id: int,
+        relation_type: str,
+        rows: list[dict[str, Any]],
+        generation: int,
+    ) -> int:
+        prepared = []
+        for row in rows:
+            item = dict(row)
+            item["company_id"] = int(company_id)
+            item["relation_type"] = relation_type
+            item["is_current"] = True
+            item["last_seen_generation"] = int(generation)
+            item.setdefault("first_seen_generation", int(generation))
+            prepared.append(item)
+        written = self.upsert_relations(conn, prepared)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                UPDATE dbo.DBD_COMPANY_RELATION
+                SET is_current=0
+                WHERE company_id=%s
+                  AND relation_type=%s
+                  AND is_current=1
+                  AND last_seen_generation < %s
+                """,
+                (int(company_id), relation_type, int(generation)),
+            )
+        finally:
+            cur.close()
+        return written
+
+    def _merge_financial_rows(
+        self,
+        conn,
+        *,
+        company_id: int,
+        rows: list[dict[str, Any]],
+        generation: int,
+        owned_columns: tuple[str, ...],
+    ) -> int:
+        cur = conn.cursor()
+        try:
+            for row in rows:
+                fiscal_year = _production_identity(
+                    row.get("fiscal_year"),
+                    "fiscal_year",
+                )
+                values = {
+                    column: _production_value(row.get(column))
+                    for column in owned_columns
+                    if column in row
+                }
+                update_columns = tuple(values)
+                cur.execute(
+                    """
+                    SELECT financial_id
+                    FROM dbo.DBD_FINANCIAL WITH (UPDLOCK,HOLDLOCK)
+                    WHERE company_id=%s AND fiscal_year=%s
+                    """,
+                    (int(company_id), fiscal_year),
+                )
+                existing = cur.fetchone()
+                if existing is None:
+                    columns = [
+                        "company_id",
+                        "fiscal_year",
+                        *update_columns,
+                        "first_seen_generation",
+                        "last_seen_generation",
+                        "published_at",
+                    ]
+                    published_at = _production_value(row.get("published_at"))
+                    if published_at is None:
+                        raise SqlServerWriteError(
+                            "DBD_FINANCIAL runtime insert requires published_at"
+                        )
+                    params = [
+                        int(company_id),
+                        fiscal_year,
+                        *[values[column] for column in update_columns],
+                        int(generation),
+                        int(generation),
+                        published_at,
+                    ]
+                    cur.execute(
+                        "INSERT INTO dbo.DBD_FINANCIAL ("
+                        + ",".join(f"[{column}]" for column in columns)
+                        + ") VALUES ("
+                        + ",".join(["%s"] * len(columns))
+                        + ")",
+                        tuple(params),
+                    )
+                    continue
+                assignments = [f"[{column}]=%s" for column in update_columns]
+                params = [values[column] for column in update_columns]
+                assignments.extend(
+                    ["last_seen_generation=%s", "published_at=%s"]
+                )
+                params.extend(
+                    [
+                        int(generation),
+                        _production_value(row.get("published_at")),
+                    ]
+                )
+                cur.execute(
+                    "UPDATE dbo.DBD_FINANCIAL SET "
+                    + ",".join(assignments)
+                    + " WHERE financial_id=%s",
+                    tuple(params + [int(existing[0])]),
+                )
+        finally:
+            cur.close()
+        return len(rows)
+
+    def merge_financial_submissions(
+        self,
+        conn,
+        *,
+        company_id: int,
+        rows: list[dict[str, Any]],
+        generation: int,
+    ) -> int:
+        return self._merge_financial_rows(
+            conn,
+            company_id=company_id,
+            rows=rows,
+            generation=generation,
+            owned_columns=_SUBMISSION_COLUMNS,
+        )
+
+    def merge_financial_statements(
+        self,
+        conn,
+        *,
+        company_id: int,
+        rows: list[dict[str, Any]],
+        generation: int,
+    ) -> int:
+        return self._merge_financial_rows(
+            conn,
+            company_id=company_id,
+            rows=rows,
+            generation=generation,
+            owned_columns=_STATEMENT_COLUMNS,
+        )
+
+    def retry_failed(
+        self,
+        conn,
+        *,
+        phase_mask: int,
+        generation: int | None = None,
+        limit: int | None = None,
+    ) -> int:
+        where = "(failed_mask & %s) <> 0"
+        params: list[Any] = [int(phase_mask)]
+        if generation is not None:
+            where += " AND last_seen_generation=%s"
+            params.append(int(generation))
+        top = "" if limit is None else f"TOP ({int(limit)}) "
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                ;WITH target AS (
+                    SELECT {top}*
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
+                    WHERE {where}
+                    ORDER BY company_id
+                )
+                UPDATE target
+                SET failed_mask=(failed_mask & ~%s),
+                    retry_at=NULL,
+                    collection_completed_at=NULL,
+                    collect_status=N'PENDING'
+                """,
+                tuple(params + [int(phase_mask)]),
+            )
+            return int(cur.rowcount or 0)
+        finally:
+            cur.close()
+
+    def status_summary(
+        self,
+        *,
+        phase_mask: int | None = None,
+        generation: int | None = None,
+    ) -> dict[str, Any]:
+        where = []
+        params: list[Any] = []
+        if generation is not None:
+            where.append("last_seen_generation=%s")
+            params.append(int(generation))
+        predicate = "WHERE " + " AND ".join(where) if where else ""
+        phase = int(phase_mask or 0)
+        unresolved_expr = (
+            "required_mask & ~(done_mask | not_available_mask | failed_mask)"
+            if phase == 0
+            else f"(required_mask & {phase}) & ~(done_mask | not_available_mask | failed_mask)"
+        )
+        with connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f"""
+                    SELECT
+                      COUNT(*) AS total,
+                      SUM(CASE WHEN collect_status=N'DISCOVERED' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN collect_status=N'PENDING' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN collect_status=N'COLLECTING' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN collect_status=N'RETRY_WAIT' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN collect_status=N'COMPLETE' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN collect_status=N'PARTIAL' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN collect_status=N'FAILED' THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN ({unresolved_expr}) <> 0 THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN lease_owner IS NOT NULL
+                                AND lease_expires_at > SYSUTCDATETIME()
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN lease_owner IS NOT NULL
+                                AND lease_expires_at <= SYSUTCDATETIME()
+                               THEN 1 ELSE 0 END)
+                    FROM dbo.DBD_COMPANY
+                    {predicate}
+                    """,
+                    tuple(params),
+                )
+                row = cur.fetchone()
+            finally:
+                cur.close()
+        names = (
+            "total",
+            "discovered",
+            "pending",
+            "collecting",
+            "retry_wait",
+            "complete",
+            "partial",
+            "failed",
+            "unresolved",
+            "active_leases",
+            "expired_leases",
+        )
+        result = {
+            name: int(value or 0)
+            for name, value in zip(names, row, strict=True)
+        }
+        result["generation"] = generation
+        result["phase_mask"] = phase_mask
+        return result
+
+    def verify_generation(
+        self,
+        *,
+        generation: int,
+        phase_mask: int,
+    ) -> dict[str, Any]:
+        with connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    """
+                    SELECT
+                      SUM(CASE WHEN
+                            (done_mask & not_available_mask) <> 0
+                         OR (done_mask & failed_mask) <> 0
+                         OR (not_available_mask & failed_mask) <> 0
+                          THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN
+                          ((required_mask & %s)
+                           & ~(done_mask | not_available_mask | failed_mask)) <> 0
+                          THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN retry_at > SYSUTCDATETIME()
+                          AND ((required_mask & %s)
+                           & ~(done_mask | not_available_mask | failed_mask)) <> 0
+                          THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN lease_owner IS NOT NULL
+                           AND lease_expires_at > SYSUTCDATETIME()
+                          THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN lease_owner IS NOT NULL
+                           AND lease_expires_at <= SYSUTCDATETIME()
+                          THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN (failed_mask & %s) <> 0
+                          THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN dataset_generation > last_seen_generation
+                                OR first_seen_generation > last_seen_generation
+                          THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN last_seen_generation=%s
+                                AND dataset_generation < %s
+                          THEN 1 ELSE 0 END)
+                    FROM dbo.DBD_COMPANY
+                    WHERE last_seen_generation=%s
+                    """,
+                    (
+                        int(phase_mask),
+                        int(phase_mask),
+                        int(phase_mask),
+                        int(generation),
+                        int(generation),
+                        int(generation),
+                    ),
+                )
+                row = [int(value or 0) for value in cur.fetchone()]
+                orphan_counts = {}
+                for table in (
+                    "dbo.DBD_COMPANY_RELATION",
+                    "dbo.DBD_COMPANY_EVENT",
+                    "dbo.DBD_FINANCIAL",
+                ):
+                    cur.execute(
+                        f"""
+                        SELECT COUNT(*)
+                        FROM {table} child
+                        LEFT JOIN dbo.DBD_COMPANY company
+                          ON company.company_id=child.company_id
+                        WHERE company.company_id IS NULL
+                        """
+                    )
+                    orphan_counts[table] = int(cur.fetchone()[0] or 0)
+            finally:
+                cur.close()
+        (
+            mask_overlap,
+            unresolved,
+            retry_wait,
+            active_leases,
+            expired_leases,
+            terminal_failures,
+            generation_errors,
+            unfinished_rows,
+        ) = row
+        ok = not any(
+            (
+                mask_overlap,
+                unresolved,
+                retry_wait,
+                active_leases,
+                expired_leases,
+                generation_errors,
+                *orphan_counts.values(),
+            )
+        )
+        return {
+            "generation": int(generation),
+            "phase_mask": int(phase_mask),
+            "mask_overlap": mask_overlap,
+            "unresolved": unresolved,
+            "retry_wait": retry_wait,
+            "active_leases": active_leases,
+            "expired_leases": expired_leases,
+            "terminal_failures": terminal_failures,
+            "generation_errors": generation_errors,
+            "unfinished_rows": unfinished_rows,
+            "orphans": orphan_counts,
+            "ok": ok,
+            "status": (
+                "COMPLETE_WITH_FAILURES"
+                if ok and terminal_failures
+                else "COMPLETE"
+                if ok
+                else "FAILED"
+            ),
+        }
+
+    def finalize_generation(
+        self,
+        conn,
+        *,
+        generation: int,
+        batch_size: int,
+    ) -> int:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"""
+                ;WITH target AS (
+                    SELECT TOP ({max(1, int(batch_size))}) *
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
+                    WHERE last_seen_generation=%s
+                      AND dataset_generation < %s
+                    ORDER BY company_id
+                )
+                UPDATE target
+                SET dataset_generation=%s
+                """,
+                (int(generation), int(generation), int(generation)),
+            )
+            return int(cur.rowcount or 0)
+        finally:
+            cur.close()
 
     def count_generation_one(self) -> int:
         with connection() as conn:
