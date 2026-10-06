@@ -367,3 +367,47 @@ async def test_fetch_company_reuses_finalized_generation_and_shared_collect(monk
     assert repo.discovered_generations == [5]
     assert calls == [(5, "core", 42)]
     assert repo.finalize_company_ids == [42]
+
+
+@pytest.mark.asyncio
+async def test_cycle_fails_if_rows_remain_unfinalized_after_bounded_finalize(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=1)
+    verify_calls = 0
+
+    async def fake_discovery_run(*_args, **_kwargs):
+        return DiscoveryResult(1, 1, 10, 1, 0)
+
+    async def fake_collect(**_kwargs):
+        return {
+            "companies_claimed": 0,
+            "companies_finished": 0,
+            "endpoints_failed": 0,
+        }
+
+    async def fake_verify(**kwargs):
+        nonlocal verify_calls
+        verify_calls += 1
+        return VerifyResult(
+            generation=kwargs["generation"],
+            phase=kwargs["phase"],
+            status="COMPLETE",
+            details={
+                "ok": True,
+                "status": "COMPLETE",
+                "terminal_failures": 0,
+                "unfinished_rows": 10 if verify_calls == 1 else 1,
+            },
+        )
+
+    monkeypatch.setattr(workflow.discovery, "run", fake_discovery_run)
+    monkeypatch.setattr(workflow, "collect", fake_collect)
+    monkeypatch.setattr(workflow, "verify", fake_verify)
+
+    result = await workflow.cycle_run(
+        phase="core",
+        repository=repo,
+        verbose=False,
+    )
+
+    assert result.status == "FAILED"
+    assert result.verification["unfinished_rows"] == 1
