@@ -164,15 +164,13 @@ async def _guard_application_lock(
     return work_task.result()
 
 
-def _prepare_locked(
+def _prepare_tx(
     repository: ProductionSqlServerRepository,
-    lock_conn,
     *,
     generation: int,
     phase: str,
     company_id: int | None = None,
 ) -> PrepareResult:
-    repository.assert_manager_lock(lock_conn)
     with repository.transaction() as conn:
         changed = repository.prepare_companies(
             conn,
@@ -184,7 +182,6 @@ def _prepare_locked(
             phase=phase,
             company_id=company_id,
         )
-    repository.assert_manager_lock(lock_conn)
     return PrepareResult(
         generation=int(generation),
         phase=phase,
@@ -204,14 +201,15 @@ async def prepare(
     with repo.manager_lock() as lock_conn:
         selected = int(generation or _manual_generation(repo, phase=phase))
         _emit(event, "phase_started", phase="PREPARE", generation=selected)
+        repo.assert_manager_lock(lock_conn)
         result = await asyncio.to_thread(
-            _prepare_locked,
+            _prepare_tx,
             repo,
-            lock_conn,
             generation=selected,
             phase=phase,
             company_id=company_id,
         )
+        repo.assert_manager_lock(lock_conn)
         _emit(
             event,
             "phase_completed",
@@ -222,15 +220,13 @@ async def prepare(
         return result
 
 
-def _retry_locked(
+def _retry_tx(
     repository: ProductionSqlServerRepository,
-    lock_conn,
     *,
     generation: int,
     phase: str,
     limit: int | None,
 ) -> RetryResult:
-    repository.assert_manager_lock(lock_conn)
     with repository.transaction() as conn:
         count = repository.retry_failed(
             conn,
@@ -238,7 +234,6 @@ def _retry_locked(
             generation=generation,
             limit=limit,
         )
-    repository.assert_manager_lock(lock_conn)
     return RetryResult(
         generation=int(generation),
         phase=phase,
@@ -257,14 +252,15 @@ async def retry(
     with repo.manager_lock() as lock_conn:
         generation = _manual_generation(repo, phase=phase)
         _emit(event, "phase_started", phase="RETRY", generation=generation)
+        repo.assert_manager_lock(lock_conn)
         result = await asyncio.to_thread(
-            _retry_locked,
+            _retry_tx,
             repo,
-            lock_conn,
             generation=generation,
             phase=phase,
             limit=limit,
         )
+        repo.assert_manager_lock(lock_conn)
         _emit(
             event,
             "phase_completed",
@@ -416,7 +412,21 @@ async def verify(
     )
 
 
-def _finalize_all(
+def _finalize_batch(
+    repository: ProductionSqlServerRepository,
+    *,
+    generation: int,
+    batch_size: int,
+) -> int:
+    with repository.transaction() as conn:
+        return repository.finalize_generation(
+            conn,
+            generation=int(generation),
+            batch_size=int(batch_size),
+        )
+
+
+async def _finalize_all(
     repository: ProductionSqlServerRepository,
     lock_conn,
     *,
@@ -426,17 +436,51 @@ def _finalize_all(
     batch_size = max(1, int(settings.dbd_materialize_batch_size))
     while True:
         repository.assert_manager_lock(lock_conn)
-        with repository.transaction() as conn:
-            changed = repository.finalize_generation(
-                conn,
-                generation=int(generation),
-                batch_size=batch_size,
-            )
+        changed = await asyncio.to_thread(
+            _finalize_batch,
+            repository,
+            generation=generation,
+            batch_size=batch_size,
+        )
         total += int(changed)
         if not changed:
             break
     repository.assert_manager_lock(lock_conn)
     return total
+
+
+def _ensure_fetch_company(
+    repository: ProductionSqlServerRepository,
+    company: CompanyIdentity,
+    *,
+    generation: int,
+    finalize_new: bool,
+) -> int:
+    with repository.transaction() as conn:
+        repository.upsert_discovered_companies(
+            conn,
+            [
+                {
+                    "juristic_type_code": company.jp_type_code,
+                    "registration_no": company.jp_no,
+                    "published_at": _utcnow(),
+                }
+            ],
+            generation=generation,
+            refresh_mask=0,
+            finalize_new=finalize_new,
+        )
+        return repository.company_ids(
+            conn,
+            [(company.jp_type_code, company.jp_no)],
+        )[(company.jp_type_code, company.jp_no)]
+
+
+def _recover_expired(
+    repository: ProductionSqlServerRepository,
+) -> int:
+    with repository.transaction() as conn:
+        return repository.recover_expired_leases(conn)
 
 
 async def fetch_company(
@@ -458,31 +502,23 @@ async def fetch_company(
             or state["finalized_generation"]
             or 1
         )
-        with repo.transaction() as conn:
-            repo.upsert_discovered_companies(
-                conn,
-                [
-                    {
-                        "juristic_type_code": company.jp_type_code,
-                        "registration_no": company.jp_no,
-                        "published_at": _utcnow(),
-                    }
-                ],
-                generation=generation,
-                refresh_mask=0,
-                finalize_new=state["active_generation"] is None,
-            )
-            company_id = repo.company_ids(
-                conn,
-                [(company.jp_type_code, company.jp_no)],
-            )[(company.jp_type_code, company.jp_no)]
-        _prepare_locked(
+        repo.assert_manager_lock(lock_conn)
+        company_id = await asyncio.to_thread(
+            _ensure_fetch_company,
             repo,
-            lock_conn,
+            company,
+            generation=generation,
+            finalize_new=state["active_generation"] is None,
+        )
+        repo.assert_manager_lock(lock_conn)
+        await asyncio.to_thread(
+            _prepare_tx,
+            repo,
             generation=generation,
             phase=phase,
             company_id=company_id,
         )
+        repo.assert_manager_lock(lock_conn)
 
     collection = await collect(
         generation=generation,
@@ -566,13 +602,14 @@ async def cycle_run(
         )
 
         _emit(event, "phase_started", phase="PREPARE", generation=generation)
+        repo.assert_manager_lock(lock_conn)
         prepare_result = await asyncio.to_thread(
-            _prepare_locked,
+            _prepare_tx,
             repo,
-            lock_conn,
             generation=generation,
             phase=phase,
         )
+        repo.assert_manager_lock(lock_conn)
         _emit(
             event,
             "phase_completed",
@@ -600,8 +637,8 @@ async def cycle_run(
         _emit(event, "phase_completed", phase="COLLECT", generation=generation)
 
         repo.assert_manager_lock(lock_conn)
-        with repo.transaction() as conn:
-            repo.recover_expired_leases(conn)
+        await asyncio.to_thread(_recover_expired, repo)
+        repo.assert_manager_lock(lock_conn)
 
         _emit(event, "phase_started", phase="VERIFY", generation=generation)
         verification = await verify(
@@ -633,8 +670,7 @@ async def cycle_run(
             return result
 
         _emit(event, "phase_started", phase="FINALIZE", generation=generation)
-        finalized_rows = await asyncio.to_thread(
-            _finalize_all,
+        finalized_rows = await _finalize_all(
             repo,
             lock_conn,
             generation=generation,
