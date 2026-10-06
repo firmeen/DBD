@@ -93,7 +93,7 @@ class CollectorStats:
 
 
 def _json_payload(value: object) -> str:
-    """Serialize API JSON while preserving Decimal as JSON numbers."""
+    """Canonical runtime JSON with production NUL cleaning and numeric Decimal values."""
 
     def encode(item: object) -> str:
         if item is None:
@@ -103,7 +103,7 @@ def _json_payload(value: object) -> str:
         if item is False:
             return "false"
         if isinstance(item, str):
-            return json.dumps(item, ensure_ascii=False)
+            return json.dumps(item.replace("\x00", ""), ensure_ascii=False)
         if isinstance(item, Decimal):
             if not item.is_finite():
                 raise ValueError("Non-finite Decimal cannot be stored as JSON")
@@ -117,14 +117,16 @@ def _json_payload(value: object) -> str:
         if isinstance(item, (list, tuple)):
             return "[" + ",".join(encode(child) for child in item) + "]"
         if isinstance(item, dict):
-            parts: list[str] = []
-            for key, child in item.items():
-                if not isinstance(key, str):
-                    raise TypeError("JSON object keys must be strings")
-                parts.append(
-                    json.dumps(key, ensure_ascii=False) + ":" + encode(child)
+            if any(not isinstance(key, str) for key in item):
+                raise TypeError("JSON object keys must be strings")
+            return (
+                "{"
+                + ",".join(
+                    json.dumps(key, ensure_ascii=False) + ":" + encode(item[key])
+                    for key in sorted(item)
                 )
-            return "{" + ",".join(parts) + "}"
+                + "}"
+            )
         raise TypeError(type(item).__name__)
 
     return encode(value)
