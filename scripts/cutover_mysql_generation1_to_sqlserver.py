@@ -50,6 +50,7 @@ class CutoverTerminal:
             self.state["phase"] = "CUTOVER"
         elif name == "progress":
             self.state["phase"] = "CUTOVER"
+            self.state["industries"] = int(payload.get("industries_written") or 0)
         elif name == "complete":
             self.state["phase"] = "COMPLETE"
             verification = payload.get("verification") or {}
@@ -98,6 +99,51 @@ class CutoverTerminal:
         )
 
         sections: list[Any] = [header, Text(""), table]
+        if phase == "COMPLETE":
+            verification = self.state.get("verification") or {}
+            evidence = Table.grid(padding=(0, 2))
+            evidence.add_column(style="dim", no_wrap=True)
+            evidence.add_column(justify="right")
+            evidence.add_column(style="dim", no_wrap=True)
+            evidence.add_column(justify="right")
+            evidence.add_row(
+                "PROFILE SRC/MAPPED",
+                f"{int(self.state.get('profile_source_companies') or 0):,}/"
+                f"{int(self.state.get('profile_mapped_companies') or 0):,}",
+                "COMMITTEE SRC/ROWS",
+                f"{int(self.state.get('committee_source_companies') or 0):,}/"
+                f"{int(self.state.get('committee_rows') or 0):,}",
+            )
+            evidence.add_row(
+                "SIGNS SRC/ROWS",
+                f"{int(self.state.get('committee_sign_source_companies') or 0):,}/"
+                f"{int(self.state.get('committee_sign_rows') or 0):,}",
+                "TRANSFORM SRC/EVENTS",
+                f"{int(self.state.get('transformation_source_companies') or 0):,}/"
+                f"{int(self.state.get('events') or 0):,}",
+            )
+            evidence.add_row(
+                "FIN SUB/STMT SRC",
+                f"{int(self.state.get('financial_submission_source_companies') or 0):,}/"
+                f"{int(self.state.get('financial_statement_source_companies') or 0):,}",
+                "FINANCIAL ROWS",
+                f"{int(self.state.get('financial') or 0):,}",
+            )
+            evidence.add_row(
+                "BENCHMARK SRC",
+                f"{int(self.state.get('benchmark_source_companies') or 0):,}",
+                "CONTRACT ERRORS",
+                f"{int(self.state.get('contract_errors') or 0):,}",
+            )
+            evidence.add_row(
+                "DUP/ORPHAN/GEN",
+                f"{int(verification.get('duplicate_company_identity') or 0):,}/"
+                f"{int(verification.get('orphan_relations') or 0) + int(verification.get('orphan_events') or 0) + int(verification.get('orphan_financial') or 0):,}/"
+                f"{int(verification.get('invalid_generation') or 0):,}",
+                "VERIFIED INDUSTRIES",
+                f"{int(verification.get('industries') or 0):,}",
+            )
+            sections.extend((Text(""), Text("VERIFICATION", style="bold"), evidence))
         if self.state.get("error"):
             sections.extend(
                 (
