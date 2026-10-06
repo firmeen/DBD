@@ -98,7 +98,11 @@ def _v06_event_sink(presenter):
             suffix = f" · generation {generation}" if generation is not None else ""
             presenter.message(f"{phase}{suffix}", kind="info")
         elif name == "cycle_waiting":
-            seconds = float(payload.get("interval_seconds") or payload.get("idle_seconds") or 0)
+            seconds = float(
+                payload.get("interval_seconds")
+                or payload.get("idle_seconds")
+                or 0
+            )
             presenter.message(f"Cycle waiting · next check in {seconds:g}s", kind="warning")
         elif name == "cycle_completed":
             status = str(payload.get("status") or "FAILED")
@@ -1002,8 +1006,12 @@ def main():
                     {
                         "generation": payload["generation"],
                         "phase": payload["phase"],
-                        "finalized_generation": payload["generation_state"].get("finalized_generation"),
-                        "active_generation": payload["generation_state"].get("active_generation"),
+                        "finalized_generation": payload["generation_state"].get(
+                            "finalized_generation"
+                        ),
+                        "active_generation": payload["generation_state"].get(
+                            "active_generation"
+                        ),
                         **payload["summary"],
                     },
                 )
@@ -1048,10 +1056,18 @@ def main():
                         "phase": payload["phase"],
                         "resumed": payload["resumed"],
                         "finalized_rows": payload["finalized_rows"],
-                        "companies_claimed": payload["collection"].get("companies_claimed", 0),
-                        "companies_finished": payload["collection"].get("companies_finished", 0),
-                        "endpoint_failed": payload["collection"].get("endpoints_failed", 0),
-                        "terminal_failures": payload["verification"].get("terminal_failures", 0),
+                        "companies_claimed": payload["collection"].get(
+                            "companies_claimed", 0
+                        ),
+                        "companies_finished": payload["collection"].get(
+                            "companies_finished", 0
+                        ),
+                        "endpoint_failed": payload["collection"].get(
+                            "endpoints_failed", 0
+                        ),
+                        "terminal_failures": payload["verification"].get(
+                            "terminal_failures", 0
+                        ),
                     },
                 )
     except KeyboardInterrupt:
