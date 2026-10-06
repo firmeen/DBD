@@ -173,9 +173,10 @@ def _prepare_tx(
 ) -> PrepareResult:
     batch_size = 1 if company_id is not None else max(1, int(settings.dbd_write_batch_size))
     total = 0
+    after_company_id = 0
     while True:
         with repository.transaction() as conn:
-            changed = repository.prepare_companies(
+            changed, last_company_id = repository.prepare_companies(
                 conn,
                 generation=generation,
                 core_mask=CORE_ENDPOINT_MASK,
@@ -185,10 +186,14 @@ def _prepare_tx(
                 phase=phase,
                 company_id=company_id,
                 limit=batch_size,
+                after_company_id=after_company_id,
             )
         total += int(changed)
-        if company_id is not None or changed < batch_size:
+        if company_id is not None or not changed:
             break
+        if last_company_id is None or last_company_id <= after_company_id:
+            raise RuntimeError("Prepare keyset did not advance")
+        after_company_id = int(last_company_id)
     return PrepareResult(
         generation=int(generation),
         phase=phase,
@@ -237,20 +242,25 @@ def _retry_tx(
     batch_size = max(1, int(settings.dbd_write_batch_size))
     target = None if limit is None else max(0, int(limit))
     total = 0
+    after_company_id = 0
     while target is None or total < target:
         current_limit = batch_size if target is None else min(batch_size, target - total)
         if current_limit <= 0:
             break
         with repository.transaction() as conn:
-            count = repository.retry_failed(
+            count, last_company_id = repository.retry_failed(
                 conn,
                 phase_mask=phase_mask(phase),
                 generation=generation,
                 limit=current_limit,
+                after_company_id=after_company_id,
             )
         total += int(count)
-        if count < current_limit:
+        if not count:
             break
+        if last_company_id is None or last_company_id <= after_company_id:
+            raise RuntimeError("Retry keyset did not advance")
+        after_company_id = int(last_company_id)
     return RetryResult(
         generation=int(generation),
         phase=phase,

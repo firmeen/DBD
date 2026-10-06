@@ -453,8 +453,8 @@ def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -
 
 
 def test_prepare_preserves_existing_outcome_masks() -> None:
-    cursor = _SequenceCursor(rowcount=4)
-    ProductionSqlServerRepository().prepare_companies(
+    cursor = _SequenceCursor([(4, 104)])
+    changed, last_company_id = ProductionSqlServerRepository().prepare_companies(
         _CaptureConnection(cursor),
         generation=2,
         core_mask=127,
@@ -462,7 +462,11 @@ def test_prepare_preserves_existing_outcome_masks() -> None:
         financial_mask=14,
         extended_mask=1920,
         phase="core",
+        limit=500,
+        after_company_id=100,
     )
+    assert changed == 4
+    assert last_company_id == 104
     sql = cursor.executions[-1][0]
     assert "required_mask=" in sql
     assert "done_mask=" not in sql
@@ -544,12 +548,16 @@ def test_stale_claimed_company_state_is_rejected() -> None:
 
 
 def test_retry_reopens_failed_bits_without_resetting_done_or_not_available() -> None:
-    cursor = _SequenceCursor(rowcount=3)
-    ProductionSqlServerRepository().retry_failed(
+    cursor = _SequenceCursor([(3, 203)])
+    changed, last_company_id = ProductionSqlServerRepository().retry_failed(
         _CaptureConnection(cursor),
         phase_mask=127,
         generation=2,
+        limit=500,
+        after_company_id=200,
     )
+    assert changed == 3
+    assert last_company_id == 203
     sql = cursor.executions[-1][0]
     assert "failed_mask=(failed_mask & ~%s)" in sql
     assert "done_mask=" not in sql
@@ -871,8 +879,8 @@ def test_discovery_explicit_empty_fiscal_scope_removes_financial_required_bits()
 
 
 def test_prepare_rebuilds_core_financial_scope_and_batches() -> None:
-    cursor = _SequenceCursor(rowcount=500)
-    ProductionSqlServerRepository().prepare_companies(
+    cursor = _SequenceCursor([(500, 1500)])
+    changed, last_company_id = ProductionSqlServerRepository().prepare_companies(
         _CaptureConnection(cursor),
         generation=5,
         core_mask=127,
@@ -881,17 +889,22 @@ def test_prepare_rebuilds_core_financial_scope_and_batches() -> None:
         extended_mask=1920,
         phase="core",
         limit=500,
+        after_company_id=1000,
     )
+    assert changed == 500
+    assert last_company_id == 1500
     sql = cursor.executions[-1][0]
     compact = " ".join(sql.split())
     assert "TOP (500)" in compact
+    assert "company_id > %s" in compact
+    assert "OUTPUT inserted.company_id INTO @updated" in compact
     assert "(required_mask & ~127)" in compact
     assert "required_mask <>" in compact
     assert "done_mask=" not in sql
 
 
 def test_extended_prepare_seeds_core_scope_for_newly_discovered_rows() -> None:
-    cursor = _SequenceCursor(rowcount=1)
+    cursor = _SequenceCursor([(1, 42)])
     ProductionSqlServerRepository().prepare_companies(
         _CaptureConnection(cursor),
         generation=5,
@@ -901,6 +914,7 @@ def test_extended_prepare_seeds_core_scope_for_newly_discovered_rows() -> None:
         extended_mask=1920,
         phase="extended",
         limit=500,
+        after_company_id=0,
     )
     sql = " ".join(cursor.executions[-1][0].split())
     assert "CASE WHEN required_mask=0" in sql
@@ -908,12 +922,13 @@ def test_extended_prepare_seeds_core_scope_for_newly_discovered_rows() -> None:
 
 
 def test_retry_skips_currently_owned_claims() -> None:
-    cursor = _SequenceCursor(rowcount=1)
+    cursor = _SequenceCursor([(1, 42)])
     ProductionSqlServerRepository().retry_failed(
         _CaptureConnection(cursor),
         phase_mask=127,
         generation=5,
         limit=500,
+        after_company_id=0,
     )
     sql = " ".join(cursor.executions[-1][0].split())
     assert "lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME()" in sql

@@ -1381,11 +1381,12 @@ class ProductionSqlServerRepository:
         phase: str,
         company_id: int | None = None,
         limit: int | None = None,
-    ) -> int:
+        after_company_id: int = 0,
+    ) -> tuple[int, int | None]:
         if phase not in {"core", "extended"}:
             raise ValueError("phase must be core or extended")
-        predicate = "last_seen_generation=%s"
-        params: list[Any] = [int(generation)]
+        predicate = "last_seen_generation=%s AND company_id > %s"
+        params: list[Any] = [int(generation), int(after_company_id)]
         if company_id is not None:
             predicate += " AND company_id=%s"
             params.append(int(company_id))
@@ -1407,9 +1408,10 @@ class ProductionSqlServerRepository:
         try:
             cur.execute(
                 f"""
+                DECLARE @updated TABLE (company_id BIGINT NOT NULL);
                 ;WITH target AS (
                     SELECT {top}*
-                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,ROWLOCK)
                     WHERE {predicate}
                       AND required_mask <> {required}
                     ORDER BY company_id
@@ -1429,10 +1431,19 @@ class ProductionSqlServerRepository:
                             THEN NULL
                         ELSE collection_completed_at
                     END
+                OUTPUT inserted.company_id INTO @updated(company_id);
+                SELECT COUNT(*),MAX(company_id) FROM @updated;
                 """,
                 tuple(params),
             )
-            return int(cur.rowcount or 0)
+            row = cur.fetchone()
+            if row is None:
+                raise SqlServerWriteError(
+                    "SQL Server prepare did not return its batch summary"
+                )
+            changed = int(row[0] or 0)
+            last_company_id = None if row[1] is None else int(row[1])
+            return changed, last_company_id
         finally:
             cur.close()
 
@@ -1882,7 +1893,8 @@ class ProductionSqlServerRepository:
         phase_mask: int,
         generation: int | None = None,
         limit: int | None = None,
-    ) -> int:
+        after_company_id: int = 0,
+    ) -> tuple[int, int | None]:
         where = (
             "(failed_mask & %s) <> 0 "
             "AND (lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME())"
@@ -1891,11 +1903,14 @@ class ProductionSqlServerRepository:
         if generation is not None:
             where += " AND last_seen_generation=%s"
             params.append(int(generation))
+        where += " AND company_id > %s"
+        params.append(int(after_company_id))
         top = "" if limit is None else f"TOP ({int(limit)}) "
         cur = conn.cursor()
         try:
             cur.execute(
                 f"""
+                DECLARE @updated TABLE (company_id BIGINT NOT NULL);
                 ;WITH target AS (
                     SELECT {top}*
                     FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
@@ -1906,16 +1921,20 @@ class ProductionSqlServerRepository:
                 SET failed_mask=(failed_mask & ~%s),
                     retry_at=NULL,
                     collection_completed_at=NULL,
-                    collect_status=CASE
-                        WHEN lease_owner IS NOT NULL
-                         AND lease_expires_at > SYSUTCDATETIME()
-                            THEN N'COLLECTING'
-                        ELSE N'PENDING'
-                    END
+                    collect_status=N'PENDING'
+                OUTPUT inserted.company_id INTO @updated(company_id);
+                SELECT COUNT(*),MAX(company_id) FROM @updated;
                 """,
                 tuple(params + [int(phase_mask)]),
             )
-            return int(cur.rowcount or 0)
+            row = cur.fetchone()
+            if row is None:
+                raise SqlServerWriteError(
+                    "SQL Server retry did not return its batch summary"
+                )
+            changed = int(row[0] or 0)
+            last_company_id = None if row[1] is None else int(row[1])
+            return changed, last_company_id
         finally:
             cur.close()
 
