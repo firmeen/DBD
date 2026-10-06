@@ -102,9 +102,10 @@ class _WorkflowRepo:
             "last_error": None,
         }
 
-    def prepare_companies(self, _conn, **_kwargs):
+    def prepare_companies(self, _conn, **kwargs):
         self.prepared += 1
-        return 10
+        after_company_id = int(kwargs.get("after_company_id") or 0)
+        return 10, after_company_id + 10
 
     def recover_expired_leases(self, _conn):
         self.recovered += 1

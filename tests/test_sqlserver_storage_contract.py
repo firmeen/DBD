@@ -562,8 +562,8 @@ def test_retry_reopens_failed_bits_without_resetting_done_or_not_available() -> 
     assert "failed_mask=(failed_mask & ~%s)" in sql
     assert "done_mask=" not in sql
     assert "not_available_mask=" not in sql
-    assert "lease_owner IS NOT NULL" in sql
-    assert "COLLECTING" in sql
+    assert "lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME()" in sql
+    assert "collect_status=N'PENDING'" in " ".join(sql.split())
 
 
 def test_relation_reconciliation_soft_retires_without_delete(monkeypatch) -> None:

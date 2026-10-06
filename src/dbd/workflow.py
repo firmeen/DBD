@@ -189,7 +189,7 @@ def _prepare_tx(
                 after_company_id=after_company_id,
             )
         total += int(changed)
-        if company_id is not None or not changed:
+        if company_id is not None or changed < batch_size:
             break
         if last_company_id is None or last_company_id <= after_company_id:
             raise RuntimeError("Prepare keyset did not advance")
@@ -256,7 +256,7 @@ def _retry_tx(
                 after_company_id=after_company_id,
             )
         total += int(count)
-        if not count:
+        if count < current_limit:
             break
         if last_company_id is None or last_company_id <= after_company_id:
             raise RuntimeError("Retry keyset did not advance")
