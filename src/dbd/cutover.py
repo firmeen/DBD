@@ -25,6 +25,7 @@ from .storage.sqlserver.repository import ProductionSqlServerRepository
 SOURCE_TABLE = "dbd_company_deep"
 SOURCE_MASTER_TABLE = "dbd_company_master"
 SOURCE_RUNTIME_TABLE = "dbd_deep_runtime"
+SOURCE_DISCOVERY_TABLE = "discovery_buckets"
 GENERATION = 1
 
 SOURCE_COLUMNS = (
@@ -727,7 +728,59 @@ def _count(conn, sql: str, params: tuple[Any, ...] = ()) -> int:
         return int(cur.fetchone()["n"] or 0)
 
 
-def source_preflight(conn) -> dict[str, int]:
+def _source_database(conn) -> str:
+    with conn.cursor() as cur:
+        cur.execute("SELECT DATABASE() AS source_database")
+        row = cur.fetchone()
+    return str(row["source_database"] or "")
+
+
+def _assert_source_database(conn) -> None:
+    database = _source_database(conn)
+    if database != "dbd":
+        raise CutoverSafetyError(
+            f"Generation 1 cutover requires MySQL database 'dbd'; current database is {database!r}"
+        )
+
+
+def _source_stability_state(conn) -> dict[str, Any]:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+              EXISTS(SELECT 1 FROM {SOURCE_MASTER_TABLE} LIMIT 1) AS master_waiting,
+              EXISTS(
+                SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
+                WHERE status='RUNNING'
+                LIMIT 1
+              ) AS runtime_running,
+              EXISTS(
+                SELECT 1 FROM {SOURCE_DISCOVERY_TABLE}
+                WHERE lease_owner IS NOT NULL
+                  AND lease_expires_at > UTC_TIMESTAMP(6)
+                LIMIT 1
+              ) AS discovery_active_leases,
+              EXISTS(
+                SELECT 1 FROM {SOURCE_TABLE}
+                WHERE deep_status IN ('PENDING','COLLECTING')
+                LIMIT 1
+              ) AS deep_active,
+              (SELECT MAX(updated_at) FROM {SOURCE_TABLE}) AS source_updated_at
+            """
+        )
+        row = cur.fetchone()
+    return {
+        "master_waiting": int(row["master_waiting"] or 0),
+        "runtime_running": int(row["runtime_running"] or 0),
+        "discovery_active_leases": int(row["discovery_active_leases"] or 0),
+        "deep_active": int(row["deep_active"] or 0),
+        "source_updated_at": row["source_updated_at"],
+    }
+
+
+def source_preflight(conn) -> dict[str, Any]:
+    _assert_source_database(conn)
+
     required = set(SOURCE_COLUMNS)
     actual = _source_columns(conn, SOURCE_TABLE)
     missing = sorted(required - actual)
@@ -737,26 +790,42 @@ def source_preflight(conn) -> dict[str, int]:
         )
     if not _source_columns(conn, SOURCE_MASTER_TABLE):
         raise CutoverSafetyError(f"Required source table {SOURCE_MASTER_TABLE} does not exist")
+
     runtime_columns = _source_columns(conn, SOURCE_RUNTIME_TABLE)
     if not runtime_columns:
         raise CutoverSafetyError(f"Required source table {SOURCE_RUNTIME_TABLE} does not exist")
+    if "status" not in runtime_columns:
+        raise CutoverSafetyError(
+            f"{SOURCE_RUNTIME_TABLE} missing required column: status"
+        )
+
+    discovery_columns = _source_columns(conn, SOURCE_DISCOVERY_TABLE)
+    if not discovery_columns:
+        raise CutoverSafetyError(
+            f"Required source table {SOURCE_DISCOVERY_TABLE} does not exist"
+        )
+    required_discovery = {"lease_owner", "lease_version", "lease_expires_at"}
+    missing_discovery = sorted(required_discovery - discovery_columns)
+    if missing_discovery:
+        raise CutoverSafetyError(
+            f"{SOURCE_DISCOVERY_TABLE} missing required column(s): "
+            + ", ".join(missing_discovery)
+        )
 
     master_waiting = _count(conn, f"SELECT COUNT(*) AS n FROM {SOURCE_MASTER_TABLE}")
     runtime_running = _count(
         conn,
         f"SELECT COUNT(*) AS n FROM {SOURCE_RUNTIME_TABLE} WHERE status='RUNNING'",
     )
-    active_leases = 0
-    if {"lease_owner", "lease_expires_at"} <= runtime_columns:
-        active_leases = _count(
-            conn,
-            f"""
-            SELECT COUNT(*) AS n
-            FROM {SOURCE_RUNTIME_TABLE}
-            WHERE lease_owner IS NOT NULL
-              AND lease_expires_at > UTC_TIMESTAMP(6)
-            """,
-        )
+    discovery_active_leases = _count(
+        conn,
+        f"""
+        SELECT COUNT(*) AS n
+        FROM {SOURCE_DISCOVERY_TABLE}
+        WHERE lease_owner IS NOT NULL
+          AND lease_expires_at > UTC_TIMESTAMP(6)
+        """,
+    )
     deep_active = _count(
         conn,
         f"""
@@ -766,11 +835,12 @@ def source_preflight(conn) -> dict[str, int]:
         """,
     )
     total = _count(conn, f"SELECT COUNT(*) AS n FROM {SOURCE_TABLE}")
+    stability = _source_stability_state(conn)
 
     blockers = {
         "master_waiting": master_waiting,
         "runtime_running": runtime_running,
-        "active_leases": active_leases,
+        "discovery_active_leases": discovery_active_leases,
         "deep_active": deep_active,
     }
     if any(blockers.values()):
@@ -778,16 +848,23 @@ def source_preflight(conn) -> dict[str, int]:
         raise CutoverSafetyError(
             "Generation 1 source is not terminal; cutover refused: " + details
         )
-    return {"source_rows": total, **blockers}
+    return {
+        "source_rows": total,
+        "source_updated_at": stability["source_updated_at"],
+        **blockers,
+    }
 
 
 @contextmanager
 def source_fence() -> Iterator[Any]:
-    """Fence legacy/discovery and standalone Deep writers with existing locks.
+    """Fence lock-aware writers and continuously verify the MySQL source snapshot.
 
-    The MySQL side issues SELECT statements only; no source row is modified.
+    Distributed Discovery does not own these advisory locks, so cutover also
+    refuses live Discovery leases and checks the Deep source watermark around
+    every target transaction. The MySQL side remains SELECT-only.
     """
     with mysql_connection() as conn:
+        _assert_source_database(conn)
         acquired: list[str] = []
         try:
             for suffix in (":dbd-api-manager", ":dbd-deep-collector"):
@@ -826,6 +903,31 @@ def _assert_source_fence(conn) -> None:
                 raise CutoverSafetyError(
                     "Generation 1 source fence was lost; cutover stopped"
                 )
+
+
+def _assert_source_snapshot(conn, baseline: dict[str, Any]) -> None:
+    _assert_source_fence(conn)
+    _assert_source_database(conn)
+    state = _source_stability_state(conn)
+    blockers = {
+        key: state[key]
+        for key in (
+            "master_waiting",
+            "runtime_running",
+            "discovery_active_leases",
+            "deep_active",
+        )
+        if state[key]
+    }
+    if blockers:
+        details = ", ".join(f"{key}={value}" for key, value in blockers.items())
+        raise CutoverSafetyError(
+            "Generation 1 source changed while cutover was running: " + details
+        )
+    if state["source_updated_at"] != baseline["source_updated_at"]:
+        raise CutoverSafetyError(
+            "Generation 1 source watermark changed while cutover was running"
+        )
 
 
 def source_batches(
@@ -1057,6 +1159,8 @@ def run_generation1_cutover(
                 if source.get("industry_benchmark_data") is not None:
                     stats["benchmark_source_companies"] += 1
 
+            _assert_source_snapshot(fence_conn, preflight)
+
             with repository.transaction() as target_conn:
                 company_ids = repository.upsert_companies(
                     target_conn, [item[1] for item in prepared]
@@ -1078,7 +1182,9 @@ def run_generation1_cutover(
                 repository.upsert_industries(
                     target_conn, industry_rows, reject_conflicts=True
                 )
+                _assert_source_snapshot(fence_conn, preflight)
 
+            _assert_source_snapshot(fence_conn, preflight)
             stats["companies"] += len(prepared)
             stats["profile_mapped_companies"] += sum(
                 1 for source in source_rows_batch if source.get("profile_data") is not None
@@ -1101,7 +1207,18 @@ def run_generation1_cutover(
             if event is not None:
                 event("progress", dict(stats))
 
+        _assert_source_snapshot(fence_conn, preflight)
+        final_preflight = source_preflight(fence_conn)
+        if (
+            int(final_preflight["source_rows"]) != int(preflight["source_rows"])
+            or final_preflight["source_updated_at"] != preflight["source_updated_at"]
+        ):
+            raise CutoverSafetyError(
+                "Generation 1 source snapshot changed before final verification"
+            )
+
         verification = verify_generation_one(int(stats["source_rows"]))
+        _assert_source_snapshot(fence_conn, preflight)
         stats["verification"] = verification
         stats["industries"] = verification["industries"]
         stats["elapsed_seconds"] = time.monotonic() - started
