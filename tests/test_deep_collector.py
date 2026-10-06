@@ -14,6 +14,7 @@ from dbd.deep.catalog import (
     ALL_ENDPOINT_MASK,
     BASE_REQUIRED_MASK,
     CORE_ENDPOINTS,
+    DESTINATION_COLUMNS,
     ENDPOINT_BITS,
     EXTENDED_ENDPOINT_MASK,
     EXTENDED_ENDPOINTS,
@@ -128,6 +129,17 @@ def test_endpoint_order_is_deterministic_for_both_phases() -> None:
     )
     assert phase_mask("core") == 127
     assert phase_mask("extended") == 1920
+
+
+def test_static_extended_specs_do_not_expand_legacy_deep_column_contract() -> None:
+    assert set(DESTINATION_COLUMNS) == set(CORE_ENDPOINTS)
+    extended = {spec.key: spec.destination_column for spec in static_endpoint_specs("extended")}
+    assert extended == {
+        "nations": "nations_data",
+        "nation_history": "nation_history_data",
+        "name_history": "name_history_data",
+        "capital_history": "capital_history_data",
+    }
 
 
 def test_latest_fiscal_year_and_required_mask_keep_existing_contract() -> None:
