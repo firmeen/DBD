@@ -640,3 +640,123 @@ def test_partial_generation_finalize_is_bounded_and_targeted() -> None:
     assert "dataset_generation < %s" in sql
     assert "SET dataset_generation=%s" in sql
     assert params == (5, 5, 5)
+
+
+def test_application_lock_uses_one_sqlserver_session_and_checks_ownership(monkeypatch) -> None:
+    cursor = _SequenceCursor([(0,), ("Exclusive",)])
+    conn = _CaptureConnection(cursor)
+
+    @contextmanager
+    def fake_connection():
+        yield conn
+
+    monkeypatch.setattr(repository_module, "connection", fake_connection)
+    repo = ProductionSqlServerRepository()
+
+    with repo.manager_lock() as lock_conn:
+        assert lock_conn is conn
+        repo.assert_manager_lock(lock_conn)
+
+    sql = "\n".join(statement for statement, _params in cursor.executions)
+    assert "sp_getapplock" in sql
+    assert "APPLOCK_MODE" in sql
+    assert "sp_releaseapplock" in sql
+
+
+def test_owned_checkpoint_update_fences_token_generation_and_live_lease() -> None:
+    cursor = _SequenceCursor(rowcount=1)
+    ProductionSqlServerRepository().update_company_state_owned(
+        _CaptureConnection(cursor),
+        company_id=42,
+        claim_token="claim-A",
+        claim_generation=5,
+        values={"done_mask": 1, "collect_status": "COLLECTING"},
+    )
+
+    sql, params = cursor.executions[-1]
+    assert "lease_owner=%s" in sql
+    assert "last_seen_generation=%s" in sql
+    assert "lease_expires_at > SYSUTCDATETIME()" in sql
+    assert "company_name_th" not in sql
+    assert params[-3:] == (42, "claim-A", 5)
+
+
+def test_expired_lease_recovery_requeues_without_business_failure() -> None:
+    cursor = _SequenceCursor(rowcount=7)
+    count = ProductionSqlServerRepository().recover_expired_leases(
+        _CaptureConnection(cursor)
+    )
+
+    sql, _params = cursor.executions[-1]
+    compact = " ".join(sql.split())
+    assert count == 7
+    assert "lease_owner=NULL" in compact
+    assert "lease_expires_at=NULL" in compact
+    assert "lease_expires_at <= SYSUTCDATETIME()" in compact
+    assert "failed_mask=" not in sql
+
+
+def test_profile_update_is_business_only_and_does_not_touch_checkpoint_state() -> None:
+    cursor = _SequenceCursor(rowcount=1)
+    ProductionSqlServerRepository().update_company_profile(
+        _CaptureConnection(cursor),
+        42,
+        {"company_name_th": "บริษัท", "email": None, "profile_payload": "{}"},
+    )
+
+    sql, params = cursor.executions[-1]
+    assert "[company_name_th]=%s" in sql
+    assert "[email]=%s" in sql
+    assert "[profile_payload]=%s" in sql
+    assert "done_mask" not in sql
+    assert "failed_mask" not in sql
+    assert "lease_owner" not in sql
+    assert params[-1] == 42
+
+
+def test_financial_submission_first_insert_contains_no_statement_owned_columns() -> None:
+    cursor = _SequenceCursor([None])
+    ProductionSqlServerRepository().merge_financial_submissions(
+        _CaptureConnection(cursor),
+        company_id=42,
+        generation=5,
+        rows=[
+            {
+                "fiscal_year": "2568",
+                "accounting_date": "31/12/2568",
+                "submission_payload": "{}",
+                "published_at": "now",
+            }
+        ],
+    )
+
+    insert_sql = cursor.executions[-1][0]
+    assert "INSERT INTO dbo.DBD_FINANCIAL" in insert_sql
+    assert "accounting_date" in insert_sql
+    assert "submission_payload" in insert_sql
+    assert "statement_payload" not in insert_sql
+    assert "current_ratio" not in insert_sql
+
+
+def test_financial_statement_first_insert_contains_no_submission_owned_columns() -> None:
+    cursor = _SequenceCursor([None])
+    ProductionSqlServerRepository().merge_financial_statements(
+        _CaptureConnection(cursor),
+        company_id=42,
+        generation=5,
+        rows=[
+            {
+                "fiscal_year": "2568",
+                "current_ratio": 1.5,
+                "statement_payload": "{}",
+                "published_at": "now",
+            }
+        ],
+    )
+
+    insert_sql = cursor.executions[-1][0]
+    assert "INSERT INTO dbo.DBD_FINANCIAL" in insert_sql
+    assert "current_ratio" in insert_sql
+    assert "statement_payload" in insert_sql
+    assert "submission_payload" not in insert_sql
+    assert "accounting_date" not in insert_sql
