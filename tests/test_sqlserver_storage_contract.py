@@ -632,20 +632,24 @@ def test_financial_statement_merge_never_updates_submission_columns() -> None:
     assert "accounting_code" not in update_sql
 
 
-def test_partial_generation_finalize_is_bounded_and_targeted() -> None:
-    cursor = _SequenceCursor(rowcount=500)
-    count = ProductionSqlServerRepository().finalize_generation(
+def test_partial_generation_finalize_is_bounded_and_keyset_targeted() -> None:
+    cursor = _SequenceCursor([(500, 9000)])
+    count, last_company_id = ProductionSqlServerRepository().finalize_generation(
         _CaptureConnection(cursor),
         generation=5,
         batch_size=500,
+        after_company_id=8500,
     )
     sql, params = cursor.executions[-1]
     assert count == 500
+    assert last_company_id == 9000
     assert "TOP (500)" in sql
     assert "last_seen_generation=%s" in sql
     assert "dataset_generation < %s" in sql
+    assert "company_id > %s" in sql
+    assert "OUTPUT inserted.company_id INTO @updated" in sql
     assert "SET dataset_generation=%s" in sql
-    assert params == (5, 5, 5)
+    assert params == (5, 5, 8500, 5)
 
 
 def test_application_lock_uses_one_sqlserver_session_and_checks_ownership(monkeypatch) -> None:

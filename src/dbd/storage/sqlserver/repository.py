@@ -2146,9 +2146,14 @@ class ProductionSqlServerRepository:
         generation: int,
         batch_size: int,
         company_id: int | None = None,
-    ) -> int:
+        after_company_id: int = 0,
+    ) -> tuple[int, int | None]:
         company_filter = ""
-        params: list[Any] = [int(generation), int(generation)]
+        params: list[Any] = [
+            int(generation),
+            int(generation),
+            int(after_company_id),
+        ]
         if company_id is not None:
             company_filter = " AND company_id=%s"
             params.append(int(company_id))
@@ -2157,20 +2162,35 @@ class ProductionSqlServerRepository:
         try:
             cur.execute(
                 f"""
+                DECLARE @updated TABLE (company_id BIGINT NOT NULL);
                 ;WITH target AS (
                     SELECT TOP ({max(1, int(batch_size))}) *
-                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,ROWLOCK)
                     WHERE last_seen_generation=%s
                       AND dataset_generation < %s
+                      AND company_id > %s
                       {company_filter}
                     ORDER BY company_id
                 )
                 UPDATE target
                 SET dataset_generation=%s
+                OUTPUT inserted.company_id INTO @updated(company_id);
+                SELECT COUNT(*),MAX(company_id) FROM @updated;
                 """,
                 tuple(params),
             )
-            return int(cur.rowcount or 0)
+            row = cur.fetchone()
+            if row is None:
+                raise SqlServerWriteError(
+                    "SQL Server finalization did not return its batch summary"
+                )
+            changed = int(row[0] or 0)
+            last_company_id = None if row[1] is None else int(row[1])
+            if changed and last_company_id is None:
+                raise SqlServerWriteError(
+                    "SQL Server finalization returned rows without a keyset boundary"
+                )
+            return changed, last_company_id
         finally:
             cur.close()
 

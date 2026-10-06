@@ -435,13 +435,15 @@ def _finalize_batch(
     generation: int,
     batch_size: int,
     company_id: int | None = None,
-) -> int:
+    after_company_id: int = 0,
+) -> tuple[int, int | None]:
     with repository.transaction() as conn:
         return repository.finalize_generation(
             conn,
             generation=int(generation),
             batch_size=int(batch_size),
             company_id=company_id,
+            after_company_id=int(after_company_id),
         )
 
 
@@ -452,18 +454,23 @@ async def _finalize_all(
     generation: int,
 ) -> int:
     total = 0
+    after_company_id = 0
     batch_size = max(1, int(settings.dbd_materialize_batch_size))
     while True:
         repository.assert_manager_lock(lock_conn)
-        changed = await asyncio.to_thread(
+        changed, last_company_id = await asyncio.to_thread(
             _finalize_batch,
             repository,
             generation=generation,
             batch_size=batch_size,
+            after_company_id=after_company_id,
         )
         total += int(changed)
         if not changed:
             break
+        if last_company_id is None or last_company_id <= after_company_id:
+            raise RuntimeError("Generation finalization keyset did not advance")
+        after_company_id = int(last_company_id)
     repository.assert_manager_lock(lock_conn)
     return total
 
@@ -571,6 +578,7 @@ async def fetch_company(
                 generation=generation,
                 batch_size=1,
                 company_id=company_id,
+                after_company_id=0,
             )
             repo.assert_manager_lock(lock_conn)
             refreshed = await asyncio.to_thread(repo.company_state, company_id)
@@ -736,7 +744,7 @@ async def cycle_run(
             "FAILED"
             if not final_ok
             else "COMPLETE_WITH_FAILURES"
-            if int(final_verification.details["terminal_failures"] or 0)
+            if int(final_verification.details.get("global_terminal_failures") or 0)
             else "COMPLETE"
         )
         result = CycleResult(
@@ -790,6 +798,8 @@ async def cycle_loop(
             event=event,
             verbose=verbose,
         )
+        if last.status == "FAILED":
+            return last
         if max_iterations is not None and iteration >= max_iterations:
             return last
         _emit(

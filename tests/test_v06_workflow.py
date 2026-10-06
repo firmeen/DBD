@@ -110,11 +110,21 @@ class _WorkflowRepo:
         self.recovered += 1
         return 0
 
-    def finalize_generation(self, _conn, *, generation, batch_size, company_id=None):
+    def finalize_generation(
+        self,
+        _conn,
+        *,
+        generation,
+        batch_size,
+        company_id=None,
+        after_company_id=0,
+    ):
         del generation, batch_size
         self.finalize_company_ids.append(company_id)
         self.finalize_calls += 1
-        return 10 if self.finalize_calls == 1 else 0
+        if self.finalize_calls == 1:
+            return 10, max(int(after_company_id) + 10, int(company_id or 0))
+        return 0, None
 
 
 def test_cycle_generation_resumes_unfinished_generation() -> None:
@@ -266,6 +276,36 @@ async def test_cycle_loop_is_simple_foreground_repetition(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
+async def test_cycle_loop_stops_immediately_after_failed_cycle(monkeypatch) -> None:
+    calls = 0
+
+    async def fake_cycle_run(**kwargs):
+        nonlocal calls
+        calls += 1
+        return workflow.CycleResult(
+            status="FAILED",
+            generation=2,
+            phase=kwargs["phase"],
+            resumed=False,
+            discovery={},
+            prepare={},
+            collection={},
+            verification={"ok": False},
+            finalized_rows=0,
+        )
+
+    monkeypatch.setattr(workflow, "cycle_run", fake_cycle_run)
+    result = await workflow.cycle_loop(
+        interval_seconds=1,
+        phase="core",
+        max_iterations=5,
+    )
+
+    assert result.status == "FAILED"
+    assert calls == 1
+
+
+@pytest.mark.asyncio
 async def test_cycle_reports_complete_with_terminal_failures(monkeypatch) -> None:
     repo = _WorkflowRepo(finalized=1)
 
@@ -287,7 +327,7 @@ async def test_cycle_reports_complete_with_terminal_failures(monkeypatch) -> Non
             details={
                 "ok": True,
                 "status": "COMPLETE_WITH_FAILURES",
-                "terminal_failures": 2,
+                "terminal_failures": 0,
                 "global_terminal_failures": 2,
             },
         )
