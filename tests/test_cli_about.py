@@ -1,12 +1,10 @@
 from __future__ import annotations
 
 import sys
-from types import SimpleNamespace
 
 import pytest
 
 import dbd.workflow as workflow
-
 from dbd.cli import main as cli_main
 from dbd.core import package_info
 
