@@ -113,6 +113,21 @@ class DeepTerminalEvents:
         self.state: dict[str, Any] = {
             "phase": "STARTING",
             "rows_prepared": 0,
+            # Legacy event keys remain accepted so retained compatibility tools
+            # do not crash; the v0.6 production renderer no longer displays them.
+            "prepare_step": "-",
+            "legacy_scope": "CHECKING",
+            "legacy_action": "-",
+            "batch": 0,
+            "batch_rows": 0,
+            "batches_committed": 0,
+            "master_staged": 0,
+            "rows_per_second": 0.0,
+            "batch_elapsed_seconds": 0.0,
+            "batch_rows_per_second": 0.0,
+            "rows_total": 0,
+            "rows_scanned": 0,
+            "rows_changed": 0,
             "leases_recovered": 0,
             "generation": "-",
             "scope": "-",
