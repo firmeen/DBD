@@ -740,36 +740,44 @@ class DeepCollector:
         error: str | None,
     ) -> dict[str, Any]:
         bit = int(spec.bit)
-        required = int(company["required_mask"])
-        done = int(company["done_mask"])
-        not_available = int(company["not_available_mask"])
-        failed = int(company["failed_mask"])
         published_at = _utcnow()
-        endpoint_meta = _endpoint_meta(
-            company.get("endpoint_meta"),
-            spec.key,
-            status=outcome,
-            http_status=http_status,
-            requested_at=requested_at,
-            error=error,
-        )
-
-        if outcome == "done":
-            done = (done | bit) & ~bit if False else (done | bit)
-            not_available &= ~bit
-            failed &= ~bit
-        elif outcome == "not_available":
-            done &= ~bit
-            not_available |= bit
-            failed &= ~bit
-        elif outcome == "failed":
-            done &= ~bit
-            not_available &= ~bit
-            failed |= bit
-        else:
-            raise ValueError(f"Unsupported endpoint outcome {outcome!r}")
 
         with self.repo.transaction() as conn:
+            current = self.repo.claimed_company_state(
+                conn,
+                company_id=int(company["company_id"]),
+                claim_token=str(company["lease_owner"]),
+                claim_generation=int(company["last_seen_generation"]),
+            )
+            required = int(current["required_mask"])
+            done = int(current["done_mask"])
+            not_available = int(current["not_available_mask"])
+            failed = int(current["failed_mask"])
+            endpoint_meta = _endpoint_meta(
+                current.get("endpoint_meta"),
+                spec.key,
+                status=outcome,
+                http_status=http_status,
+                requested_at=requested_at,
+                error=error,
+            )
+
+            if outcome == "done":
+                done |= bit
+                not_available &= ~bit
+                failed &= ~bit
+            elif outcome == "not_available":
+                done &= ~bit
+                not_available |= bit
+                failed &= ~bit
+            elif outcome == "failed":
+                done &= ~bit
+                not_available &= ~bit
+                failed |= bit
+            else:
+                raise ValueError(f"Unsupported endpoint outcome {outcome!r}")
+
+            latest_fiscal = current.get("latest_fiscal_year")
             if outcome == "done":
                 if spec.key == "profile":
                     assert isinstance(normalized, CompanyProfile)
@@ -778,7 +786,7 @@ class DeepCollector:
                         raw_payload,
                         published_at=published_at,
                     )
-                    old_fiscal = latest_fiscal_year(company.get("latest_fiscal_year"))
+                    old_fiscal = latest_fiscal_year(latest_fiscal)
                     fiscal_present = "submit_fin_year" in normalized.present_fields
                     new_fiscal = (
                         latest_fiscal_year(normalized.submit_fin_year)
@@ -799,7 +807,7 @@ class DeepCollector:
                         values,
                     )
                     if fiscal_present:
-                        company["latest_fiscal_year"] = new_fiscal
+                        latest_fiscal = new_fiscal
 
                 elif spec.key in {"committees", "committee_signs", "nations"}:
                     assert isinstance(normalized, list)
@@ -914,6 +922,7 @@ class DeepCollector:
             "collect_status": status,
             "collection_completed_at": completed_at,
             "endpoint_meta": endpoint_meta,
+            "latest_fiscal_year": latest_fiscal,
         }
 
     async def _commit_outcome(
