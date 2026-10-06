@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -449,10 +450,20 @@ def _column_rows(cur, table_name: str) -> dict[str, tuple[Any, ...]]:
     return {str(row[0]): row for row in cur.fetchall()}
 
 
-def _index_rows(cur, table_name: str) -> dict[str, tuple[bool, tuple[str, ...]]]:
+def _index_rows(
+    cur,
+    table_name: str,
+) -> dict[str, tuple[bool, tuple[str, ...], bool, bool, str | None]]:
     cur.execute(
         """
-        SELECT i.name, i.is_unique, ic.key_ordinal, c.name
+        SELECT
+            i.name,
+            i.is_unique,
+            i.is_disabled,
+            i.has_filter,
+            i.filter_definition,
+            ic.key_ordinal,
+            c.name
         FROM sys.indexes i
         JOIN sys.index_columns ic
           ON ic.object_id=i.object_id AND ic.index_id=i.index_id
@@ -464,13 +475,28 @@ def _index_rows(cur, table_name: str) -> dict[str, tuple[bool, tuple[str, ...]]]
         """,
         (table_name,),
     )
-    grouped: dict[str, list[tuple[int, str, bool]]] = {}
-    for name, unique, ordinal, column in cur.fetchall():
-        grouped.setdefault(str(name), []).append((int(ordinal), str(column), bool(unique)))
+    grouped: dict[
+        str,
+        list[tuple[int, str, bool, bool, bool, str | None]],
+    ] = {}
+    for name, unique, disabled, has_filter, filter_definition, ordinal, column in cur.fetchall():
+        grouped.setdefault(str(name), []).append(
+            (
+                int(ordinal),
+                str(column),
+                bool(unique),
+                bool(disabled),
+                bool(has_filter),
+                None if filter_definition is None else str(filter_definition),
+            )
+        )
     return {
         name: (
             bool(entries[0][2]),
             tuple(entry[1] for entry in sorted(entries)),
+            bool(entries[0][3]),
+            bool(entries[0][4]),
+            entries[0][5],
         )
         for name, entries in grouped.items()
     }
@@ -487,6 +513,48 @@ def _constraint_names(cur, table_name: str) -> set[str]:
         (table_name,),
     )
     return {str(row[0]) for row in cur.fetchall()}
+
+
+def _normalize_check_definition(value: object) -> str:
+    text = re.sub(
+        r"\s+",
+        "",
+        str(value).upper().replace("[", "").replace("]", ""),
+    )
+    text = re.sub(r"\((-?\d+(?:\.\d+)?)\)", r"\1", text)
+    while text.startswith("(") and text.endswith(")"):
+        depth = 0
+        encloses_all = True
+        for index, char in enumerate(text):
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth == 0 and index != len(text) - 1:
+                    encloses_all = False
+                    break
+        if not encloses_all or depth != 0:
+            break
+        text = text[1:-1]
+    return text
+
+
+def _check_constraint_rows(
+    cur,
+    table_name: str,
+) -> dict[str, tuple[str, bool, bool]]:
+    cur.execute(
+        """
+        SELECT name,definition,is_disabled,is_not_trusted
+        FROM sys.check_constraints
+        WHERE parent_object_id=OBJECT_ID(%s)
+        """,
+        (table_name,),
+    )
+    return {
+        str(name): (str(definition), bool(disabled), bool(not_trusted))
+        for name, definition, disabled, not_trusted in cur.fetchall()
+    }
 
 
 def _validate_columns(cur, table_name: str) -> None:
@@ -518,12 +586,30 @@ def _validate_indexes(cur, table_name: str) -> None:
     actual = _index_rows(cur, table_name)
     pk_name, pk_column = PRIMARY_KEYS[table_name]
     pk = actual.get(pk_name)
-    if pk is None or pk[1] != (pk_column,):
-        raise SqlServerSchemaError(f"{table_name} primary key {pk_name} does not match contract")
+    if (
+        pk is None
+        or not pk[0]
+        or pk[1] != (pk_column,)
+        or pk[2]
+        or pk[3]
+        or pk[4] is not None
+    ):
+        raise SqlServerSchemaError(
+            f"{table_name} primary key {pk_name} does not match contract"
+        )
     for name, unique, columns in INDEXES[table_name]:
         found = actual.get(name)
-        if found is None or found != (unique, columns):
-            raise SqlServerSchemaError(f"{table_name} index {name} does not match contract")
+        if (
+            found is None
+            or found[0] != unique
+            or found[1] != columns
+            or found[2]
+            or found[3]
+            or found[4] is not None
+        ):
+            raise SqlServerSchemaError(
+                f"{table_name} index {name} does not match contract"
+            )
 
 
 def _required_constraint_names(table_name: str) -> set[str]:
@@ -543,6 +629,34 @@ def _validate_constraints(cur, table_name: str) -> None:
             f"{table_name} missing required constraint(s): {', '.join(missing)}"
         )
 
+    check_rows = _check_constraint_rows(cur, table_name)
+    expected_checks = {
+        name: f"([{column}] IS NULL OR ISJSON([{column}]) = 1)"
+        for name, column in JSON_CHECKS.get(table_name, ())
+    }
+    expected_checks.update(
+        {
+            name: expression
+            for name, expression in EXTRA_CHECKS.get(table_name, ())
+        }
+    )
+    for name, expected_definition in expected_checks.items():
+        found = check_rows.get(name)
+        if found is None:
+            raise SqlServerSchemaError(
+                f"{table_name} check constraint {name} is missing"
+            )
+        definition, disabled, not_trusted = found
+        if (
+            disabled
+            or not_trusted
+            or _normalize_check_definition(definition)
+            != _normalize_check_definition(expected_definition)
+        ):
+            raise SqlServerSchemaError(
+                f"{table_name} check constraint {name} does not match contract"
+            )
+
     if table_name in FOREIGN_KEYS:
         expected_name, expected_column, expected_target, expected_target_column = (
             FOREIGN_KEYS[table_name]
@@ -556,7 +670,9 @@ def _validate_constraints(cur, table_name: str) -> None:
                 rs.name,
                 rt.name,
                 rc.name,
-                fk.delete_referential_action_desc
+                fk.delete_referential_action_desc,
+                fk.is_disabled,
+                fk.is_not_trusted
             FROM sys.foreign_keys fk
             JOIN sys.foreign_key_columns fkc
               ON fkc.constraint_object_id=fk.object_id
@@ -584,7 +700,12 @@ def _validate_constraints(cur, table_name: str) -> None:
             expected_target_column,
             "NO_ACTION",
         )
-        if row is None or tuple(str(value) for value in row) != expected:
+        if (
+            row is None
+            or tuple(str(value) for value in row[:6]) != expected
+            or bool(row[6])
+            or bool(row[7])
+        ):
             raise SqlServerSchemaError(
                 f"{table_name} foreign key {expected_name} does not match contract"
             )
@@ -609,8 +730,16 @@ def _ensure_indexes(cur, table_name: str) -> None:
     for name, unique, columns in INDEXES[table_name]:
         found = actual.get(name)
         if found is not None:
-            if found != (unique, columns):
-                raise SqlServerSchemaError(f"{table_name} index {name} exists with incompatible definition")
+            if (
+                found[0] != unique
+                or found[1] != columns
+                or found[2]
+                or found[3]
+                or found[4] is not None
+            ):
+                raise SqlServerSchemaError(
+                    f"{table_name} index {name} exists with incompatible definition"
+                )
             continue
         unique_sql = "UNIQUE " if unique else ""
         column_sql = ", ".join(f"[{column}]" for column in columns)
