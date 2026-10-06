@@ -2022,7 +2022,14 @@ class ProductionSqlServerRepository:
         *,
         generation: int,
         batch_size: int,
+        company_id: int | None = None,
     ) -> int:
+        company_filter = ""
+        params: list[Any] = [int(generation), int(generation)]
+        if company_id is not None:
+            company_filter = " AND company_id=%s"
+            params.append(int(company_id))
+        params.append(int(generation))
         cur = conn.cursor()
         try:
             cur.execute(
@@ -2032,12 +2039,13 @@ class ProductionSqlServerRepository:
                     FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
                     WHERE last_seen_generation=%s
                       AND dataset_generation < %s
+                      {company_filter}
                     ORDER BY company_id
                 )
                 UPDATE target
                 SET dataset_generation=%s
                 """,
-                (int(generation), int(generation), int(generation)),
+                tuple(params),
             )
             return int(cur.rowcount or 0)
         finally:
