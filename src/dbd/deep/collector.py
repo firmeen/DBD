@@ -41,7 +41,6 @@ from ..storage.sqlserver.repository import (
     SqlServerLeaseLost,
 )
 from .catalog import (
-    ENDPOINT_BITS,
     FINANCIAL_ENDPOINTS,
     FINANCIAL_MASK,
     EndpointSpec,
