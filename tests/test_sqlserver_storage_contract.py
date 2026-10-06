@@ -143,16 +143,16 @@ def test_company_state_update_rejects_business_columns() -> None:
 
 
 def test_company_identity_cleaning_is_shared_by_lookup_boundary() -> None:
-    assert _production_identity("0105\x005", "registration_no") == "010505"
+    assert _production_identity("0105\x005", "registration_no") == "01055"
 
-    cursor = _CaptureCursor(rows=[("5", "010505", 77)])
+    cursor = _CaptureCursor(rows=[("5", "01055", 77)])
     result = ProductionSqlServerRepository().company_ids(
         _CaptureConnection(cursor),
         [("5", "0105\x005")],
     )
 
-    assert cursor.params == ("5", "010505")
-    assert result == {("5", "010505"): 77}
+    assert cursor.params == ("5", "01055")
+    assert result == {("5", "01055"): 77}
 
 
 def test_check_database_requires_dml_on_all_managed_tables(monkeypatch) -> None:
