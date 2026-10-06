@@ -44,6 +44,10 @@ ENDPOINT_BITS = {
     "capital_history": 1 << 10,
 }
 
+# Compatibility surface for the legacy MySQL Deep repository. Keep this
+# limited to the original seven active payload columns so old readiness/schema
+# validation does not start requiring extended columns merely because v0.6
+# production can collect them directly into SQL Server.
 DESTINATION_COLUMNS = {
     "profile": "profile_data",
     "committees": "committees_data",
@@ -52,10 +56,6 @@ DESTINATION_COLUMNS = {
     "financial_submissions": "financial_submissions_data",
     "financial_statements": "financial_statements_data",
     "industry_benchmark": "industry_benchmark_data",
-    "nations": "nations_data",
-    "nation_history": "nation_history_data",
-    "name_history": "name_history_data",
-    "capital_history": "capital_history_data",
 }
 
 FINANCIAL_ENDPOINTS = frozenset(
@@ -174,7 +174,7 @@ def static_endpoint_specs(phase: str) -> tuple[EndpointSpec, ...]:
                 method="GET",
                 path_template=path,
                 referer_template=None,
-                destination_column=DESTINATION_COLUMNS[key],
+                destination_column=DESTINATION_COLUMNS.get(key, f"{key}_data"),
                 request_schema={
                     "path": {"jp_type_code": "string", "jp_no": "string"},
                     **(
