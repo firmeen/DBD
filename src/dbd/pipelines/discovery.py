@@ -629,8 +629,17 @@ async def _run_work(
 
 
 def _canonical_company_payload(value: object) -> str:
+    def clean(item: object):
+        if isinstance(item, str):
+            return item.replace("\x00", "")
+        if isinstance(item, list):
+            return [clean(child) for child in item]
+        if isinstance(item, dict):
+            return {str(key): clean(child) for key, child in item.items()}
+        return item
+
     return json.dumps(
-        value,
+        clean(value),
         ensure_ascii=False,
         sort_keys=True,
         separators=(",", ":"),
