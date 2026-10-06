@@ -11,6 +11,8 @@ import dbd.cutover as cutover
 from dbd.core.exceptions import ContractError
 from dbd.cutover import (
     CutoverSafetyError,
+    _assert_source_snapshot,
+    _source_stability_state,
     source_batches,
     source_fence,
     source_preflight,
@@ -212,7 +214,13 @@ def test_cutover_refuses_generation_two_before_touching_mysql(monkeypatch) -> No
 def test_cutover_mysql_source_functions_contain_no_data_mutation_sql() -> None:
     source = "\n".join(
         inspect.getsource(function)
-        for function in (source_fence, source_preflight, source_batches)
+        for function in (
+            source_fence,
+            source_preflight,
+            _source_stability_state,
+            _assert_source_snapshot,
+            source_batches,
+        )
     ).upper()
     for forbidden in ("UPDATE ", "DELETE ", "TRUNCATE ", "DROP ", "INSERT "):
         assert forbidden not in source
@@ -263,3 +271,98 @@ def test_industry_optional_scope_blanks_clean_to_null() -> None:
     assert industry["business_size_code"] is None
     assert industry["location_type"] is None
     assert industry["location_no"] is None
+
+
+
+def test_source_preflight_refuses_non_production_mysql_database(monkeypatch) -> None:
+    monkeypatch.setattr(cutover, "_source_database", lambda _conn: "dbd_test_local")
+
+    with pytest.raises(CutoverSafetyError, match="requires MySQL database 'dbd'"):
+        source_preflight(object())
+
+
+def test_source_preflight_rejects_live_distributed_discovery_lease(monkeypatch) -> None:
+    monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
+
+    def source_columns(_conn, table_name: str) -> set[str]:
+        if table_name == cutover.SOURCE_TABLE:
+            return set(cutover.SOURCE_COLUMNS)
+        if table_name == cutover.SOURCE_MASTER_TABLE:
+            return {"jp_type_code", "jp_no"}
+        if table_name == cutover.SOURCE_RUNTIME_TABLE:
+            return {"status"}
+        if table_name == cutover.SOURCE_DISCOVERY_TABLE:
+            return {"lease_owner", "lease_version", "lease_expires_at"}
+        raise AssertionError(table_name)
+
+    def count(_conn, sql: str, _params=()) -> int:
+        if "FROM discovery_buckets" in sql:
+            return 1
+        if "FROM dbd_company_master" in sql:
+            return 0
+        if "FROM dbd_deep_runtime" in sql:
+            return 0
+        if "deep_status IN" in sql:
+            return 0
+        if "FROM dbd_company_deep" in sql:
+            return 10
+        raise AssertionError(sql)
+
+    monkeypatch.setattr(cutover, "_source_columns", source_columns)
+    monkeypatch.setattr(cutover, "_count", count)
+    monkeypatch.setattr(
+        cutover,
+        "_source_stability_state",
+        lambda _conn: {
+            "master_waiting": 0,
+            "runtime_running": 0,
+            "discovery_active_leases": 1,
+            "deep_active": 0,
+            "source_updated_at": datetime(2026, 10, 5, 8, 0, 0),
+        },
+    )
+
+    with pytest.raises(CutoverSafetyError, match="discovery_active_leases=1"):
+        source_preflight(object())
+
+
+def test_source_snapshot_detects_watermark_change(monkeypatch) -> None:
+    baseline = {"source_updated_at": datetime(2026, 10, 5, 8, 0, 0)}
+    monkeypatch.setattr(cutover, "_assert_source_fence", lambda _conn: None)
+    monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
+    monkeypatch.setattr(
+        cutover,
+        "_source_stability_state",
+        lambda _conn: {
+            "master_waiting": 0,
+            "runtime_running": 0,
+            "discovery_active_leases": 0,
+            "deep_active": 0,
+            "source_updated_at": datetime(2026, 10, 5, 8, 0, 1),
+        },
+    )
+
+    with pytest.raises(CutoverSafetyError, match="watermark changed"):
+        _assert_source_snapshot(object(), baseline)
+
+
+def test_cutover_rechecks_source_around_every_target_transaction() -> None:
+    source = inspect.getsource(cutover.run_generation1_cutover)
+    transaction = source.index("with repository.transaction() as target_conn:")
+    before_transaction = source.rfind(
+        "_assert_source_snapshot(fence_conn, preflight)",
+        0,
+        transaction,
+    )
+    inside_transaction = source.index(
+        "_assert_source_snapshot(fence_conn, preflight)",
+        transaction,
+    )
+    after_transaction = source.index(
+        "_assert_source_snapshot(fence_conn, preflight)",
+        inside_transaction + 1,
+    )
+
+    assert before_transaction >= 0
+    assert transaction < inside_transaction < after_transaction
+    assert source.count("_assert_source_snapshot(fence_conn, preflight)") >= 5
