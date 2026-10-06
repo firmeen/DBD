@@ -462,6 +462,32 @@ def _production_value(value: Any) -> Any:
     return value
 
 
+def _production_identity(value: Any, field: str) -> str:
+    cleaned = _production_value(value)
+    if cleaned is None:
+        raise SqlServerWriteError(f"dbo.DBD_COMPANY missing natural-key value: {field}")
+    return str(cleaned)
+
+
+_COMPANY_STATE_COLUMNS = (
+    "required_mask",
+    "done_mask",
+    "not_available_mask",
+    "failed_mask",
+    "collect_status",
+    "last_endpoint",
+    "last_http_status",
+    "last_error",
+    "last_error_at",
+    "last_request_at",
+    "collection_started_at",
+    "collection_completed_at",
+    "lease_owner",
+    "lease_expires_at",
+    "retry_at",
+)
+
+
 def _table_write_columns(table_name: str) -> tuple[str, ...]:
     return tuple(
         column.name
@@ -565,41 +591,63 @@ class ProductionSqlServerRepository:
 
     def check_database(self) -> dict[str, object]:
         info = check_connection()
+        actions = ("SELECT", "INSERT", "UPDATE")
+        permission_keys = [
+            (table_name, action)
+            for table_name in MANAGED_TABLES
+            for action in actions
+        ]
+        permission_sql = ",\n                        ".join(
+            f"HAS_PERMS_BY_NAME('{table_name}', 'OBJECT', '{action}')"
+            for table_name, action in permission_keys
+        )
         with connection() as conn:
             schema = validate_production_schema(conn)
             cur = conn.cursor()
             try:
                 cur.execute(
-                    """
+                    f"""
                     SELECT
                         HAS_PERMS_BY_NAME(DB_NAME(), 'DATABASE', 'CREATE TABLE'),
                         HAS_PERMS_BY_NAME('dbo', 'SCHEMA', 'ALTER'),
-                        HAS_PERMS_BY_NAME('dbo.DBD_COMPANY', 'OBJECT', 'SELECT'),
-                        HAS_PERMS_BY_NAME('dbo.DBD_COMPANY', 'OBJECT', 'INSERT'),
-                        HAS_PERMS_BY_NAME('dbo.DBD_COMPANY', 'OBJECT', 'UPDATE')
+                        {permission_sql}
                     """
                 )
-                create_table, alter_schema, can_select, can_insert, can_update = cur.fetchone()
+                row = cur.fetchone()
             finally:
                 cur.close()
-        required_dml = {
-            "SELECT": bool(can_select),
-            "INSERT": bool(can_insert),
-            "UPDATE": bool(can_update),
+
+        create_table = bool(row[0])
+        alter_schema = bool(row[1])
+        table_permissions = {
+            key: bool(value)
+            for key, value in zip(permission_keys, row[2:], strict=True)
         }
-        missing_dml = [name for name, allowed in required_dml.items() if not allowed]
+        missing_dml = [
+            f"{table_name} {action}"
+            for (table_name, action), allowed in table_permissions.items()
+            if not allowed
+        ]
         if missing_dml:
             raise SqlServerSchemaError(
                 "SQL Server production login is missing required DML permission(s): "
                 + ", ".join(missing_dml)
             )
+
+        required_dml = {
+            action: all(
+                table_permissions[(table_name, action)]
+                for table_name in MANAGED_TABLES
+            )
+            for action in actions
+        }
         return {
             **info,
             "schema": schema["status"],
             "managed_tables": int(schema["managed_tables"]),
             "expected_tables": len(MANAGED_TABLES),
-            "create_table": bool(create_table),
-            "alter_schema": bool(alter_schema),
+            "create_table": create_table,
+            "alter_schema": alter_schema,
             "select": required_dml["SELECT"],
             "insert": required_dml["INSERT"],
             "update": required_dml["UPDATE"],
@@ -628,20 +676,29 @@ class ProductionSqlServerRepository:
             rows=rows,
             key_columns=("juristic_type_code", "registration_no"),
         )
-        return self.company_ids(
-            conn,
-            [
-                (str(row["juristic_type_code"]), str(row["registration_no"]))
-                for row in rows
-            ],
-        )
+        identities = [
+            (
+                _production_identity(row.get("juristic_type_code"), "juristic_type_code"),
+                _production_identity(row.get("registration_no"), "registration_no"),
+            )
+            for row in rows
+        ]
+        return self.company_ids(conn, identities)
 
     def company_ids(
         self,
         conn,
         identities: Iterable[tuple[str, str]],
     ) -> dict[tuple[str, str], int]:
-        unique = list(dict.fromkeys((str(t), str(n)) for t, n in identities))
+        unique = list(
+            dict.fromkeys(
+                (
+                    _production_identity(jp_type, "juristic_type_code"),
+                    _production_identity(jp_no, "registration_no"),
+                )
+                for jp_type, jp_no in identities
+            )
+        )
         result: dict[tuple[str, str], int] = {}
         chunk_size = 500
         for offset in range(0, len(unique), chunk_size):
@@ -675,6 +732,39 @@ class ProductionSqlServerRepository:
                 + ", ".join(f"{jp_type}/{jp_no}" for jp_type, jp_no in missing[:10])
             )
         return result
+
+    def update_company_state(
+        self,
+        conn,
+        company_id: int,
+        values: dict[str, Any],
+    ) -> None:
+        unknown = sorted(set(values) - set(_COMPANY_STATE_COLUMNS))
+        if unknown:
+            raise SqlServerWriteError(
+                "Unsupported DBD_COMPANY state field(s): " + ", ".join(unknown)
+            )
+        columns = tuple(
+            column for column in _COMPANY_STATE_COLUMNS if column in values
+        )
+        if not columns:
+            return
+
+        assignments = ", ".join(f"[{column}]=%s" for column in columns)
+        params = tuple(_production_value(values[column]) for column in columns)
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"UPDATE dbo.DBD_COMPANY WITH (UPDLOCK) "
+                f"SET {assignments} WHERE company_id=%s",
+                params + (int(company_id),),
+            )
+            if int(cur.rowcount or 0) != 1:
+                raise SqlServerWriteError(
+                    f"Unable to update DBD_COMPANY state for company_id={company_id}"
+                )
+        finally:
+            cur.close()
 
     def upsert_relations(self, conn, rows: list[dict[str, Any]]) -> int:
         return _upsert_many(
