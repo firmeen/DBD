@@ -180,6 +180,29 @@ def _raw_by_key(payload: object, key: str) -> dict[str, dict[str, Any]]:
     return result
 
 
+_NESTED_PROFILE_FIELDS = {
+    "jp_stat_desc": ("jpStatus", "jpStatDesc"),
+    "jp_type_desc": ("jpType", "jpTypeDesc"),
+    "pv_desc": ("locationProvince", "pvDesc"),
+    "business_type_desc": ("businessType", "businessTypeDesc"),
+    "setup_obj_desc": ("setupObjType", "objDesc"),
+    "setup_obj_grp_code": ("setupObjType", "objGrpCode"),
+    "setup_obj_grp_desc": ("setupObjType", "objGrpDesc"),
+    "submit_obj_desc": ("submitObjType", "objDesc"),
+    "ampur_desc": ("locationAmpur", "ampurDesc"),
+    "tumbon_desc": ("locationTumbon", "tumbonDesc"),
+}
+
+
+def _profile_field_present(profile: CompanyProfile, field: str) -> bool:
+    nested = _NESTED_PROFILE_FIELDS.get(field)
+    if nested is None:
+        return field in profile.present_fields
+    container, key = nested
+    source = profile.facts.get(container)
+    return isinstance(source, dict) and key in source
+
+
 def _profile_values(
     profile: CompanyProfile,
     raw_payload: object,
@@ -234,7 +257,7 @@ def _profile_values(
     values = {
         sql_name: getattr(profile, field)
         for field, sql_name in mapping.items()
-        if field in profile.present_fields
+        if _profile_field_present(profile, field)
     }
     if "submit_fin_year" in profile.present_fields:
         values["latest_fiscal_year"] = latest_fiscal_year(profile.submit_fin_year)
@@ -734,6 +757,7 @@ class DeepCollector:
         http_status: int | None,
         requested_at: datetime | None,
         error: str | None,
+        fail_unresolved: bool = False,
     ) -> dict[str, Any]:
         bit = int(spec.bit)
         published_at = _utcnow()
@@ -772,6 +796,9 @@ class DeepCollector:
                 failed |= bit
             else:
                 raise ValueError(f"Unsupported endpoint outcome {outcome!r}")
+
+            if fail_unresolved:
+                failed |= required & ~(done | not_available | failed)
 
             latest_fiscal = current.get("latest_fiscal_year")
             if outcome == "done":
@@ -932,6 +959,7 @@ class DeepCollector:
         http_status: int | None,
         requested_at: datetime | None,
         error: str | None = None,
+        fail_unresolved: bool = False,
     ) -> None:
         state = await asyncio.to_thread(
             self._commit_outcome_sync,
@@ -943,6 +971,7 @@ class DeepCollector:
             http_status=http_status,
             requested_at=requested_at,
             error=error,
+            fail_unresolved=fail_unresolved,
         )
         company.update(state)
         if outcome == "done":
@@ -1100,6 +1129,7 @@ class DeepCollector:
                     )
                     continue
 
+                fail_unresolved = False
                 try:
                     normalized = _normalize_resource(spec.key, response.data)
                     if spec.key == "profile":
@@ -1113,6 +1143,7 @@ class DeepCollector:
                 except IdentityConflict as exc:
                     outcome = "failed"
                     normalized = None
+                    fail_unresolved = True
                     error = f"profile: IdentityConflict: {exc}"
                 except (ContractError, TypeError, ValueError) as exc:
                     outcome = "failed"
@@ -1134,7 +1165,10 @@ class DeepCollector:
                     http_status=response.status,
                     requested_at=response.requested_at,
                     error=error,
+                    fail_unresolved=fail_unresolved,
                 )
+                if fail_unresolved:
+                    break
 
             await asyncio.to_thread(self._release_sync, company)
             await self._bump(companies_finished=1)

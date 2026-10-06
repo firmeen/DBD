@@ -20,6 +20,7 @@ from ..contracts.company import normalize
 from ..core.exceptions import ContractError
 from ..core.progress import ProgressLine
 from ..core.settings import settings
+from ..deep.catalog import FINANCIAL_MASK
 from ..deep.http import FixedRateDbdClient
 from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
@@ -648,6 +649,29 @@ def _canonical_company_payload(value: object) -> str:
     )
 
 
+_NESTED_PROFILE_FIELDS = {
+    "jp_stat_desc": ("jpStatus", "jpStatDesc"),
+    "jp_type_desc": ("jpType", "jpTypeDesc"),
+    "pv_desc": ("locationProvince", "pvDesc"),
+    "business_type_desc": ("businessType", "businessTypeDesc"),
+    "setup_obj_desc": ("setupObjType", "objDesc"),
+    "setup_obj_grp_code": ("setupObjType", "objGrpCode"),
+    "setup_obj_grp_desc": ("setupObjType", "objGrpDesc"),
+    "submit_obj_desc": ("submitObjType", "objDesc"),
+    "ampur_desc": ("locationAmpur", "ampurDesc"),
+    "tumbon_desc": ("locationTumbon", "tumbonDesc"),
+}
+
+
+def _profile_field_present(profile, field: str) -> bool:
+    nested = _NESTED_PROFILE_FIELDS.get(field)
+    if nested is None:
+        return field in profile.present_fields
+    container, key = nested
+    source = profile.facts.get(container)
+    return isinstance(source, dict) and key in source
+
+
 def _discovery_company_row(profile, raw: dict, *, published_at: datetime) -> dict:
     mapping = {
         "jp_name": "company_name_th",
@@ -693,7 +717,7 @@ def _discovery_company_row(profile, raw: dict, *, published_at: datetime) -> dic
         "published_at": published_at,
     }
     for field, column in mapping.items():
-        if field in profile.present_fields:
+        if _profile_field_present(profile, field):
             result[column] = getattr(profile, field)
     if "submit_fin_year" in profile.present_fields:
         from ..deep.catalog import latest_fiscal_year
@@ -738,6 +762,7 @@ def _persist_direct_batch(
             conn,
             rows,
             generation=generation,
+            financial_mask=FINANCIAL_MASK,
             refresh_mask=refresh_mask,
         )
 

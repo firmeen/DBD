@@ -124,7 +124,7 @@ def _cycle_generation(
     finalized = state["finalized_generation"]
     if finalized is not None:
         summary = repository.status_summary(
-            phase_mask=phase_mask(phase),
+            phase_mask=None,
             generation=int(finalized),
         )
         if int(summary["unresolved"] or 0):
@@ -197,6 +197,10 @@ async def prepare(
     repository: ProductionSqlServerRepository | None = None,
     event: EventCallback | None = None,
 ) -> PrepareResult:
+    if seeds or search_type or max_buckets is not None:
+        raise ValueError(
+            "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
+        )
     repo = _repo(repository)
     with repo.manager_lock() as lock_conn:
         selected = int(generation or _manual_generation(repo, phase=phase))
@@ -368,11 +372,11 @@ async def discover(
             resumed=resumed,
         )
         work = discovery.run(
-            list(seeds or []),
-            search_type=search_type,
+            [],
+            search_type="",
             concurrency=concurrency,
             rate=rate,
-            max_buckets=max_buckets,
+            max_buckets=None,
             verbose=verbose,
             distributed=False,
             generation=generation,
@@ -469,8 +473,8 @@ def _ensure_fetch_company(
                 }
             ],
             generation=generation,
+            financial_mask=FINANCIAL_MASK,
             refresh_mask=0,
-            finalize_new=finalize_new,
         )
         return repository.company_ids(
             conn,

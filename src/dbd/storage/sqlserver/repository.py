@@ -1158,6 +1158,19 @@ class ProductionSqlServerRepository:
                 """
             )
             finalized_max, seen_max = (int(value or 0) for value in cur.fetchone())
+            cur.execute(
+                """
+                SELECT COUNT(*)
+                FROM dbo.DBD_COMPANY
+                WHERE dataset_generation > last_seen_generation
+                   OR first_seen_generation > last_seen_generation
+                """
+            )
+            generation_errors = int(cur.fetchone()[0] or 0)
+            if generation_errors:
+                raise SqlServerWriteError(
+                    f"DBD_COMPANY contains {generation_errors} impossible generation row(s)"
+                )
             candidate = max(finalized_max, seen_max)
             unfinished = 0
             if candidate > 0:
@@ -1194,10 +1207,10 @@ class ProductionSqlServerRepository:
         rows: list[dict[str, Any]],
         *,
         generation: int,
+        financial_mask: int,
         refresh_mask: int = 0,
-        finalize_new: bool = False,
     ) -> dict[str, int]:
-        """Upsert observations without overwriting collector-owned state."""
+        """Persist Search observations without regressing collected Profile truth."""
         if generation < 1:
             raise SqlServerWriteError("v0.6 generation must be positive")
         inserted = updated = refresh_reopened = 0
@@ -1223,7 +1236,8 @@ class ProductionSqlServerRepository:
                     )
                 cur.execute(
                     """
-                    SELECT company_id,last_seen_generation
+                    SELECT
+                      company_id,last_seen_generation,profile_payload,latest_fiscal_year
                     FROM dbo.DBD_COMPANY WITH (UPDLOCK,HOLDLOCK)
                     WHERE juristic_type_code=%s AND registration_no=%s
                     """,
@@ -1258,7 +1272,7 @@ class ProductionSqlServerRepository:
                         0,
                         0,
                         "DISCOVERED",
-                        generation if finalize_new else max(1, generation - 1),
+                        max(1, generation - 1),
                         generation,
                         generation,
                     ]
@@ -1273,7 +1287,7 @@ class ProductionSqlServerRepository:
                     inserted += 1
                     continue
 
-                _company_id, old_generation = existing
+                _company_id, old_generation, profile_payload, old_fiscal = existing
                 old_generation = int(old_generation or 0)
                 if old_generation > generation:
                     raise SqlServerWriteError(
@@ -1281,9 +1295,30 @@ class ProductionSqlServerRepository:
                         f"row={old_generation}, incoming={generation}"
                     )
                 first_observation = old_generation < generation
+
+                fiscal_present = "latest_fiscal_year" in values
+                incoming_fiscal = values.get("latest_fiscal_year")
+                fiscal_changed = fiscal_present and incoming_fiscal != old_fiscal
+
+                if profile_payload is not None:
+                    # Search remains durable raw/master truth, but collected
+                    # Profile-owned typed columns remain authoritative.
+                    allowed = {"master_payload", "published_at", "latest_fiscal_year"}
+                    values = {key: value for key, value in values.items() if key in allowed}
+
                 assignments = [f"[{column}]=%s" for column in values]
                 params = list(values.values())
-                if first_observation and refresh_mask:
+
+                reopen_mask = int(refresh_mask) if first_observation else 0
+                if fiscal_changed:
+                    reopen_mask |= int(financial_mask)
+                    if incoming_fiscal is None:
+                        assignments.append("required_mask=(required_mask & ~%s)")
+                    else:
+                        assignments.append("required_mask=(required_mask | %s)")
+                    params.append(int(financial_mask))
+
+                if reopen_mask:
                     assignments.extend(
                         [
                             "done_mask=(done_mask & ~%s)",
@@ -1293,14 +1328,19 @@ class ProductionSqlServerRepository:
                             "collection_completed_at=NULL",
                         ]
                     )
-                    params.extend(
-                        [int(refresh_mask), int(refresh_mask), int(refresh_mask)]
-                    )
-                    refresh_reopened += 1
+                    params.extend([reopen_mask, reopen_mask, reopen_mask])
+                    if first_observation and refresh_mask:
+                        refresh_reopened += 1
+
                 assignments.append("last_seen_generation=%s")
                 params.append(int(generation))
-                if first_observation and refresh_mask:
-                    assignments.append("collect_status=N'PENDING'")
+                if reopen_mask:
+                    assignments.append(
+                        "collect_status=CASE "
+                        "WHEN lease_owner IS NOT NULL "
+                        " AND lease_expires_at > SYSUTCDATETIME() "
+                        "THEN N'COLLECTING' ELSE N'PENDING' END"
+                    )
                 cur.execute(
                     "UPDATE dbo.DBD_COMPANY SET "
                     + ",".join(assignments)
@@ -1335,13 +1375,19 @@ class ProductionSqlServerRepository:
         if company_id is not None:
             predicate += " AND company_id=%s"
             params.append(int(company_id))
+        core_required = (
+            f"({int(base_mask)} | "
+            f"CASE WHEN latest_fiscal_year IS NULL THEN 0 ELSE {int(financial_mask)} END)"
+        )
         if phase == "core":
             required = (
-                f"(required_mask | {int(base_mask)} | "
-                f"CASE WHEN latest_fiscal_year IS NULL THEN 0 ELSE {int(financial_mask)} END)"
+                f"((required_mask & ~{int(core_mask)}) | {core_required})"
             )
         else:
-            required = f"(required_mask | {int(extended_mask)})"
+            required = (
+                f"((CASE WHEN required_mask=0 THEN {core_required} "
+                f"ELSE required_mask END) | {int(extended_mask)})"
+            )
         cur = conn.cursor()
         try:
             cur.execute(
@@ -1938,6 +1984,10 @@ class ProductionSqlServerRepository:
                           ((required_mask & %s)
                            & ~(done_mask | not_available_mask | failed_mask)) <> 0
                           THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN
+                          (required_mask
+                           & ~(done_mask | not_available_mask | failed_mask)) <> 0
+                          THEN 1 ELSE 0 END),
                       SUM(CASE WHEN retry_at > SYSUTCDATETIME()
                           AND ((required_mask & %s)
                            & ~(done_mask | not_available_mask | failed_mask)) <> 0
@@ -1950,8 +2000,7 @@ class ProductionSqlServerRepository:
                           THEN 1 ELSE 0 END),
                       SUM(CASE WHEN (failed_mask & %s) <> 0
                           THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN dataset_generation > last_seen_generation
-                                OR first_seen_generation > last_seen_generation
+                      SUM(CASE WHEN (failed_mask & required_mask) <> 0
                           THEN 1 ELSE 0 END),
                       SUM(CASE WHEN last_seen_generation=%s
                                 AND dataset_generation < %s
@@ -1969,6 +2018,15 @@ class ProductionSqlServerRepository:
                     ),
                 )
                 row = [int(value or 0) for value in cur.fetchone()]
+                cur.execute(
+                    """
+                    SELECT COUNT(*)
+                    FROM dbo.DBD_COMPANY
+                    WHERE dataset_generation > last_seen_generation
+                       OR first_seen_generation > last_seen_generation
+                    """
+                )
+                generation_errors = int(cur.fetchone()[0] or 0)
                 orphan_counts = {}
                 for table in (
                     "dbo.DBD_COMPANY_RELATION",
@@ -1990,17 +2048,19 @@ class ProductionSqlServerRepository:
         (
             mask_overlap,
             unresolved,
+            global_unresolved,
             retry_wait,
             active_leases,
             expired_leases,
             terminal_failures,
-            generation_errors,
+            global_terminal_failures,
             unfinished_rows,
         ) = row
         ok = not any(
             (
                 mask_overlap,
                 unresolved,
+                global_unresolved,
                 retry_wait,
                 active_leases,
                 expired_leases,
@@ -2013,17 +2073,19 @@ class ProductionSqlServerRepository:
             "phase_mask": int(phase_mask),
             "mask_overlap": mask_overlap,
             "unresolved": unresolved,
+            "global_unresolved": global_unresolved,
             "retry_wait": retry_wait,
             "active_leases": active_leases,
             "expired_leases": expired_leases,
             "terminal_failures": terminal_failures,
+            "global_terminal_failures": global_terminal_failures,
             "generation_errors": generation_errors,
             "unfinished_rows": unfinished_rows,
             "orphans": orphan_counts,
             "ok": ok,
             "status": (
                 "COMPLETE_WITH_FAILURES"
-                if ok and terminal_failures
+                if ok and global_terminal_failures
                 else "COMPLETE"
                 if ok
                 else "FAILED"
