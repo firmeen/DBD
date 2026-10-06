@@ -25,6 +25,8 @@ from dbd.deep.catalog import (
     static_endpoint_specs,
 )
 from dbd.deep.collector import DeepCollector, _json_payload, _profile_values
+from dbd.deep.http import DeepNotAvailable, DeepPermanentHttpError, DeepTransientHttpError
+from dbd.storage.sqlserver.repository import SqlServerLeaseLost
 
 
 class _DirectClaimRepo:
@@ -324,3 +326,196 @@ async def test_cancelled_company_best_effort_releases_owned_claim() -> None:
         await task
 
     collector._release_sync.assert_called_once()
+
+
+class _OutcomeRepo:
+    def __init__(self, state: dict) -> None:
+        self.state = dict(state)
+        self.released = 0
+        self.renewed = 0
+        self.relations = []
+
+    @contextmanager
+    def transaction(self):
+        yield object()
+
+    def claimed_company_state(self, _conn, **_kwargs):
+        return dict(self.state)
+
+    def update_company_state_owned(self, _conn, **kwargs):
+        self.state.update(kwargs["values"])
+
+    def update_company_profile(self, _conn, _company_id, _values):
+        return None
+
+    def reconcile_relations(self, _conn, **kwargs):
+        self.relations.append(kwargs)
+        return len(kwargs["rows"])
+
+    def upsert_events(self, _conn, _rows):
+        return 0
+
+    def merge_financial_submissions(self, _conn, **_kwargs):
+        return 0
+
+    def merge_financial_statements(self, _conn, **_kwargs):
+        return 0
+
+    def upsert_industries(self, _conn, _rows):
+        return 0
+
+    def release_company_lease(self, _conn, **_kwargs):
+        self.released += 1
+        self.state["lease_owner"] = None
+        self.state["lease_expires_at"] = None
+
+    def renew_company_lease(self, _conn, **_kwargs):
+        self.renewed += 1
+
+
+def _outcome_company(required_mask: int) -> dict:
+    company = _company("0107556000001")
+    company["required_mask"] = required_mask
+    company["done_mask"] = 0
+    company["not_available_mask"] = 0
+    company["failed_mask"] = 0
+    return company
+
+
+@pytest.mark.asyncio
+async def test_not_available_is_terminal_without_erasing_other_business_state() -> None:
+    bit = ENDPOINT_BITS["profile"]
+    company = _outcome_company(bit)
+    repo = _OutcomeRepo(company)
+    collector = _collector(repo)
+    collector._specs = tuple(
+        spec for spec in static_endpoint_specs("core") if spec.key == "profile"
+    )
+
+    class Client:
+        async def fetch(self, *_args, **_kwargs):
+            raise DeepNotAvailable(404)
+
+    await collector._process_company(company, Client())
+
+    assert repo.state["not_available_mask"] == bit
+    assert repo.state["failed_mask"] == 0
+    assert repo.state["collect_status"] == "COMPLETE"
+    assert repo.released == 1
+
+
+@pytest.mark.asyncio
+async def test_transient_http_exhaustion_enters_retry_wait_without_failed_bit() -> None:
+    bit = ENDPOINT_BITS["profile"]
+    company = _outcome_company(bit)
+    repo = _OutcomeRepo(company)
+    collector = _collector(repo)
+    collector._specs = tuple(
+        spec for spec in static_endpoint_specs("core") if spec.key == "profile"
+    )
+
+    class Client:
+        async def fetch(self, *_args, **_kwargs):
+            raise DeepTransientHttpError("HTTP 503", status=503)
+
+    await collector._process_company(company, Client())
+
+    assert repo.state["collect_status"] == "RETRY_WAIT"
+    assert repo.state["failed_mask"] == 0
+    assert repo.state["lease_owner"] is None
+    assert repo.state["lease_expires_at"] is None
+
+
+@pytest.mark.asyncio
+async def test_terminal_endpoint_failure_isolated_from_independent_endpoint() -> None:
+    profile_bit = ENDPOINT_BITS["profile"]
+    committee_bit = ENDPOINT_BITS["committees"]
+    company = _outcome_company(profile_bit | committee_bit)
+    repo = _OutcomeRepo(company)
+    collector = _collector(repo)
+    collector._specs = tuple(
+        spec
+        for spec in static_endpoint_specs("core")
+        if spec.key in {"profile", "committees"}
+    )
+    calls = 0
+
+    class Client:
+        async def fetch(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise DeepPermanentHttpError(400)
+            return SimpleNamespace(data=[], status=200, requested_at=None)
+
+    await collector._process_company(company, Client())
+
+    assert calls == 2
+    assert repo.state["failed_mask"] & profile_bit
+    assert repo.state["done_mask"] & committee_bit
+    assert repo.state["collect_status"] == "PARTIAL"
+    assert repo.released == 1
+
+
+def test_stale_generation_fence_prevents_domain_write() -> None:
+    bit = ENDPOINT_BITS["committees"]
+    company = _outcome_company(bit)
+
+    class StaleRepo(_OutcomeRepo):
+        def claimed_company_state(self, _conn, **_kwargs):
+            raise SqlServerLeaseLost("stale generation")
+
+    repo = StaleRepo(company)
+    collector = _collector(repo)
+    spec = next(
+        item for item in static_endpoint_specs("core") if item.key == "committees"
+    )
+
+    with pytest.raises(SqlServerLeaseLost, match="stale generation"):
+        collector._commit_outcome_sync(
+            company,
+            spec,
+            outcome="done",
+            raw_payload=[],
+            normalized=[],
+            http_status=200,
+            requested_at=None,
+            error=None,
+        )
+
+    assert repo.relations == []
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_renews_and_stops_on_lost_fence(monkeypatch) -> None:
+    company = _outcome_company(ENDPOINT_BITS["profile"])
+    repo = _OutcomeRepo(company)
+    collector = _collector(repo)
+    stop = asyncio.Event()
+    lost = asyncio.Event()
+    waits = 0
+
+    async def immediate_timeout(awaitable, *, timeout):
+        nonlocal waits
+        del timeout
+        waits += 1
+        awaitable.close()
+        if waits == 1:
+            raise TimeoutError
+        stop.set()
+        return True
+
+    renewals = 0
+
+    def renew(_company):
+        nonlocal renewals
+        renewals += 1
+        raise SqlServerLeaseLost("superseded")
+
+    monkeypatch.setattr(asyncio, "wait_for", immediate_timeout)
+    collector._renew_sync = renew
+
+    await collector._lease_heartbeat(company, stop, lost)
+
+    assert renewals == 1
+    assert lost.is_set()
