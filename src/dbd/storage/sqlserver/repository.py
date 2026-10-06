@@ -1123,15 +1123,21 @@ class ProductionSqlServerRepository:
         conn,
         resource: str = "TIPDI:DBD:v0.6:cycle",
     ) -> None:
-        cur = conn.cursor()
         try:
-            cur.execute(
-                "SELECT APPLOCK_MODE(N'public', %s, N'Session')",
-                (resource,),
-            )
-            mode = cur.fetchone()[0]
-        finally:
-            cur.close()
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT APPLOCK_MODE(N'public', %s, N'Session')",
+                    (resource,),
+                )
+                row = cur.fetchone()
+                mode = None if row is None else row[0]
+            finally:
+                cur.close()
+        except Exception as exc:
+            raise SqlServerApplicationLockError(
+                f"SQL Server application lock {resource!r} session is unavailable"
+            ) from exc
         if str(mode or "").upper() not in {"EXCLUSIVE", "X"}:
             raise SqlServerApplicationLockError(
                 f"SQL Server application lock {resource!r} was lost"
