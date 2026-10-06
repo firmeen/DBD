@@ -1952,7 +1952,7 @@ class ProductionSqlServerRepository:
                                 AND ({unresolved_expr})<>0
                                 AND NOT (lease_owner IS NOT NULL
                                          AND lease_expires_at > SYSUTCDATETIME())
-                                AND NOT (retry_at > SYSUTCDATETIME())
+                                AND (retry_at IS NULL OR retry_at <= SYSUTCDATETIME())
                                THEN 1 ELSE 0 END),
                       SUM(CASE WHEN ({unresolved_expr})<>0
                                 AND lease_owner IS NOT NULL

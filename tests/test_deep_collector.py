@@ -275,6 +275,18 @@ def test_profile_fiscal_year_change_reopens_only_financial_bits() -> None:
         http_status=200,
         requested_at=None,
         error=None,
+        domain_write={
+            "kind": "profile",
+            "values": _profile_values(
+                profile,
+                {
+                    "jpNo": "0107556000051",
+                    "jpTypeCode": "7",
+                    "submitFinYear": "2568",
+                },
+                published_at=SimpleNamespace(),
+            ),
+        },
     )
 
     assert state["latest_fiscal_year"] == "2568"
