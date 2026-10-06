@@ -473,7 +473,6 @@ def _ensure_fetch_company(
     company: CompanyIdentity,
     *,
     generation: int,
-    finalize_new: bool,
 ) -> int:
     with repository.transaction() as conn:
         repository.upsert_discovered_companies(
@@ -528,7 +527,6 @@ async def fetch_company(
             repo,
             company,
             generation=generation,
-            finalize_new=False,
         )
         repo.assert_manager_lock(lock_conn)
         await asyncio.to_thread(
@@ -561,16 +559,12 @@ async def fetch_company(
                 f"company_id={company_id} disappeared after collection"
             )
 
-        selected_unresolved = (
-            int(company_state["required_mask"])
-            & phase_mask(phase)
-            & ~(
-                int(company_state["done_mask"])
-                | int(company_state["not_available_mask"])
-                | int(company_state["failed_mask"])
-            )
+        global_unresolved = int(company_state["required_mask"]) & ~(
+            int(company_state["done_mask"])
+            | int(company_state["not_available_mask"])
+            | int(company_state["failed_mask"])
         )
-        if not has_active_generation and selected_unresolved == 0:
+        if not has_active_generation and global_unresolved == 0:
             await asyncio.to_thread(
                 _finalize_batch,
                 repo,
