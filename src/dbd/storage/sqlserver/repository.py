@@ -1389,6 +1389,10 @@ class ProductionSqlServerRepository:
                     SELECT TOP (1) *
                     FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
                     WHERE last_seen_generation=%s
+                      AND collect_status IN (
+                          N'DISCOVERED',N'PENDING',N'COLLECTING',
+                          N'RETRY_WAIT',N'PARTIAL'
+                      )
                       AND (required_mask & %s) <> 0
                       AND ((required_mask & %s)
                            & ~(done_mask | not_available_mask | failed_mask)) <> 0
@@ -1446,6 +1450,47 @@ class ProductionSqlServerRepository:
             "endpoint_meta",
         )
         return dict(zip(keys, row, strict=True))
+
+    def claimed_company_state(
+        self,
+        conn,
+        *,
+        company_id: int,
+        claim_token: str,
+        claim_generation: int,
+    ) -> dict[str, Any]:
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                SELECT
+                  required_mask,done_mask,not_available_mask,failed_mask,
+                  latest_fiscal_year,endpoint_meta,collect_status
+                FROM dbo.DBD_COMPANY WITH (UPDLOCK,ROWLOCK)
+                WHERE company_id=%s
+                  AND lease_owner=%s
+                  AND last_seen_generation=%s
+                  AND lease_expires_at > SYSUTCDATETIME()
+                """,
+                (int(company_id), claim_token, int(claim_generation)),
+            )
+            row = cur.fetchone()
+        finally:
+            cur.close()
+        if row is None:
+            raise SqlServerLeaseLost(
+                f"Stale claim rejected for company_id={company_id}"
+            )
+        names = (
+            "required_mask",
+            "done_mask",
+            "not_available_mask",
+            "failed_mask",
+            "latest_fiscal_year",
+            "endpoint_meta",
+            "collect_status",
+        )
+        return dict(zip(names, row, strict=True))
 
     def renew_company_lease(
         self,
