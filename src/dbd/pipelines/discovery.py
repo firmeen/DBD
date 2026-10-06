@@ -6,6 +6,7 @@ import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from decimal import Decimal
 from hashlib import sha256
 
 from ..client.async_client import AsyncDbdClient
@@ -631,22 +632,37 @@ async def _run_work(
 
 
 def _canonical_company_payload(value: object) -> str:
-    def clean(item: object):
+    def encode(item: object) -> str:
+        if item is None:
+            return "null"
+        if item is True:
+            return "true"
+        if item is False:
+            return "false"
         if isinstance(item, str):
-            return item.replace("\x00", "")
+            return json.dumps(item.replace("\x00", ""), ensure_ascii=False)
+        if isinstance(item, Decimal):
+            if not item.is_finite():
+                raise ValueError("Non-finite Decimal cannot be stored as JSON")
+            return str(item)
+        if isinstance(item, int):
+            return str(item)
+        if isinstance(item, float):
+            return json.dumps(item, allow_nan=False)
         if isinstance(item, list):
-            return [clean(child) for child in item]
+            return "[" + ",".join(encode(child) for child in item) + "]"
         if isinstance(item, dict):
-            return {str(key): clean(child) for key, child in item.items()}
-        return item
+            return (
+                "{"
+                + ",".join(
+                    json.dumps(str(key), ensure_ascii=False) + ":" + encode(item[key])
+                    for key in sorted(item, key=lambda value: str(value))
+                )
+                + "}"
+            )
+        raise TypeError(type(item).__name__)
 
-    return json.dumps(
-        clean(value),
-        ensure_ascii=False,
-        sort_keys=True,
-        separators=(",", ":"),
-        default=str,
-    )
+    return encode(value)
 
 
 _NESTED_PROFILE_FIELDS = {
@@ -922,33 +938,37 @@ async def run(
             first_data = data
             for offset in range(0, len(page_numbers), page_chunk):
                 chunk = page_numbers[offset : offset + page_chunk]
-                tasks = []
-                for page_no in chunk:
-                    if page_no == 1:
-                        tasks.append(None)
-                    else:
-                        tasks.append(
-                            asyncio.create_task(
-                                _direct_page(client, filters, page_no)
-                            )
-                        )
+                tasks = {
+                    page_no: asyncio.create_task(
+                        _direct_page(client, filters, page_no)
+                    )
+                    for page_no in chunk
+                    if page_no != 1
+                }
 
                 company_rows: list[dict] = []
-                for page_no, task in zip(chunk, tasks, strict=True):
-                    if page_no == 1:
-                        page_data = first_data
-                        page_obj = page
-                    else:
-                        assert task is not None
-                        page_data, _requested = await task
-                        page_obj = parse_search_response(page_data)
-                        pages_fetched += 1
-                    normalized, rejected = _normalize_direct_rows(
-                        page_obj.rows,
-                        published_at=_now(),
-                    )
-                    invalid_rows += rejected
-                    company_rows.extend(normalized)
+                try:
+                    for page_no in chunk:
+                        if page_no == 1:
+                            page_data = first_data
+                            page_obj = page
+                        else:
+                            page_data, _requested = await tasks[page_no]
+                            page_obj = parse_search_response(page_data)
+                            pages_fetched += 1
+                        normalized, rejected = _normalize_direct_rows(
+                            page_obj.rows,
+                            published_at=_now(),
+                        )
+                        invalid_rows += rejected
+                        company_rows.extend(normalized)
+                except BaseException:
+                    for task in tasks.values():
+                        if not task.done():
+                            task.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks.values(), return_exceptions=True)
+                    raise
 
                 write_size = max(1, int(settings.dbd_write_batch_size))
                 for write_offset in range(0, len(company_rows), write_size):

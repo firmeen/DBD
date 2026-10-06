@@ -1380,6 +1380,7 @@ class ProductionSqlServerRepository:
         extended_mask: int,
         phase: str,
         company_id: int | None = None,
+        limit: int | None = None,
     ) -> int:
         if phase not in {"core", "extended"}:
             raise ValueError("phase must be core or extended")
@@ -1401,11 +1402,19 @@ class ProductionSqlServerRepository:
                 f"((CASE WHEN required_mask=0 THEN {core_required} "
                 f"ELSE required_mask END) | {int(extended_mask)})"
             )
+        top = "" if limit is None else f"TOP ({max(1, int(limit))}) "
         cur = conn.cursor()
         try:
             cur.execute(
                 f"""
-                UPDATE dbo.DBD_COMPANY
+                ;WITH target AS (
+                    SELECT {top}*
+                    FROM dbo.DBD_COMPANY WITH (UPDLOCK,READPAST,ROWLOCK)
+                    WHERE {predicate}
+                      AND required_mask <> {required}
+                    ORDER BY company_id
+                )
+                UPDATE target
                 SET required_mask={required},
                     collect_status=CASE
                         WHEN lease_owner IS NOT NULL
@@ -1420,7 +1429,6 @@ class ProductionSqlServerRepository:
                             THEN NULL
                         ELSE collection_completed_at
                     END
-                WHERE {predicate}
                 """,
                 tuple(params),
             )
@@ -1924,11 +1932,14 @@ class ProductionSqlServerRepository:
             params.append(int(generation))
         predicate = "WHERE " + " AND ".join(where) if where else ""
         phase = int(phase_mask or 0)
-        unresolved_expr = (
-            "required_mask & ~(done_mask | not_available_mask | failed_mask)"
+        required_expr = "required_mask" if phase == 0 else f"(required_mask & {phase})"
+        failed_expr = "failed_mask" if phase == 0 else f"(failed_mask & {phase})"
+        resolved_expr = (
+            "(done_mask | not_available_mask | failed_mask)"
             if phase == 0
-            else f"(required_mask & {phase}) & ~(done_mask | not_available_mask | failed_mask)"
+            else f"((done_mask | not_available_mask | failed_mask) & {phase})"
         )
+        unresolved_expr = f"({required_expr} & ~{resolved_expr})"
         with connection() as conn:
             cur = conn.cursor()
             try:
@@ -1936,14 +1947,34 @@ class ProductionSqlServerRepository:
                     f"""
                     SELECT
                       COUNT(*) AS total,
-                      SUM(CASE WHEN collect_status=N'DISCOVERED' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN collect_status=N'PENDING' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN collect_status=N'COLLECTING' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN collect_status=N'RETRY_WAIT' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN collect_status=N'COMPLETE' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN collect_status=N'PARTIAL' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN collect_status=N'FAILED' THEN 1 ELSE 0 END),
-                      SUM(CASE WHEN ({unresolved_expr}) <> 0 THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN {required_expr}=0 THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN {required_expr}<>0
+                                AND ({unresolved_expr})<>0
+                                AND NOT (lease_owner IS NOT NULL
+                                         AND lease_expires_at > SYSUTCDATETIME())
+                                AND NOT (retry_at > SYSUTCDATETIME())
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN ({unresolved_expr})<>0
+                                AND lease_owner IS NOT NULL
+                                AND lease_expires_at > SYSUTCDATETIME()
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN ({unresolved_expr})<>0
+                                AND retry_at > SYSUTCDATETIME()
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN {required_expr}<>0
+                                AND ({unresolved_expr})=0
+                                AND {failed_expr}=0
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN {required_expr}<>0
+                                AND ({unresolved_expr})=0
+                                AND {failed_expr}<>0
+                                AND {failed_expr}<>{required_expr}
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN {required_expr}<>0
+                                AND ({unresolved_expr})=0
+                                AND {failed_expr}={required_expr}
+                               THEN 1 ELSE 0 END),
+                      SUM(CASE WHEN ({unresolved_expr})<>0 THEN 1 ELSE 0 END),
                       SUM(CASE WHEN lease_owner IS NOT NULL
                                 AND lease_expires_at > SYSUTCDATETIME()
                                THEN 1 ELSE 0 END),

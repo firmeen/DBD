@@ -171,21 +171,28 @@ def _prepare_tx(
     phase: str,
     company_id: int | None = None,
 ) -> PrepareResult:
-    with repository.transaction() as conn:
-        changed = repository.prepare_companies(
-            conn,
-            generation=generation,
-            core_mask=CORE_ENDPOINT_MASK,
-            base_mask=BASE_REQUIRED_MASK,
-            financial_mask=FINANCIAL_MASK,
-            extended_mask=EXTENDED_ENDPOINT_MASK,
-            phase=phase,
-            company_id=company_id,
-        )
+    batch_size = 1 if company_id is not None else max(1, int(settings.dbd_write_batch_size))
+    total = 0
+    while True:
+        with repository.transaction() as conn:
+            changed = repository.prepare_companies(
+                conn,
+                generation=generation,
+                core_mask=CORE_ENDPOINT_MASK,
+                base_mask=BASE_REQUIRED_MASK,
+                financial_mask=FINANCIAL_MASK,
+                extended_mask=EXTENDED_ENDPOINT_MASK,
+                phase=phase,
+                company_id=company_id,
+                limit=batch_size,
+            )
+        total += int(changed)
+        if company_id is not None or changed < batch_size:
+            break
     return PrepareResult(
         generation=int(generation),
         phase=phase,
-        rows_prepared=int(changed),
+        rows_prepared=total,
     )
 
 
@@ -227,17 +234,27 @@ def _retry_tx(
     phase: str,
     limit: int | None,
 ) -> RetryResult:
-    with repository.transaction() as conn:
-        count = repository.retry_failed(
-            conn,
-            phase_mask=phase_mask(phase),
-            generation=generation,
-            limit=limit,
-        )
+    batch_size = max(1, int(settings.dbd_write_batch_size))
+    target = None if limit is None else max(0, int(limit))
+    total = 0
+    while target is None or total < target:
+        current_limit = batch_size if target is None else min(batch_size, target - total)
+        if current_limit <= 0:
+            break
+        with repository.transaction() as conn:
+            count = repository.retry_failed(
+                conn,
+                phase_mask=phase_mask(phase),
+                generation=generation,
+                limit=current_limit,
+            )
+        total += int(count)
+        if count < current_limit:
+            break
     return RetryResult(
         generation=int(generation),
         phase=phase,
-        reopened=int(count),
+        reopened=total,
     )
 
 
