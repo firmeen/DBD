@@ -12,7 +12,6 @@ from typing import Any, Callable
 from ..contracts.common import money
 from ..contracts.company import (
     CompanyProfile,
-    normalize as normalize_profile,
     normalize_capital_history,
     normalize_committee_signs,
     normalize_committees,
@@ -21,6 +20,7 @@ from ..contracts.company import (
     normalize_nations,
     normalize_transformations,
 )
+from ..contracts.company import normalize as normalize_profile
 from ..contracts.financial import (
     FinancialStatement,
     IndustryBenchmark,
@@ -29,12 +29,7 @@ from ..contracts.financial import (
 )
 from ..contracts.identity import identity
 from ..contracts.strict import normalize_industry_benchmark
-from ..core.exceptions import (
-    ContractError,
-    DbdAuthError,
-    DbdForbiddenError,
-    IdentityConflict,
-)
+from ..core.exceptions import ContractError, IdentityConflict
 from ..core.settings import settings
 from ..storage.sqlserver.repository import (
     ProductionSqlServerRepository,
