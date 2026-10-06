@@ -528,11 +528,27 @@ def _statement_rows(
         if isinstance(raw_payload, dict)
         else []
     )
-    raw = _raw_by_key(raw_source, "fiscalYear")
-    rows = []
+    raw_rows = _raw_rows(raw_source)
+    raw: dict[str, tuple[str, dict[str, Any]]] = {}
+    for source in raw_rows:
+        value = source.get("fiscalYear")
+        if value is None:
+            continue
+        key = str(value)
+        encoded = _json_payload(source)
+        previous = raw.get(key)
+        if previous is not None and previous[0] != encoded:
+            raise ContractError(
+                f"Conflicting financial statements for fiscalYear {key}"
+            )
+        raw[key] = (encoded, source)
+
+    rows_by_year: dict[str, dict[str, Any]] = {}
+    fingerprints: dict[str, str] = {}
     for item in normalized:
+        key = str(item.fiscal_year)
         values = {
-            "fiscal_year": str(item.fiscal_year),
+            "fiscal_year": key,
             "fiscal_year_end_date": item.fiscal_year_end_date,
             "submit_objective_code": item.submit_obj_code,
             "business_size_code": item.business_size_code,
@@ -540,11 +556,20 @@ def _statement_rows(
             **item.ratios,
             "statement_items": _json_payload(item.items) if item.items else None,
             "statement_updated_at": item.update_date,
-            "statement_payload": _json_payload(raw.get(str(item.fiscal_year), {})),
+            "statement_payload": _json_payload(raw.get(key, ("{}", {}))[1]),
             "published_at": published_at,
         }
-        rows.append(values)
-    return rows
+        fingerprint = _json_payload(
+            {name: value for name, value in values.items() if name != "published_at"}
+        )
+        previous = fingerprints.get(key)
+        if previous is not None and previous != fingerprint:
+            raise ContractError(
+                f"Conflicting financial statements for fiscalYear {key}"
+            )
+        fingerprints[key] = fingerprint
+        rows_by_year[key] = values
+    return list(rows_by_year.values())
 
 
 def _industry_rows(
@@ -584,6 +609,85 @@ def _industry_rows(
             "published_at": published_at,
         }
     ]
+
+
+def _prepare_domain_write(
+    endpoint: str,
+    normalized: object,
+    raw_payload: object,
+    *,
+    generation: int,
+    published_at: datetime,
+    company_id: int,
+) -> dict[str, Any]:
+    if endpoint == "profile":
+        assert isinstance(normalized, CompanyProfile)
+        return {
+            "kind": "profile",
+            "values": _profile_values(
+                normalized,
+                raw_payload,
+                published_at=published_at,
+            ),
+        }
+    if endpoint in {"committees", "committee_signs", "nations"}:
+        assert isinstance(normalized, list)
+        relation_type, rows = _relation_rows(
+            endpoint,
+            normalized,
+            raw_payload,
+            generation=generation,
+            published_at=published_at,
+        )
+        return {"kind": "relation", "relation_type": relation_type, "rows": rows}
+    if endpoint in {
+        "transformations",
+        "name_history",
+        "capital_history",
+        "nation_history",
+    }:
+        assert isinstance(normalized, list)
+        rows = _event_rows(
+            endpoint,
+            normalized,
+            raw_payload,
+            generation=generation,
+            published_at=published_at,
+        )
+        for row in rows:
+            row["company_id"] = int(company_id)
+        return {"kind": "event", "rows": rows}
+    if endpoint == "financial_submissions":
+        assert isinstance(normalized, list)
+        return {
+            "kind": "financial_submissions",
+            "rows": _submission_rows(
+                normalized,
+                raw_payload,
+                published_at=published_at,
+            ),
+        }
+    if endpoint == "financial_statements":
+        assert isinstance(normalized, list)
+        return {
+            "kind": "financial_statements",
+            "rows": _statement_rows(
+                normalized,
+                raw_payload,
+                published_at=published_at,
+            ),
+        }
+    if endpoint == "industry_benchmark":
+        return {
+            "kind": "industry",
+            "rows": _industry_rows(
+                normalized if isinstance(normalized, IndustryBenchmark) else None,
+                raw_payload,
+                generation=generation,
+                published_at=published_at,
+            ),
+        }
+    raise ValueError(f"Unknown endpoint {endpoint!r}")
 
 
 class DeepCollector:
@@ -646,6 +750,19 @@ class DeepCollector:
             snapshot = asdict(self.stats)
         self._emit("progress", **snapshot)
 
+    async def _db_call(self, function, /, *args, **kwargs):
+        attempts = 3
+        for attempt in range(1, attempts + 1):
+            try:
+                return await asyncio.to_thread(function, *args, **kwargs)
+            except SqlServerLeaseLost:
+                raise
+            except Exception as exc:
+                checker = getattr(self.repo, "is_transient_error", None)
+                if not callable(checker) or not checker(exc) or attempt >= attempts:
+                    raise
+                await asyncio.sleep(min(2.0, float(attempt)))
+
     async def _remaining_budget(self) -> int | None:
         if self.company_limit is None:
             return None
@@ -669,7 +786,7 @@ class DeepCollector:
                 async with self._stats_lock:
                     if self.stats.companies_claimed >= self.company_limit:
                         return None
-            row = await asyncio.to_thread(self._claim_sync)
+            row = await self._db_call(self._claim_sync)
             if row is None:
                 return None
             await self._bump(companies_claimed=1, companies_in_flight=1)
@@ -724,7 +841,7 @@ class DeepCollector:
             except TimeoutError:
                 pass
             try:
-                await asyncio.to_thread(self._renew_sync, company)
+                await self._db_call(self._renew_sync, company)
             except SqlServerLeaseLost:
                 lost.set()
                 self._emit(
@@ -757,10 +874,10 @@ class DeepCollector:
         http_status: int | None,
         requested_at: datetime | None,
         error: str | None,
+        domain_write: dict[str, Any] | None = None,
         fail_unresolved: bool = False,
     ) -> dict[str, Any]:
         bit = int(spec.bit)
-        published_at = _utcnow()
 
         with self.repo.transaction() as conn:
             current = self.repo.claimed_company_state(
@@ -802,13 +919,12 @@ class DeepCollector:
 
             latest_fiscal = current.get("latest_fiscal_year")
             if outcome == "done":
-                if spec.key == "profile":
+                if domain_write is None:
+                    raise ValueError(f"Missing domain write for completed {spec.key}")
+                kind = str(domain_write["kind"])
+                if kind == "profile":
                     assert isinstance(normalized, CompanyProfile)
-                    values = _profile_values(
-                        normalized,
-                        raw_payload,
-                        published_at=published_at,
-                    )
+                    values = dict(domain_write["values"])
                     old_fiscal = latest_fiscal_year(latest_fiscal)
                     fiscal_present = "submit_fin_year" in normalized.present_fields
                     new_fiscal = (
@@ -831,76 +947,34 @@ class DeepCollector:
                     )
                     if fiscal_present:
                         latest_fiscal = new_fiscal
-
-                elif spec.key in {"committees", "committee_signs", "nations"}:
-                    assert isinstance(normalized, list)
-                    relation_type, rows = _relation_rows(
-                        spec.key,
-                        normalized,
-                        raw_payload,
-                        generation=self.generation,
-                        published_at=published_at,
-                    )
+                elif kind == "relation":
                     self.repo.reconcile_relations(
                         conn,
                         company_id=int(company["company_id"]),
-                        relation_type=relation_type,
-                        rows=rows,
+                        relation_type=str(domain_write["relation_type"]),
+                        rows=list(domain_write["rows"]),
                         generation=self.generation,
                     )
-
-                elif spec.key in {
-                    "transformations",
-                    "name_history",
-                    "capital_history",
-                    "nation_history",
-                }:
-                    assert isinstance(normalized, list)
-                    rows = _event_rows(
-                        spec.key,
-                        normalized,
-                        raw_payload,
-                        generation=self.generation,
-                        published_at=published_at,
-                    )
-                    for row in rows:
-                        row["company_id"] = int(company["company_id"])
-                    self.repo.upsert_events(conn, rows)
-
-                elif spec.key == "financial_submissions":
-                    assert isinstance(normalized, list)
+                elif kind == "event":
+                    self.repo.upsert_events(conn, list(domain_write["rows"]))
+                elif kind == "financial_submissions":
                     self.repo.merge_financial_submissions(
                         conn,
                         company_id=int(company["company_id"]),
-                        rows=_submission_rows(
-                            normalized,
-                            raw_payload,
-                            published_at=published_at,
-                        ),
+                        rows=list(domain_write["rows"]),
                         generation=self.generation,
                     )
-
-                elif spec.key == "financial_statements":
-                    assert isinstance(normalized, list)
+                elif kind == "financial_statements":
                     self.repo.merge_financial_statements(
                         conn,
                         company_id=int(company["company_id"]),
-                        rows=_statement_rows(
-                            normalized,
-                            raw_payload,
-                            published_at=published_at,
-                        ),
+                        rows=list(domain_write["rows"]),
                         generation=self.generation,
                     )
-
-                elif spec.key == "industry_benchmark":
-                    rows = _industry_rows(
-                        normalized if isinstance(normalized, IndustryBenchmark) else None,
-                        raw_payload,
-                        generation=self.generation,
-                        published_at=published_at,
-                    )
-                    self.repo.upsert_industries(conn, rows)
+                elif kind == "industry":
+                    self.repo.upsert_industries(conn, list(domain_write["rows"]))
+                else:
+                    raise ValueError(f"Unsupported domain write kind {kind!r}")
 
             resolved = (done | not_available | failed) & required
             if resolved != required:
@@ -959,9 +1033,10 @@ class DeepCollector:
         http_status: int | None,
         requested_at: datetime | None,
         error: str | None = None,
+        domain_write: dict[str, Any] | None = None,
         fail_unresolved: bool = False,
     ) -> None:
-        state = await asyncio.to_thread(
+        state = await self._db_call(
             self._commit_outcome_sync,
             company,
             spec,
@@ -971,6 +1046,7 @@ class DeepCollector:
             http_status=http_status,
             requested_at=requested_at,
             error=error,
+            domain_write=domain_write,
             fail_unresolved=fail_unresolved,
         )
         company.update(state)
@@ -1098,7 +1174,7 @@ class DeepCollector:
                             f"Lease lost for company_id={company['company_id']}"
                         )
                     error = f"{spec.key}: {exc}"
-                    await asyncio.to_thread(
+                    await self._db_call(
                         self._retry_wait_sync,
                         company,
                         spec,
@@ -1130,6 +1206,7 @@ class DeepCollector:
                     continue
 
                 fail_unresolved = False
+                domain_write = None
                 try:
                     normalized = _normalize_resource(spec.key, response.data)
                     if spec.key == "profile":
@@ -1140,6 +1217,15 @@ class DeepCollector:
                         if spec.key == "industry_benchmark" and normalized is None
                         else "done"
                     )
+                    if outcome == "done":
+                        domain_write = _prepare_domain_write(
+                            spec.key,
+                            normalized,
+                            response.data,
+                            generation=self.generation,
+                            published_at=_utcnow(),
+                            company_id=int(company["company_id"]),
+                        )
                 except IdentityConflict as exc:
                     outcome = "failed"
                     normalized = None
@@ -1148,6 +1234,7 @@ class DeepCollector:
                 except (ContractError, TypeError, ValueError) as exc:
                     outcome = "failed"
                     normalized = None
+                    domain_write = None
                     error = f"{spec.key}: {type(exc).__name__}: {exc}"
                 else:
                     error = None
@@ -1165,12 +1252,19 @@ class DeepCollector:
                     http_status=response.status,
                     requested_at=response.requested_at,
                     error=error,
+                    domain_write=domain_write,
                     fail_unresolved=fail_unresolved,
                 )
                 if fail_unresolved:
                     break
 
-            await asyncio.to_thread(self._release_sync, company)
+            await self._db_call(self._release_sync, company)
+            durable = await self._db_call(
+                self.repo.company_state,
+                int(company["company_id"]),
+            )
+            if durable is not None:
+                company.update(durable)
             await self._bump(companies_finished=1)
             self._emit(
                 "company_completed",
@@ -1233,7 +1327,7 @@ class DeepCollector:
     async def run(self) -> dict[str, Any]:
         self._emit("phase_started", phase="PREFLIGHT")
         await asyncio.to_thread(self.repo.validate_schema)
-        self.stats.leases_recovered = await asyncio.to_thread(self._recover_sync)
+        self.stats.leases_recovered = await self._db_call(self._recover_sync)
 
         self._emit("phase_started", phase="AUTH")
         async with FixedRateDbdClient(

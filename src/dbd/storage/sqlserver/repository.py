@@ -754,6 +754,10 @@ class ProductionSqlServerRepository:
         with sqlserver_transaction() as conn:
             yield conn
 
+    @staticmethod
+    def is_transient_error(exc: BaseException) -> bool:
+        return _transient(exc)
+
     def ensure_schema(self) -> dict[str, object]:
         with self.transaction() as conn:
             return ensure_production_schema(conn)
@@ -1045,6 +1049,11 @@ class ProductionSqlServerRepository:
                             "Conflicting industry benchmark payload for the same "
                             "Generation 1 natural key"
                         )
+                    if existing_updated is not None and incoming_updated is None:
+                        raise SqlServerWriteError(
+                            "Conflicting industry benchmark payload has no source_updated_at "
+                            "to supersede an existing dated row"
+                        )
                     if (
                         existing_updated is not None
                         and incoming_updated is not None
@@ -1056,6 +1065,10 @@ class ProductionSqlServerRepository:
                             "Conflicting industry benchmark payload for the same "
                             "natural key and source_updated_at"
                         )
+                elif existing_updated is not None and (
+                    incoming_updated is None or incoming_updated < existing_updated
+                ):
+                    continue
 
                 cur.execute(
                     update_sql,
@@ -1862,7 +1875,10 @@ class ProductionSqlServerRepository:
         generation: int | None = None,
         limit: int | None = None,
     ) -> int:
-        where = "(failed_mask & %s) <> 0"
+        where = (
+            "(failed_mask & %s) <> 0 "
+            "AND (lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME())"
+        )
         params: list[Any] = [int(phase_mask)]
         if generation is not None:
             where += " AND last_seen_generation=%s"
