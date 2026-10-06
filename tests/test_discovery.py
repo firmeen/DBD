@@ -333,6 +333,33 @@ async def test_bounded_direct_discovery_reports_incomplete_coverage(monkeypatch)
 
     assert len(persisted) == 1
 
+@pytest.mark.asyncio
+async def test_bounded_direct_discovery_still_rejects_invalid_rows(monkeypatch) -> None:
+    async def direct_page(_client, _filters, page_no):
+        assert page_no == 1
+        return (
+            {
+                "meta": {"currentPage": 1, "totalItems": 1, "totalPages": 1},
+                "contents": [
+                    {"jpTypeCode": "7", "jpNo": "short", "jpName": "invalid"}
+                ],
+            },
+            discovery._now(),
+        )
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+
+    with pytest.raises(ContractError, match="contract-invalid"):
+        await discovery.run(
+            ["010"],
+            generation=2,
+            max_buckets=1,
+            repository=object(),
+            verbose=False,
+        )
+
+
 def test_fully_partitioned_search_has_no_silent_fallback_split() -> None:
     filters = SearchFilters(
         keyword="010",
