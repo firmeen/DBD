@@ -197,10 +197,6 @@ async def prepare(
     repository: ProductionSqlServerRepository | None = None,
     event: EventCallback | None = None,
 ) -> PrepareResult:
-    if seeds or search_type or max_buckets is not None:
-        raise ValueError(
-            "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
-        )
     repo = _repo(repository)
     with repo.manager_lock() as lock_conn:
         selected = int(generation or _manual_generation(repo, phase=phase))
@@ -372,11 +368,11 @@ async def discover(
             resumed=resumed,
         )
         work = discovery.run(
-            [],
-            search_type="",
+            list(seeds or []),
+            search_type=search_type,
             concurrency=concurrency,
             rate=rate,
-            max_buckets=None,
+            max_buckets=max_buckets,
             verbose=verbose,
             distributed=False,
             generation=generation,
@@ -596,6 +592,10 @@ async def cycle_run(
     event: EventCallback | None = None,
     verbose: bool = True,
 ) -> CycleResult:
+    if seeds or search_type or max_buckets is not None:
+        raise ValueError(
+            "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
+        )
     repo = _repo(repository)
     with repo.manager_lock() as lock_conn:
         _emit(event, "phase_started", phase="PRECHECK")

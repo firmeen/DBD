@@ -788,35 +788,27 @@ def main():
 
     cycle = sub.add_parser("cycle", help="Run the v0.6 SQL Server production workflow")
     cycle_sub = cycle.add_subparsers(dest="cycle_command", required=True)
-    cycle_run_parser = _add_output_options(
-        cycle_sub.add_parser("run", help="Run one discover/prepare/collect/verify/finalize cycle")
+    cycle_run_parser = cycle_sub.add_parser(
+        "run", help="Run one full-universe discover/prepare/collect/verify/finalize cycle"
     )
-    cycle_run_parser.add_argument("seeds", nargs="*")
-    cycle_run_parser.add_argument("--seed-file")
-    cycle_run_parser.add_argument("--type", default="")
     cycle_run_parser.add_argument("--phase", choices=("core", "extended"), default="core")
     cycle_run_parser.add_argument("--refresh", action="store_true")
     cycle_run_parser.add_argument("--concurrency", type=positive)
     cycle_run_parser.add_argument("--rate", type=positive_rate)
     cycle_run_parser.add_argument("--http-retries", type=non_negative)
-    cycle_run_parser.add_argument("--max-buckets", type=positive)
 
-    cycle_loop_parser = _add_output_options(
-        cycle_sub.add_parser("loop", help="Repeat complete foreground v0.6 cycles")
+    cycle_loop_parser = cycle_sub.add_parser(
+        "loop", help="Repeat full-universe foreground v0.6 cycles"
     )
-    cycle_loop_parser.add_argument("seeds", nargs="*")
-    cycle_loop_parser.add_argument("--seed-file")
-    cycle_loop_parser.add_argument("--type", default="")
     cycle_loop_parser.add_argument("--phase", choices=("core", "extended"), default="core")
     cycle_loop_parser.add_argument("--refresh", action="store_true")
     cycle_loop_parser.add_argument("--concurrency", type=positive)
     cycle_loop_parser.add_argument("--rate", type=positive_rate)
     cycle_loop_parser.add_argument("--http-retries", type=non_negative)
-    cycle_loop_parser.add_argument("--max-buckets", type=positive)
     cycle_loop_parser.add_argument("--interval", type=interval_seconds, default=21600.0)
 
-    cycle_status_parser = _add_output_options(
-        cycle_sub.add_parser("status", help="Read durable v0.6 cycle state without mutation")
+    cycle_status_parser = cycle_sub.add_parser(
+        "status", help="Read durable v0.6 cycle state without mutation"
     )
     cycle_status_parser.add_argument("--phase", choices=("core", "extended"), default="core")
     args = parser.parse_args()
@@ -1016,26 +1008,13 @@ def main():
                     },
                 )
             else:
-                seeds = list(args.seeds)
-                if args.seed_file:
-                    with open(args.seed_file, encoding="utf-8-sig") as handle:
-                        seeds.extend(
-                            s.strip()
-                            for s in handle
-                            if s.strip() and not s.lstrip().startswith("#")
-                        )
-                if any(len(seed) < 3 for seed in seeds):
-                    raise ValueError("Search keywords must contain at least 3 characters")
                 common = {
                     "phase": args.phase,
                     "refresh": args.refresh,
-                    "seeds": seeds,
-                    "search_type": args.type,
                     "concurrency": args.concurrency,
                     "rate": args.rate,
                     "http_retries": args.http_retries,
-                    "max_buckets": args.max_buckets,
-                    "verbose": not bool(getattr(args, "json", False)),
+                    "verbose": True,
                     "event": _v06_event_sink(presenter),
                 }
                 if args.cycle_command == "run":
@@ -1070,6 +1049,8 @@ def main():
                         ),
                     },
                 )
+                if result.status == "FAILED":
+                    raise SystemExit(1)
     except KeyboardInterrupt:
         presenter.message("Interrupted. Durable checkpoints remain recoverable.", kind="warning")
         raise SystemExit(130) from None

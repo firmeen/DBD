@@ -247,7 +247,8 @@ class DeepTerminalEvents:
         if name in {"retry_wait", "worker_error", "endpoint_retry", "endpoint_failed", "warning"}:
             endpoint = payload.get("endpoint") or "-"
             self.console.print(
-                f"{name.upper()} endpoint={endpoint} error={payload.get('error')}"
+                f"{name.upper()} endpoint={endpoint} "
+                f"error={payload.get('error') or payload.get('message')}"
             )
             return
 
@@ -344,7 +345,7 @@ class DeepTerminalEvents:
                     ),
                     (
                         "Claimed",
-                        _priority_count(self.state.get("companies_claimed"), "blue"),
+                        _priority_count(self.state.get("companies_claimed"), "cyan"),
                         "Finished",
                         _priority_count(self.state.get("companies_finished"), "green"),
                     ),
