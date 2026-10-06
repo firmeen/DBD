@@ -548,14 +548,14 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
+    parser = argparse.ArgumentParser(prog="dbd-data", description="TIPDI DBD data ingestion and collection")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
     _add_output_options(
         sub.add_parser("about", help="Inspect package, Python and installation integrity")
     )
     _add_output_options(sub.add_parser("check-db", help="Check database connectivity"))
-    _add_output_options(sub.add_parser("migrate", help="Apply versioned migrations (requires schema privileges)"))
+    _add_output_options(sub.add_parser("migrate", help="Converge the SQL Server production schema"))
     _add_output_options(sub.add_parser("master-status", help="Count discovered and verified company identities"))
     _add_output_options(sub.add_parser("discover-status", help="Show discovery coverage"))
     _add_output_options(sub.add_parser("discover-retry", help="Requeue failed discovery buckets"))
