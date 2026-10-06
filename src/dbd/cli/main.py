@@ -88,6 +88,39 @@ def _add_output_options(parser):
     return parser
 
 
+def _v06_event_sink(presenter):
+    def event(name, payload):
+        if presenter.json_mode:
+            return
+        if name == "phase_started":
+            phase = str(payload.get("phase") or "WORK")
+            generation = payload.get("generation")
+            suffix = f" · generation {generation}" if generation is not None else ""
+            presenter.message(f"{phase}{suffix}", kind="info")
+        elif name == "cycle_waiting":
+            seconds = float(payload.get("interval_seconds") or payload.get("idle_seconds") or 0)
+            presenter.message(f"Cycle waiting · next check in {seconds:g}s", kind="warning")
+        elif name == "cycle_completed":
+            status = str(payload.get("status") or "FAILED")
+            kind = (
+                "success"
+                if status == "COMPLETE"
+                else "warning"
+                if status == "COMPLETE_WITH_FAILURES"
+                else "error"
+            )
+            presenter.message(
+                f"Cycle {status} · generation {payload.get('generation')}",
+                kind=kind,
+            )
+        elif name == "warning":
+            presenter.message(str(payload.get("message") or "warning"), kind="warning")
+        elif name == "error":
+            presenter.message(str(payload.get("message") or "error"), kind="error")
+
+    return event
+
+
 def endpoint_rate_map(value):
     valid = {endpoint for group in PARTS.values() for endpoint in group}
     result = {}
@@ -858,6 +891,7 @@ def main():
                     concurrency=args.concurrency,
                     rate=args.rate,
                     http_retries=args.http_retries,
+                    event=_v06_event_sink(presenter),
                 )
             )
             presenter.command_result(
@@ -994,6 +1028,7 @@ def main():
                     "http_retries": args.http_retries,
                     "max_buckets": args.max_buckets,
                     "verbose": not bool(getattr(args, "json", False)),
+                    "event": _v06_event_sink(presenter),
                 }
                 if args.cycle_command == "run":
                     result = asyncio.run(cycle_run(**common))
