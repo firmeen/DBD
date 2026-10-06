@@ -20,6 +20,7 @@ from ..contracts.company import normalize
 from ..core.exceptions import ContractError
 from ..core.progress import ProgressLine
 from ..core.settings import settings
+from ..deep.http import FixedRateDbdClient
 from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
     DiscoveryLeaseLost,
@@ -742,18 +743,18 @@ def _persist_direct_batch(
 
 
 async def _direct_page(
-    client: AsyncDbdClient,
+    client: FixedRateDbdClient,
     filters: SearchFilters,
     page_no: int,
 ) -> tuple[object, datetime]:
-    requested = _now()
-    data = await client.post(
+    response = await client.fetch(
+        "POST",
         SEARCH_PATH,
-        filters.payload(page=page_no),
+        json_body=filters.payload(page=page_no),
         referer=SEARCH_REFERER,
         timeout=settings.dbd_count_timeout_seconds if page_no == 1 else None,
-        rate_key="search",
     )
+    data = response.data
     page = parse_search_response(data)
     if page.current_page != page_no:
         raise ContractError(
@@ -761,7 +762,7 @@ async def _direct_page(
         )
     if not page.rows and page.total_items > 0:
         raise ContractError(f"Search page {page_no} is empty for a non-empty partition")
-    return data, requested
+    return data, response.requested_at
 
 
 async def run(
@@ -802,14 +803,25 @@ async def run(
     companies_written = 0
     invalid_rows = 0
 
-    async with AsyncDbdClient(
-        concurrency=concurrency,
-        rate_per_second=global_rate,
-        endpoint_rates={"search": global_rate},
-        redis_url=None,
-        redis_key=settings.dbd_redis_rate_key,
+    async with FixedRateDbdClient(
+        concurrency=int(concurrency or settings.dbd_concurrency),
+        rate_per_second=float(global_rate),
+        max_retries=int(settings.dbd_http_retries),
     ) as client:
-        provinces = await fetch_provinces(client)
+        province_response = await client.fetch(
+            "GET",
+            "/api/v1/commons/provinces",
+        )
+        province_data = province_response.data
+        if not isinstance(province_data, list):
+            raise ContractError("Province response must be a JSON array")
+        provinces = [
+            str(row["pvCode"])
+            for row in province_data
+            if isinstance(row, dict) and row.get("pvCode")
+        ]
+        if not provinces:
+            raise ContractError("Province response contains no usable pvCode values")
         if not seeds:
             seeds = sorted(
                 {
