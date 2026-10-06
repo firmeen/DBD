@@ -2,13 +2,11 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import time
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from hashlib import sha256
-from uuid import uuid4
 
 from ..client.async_client import AsyncDbdClient
 from ..client.endpoints.search import (
