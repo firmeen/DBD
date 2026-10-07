@@ -411,6 +411,10 @@ class V06Terminal:
                 return
 
             if name == "progress":
+                if self.state.command == "collect" and self.state.status == "WAITING":
+                    self.state.status = "RUNNING"
+                    self.state.wait_started_monotonic = None
+                    self.state.wait_seconds = None
                 self._update_collection(payload, now)
                 return
 
@@ -1557,8 +1561,11 @@ class V06Terminal:
             self._plain_write(f"{stamp} {phase} complete{suffix}")
             return
         if name == "cycle_waiting":
-            seconds = float(payload.get("interval_seconds") or payload.get("idle_seconds") or 0)
-            self._plain_write(f"{stamp} WAITING next_cycle={_duration(seconds)}")
+            seconds = float(
+                payload.get("interval_seconds") or payload.get("idle_seconds") or 0
+            )
+            target = "next_check" if self.state.command == "collect" else "next_cycle"
+            self._plain_write(f"{stamp} WAITING {target}={_duration(seconds)}")
             return
         if name == "warning":
             message = payload.get("message") or payload.get("error") or "warning"

@@ -721,3 +721,52 @@ def test_v06_fetch_company_selected_endpoints_are_neutral_until_observed() -> No
     terminal.event("endpoint_started", {"company_id": 42, "endpoint": "profile"})
     assert terminal.state.endpoint_states["profile"] == "ACTIVE"
     terminal.close()
+
+
+
+def test_v06_continuous_collect_resumes_running_on_real_progress() -> None:
+    terminal = V06Terminal(
+        "collect",
+        stream=StringIO(),
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core", continuous=True)
+    terminal.event("cycle_waiting", {"idle_seconds": 5.0})
+    assert terminal.state.status == "WAITING"
+
+    terminal.event(
+        "progress",
+        {
+            "companies_claimed": 1,
+            "companies_finished": 0,
+            "companies_in_flight": 1,
+            "companies_retry_wait": 0,
+            "endpoints_done": 0,
+            "endpoints_not_available": 0,
+            "endpoints_failed": 0,
+            "leases_recovered": 0,
+        },
+    )
+
+    assert terminal.state.status == "RUNNING"
+    assert terminal.state.wait_started_monotonic is None
+    assert terminal.state.wait_seconds is None
+    terminal.close()
+
+
+def test_v06_plain_continuous_wait_uses_next_check_not_next_cycle() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "collect",
+        stream=stream,
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core", continuous=True)
+    terminal.event("cycle_waiting", {"idle_seconds": 5.0})
+    terminal.close()
+
+    output = stream.getvalue()
+    assert "WAITING next_check=00:00:05" in output
+    assert "next_cycle" not in output
