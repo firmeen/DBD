@@ -75,22 +75,22 @@ MSSQL_TIMEOUT=60
 
 อย่า commit .env
 
-## 5. ตรวจ Production SQL Server
+## 5. เตรียม Production schema
 
-~~~powershell
-dbd-data check-db
-~~~
-
-ถ้า connection ไม่ผ่าน ให้หยุดตรงนี้และแก้ network/credential/database ก่อน
-
-## 6. Converge schema
-
-สำหรับเครื่องหรือ environment ที่ต้องเตรียม schema:
+ถ้าเป็น environment ใหม่ หรือ source code มี schema contract ใหม่:
 
 ~~~powershell
 dbd-data migrate
 dbd-data check-db
 ~~~
+
+ถ้า Production schema มีอยู่และตรง contract อยู่แล้ว:
+
+~~~powershell
+dbd-data check-db
+~~~
+
+ถ้า check-db ไม่ผ่าน ให้หยุดตรงนี้และแก้ network, credential, permission หรือ schema ก่อน
 
 migrate เป็น fail-closed ถ้า schema เดิมขัดกับ contract ที่แก้อัตโนมัติไม่ได้
 
