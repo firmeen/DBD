@@ -819,6 +819,7 @@ async def run(
     generation: int | None = None,
     refresh_mask: int = 0,
     repository=None,
+    event=None,
 ) -> DiscoveryResult:
     """Direct v0.6 Search traversal into SQL Server DBD_COMPANY.
 
@@ -837,12 +838,25 @@ async def run(
 
     repo = repository or ProductionSqlServerRepository()
     global_rate = settings.dbd_rate_per_second if rate is None else rate
-    progress_line = ProgressLine("DISCOVERY", interval=0.75, enabled=verbose)
 
     buckets_processed = 0
     pages_fetched = 0
     companies_written = 0
     invalid_rows = 0
+
+    def emit_progress(client: FixedRateDbdClient) -> None:
+        if event is None:
+            return
+        event(
+            "discovery_progress",
+            {
+                "buckets_processed": buckets_processed,
+                "pages_fetched": pages_fetched,
+                "companies_written": companies_written,
+                "requests_made": client.requests_made,
+                "invalid_rows": invalid_rows,
+            },
+        )
 
     async with FixedRateDbdClient(
         concurrency=int(concurrency or settings.dbd_concurrency),
@@ -895,12 +909,12 @@ async def run(
 
             buckets_processed += 1
             if page.total_items == 0:
+                emit_progress(client)
                 continue
 
             if page.total_items > MAX_ROWS_PER_QUERY:
                 children = _children_for(filters, provinces)
                 if not children:
-                    progress_line.close()
                     raise ContractError(
                         f"{page.total_items} rows exceeds the "
                         f"{MAX_ROWS_PER_QUERY} ceiling and no split dimension remains"
@@ -915,16 +929,25 @@ async def run(
                     child_total += int(child_page.total_items)
                     counted_children.append((child, (child_data, child_page)))
                 if child_total != int(page.total_items):
-                    progress_line.close()
                     raise ContractError(
                         "Discovery partition is not lossless: "
                         f"parent={page.total_items:,}, children={child_total:,}"
                     )
                 queue.extend(counted_children)
-                progress_line.event(
-                    f"{filters.key()}: {page.total_items:,} rows -> "
-                    f"{len(children)} lossless child partitions"
-                )
+                if event is not None:
+                    event(
+                        "discovery_split",
+                        {
+                            "rows": int(page.total_items),
+                            "children": len(children),
+                            "buckets_processed": buckets_processed,
+                            "pages_fetched": pages_fetched,
+                            "companies_written": companies_written,
+                            "requests_made": client.requests_made,
+                            "invalid_rows": invalid_rows,
+                        },
+                    )
+                emit_progress(client)
                 continue
 
             page_numbers = list(range(1, int(page.total_pages) + 1))
@@ -982,25 +1005,15 @@ async def run(
                     )
                     companies_written += int(result["inserted"]) + int(result["updated"])
 
-                progress_line.event(
-                    f"{filters.key()}: pages={min(offset + len(chunk), len(page_numbers))}/"
-                    f"{len(page_numbers)} companies={companies_written:,}"
-                )
+                emit_progress(client)
 
     if queue:
-        progress_line.close()
         raise ContractError(
             "Discovery stopped before all in-memory partitions were drained; "
             "persisted rows remain safe but generation coverage is incomplete"
         )
 
-    progress_line.close(
-        message=(
-            f"Discovery: partitions={buckets_processed:,} "
-            f"pages={pages_fetched:,} companies={companies_written:,} "
-            f"invalid={invalid_rows:,}"
-        )
-    )
+    emit_progress(client)
     if invalid_rows:
         raise ContractError(
             f"Discovery encountered {invalid_rows:,} contract-invalid company row(s); "

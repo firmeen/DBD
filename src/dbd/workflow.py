@@ -405,6 +405,7 @@ async def discover(
             generation=generation,
             refresh_mask=phase_mask(phase) if refresh else 0,
             repository=repo,
+            event=event,
         )
         result = await _guard_application_lock(repo, lock_conn, work)
         repo.assert_manager_lock(lock_conn)
@@ -414,6 +415,9 @@ async def discover(
             phase="DISCOVER",
             generation=generation,
             companies=result.companies_written,
+            partitions=result.buckets_processed,
+            pages=result.pages_fetched,
+            requests=result.requests_made,
             invalid_rows=result.invalid_rows,
         )
         return generation, result
@@ -651,6 +655,7 @@ async def cycle_run(
             generation=generation,
             refresh_mask=phase_mask(phase) if refresh else 0,
             repository=repo,
+            event=event,
         )
         _emit(event, "phase_started", phase="DISCOVER", generation=generation)
         discovery_result = await _guard_application_lock(
@@ -664,6 +669,9 @@ async def cycle_run(
             phase="DISCOVER",
             generation=generation,
             companies=discovery_result.companies_written,
+            partitions=discovery_result.buckets_processed,
+            pages=discovery_result.pages_fetched,
+            requests=discovery_result.requests_made,
             invalid_rows=discovery_result.invalid_rows,
         )
 
