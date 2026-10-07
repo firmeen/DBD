@@ -1317,6 +1317,8 @@ class V06Terminal:
         if normalized in {
             "WAITING",
             "RETRY",
+            "RETRY_WAIT",
+            "PARTIAL",
             "DEGRADED",
             "STOPPING",
             "COMPLETE_WITH_FAILURES",

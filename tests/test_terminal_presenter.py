@@ -355,6 +355,8 @@ def test_v06_plain_output_has_start_time_and_no_repaint_sequences() -> None:
 def test_v06_semantic_complete_with_failures_is_yellow_not_green() -> None:
     terminal = V06Terminal("collect", stream=StringIO(), tty=False)
     assert terminal._status_style("COMPLETE_WITH_FAILURES") == "bold yellow"
+    assert terminal._status_style("RETRY_WAIT") == "bold yellow"
+    assert terminal._status_style("PARTIAL") == "bold yellow"
     assert terminal._status_style("COMPLETE") == "bold green"
     assert terminal._status_style("FAILED") == "bold red"
 
