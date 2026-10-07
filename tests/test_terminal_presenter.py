@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 
 from dbd.presentation import TerminalPresenter
+from dbd.presentation.v06 import V06Terminal
 
 
 def presenter(*, json_mode=False, verbose=False):
@@ -286,3 +288,167 @@ def test_package_about_json_mode_preserves_snapshot() -> None:
     output.package_about(payload)
 
     assert json.loads(stream.getvalue()) == payload
+
+
+
+def _v06_wall_clock():
+    return datetime(2026, 10, 7, 10, 22, 41, tzinfo=timezone(timedelta(hours=7)))
+
+
+def test_v06_plain_output_has_start_time_and_no_repaint_sequences() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "discover",
+        app="DBD DATA",
+        stream=stream,
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core")
+    terminal.event("phase_started", {"phase": "DISCOVER", "generation": 12})
+    terminal.event(
+        "discovery_progress",
+        {
+            "buckets_processed": 8,
+            "pages_fetched": 21,
+            "companies_written": 144,
+            "requests_made": 22,
+            "invalid_rows": 0,
+        },
+    )
+    terminal.event(
+        "phase_completed",
+        {
+            "phase": "DISCOVER",
+            "generation": 12,
+            "partitions": 8,
+            "pages": 21,
+            "companies": 144,
+            "requests": 22,
+            "invalid_rows": 0,
+        },
+    )
+    terminal.finish(
+        {
+            "generation": 12,
+            "phase": "core",
+            "partitions": 8,
+            "pages": 21,
+            "companies": 144,
+            "requests": 22,
+            "invalid_rows": 0,
+        }
+    )
+
+    output = stream.getvalue()
+    assert "DBD DATA / DISCOVER" in output
+    assert "Started: 2026-10-07 10:22:41 +07:00" in output
+    assert "DISCOVER complete" in output
+    assert "Duration: 00:00:00" in output
+    assert "\r" not in output
+    assert "\x1b[" not in output
+    assert "ETA" not in output
+    assert "Actual rate" not in output
+    assert not output.lstrip().startswith("{")
+
+
+def test_v06_semantic_complete_with_failures_is_yellow_not_green() -> None:
+    terminal = V06Terminal("collect", stream=StringIO(), tty=False)
+    assert terminal._status_style("COMPLETE_WITH_FAILURES") == "bold yellow"
+    assert terminal._status_style("COMPLETE") == "bold green"
+    assert terminal._status_style("FAILED") == "bold red"
+
+
+def test_v06_compact_render_keeps_exact_numbers_and_configured_rate() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "collect",
+        app="DBD DEEP",
+        stream=stream,
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core", concurrency=24, rate=60)
+    terminal.event(
+        "started",
+        {
+            "generation": 12,
+            "phase": "core",
+            "concurrency": 24,
+            "rate_per_second": 60.0,
+            "company_limit": None,
+            "continuous": False,
+            "idle_seconds": 5.0,
+            "active_endpoints": ["profile"],
+        },
+    )
+    terminal.event(
+        "progress",
+        {
+            "companies_claimed": 14821,
+            "companies_finished": 14797,
+            "companies_in_flight": 24,
+            "companies_retry_wait": 18,
+            "endpoints_done": 61225,
+            "endpoints_not_available": 7991,
+            "endpoints_failed": 42,
+            "leases_recovered": 0,
+        },
+    )
+    terminal.console.print(terminal._render(72))
+    terminal.close()
+
+    output = stream.getvalue()
+    assert "14,821" in output
+    assert "14.8k" not in output
+    assert "Configured rate" in output
+    assert "60" in output
+    assert "ETA" not in output
+
+
+def test_v06_cycle_wait_is_truthful_local_countdown() -> None:
+    current = [100.0]
+    stream = StringIO()
+    terminal = V06Terminal(
+        "cycle-loop",
+        stream=stream,
+        tty=False,
+        clock=lambda: current[0],
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core")
+    terminal.event(
+        "cycle_completed",
+        {
+            "status": "COMPLETE",
+            "generation": 12,
+            "phase": "core",
+            "resumed": False,
+            "discovery": {},
+            "prepare": {},
+            "collection": {},
+            "verification": {},
+            "finalized_rows": 10,
+        },
+    )
+    terminal.event("cycle_waiting", {"interval_seconds": 60.0, "iteration": 1})
+    current[0] = 115.0
+    terminal.console.print(terminal._render(100))
+    terminal.close()
+
+    output = stream.getvalue()
+    assert "NEXT CYCLE" in output
+    assert "WAITING" in output
+    assert "00:00:45" in output
+
+
+def test_v06_event_renderer_failure_isolated_from_runtime(monkeypatch) -> None:
+    terminal = V06Terminal("collect", stream=StringIO(), tty=False).start(phase="core")
+
+    def broken_event(_name, _payload):
+        raise RuntimeError("renderer fault")
+
+    monkeypatch.setattr(terminal, "_apply_event", broken_event)
+    terminal.event("progress", {"companies_finished": 1})
+
+    assert terminal._renderer_failed is True
+    terminal.close()
