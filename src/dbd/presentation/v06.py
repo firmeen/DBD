@@ -523,9 +523,12 @@ class V06Terminal:
     def _final_status(self, payload: Mapping[str, Any]) -> str:
         if self.state.command == "check-db":
             return "READY"
-        if self.state.command in {"cycle-run", "cycle-loop", "fetch-company"}:
+        if self.state.command in {"cycle-run", "cycle-loop"}:
             value = payload.get("status")
             return str(value or "COMPLETE").upper()
+        if self.state.command == "fetch-company":
+            value = str(payload.get("status") or "COMPLETE").upper()
+            return "COMPLETE" if value == "COMPLETE" else "COMPLETE_WITH_FAILURES"
         if self.state.command == "collect":
             failures = payload.get("endpoints_failed")
             if _truthy_count(failures):
@@ -1443,7 +1446,9 @@ class V06Terminal:
         if result_line:
             self._plain_write(result_line)
         finished = self.state.finished_at or self._wall_clock()
-        if status == "COMPLETE_WITH_FAILURES":
+        if status == "FAILED":
+            self._plain_write(f"Failed: {_timestamp(finished)} · Exit 1")
+        elif status == "COMPLETE_WITH_FAILURES":
             self._plain_write(f"Completed with failures: {_timestamp(finished)}")
         else:
             self._plain_write(f"Completed: {_timestamp(finished)}")
