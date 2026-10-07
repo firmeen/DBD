@@ -1,95 +1,121 @@
-# MySQL setup
+# MySQL — Generation 1 Source and Test Setup
 
-MySQL เป็นฐานข้อมูลหลักของโครงการ DBD และเป็น durable source of truth สำหรับ master data, run/task state และ response archive metadata
+MySQL ไม่ใช่ Production backend ของ DBD v0.6
 
-โครงการรองรับ MySQL 8+ และ environment ปัจจุบันมักใช้ port `3307`
+ไฟล์นี้มีไว้เฉพาะ:
 
-## 1. ตรวจว่า MySQL ทำงาน
+1. อ่าน Dataset 1 เดิมเพื่อทำ Generation 1 Cutover
+2. development/integration test ที่ระบุว่าต้องใช้ MySQL
 
-```powershell
-mysql --version
-Test-NetConnection 127.0.0.1 -Port 3307
-```
+Production หลัง cutover ใช้ SQL Server
 
-ถ้าใช้ port อื่น ให้เปลี่ยนทั้งคำสั่งและ `DB_PORT` ใน `.env`
+## Generation 1 source
 
-## 2. สร้าง database และ local application user
+cutover คาดว่า MySQL database ชื่อ:
 
-เข้า MySQL ด้วย account ผู้ดูแล:
+~~~text
+dbd
+~~~
 
-```powershell
-mysql -h 127.0.0.1 -P 3307 -u root -p
-```
+และใช้ source หลัก:
 
-จากนั้น:
+~~~text
+dbd_company_deep
+~~~
 
-```sql
-CREATE DATABASE IF NOT EXISTS dbd
-  CHARACTER SET utf8mb4
-  COLLATE utf8mb4_0900_ai_ci;
+พร้อม state ที่ใช้ตรวจความปลอดภัย:
 
-CREATE USER IF NOT EXISTS 'dbd-data'@'127.0.0.1'
-IDENTIFIED BY '<STRONG_PASSWORD>';
+~~~text
+dbd_company_master
+dbd_deep_runtime
+discovery_buckets
+~~~
 
-GRANT ALL PRIVILEGES ON dbd.*
-TO 'dbd-data'@'127.0.0.1';
-```
+## Environment
 
-คำสั่งด้านบนเหมาะกับ local development เพราะ account เดียวสามารถ migrate schema และใช้งาน runtime ได้ ใน production ควรแยก migration/admin account ออกจาก runtime account และลดสิทธิ์ตามหน้าที่
-
-## 3. ตั้งค่า .env
-
-```env
+~~~text
 DB_HOST=127.0.0.1
 DB_PORT=3307
 DB_NAME=dbd
-DB_USER=dbd-data
-DB_PASSWORD=<STRONG_PASSWORD>
-```
+DB_USER=<MYSQL_USER>
+DB_PASSWORD=<MYSQL_PASSWORD>
+~~~
 
-อย่า commit `.env`
+DB_NAME สำหรับ Generation 1 Cutover ต้องเป็น dbd
 
-## 4. ตรวจ connection และ migrate schema
+## ตรวจ connection
 
-จาก root ของ repository และเปิด virtual environment แล้ว:
+ตัวอย่างด้วย mysql client:
 
-```powershell
-dbd-data check-db
+~~~powershell
+mysql -h 127.0.0.1 -P 3307 -u <MYSQL_USER> -p dbd
+~~~
+
+จากนั้นใช้ read-only checks:
+
+~~~sql
+SELECT COUNT(*) AS master_waiting
+FROM dbd_company_master;
+
+SELECT deep_status, COUNT(*) AS rows
+FROM dbd_company_deep
+GROUP BY deep_status
+ORDER BY deep_status;
+
+SELECT status, COUNT(*) AS rows
+FROM dbd_deep_runtime
+GROUP BY status
+ORDER BY status;
+~~~
+
+cutover script จะตรวจ safety conditions เพิ่มเอง รวมถึง active Discovery lease และ source watermark
+
+## Cutover readiness
+
+ก่อน cutover ต้องไม่มี:
+
+- rows ใน dbd_company_master
+- dbd_deep_runtime ที่ status = RUNNING
+- active Discovery lease
+- dbd_company_deep ที่ deep_status = PENDING
+- dbd_company_deep ที่ deep_status = COLLECTING
+
+PARTIAL และ FAILED เป็น terminal source states สำหรับ cutover และไม่ใช่ blocker แบบเดียวกับ PENDING/COLLECTING
+
+## SQL Server ต้องพร้อมก่อน
+
+~~~powershell
 dbd-data migrate
-```
+dbd-data check-db
+~~~
 
-ผลของ migration ที่สำเร็จควรจบด้วย:
+จากนั้น:
 
-```text
-Schema is current
-```
+~~~powershell
+python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
+~~~
 
-ตรวจสถานะข้อมูล:
+## Safety
 
-```powershell
-dbd-data master-status
-dbd-data discover-status
-```
+cutover อ่าน source MySQL แบบ read-only ยกเว้น advisory locks ที่ใช้ fence การทำงานเดิม
 
-## 5. เปิดดูผ่าน SQL client
+อย่าแก้ Dataset 1 ระหว่าง cutover
 
-ถ้าต้องการใช้ GUI ดู table/query ให้ทำตาม [DBeaver setup](DBEAVER.md)
+script ตรวจ watermark ของ source ระหว่าง target transactions ถ้า source เปลี่ยนจะหยุดแทนการย้าย snapshot ที่ไม่สอดคล้องกัน
 
-ถ้าจะให้เครื่องอื่นเชื่อมต่อ MySQL ให้ใช้ account แยกต่อทีม/ต่อ source IP และอ่าน [DBD Client Access](../DBD_CLIENT_ACCESS.md) ก่อน ไม่ควรนำ `dbd-data` ซึ่งเป็น runtime credential ไปแจกให้ client ภายนอก
+## หลัง Cutover
 
-## 6. Troubleshooting เบื้องต้น
+ตรวจ SQL Server:
 
-ดู listener:
+~~~powershell
+dbd-data cycle status --phase core
+dbd-deep status --phase core --coverage
+~~~
 
-```powershell
-Get-NetTCPConnection -LocalPort 3307 -State Listen |
-  Format-Table LocalAddress,LocalPort,OwningProcess
-```
+เมื่อ Generation 1 สำเร็จแล้ว MySQL ไม่ใช่ dependency ของ normal Production cycle
 
-ทดสอบ local TCP:
+## Development / Integration
 
-```powershell
-Test-NetConnection 127.0.0.1 -Port 3307
-```
+test ที่ต้องใช้ MySQL ควรใช้ database แยกจาก dbd และตาม safety gate ของ test suite
 
-ถ้า `check-db` ไม่ผ่าน ให้ตรวจตามลำดับ: MySQL process → port → `.env` → username/password → database name
+อย่าใช้ Production Dataset 1 เป็น disposable test database
