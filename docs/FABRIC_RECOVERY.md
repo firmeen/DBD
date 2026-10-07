@@ -1,3 +1,10 @@
+> [!WARNING]
+> **LEGACY / HISTORICAL DOCUMENT**
+>
+> เอกสารนี้ไม่ใช่คู่มือสำหรับ SQL Server v0.6 Production workflow ปัจจุบัน
+> สำหรับการรัน Production ให้เริ่มจาก README.md และ docs/RUNBOOK.md
+> เก็บไฟล์นี้ไว้เพื่ออ้างอิง runtime รุ่นเดิมเท่านั้น และไม่ควรนำ command หรือ state model ในไฟล์นี้มาปะปนกับ v0.6
+
 # Fabric V2 upstream recovery
 
 Issue: #61  
