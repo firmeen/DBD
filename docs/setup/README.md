@@ -12,8 +12,8 @@ Production backend คือ SQL Server
 2. clone repository
 3. install package
 4. ตั้งค่า SQL Server ใน .env
-5. รัน check-db
-6. รัน migrate เมื่อเป็นการติดตั้งครั้งแรกหรือ schema contract เปลี่ยน
+5. รัน migrate เมื่อเป็นการติดตั้งครั้งแรกหรือ schema contract เปลี่ยน
+6. รัน check-db
 7. ตรวจ cycle status
 8. เริ่ม Production cycle เมื่อพร้อม
 
@@ -23,11 +23,12 @@ Production backend คือ SQL Server
 
 ~~~powershell
 python -m pip install -e .
-dbd-data check-db
 dbd-data migrate
 dbd-data check-db
 dbd-data cycle status --phase core
 ~~~
+
+ถ้า Production schema มีอยู่และตรง contract อยู่แล้ว สามารถเริ่มจาก dbd-data check-db ได้
 
 ถ้า schema พร้อมอยู่แล้ว migrate จะ converge ตาม contract ที่รองรับ
 
