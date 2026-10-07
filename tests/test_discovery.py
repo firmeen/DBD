@@ -1,3 +1,7 @@
+import asyncio
+from decimal import Decimal
+from types import SimpleNamespace
+
 import pytest
 
 from dbd.client.endpoints.search import SearchFilters
@@ -176,3 +180,268 @@ async def test_invalid_or_empty_province_response_fails_loudly(payload):
 
     with pytest.raises(ContractError):
         await discovery.fetch_provinces(Client())
+
+
+class _DirectClient:
+    def __init__(self, *args, **kwargs) -> None:
+        self.concurrency = int(kwargs.get("concurrency") or 4)
+        self.requests_made = 0
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_args):
+        return None
+
+    async def fetch(self, method, path, **_kwargs):
+        assert method == "GET"
+        assert path == "/api/v1/commons/provinces"
+        self.requests_made += 1
+        return SimpleNamespace(
+            data=[{"pvCode": "10"}],
+            requested_at=discovery._now(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_direct_discovery_persists_valid_rows_without_mysql_runtime(monkeypatch):
+    persisted = []
+    legacy_called = []
+
+    async def direct_page(_client, filters, page_no):
+        assert filters.keyword == "010"
+        assert page_no == 1
+        data = {
+            "meta": {"currentPage": 1, "totalItems": 2, "totalPages": 1},
+            "contents": [
+                {"jpTypeCode": "7", "jpNo": "0107556000051", "jpName": "valid"},
+                {"jpTypeCode": "7", "jpNo": "short", "jpName": "invalid"},
+            ],
+        }
+        return data, discovery._now()
+
+    def persist(_repo, rows, *, generation, refresh_mask):
+        persisted.extend(rows)
+        assert generation == 2
+        assert refresh_mask == 0
+        return {"inserted": len(rows), "updated": 0, "refresh_reopened": 0}
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+    monkeypatch.setattr(discovery, "_persist_direct_batch", persist)
+    monkeypatch.setattr(
+        discovery,
+        "upsert_bucket",
+        lambda *_args, **_kwargs: legacy_called.append("upsert_bucket"),
+    )
+
+    with pytest.raises(ContractError, match="contract-invalid"):
+        await discovery.run(
+            ["010"],
+            generation=2,
+            repository=object(),
+            verbose=False,
+        )
+
+    assert legacy_called == []
+    assert len(persisted) == 1
+    assert persisted[0]["juristic_type_code"] == "7"
+    assert persisted[0]["registration_no"] == "0107556000051"
+    assert '"jpNo":"0107556000051"' in persisted[0]["master_payload"]
+
+
+@pytest.mark.asyncio
+async def test_direct_discovery_splits_oversized_partition_and_reconciles_counts(monkeypatch):
+    persisted = []
+    child_calls = []
+
+    async def direct_page(_client, filters, page_no):
+        assert page_no == 1
+        if not filters.jp_types:
+            total = 16000
+            row = {"jpTypeCode": "7", "jpNo": "0107556000051"}
+        else:
+            child_calls.append(filters.jp_types[0])
+            total = 2000
+            index = len(child_calls)
+            row = {
+                "jpTypeCode": "A",
+                "jpNo": f"{index:011d}",
+                "jpName": f"child-{index}",
+            }
+        data = {
+            "meta": {"currentPage": 1, "totalItems": total, "totalPages": 1},
+            "contents": [row],
+        }
+        return data, discovery._now()
+
+    def persist(_repo, rows, *, generation, refresh_mask):
+        persisted.extend(rows)
+        return {"inserted": len(rows), "updated": 0, "refresh_reopened": 0}
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+    monkeypatch.setattr(discovery, "_persist_direct_batch", persist)
+
+    result = await discovery.run(
+        ["010"],
+        generation=2,
+        repository=object(),
+        verbose=False,
+    )
+
+    assert set(child_calls) == set(discovery.JP_TYPES)
+    assert result.buckets_processed == 1 + len(discovery.JP_TYPES)
+    assert result.pages_fetched == 1 + len(discovery.JP_TYPES)
+    assert result.invalid_rows == 0
+    assert len(persisted) == len(discovery.JP_TYPES)
+
+
+
+@pytest.mark.asyncio
+async def test_bounded_direct_discovery_reports_incomplete_coverage(monkeypatch) -> None:
+    persisted = []
+
+    async def direct_page(_client, filters, page_no):
+        assert page_no == 1
+        data = {
+            "meta": {"currentPage": 1, "totalItems": 1, "totalPages": 1},
+            "contents": [
+                {
+                    "jpTypeCode": "7",
+                    "jpNo": "0107556000051",
+                    "jpName": filters.keyword,
+                }
+            ],
+        }
+        return data, discovery._now()
+
+    def persist(_repo, rows, *, generation, refresh_mask):
+        persisted.extend(rows)
+        return {"inserted": len(rows), "updated": 0, "refresh_reopened": 0}
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+    monkeypatch.setattr(discovery, "_persist_direct_batch", persist)
+
+    with pytest.raises(ContractError, match="coverage is incomplete"):
+        await discovery.run(
+            ["010", "011"],
+            generation=2,
+            max_buckets=1,
+            repository=object(),
+            verbose=False,
+        )
+
+    assert len(persisted) == 1
+
+@pytest.mark.asyncio
+async def test_bounded_direct_discovery_still_rejects_invalid_rows(monkeypatch) -> None:
+    async def direct_page(_client, _filters, page_no):
+        assert page_no == 1
+        return (
+            {
+                "meta": {"currentPage": 1, "totalItems": 1, "totalPages": 1},
+                "contents": [
+                    {"jpTypeCode": "7", "jpNo": "short", "jpName": "invalid"}
+                ],
+            },
+            discovery._now(),
+        )
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+
+    with pytest.raises(ContractError, match="contract-invalid"):
+        await discovery.run(
+            ["010"],
+            generation=2,
+            max_buckets=1,
+            repository=object(),
+            verbose=False,
+        )
+
+
+def test_fully_partitioned_search_has_no_silent_fallback_split() -> None:
+    filters = SearchFilters(
+        keyword="010",
+        jp_types=["7"],
+        pv_codes=["10"],
+        business_sizes=["S"],
+    )
+    assert discovery._children_for(filters, ["10"]) == []
+
+
+@pytest.mark.asyncio
+async def test_v06_direct_discovery_rejects_legacy_distributed_mode() -> None:
+    with pytest.raises(ValueError, match="legacy MySQL discovery mode"):
+        await discovery.run(
+            ["010"],
+            generation=2,
+            distributed=True,
+            repository=object(),
+            verbose=False,
+        )
+
+
+def test_direct_discovery_payload_preserves_decimal_as_json_number() -> None:
+    encoded = discovery._canonical_company_payload(
+        {"amount": Decimal("123.4500"), "name": "A\x00B"}
+    )
+    assert '"amount":123.4500' in encoded
+    assert '"amount":"123.4500"' not in encoded
+    assert "\x00" not in encoded
+
+
+def test_discovery_nested_container_without_nested_key_does_not_emit_null_field() -> None:
+    profile = discovery.normalize(
+        {
+            "jpNo": "0107556000051",
+            "jpTypeCode": "7",
+            "jpStatus": {},
+        }
+    )
+    row = discovery._discovery_company_row(
+        profile,
+        {"jpNo": "0107556000051", "jpTypeCode": "7", "jpStatus": {}},
+        published_at=discovery._now(),
+    )
+    assert "status_description" not in row
+
+
+@pytest.mark.asyncio
+async def test_direct_discovery_cancels_sibling_page_tasks_after_failure(monkeypatch) -> None:
+    cancelled = asyncio.Event()
+
+    async def direct_page(_client, _filters, page_no):
+        if page_no == 1:
+            return (
+                {
+                    "meta": {"currentPage": 1, "totalItems": 3, "totalPages": 3},
+                    "contents": [
+                        {"jpTypeCode": "7", "jpNo": "0107556000051", "jpName": "A"}
+                    ],
+                },
+                discovery._now(),
+            )
+        if page_no == 2:
+            await asyncio.sleep(0)
+            raise RuntimeError("page 2 failed")
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", _DirectClient)
+    monkeypatch.setattr(discovery, "_direct_page", direct_page)
+
+    with pytest.raises(RuntimeError, match="page 2 failed"):
+        await discovery.run(
+            ["010"],
+            generation=2,
+            repository=object(),
+            verbose=False,
+        )
+
+    assert cancelled.is_set()

@@ -285,8 +285,10 @@ class FixedRateDbdClient:
         method: str,
         path: str,
         *,
+        json_body: object | None = None,
         params: dict[str, object] | None = None,
         referer: str | None = None,
+        timeout: float | None = None,
     ) -> DeepResponse:
         if self._session is None:
             raise RuntimeError("Use async with FixedRateDbdClient")
@@ -307,9 +309,10 @@ class FixedRateDbdClient:
                     response = await self._session.request(
                         method,
                         settings.dbd_base_url.rstrip("/") + path,
+                        json=json_body,
                         params=params,
                         headers=self._headers(token, referer),
-                        timeout=self.timeout,
+                        timeout=float(timeout or self.timeout),
                     )
             except (RequestsError, TimeoutError) as exc:
                 last_error = exc

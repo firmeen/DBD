@@ -5,9 +5,10 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
-# Active Deep scope is intentionally seven endpoints. The four nationality/history
-# columns may remain in dbd_company_deep, but they are not scheduled or required.
-ACTIVE_ENDPOINTS = (
+# v0.6 production endpoint order is static. The original seven Deep bits are a
+# compatibility contract and must never change; extended endpoints take the next
+# non-overlapping bits. Legacy MySQL catalog parsing remains below for old tools.
+CORE_ENDPOINTS = (
     "profile",
     "committees",
     "committee_signs",
@@ -17,16 +18,18 @@ ACTIVE_ENDPOINTS = (
     "industry_benchmark",
 )
 
-# These legacy Deep endpoints remain valid schema/catalog entries for migration
-# compatibility, but the standalone collector must never schedule or require them.
-INACTIVE_ENDPOINTS = (
+EXTENDED_ENDPOINTS = (
     "nations",
     "nation_history",
     "name_history",
     "capital_history",
 )
 
-# These bit values are the stable contract created by canary-new_model.py.
+ALL_ENDPOINTS = CORE_ENDPOINTS + EXTENDED_ENDPOINTS
+
+ACTIVE_ENDPOINTS = CORE_ENDPOINTS
+INACTIVE_ENDPOINTS = EXTENDED_ENDPOINTS
+
 ENDPOINT_BITS = {
     "profile": 1 << 0,
     "financial_submissions": 1 << 1,
@@ -35,8 +38,16 @@ ENDPOINT_BITS = {
     "committees": 1 << 4,
     "committee_signs": 1 << 5,
     "transformations": 1 << 6,
+    "nations": 1 << 7,
+    "nation_history": 1 << 8,
+    "name_history": 1 << 9,
+    "capital_history": 1 << 10,
 }
 
+# Compatibility surface for the legacy MySQL Deep repository. Keep this
+# limited to the original seven active payload columns so old readiness/schema
+# validation does not start requiring extended columns merely because v0.6
+# production can collect them directly into SQL Server.
 DESTINATION_COLUMNS = {
     "profile": "profile_data",
     "committees": "committees_data",
@@ -51,9 +62,14 @@ FINANCIAL_ENDPOINTS = frozenset(
     ("financial_submissions", "financial_statements", "industry_benchmark")
 )
 
-ACTIVE_ENDPOINT_MASK = sum(ENDPOINT_BITS.values())
+CORE_ENDPOINT_MASK = sum(ENDPOINT_BITS[key] for key in CORE_ENDPOINTS)
+EXTENDED_ENDPOINT_MASK = sum(ENDPOINT_BITS[key] for key in EXTENDED_ENDPOINTS)
+ALL_ENDPOINT_MASK = CORE_ENDPOINT_MASK | EXTENDED_ENDPOINT_MASK
+
+# Compatibility names used by the legacy standalone Deep repository.
+ACTIVE_ENDPOINT_MASK = CORE_ENDPOINT_MASK
 BASE_REQUIRED_MASK = sum(
-    ENDPOINT_BITS[key] for key in ACTIVE_ENDPOINTS if key not in FINANCIAL_ENDPOINTS
+    ENDPOINT_BITS[key] for key in CORE_ENDPOINTS if key not in FINANCIAL_ENDPOINTS
 )
 FINANCIAL_MASK = sum(ENDPOINT_BITS[key] for key in FINANCIAL_ENDPOINTS)
 ACTIVE_STATUS_CODE = "1"
@@ -72,6 +88,106 @@ class EndpointSpec:
     request_schema: dict[str, Any]
     response_schema: dict[str, Any]
     required_rule: dict[str, Any]
+
+
+
+_STATIC_ENDPOINTS = {
+    "profile": (
+        10,
+        "/api/v1/company-profiles/info/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+    "committees": (
+        50,
+        "/api/v1/company-profiles/committees/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+    "committee_signs": (
+        60,
+        "/api/v1/company-profiles/committee-signs/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+    "transformations": (
+        70,
+        "/api/v1/company-profiles/mergers/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+    "financial_submissions": (
+        20,
+        "/api/v1/fin/submit/{jp_type_code}/{jp_no}",
+        {"type": "when_master_field_present", "field": "submit_fin_year"},
+    ),
+    "financial_statements": (
+        30,
+        "/api/v1/fin/balancesheet/year/{jp_type_code}/{jp_no}",
+        {"type": "when_master_field_present", "field": "submit_fin_year"},
+    ),
+    "industry_benchmark": (
+        40,
+        "/api/v1/fin/basics/{jp_type_code}/{jp_no}",
+        {"type": "when_master_field_present", "field": "submit_fin_year"},
+    ),
+    "nations": (
+        80,
+        "/api/v1/company-profiles/nations/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+    "nation_history": (
+        90,
+        "/api/v1/company-profiles/nations/charts/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+    "name_history": (
+        100,
+        "/api/v1/company-profiles/names/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+    "capital_history": (
+        110,
+        "/api/v1/company-profiles/capitals/{jp_type_code}/{jp_no}",
+        {"type": "always"},
+    ),
+}
+
+
+def phase_endpoints(phase: str) -> tuple[str, ...]:
+    if phase == "core":
+        return CORE_ENDPOINTS
+    if phase == "extended":
+        return EXTENDED_ENDPOINTS
+    raise ValueError("phase must be core or extended")
+
+
+def phase_mask(phase: str) -> int:
+    return sum(ENDPOINT_BITS[key] for key in phase_endpoints(phase))
+
+
+def static_endpoint_specs(phase: str) -> tuple[EndpointSpec, ...]:
+    specs = []
+    for key in phase_endpoints(phase):
+        sequence, path, rule = _STATIC_ENDPOINTS[key]
+        specs.append(
+            EndpointSpec(
+                key=key,
+                sequence_no=sequence,
+                bit=ENDPOINT_BITS[key],
+                method="GET",
+                path_template=path,
+                referer_template=None,
+                destination_column=DESTINATION_COLUMNS.get(key, f"{key}_data"),
+                request_schema={
+                    "path": {"jp_type_code": "string", "jp_no": "string"},
+                    **(
+                        {"query": {"fiscalYear": "string"}}
+                        if key in FINANCIAL_ENDPOINTS
+                        else {}
+                    ),
+                },
+                response_schema={"allow_extra_fields": True},
+                required_rule=rule,
+            )
+        )
+    return tuple(specs)
 
 
 def latest_fiscal_year(value: object) -> str | None:
