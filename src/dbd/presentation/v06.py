@@ -132,6 +132,7 @@ class V06TerminalState:
     handoff_phase: str | None = None
     handoff_until: float = 0.0
     changed_at: dict[str, float] = field(default_factory=dict)
+    last_plain_milestone: tuple[str, str, int | None] | None = None
 
 
 class _Scene:
@@ -440,6 +441,12 @@ class V06Terminal:
                         "endpoint_failed": "FAILED",
                     }[name]
                     self.state.endpoint_states[endpoint] = endpoint_status
+                if name == "endpoint_failed":
+                    self.state.last_warning = (
+                        f"{endpoint} failed" if endpoint else "Endpoint failed"
+                    )
+                    self.state.transient_kind = "warning"
+                    self.state.transient_until = now + 1.2
                 return
 
             if name == "endpoint_retry":
@@ -1340,12 +1347,20 @@ class V06Terminal:
 
     def _motion(self, kind: str, width: int = 120) -> str:
         now = self._clock()
+        if self._transient("settle"):
+            if kind == "sweep":
+                return "━" * max(18, min(44, width - 12))
+            if kind == "stream":
+                return "━" * max(20, min(48, width - 12))
+            return "◆"
+
+        speed = 0.35 if self.state.status == "STOPPING" else 1.0
         if kind == "orbit":
             frames = ("◐", "◓", "◑", "◒")
-            return frames[int(now * 8) % len(frames)]
+            return frames[int(now * 8 * speed) % len(frames)]
         if kind == "radar":
             frames = ("◌", "◔", "◑", "●", "◑", "◔")
-            return frames[int(now * 6) % len(frames)]
+            return frames[int(now * 6 * speed) % len(frames)]
         if kind == "wait":
             frames = ("◷", "◶", "◵", "◴")
             return frames[int(now * 3) % len(frames)]
@@ -1355,7 +1370,7 @@ class V06Terminal:
                 "  · › · › · › · ›",
                 "› · › · › · › ·  ",
             )
-            return frames[int(now * 5) % len(frames)]
+            return frames[int(now * 5 * speed) % len(frames)]
         if kind == "seal":
             frames = (
                 ">         <",
@@ -1365,11 +1380,11 @@ class V06Terminal:
                 "    > <    ",
                 "  >     <  ",
             )
-            return frames[int(now * 6) % len(frames)]
+            return frames[int(now * 6 * speed) % len(frames)]
         if kind == "sweep":
             length = max(18, min(44, width - 12))
             cycle = max(2, length * 2 - 2)
-            position = int(now * 8) % cycle
+            position = int(now * 8 * speed) % cycle
             if position >= length:
                 position = cycle - position
             chars = ["━"] * length
@@ -1378,7 +1393,7 @@ class V06Terminal:
         if kind == "stream":
             length = max(20, min(48, width - 12))
             chars = [" "] * length
-            offset = int(now * 7) % 10
+            offset = int(now * 7 * speed) % 10
             for pos in range(offset, length, 10):
                 pulse = "╺━━"
                 for index, char in enumerate(pulse):
@@ -1430,8 +1445,18 @@ class V06Terminal:
 
     def _plain_event(self, name: str, payload: Mapping[str, Any]) -> None:
         stamp = _clock_time(self._wall_clock())
-        if name == "phase_started":
+        if name in {"phase_started", "phase_completed"}:
             phase = str(payload.get("phase") or "WORK").upper()
+            generation = (
+                int(payload["generation"])
+                if payload.get("generation") is not None
+                else None
+            )
+            signature = (name, phase, generation)
+            if self.state.last_plain_milestone == signature:
+                return
+            self.state.last_plain_milestone = signature
+        if name == "phase_started":
             suffix = (
                 f" generation={payload.get('generation')}"
                 if payload.get("generation") is not None
@@ -1440,7 +1465,6 @@ class V06Terminal:
             self._plain_write(f"{stamp} {phase} started{suffix}")
             return
         if name == "phase_completed":
-            phase = str(payload.get("phase") or "WORK").upper()
             details = []
             if payload.get("generation") is not None:
                 details.append(f"generation={payload['generation']}")

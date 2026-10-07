@@ -452,3 +452,62 @@ def test_v06_event_renderer_failure_isolated_from_runtime(monkeypatch) -> None:
 
     assert terminal._renderer_failed is True
     terminal.close()
+
+
+
+def test_v06_plain_phase_milestones_dedupe_adjacent_runtime_sources() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "cycle-run",
+        stream=stream,
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core")
+
+    payload = {"phase": "COLLECT", "generation": 12}
+    terminal.event("phase_started", payload)
+    terminal.event("phase_started", payload)
+    terminal.event("phase_completed", payload)
+    terminal.event("phase_completed", payload)
+    terminal.close()
+
+    output = stream.getvalue()
+    assert output.count("COLLECT started generation=12") == 1
+    assert output.count("COLLECT complete generation=12") == 1
+
+
+def test_v06_endpoint_failure_is_degraded_but_not_process_fatal() -> None:
+    terminal = V06Terminal(
+        "collect",
+        stream=StringIO(),
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core")
+    terminal.event(
+        "endpoint_failed",
+        {"company_id": 42, "endpoint": "profile", "http_status": 404},
+    )
+
+    assert terminal.state.status == "RUNNING"
+    assert terminal._active_status() == "DEGRADED"
+    assert terminal.state.last_warning == "profile failed"
+    terminal.close()
+
+
+def test_v06_completion_settle_uses_static_motion_frame() -> None:
+    current = [100.0]
+    terminal = V06Terminal(
+        "collect",
+        stream=StringIO(),
+        tty=False,
+        clock=lambda: current[0],
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core")
+    terminal.state.transient_kind = "settle"
+    terminal.state.transient_until = 101.0
+
+    assert set(terminal._motion("stream", 100)) == {"━"}
+    assert terminal._motion("orbit") == "◆"
+    terminal.close()
