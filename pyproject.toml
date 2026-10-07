@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "dbd-data"
 dynamic = ["version"]
-description = "DBD DataWarehouse company data ingestion into MySQL"
+description = "TIPDI DBD data ingestion and collection platform"
 requires-python = ">=3.11"
 dependencies = [
   "curl_cffi>=0.7,<1",
@@ -13,6 +13,7 @@ dependencies = [
   "truststore>=0.10,<1",
   "browser-cookie3>=0.19,<1",
   "PyMySQL>=1.1,<2",
+  "pymssql>=2.3,<3",
   "python-dotenv>=1.1,<2",
   "aiolimiter>=1.2,<2",
   "tenacity>=9,<10",
