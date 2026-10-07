@@ -1,122 +1,113 @@
-# DBeaver setup
+# DBeaver Production SQL Server Setup
 
-DBeaver เป็น GUI สำหรับเปิดดู schema, table และรัน SQL กับ MySQL โดยไม่จำเป็นต่อ collector runtime
+DBeaver เป็นเครื่องมือ GUI สำหรับตรวจ SQL Server ด้วยคน ไม่จำเป็นต่อ collector runtime
 
-## 1. ติดตั้ง DBeaver
+แนะนำให้ใช้ account แบบ read-only สำหรับการตรวจข้อมูลทั่วไป
 
-ใช้ DBeaver Community หรือ edition ที่องค์กรอนุญาต จากนั้นเปิดโปรแกรมและสร้าง connection ใหม่
+## 1. สร้าง connection
 
-## 2. สร้าง MySQL connection
+ใน DBeaver:
 
-เลือก:
+~~~text
+Database -> New Database Connection -> SQL Server
+~~~
 
-```text
-New Database Connection
-→ MySQL
-```
+ใส่ค่าตาม environment:
 
-สำหรับ MySQL ที่รันในเครื่องเดียวกับ DBD:
+~~~text
+Server   = MSSQL_SERVER
+Port     = MSSQL_PORT
+Database = MSSQL_DATABASE
+User     = approved SQL Server user
+Password = account password
+~~~
 
-| Field | Value |
-| --- | --- |
-| Host | `127.0.0.1` |
-| Port | `3307` หรือ port ที่ตั้งจริง |
-| Database | `dbd` |
-| Username | local DB user ที่ได้รับ |
-| Password | password ของ user นั้น |
+ค่าทั่วไปของ project:
 
-กด `Test Connection` ก่อน Save
+~~~text
+Database = TIPDataIntelligence
+Port     = 1433
+~~~
 
-ถ้า DBeaver ขอ MySQL driver ให้กด Download/Install driver ตามหน้าจอ
+อย่าคัดลอก password ลงเอกสารหรือ Git
 
-## 3. Remote client
+## 2. ตาราง Production
 
-ถ้า DBeaver อยู่คนละเครื่องกับ MySQL server อย่าใช้ `127.0.0.1`
+ควรเห็น:
 
-ใช้:
+~~~text
+dbo.DBD_COMPANY
+dbo.DBD_COMPANY_RELATION
+dbo.DBD_COMPANY_EVENT
+dbo.DBD_FINANCIAL
+dbo.DBD_INDUSTRY
+~~~
 
-```text
-Host = IP/DNS ของ MySQL server
-Port = 3307
-Database = dbd
-```
+## 3. Read-only checks
 
-และใช้ remote account แยก เช่น `dbd-<team>` ตาม [DBD Client Access](../DBD_CLIENT_ACCESS.md)
+จำนวนบริษัท:
 
-Runtime account `dbd-data` ไม่ควรถูกแชร์เป็น analyst/client account
-
-## 4. SQL Editor
-
-หลัง connect:
-
-```text
-DBD connection
-→ dbd
-→ SQL Editor
-→ New SQL Script
-```
-
-ตรวจ connection:
-
-```sql
-SELECT
-    DATABASE() AS database_name,
-    USER() AS login_identity,
-    CURRENT_USER() AS matched_mysql_account,
-    NOW() AS server_time;
-```
-
-ตรวจจำนวน master:
-
-```sql
+~~~sql
 SELECT COUNT(*) AS companies
-FROM company_master;
-```
+FROM dbo.DBD_COMPANY;
+~~~
 
-ดู campaign ล่าสุด:
+ดู Generation ล่าสุด:
 
-```sql
+~~~sql
 SELECT
-    id,
-    source_label,
-    parts,
-    status,
-    created_at,
-    finished_at
-FROM worker_runs
-ORDER BY id DESC
-LIMIT 20;
-```
+    MAX(dataset_generation) AS finalized_generation,
+    MAX(last_seen_generation) AS last_seen_generation
+FROM dbo.DBD_COMPANY;
+~~~
 
-ดู task summary ของ campaign:
+ดู collection status:
 
-```sql
-SET @run_id = 1;
+~~~sql
+SELECT collect_status, COUNT(*) AS rows
+FROM dbo.DBD_COMPANY
+GROUP BY collect_status
+ORDER BY collect_status;
+~~~
 
-SELECT
-    status,
-    COUNT(*) AS tasks
-FROM endpoint_tasks
-WHERE run_id = @run_id
-GROUP BY status
-ORDER BY status;
-```
+ดูตัวอย่างบริษัท:
 
-ดู endpoint summary:
+~~~sql
+SELECT TOP (50)
+    company_id,
+    juristic_type_code,
+    registration_no,
+    company_name_th,
+    collect_status,
+    dataset_generation,
+    last_seen_generation
+FROM dbo.DBD_COMPANY
+ORDER BY company_id;
+~~~
 
-```sql
-SELECT
-    endpoint,
-    status,
-    COUNT(*) AS tasks
-FROM endpoint_tasks
-WHERE run_id = @run_id
-GROUP BY endpoint, status
-ORDER BY endpoint, status;
-```
+## 4. สิ่งที่ไม่ควรทำผ่าน GUI
 
-## 5. Safe usage
+บน Production อย่าใช้ DBeaver เพื่อ:
 
-ถ้าเป็น account สำหรับ analyst/client แนะนำให้ใช้ `SELECT` only
+- DELETE row เพื่อแก้ status
+- TRUNCATE table
+- DROP table
+- reset masks
+- reset Generation
+- clear lease
+- ALTER schema แบบ ad-hoc
 
-อย่ารันคำสั่ง `DELETE`, `TRUNCATE`, `DROP`, `ALTER` หรือ manual update กับ task/run state บน production database เว้นแต่เป็นขั้นตอน maintenance ที่ระบุไว้ใน runbook
+ถ้าต้องแก้ schema ให้เริ่มจาก:
+
+~~~powershell
+dbd-data migrate
+dbd-data check-db
+~~~
+
+ถ้าเป็น incident ให้ใช้ docs/OPERATIONS.md
+
+## 5. MySQL connection
+
+สร้าง MySQL connection แยกเฉพาะเมื่อจำเป็นต้องตรวจ Generation 1 source ก่อน cutover
+
+MySQL connection นั้นไม่ใช่ Production v0.6 target
