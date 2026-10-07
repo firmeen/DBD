@@ -336,6 +336,11 @@ class V06Terminal:
             if name == "phase_started":
                 phase = str(payload.get("phase") or "WORK").upper()
                 if (
+                    self.state.command in {"cycle-run", "cycle-loop"}
+                    and phase not in _CYCLE_PHASES
+                ):
+                    return
+                if (
                     self.state.command == "cycle-loop"
                     and phase == "PRECHECK"
                     and self.state.status == "WAITING"
@@ -401,7 +406,7 @@ class V06Terminal:
                 active = tuple(str(item) for item in payload.get("active_endpoints") or ())
                 self.state.active_endpoints = active
                 if self.state.command == "fetch-company":
-                    self.state.endpoint_states = {key: "PENDING" for key in active}
+                    self.state.endpoint_states = {key: "SELECTED" for key in active}
                 self._update_collection(payload, now)
                 return
 
@@ -485,6 +490,12 @@ class V06Terminal:
             if name == "cycle_waiting":
                 self.state.status = "WAITING"
                 self.state.phase = None
+                if self.state.command == "collect":
+                    self.state.current_company_id = None
+                    self.state.current_registration_no = None
+                    self.state.current_endpoint = None
+                    self.state.transient_kind = None
+                    self.state.transient_until = 0.0
                 self.state.iteration = int(payload.get("iteration") or 0) or None
                 self.state.wait_seconds = float(
                     payload.get("interval_seconds") or payload.get("idle_seconds") or 0
@@ -548,8 +559,13 @@ class V06Terminal:
             value = str(payload.get("status") or "COMPLETE").upper()
             return "COMPLETE" if value == "COMPLETE" else "COMPLETE_WITH_FAILURES"
         if self.state.command == "collect":
-            failures = payload.get("endpoints_failed")
-            if _truthy_count(failures):
+            durable = payload.get("status")
+            if isinstance(durable, Mapping) and any(
+                _truthy_count(durable.get(key))
+                for key in ("retry_wait", "partial", "failed")
+            ):
+                return "COMPLETE_WITH_FAILURES"
+            if _truthy_count(payload.get("endpoints_failed")):
                 return "COMPLETE_WITH_FAILURES"
             return "COMPLETE"
         if self.state.command in {"cycle-status", "status"}:
@@ -777,7 +793,13 @@ class V06Terminal:
         )
         return [runtime, self._render_collection_block(width, final=False)]
 
-    def _render_collection_block(self, width: int, *, final: bool):
+    def _render_collection_block(
+        self,
+        width: int,
+        *,
+        final: bool,
+        include_config: bool = False,
+    ):
         source = self.state.result if final else self.state.collection
         items = [
             ("Claimed", source.get("companies_claimed", 0), "collection.companies_claimed"),
@@ -801,13 +823,54 @@ class V06Terminal:
                 if key in source:
                     items.append((label, source.get(key), f"collection.{key}"))
         body_parts: list[Any] = [self._metric_grid(items, width)]
-        if not final:
+        if not final and include_config:
+            config_items: list[tuple[str, Any, str]] = []
+            concurrency = self.state.config.get("concurrency")
+            if concurrency is not None:
+                config_items.append(
+                    ("Concurrency", concurrency, "collection.concurrency")
+                )
+            rate = self.state.config.get(
+                "rate_per_second",
+                self.state.config.get("rate"),
+            )
+            if rate is not None:
+                config_items.append(
+                    ("Configured rate", f"{rate:g} req/s", "collection.rate")
+                )
+            if config_items:
+                body_parts.append(Text())
+                body_parts.append(self._metric_grid(config_items, width))
+
+        waiting = not final and self.state.status == "WAITING"
+        if waiting:
+            total = max(0.0, float(self.state.wait_seconds or 0.0))
+            started = self.state.wait_started_monotonic or self._clock()
+            elapsed = max(0.0, self._clock() - started)
+            remaining = max(0.0, total - elapsed)
+            body_parts.extend(
+                [
+                    Text(),
+                    self._centered(self._motion("wait"), width, "yellow"),
+                    self._centered(self._wait_rail(elapsed, total, width), width, "yellow"),
+                    self._centered(
+                        f"Next check in  {_duration(remaining)}",
+                        width,
+                        "yellow",
+                    ),
+                ]
+            )
+        elif not final:
             body_parts.append(Text())
-            body_parts.append(self._centered(self._motion("stream", width), width, "cyan"))
+            body_parts.append(
+                self._centered(self._motion("stream", width), width, "cyan")
+            )
             activity = self._activity_text()
             if activity:
-                body_parts.append(self._centered(activity.plain, width, activity.style or "cyan"))
-        status = self.state.status if final else self._active_status()
+                body_parts.append(
+                    self._centered(activity.plain, width, activity.style or "cyan")
+                )
+        status = self.state.status if final else ("WAITING" if waiting else self._active_status())
         if final and status not in {"COMPLETE_WITH_FAILURES", "FAILED"}:
             status = "COMPLETE"
         return self._panel(
@@ -899,6 +962,8 @@ class V06Terminal:
             marker, style = "↻", "bold yellow"
         elif normalized == "ACTIVE":
             marker, style = self._motion("orbit"), "bold cyan"
+        elif normalized == "SELECTED":
+            marker, style = "·", "dim"
         else:
             marker, style = "○", "dim"
         return Text(f"  {marker} {endpoint}", style=style)
@@ -969,7 +1034,11 @@ class V06Terminal:
         elif active_phase == "PREPARE":
             active = self._render_prepare(width)
         elif active_phase == "COLLECT":
-            active = self._render_collection_block(width, final=False)
+            active = self._render_collection_block(
+                width,
+                final=False,
+                include_config=True,
+            )
         elif active_phase == "VERIFY":
             active = self._render_activity_panel(
                 "VERIFICATION",
@@ -1304,7 +1373,7 @@ class V06Terminal:
         return None
 
     def _active_status(self) -> str:
-        if self.state.status in {"FAILED", "STOPPED", "STOPPING"}:
+        if self.state.status in {"FAILED", "STOPPED", "STOPPING", "WAITING"}:
             return self.state.status
         if self._transient("retry") or self._transient("warning"):
             return "DEGRADED"
@@ -1448,6 +1517,11 @@ class V06Terminal:
         stamp = _clock_time(self._wall_clock())
         if name in {"phase_started", "phase_completed"}:
             phase = str(payload.get("phase") or "WORK").upper()
+            if (
+                self.state.command in {"cycle-run", "cycle-loop"}
+                and phase not in _CYCLE_PHASES
+            ):
+                return
             generation = (
                 int(payload["generation"])
                 if payload.get("generation") is not None

@@ -549,3 +549,176 @@ def test_v06_interactive_live_lifecycle_produces_final_receipt() -> None:
     assert "Duration" in output
     assert "DATABASE CONTRACT" in output
     assert "READY" in output
+
+
+
+def test_v06_cycle_ignores_collector_internal_phases_in_scene_and_plain_output() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "cycle-run",
+        stream=stream,
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core")
+
+    terminal.event("phase_started", {"phase": "COLLECT", "generation": 12})
+    terminal.event("phase_started", {"phase": "PREFLIGHT"})
+    terminal.event("phase_started", {"phase": "AUTH"})
+    terminal.event("phase_started", {"phase": "COLLECT", "generation": 12})
+
+    assert terminal.state.phase == "COLLECT"
+    assert terminal.state.phase_states["COLLECT"] == "RUNNING"
+    output = stream.getvalue()
+    assert "PREFLIGHT" not in output
+    assert "AUTH" not in output
+    assert output.count("COLLECT started generation=12") == 1
+    terminal.close()
+
+
+def test_v06_cycle_collection_shows_real_runtime_config() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "cycle-run",
+        stream=stream,
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core")
+    terminal.event("phase_started", {"phase": "COLLECT", "generation": 12})
+    terminal.event(
+        "started",
+        {
+            "generation": 12,
+            "phase": "core",
+            "concurrency": 24,
+            "rate_per_second": 60.0,
+            "company_limit": None,
+            "continuous": False,
+            "idle_seconds": 5.0,
+            "active_endpoints": ["profile"],
+        },
+    )
+    terminal.console.print(terminal._render(100))
+    terminal.close()
+
+    output = stream.getvalue()
+    assert "COLLECTION" in output
+    assert "Concurrency" in output
+    assert "24" in output
+    assert "Configured rate" in output
+    assert "60 req/s" in output
+
+
+def test_v06_collect_final_status_uses_durable_retry_partial_failure_truth() -> None:
+    terminal = V06Terminal("collect", stream=StringIO(), tty=False)
+
+    assert terminal._final_status(
+        {
+            "endpoints_failed": 0,
+            "status": {"retry_wait": 2, "partial": 0, "failed": 0},
+        }
+    ) == "COMPLETE_WITH_FAILURES"
+    assert terminal._final_status(
+        {
+            "endpoints_failed": 0,
+            "status": {"retry_wait": 0, "partial": 3, "failed": 0},
+        }
+    ) == "COMPLETE_WITH_FAILURES"
+    assert terminal._final_status(
+        {
+            "endpoints_failed": 0,
+            "status": {"retry_wait": 0, "partial": 0, "failed": 4},
+        }
+    ) == "COMPLETE_WITH_FAILURES"
+    assert terminal._final_status(
+        {
+            "endpoints_failed": 0,
+            "status": {"retry_wait": 0, "partial": 0, "failed": 0},
+        }
+    ) == "COMPLETE"
+
+
+def test_v06_continuous_collect_waits_without_stream_or_stale_activity() -> None:
+    current = [100.0]
+    stream = StringIO()
+    terminal = V06Terminal(
+        "collect",
+        stream=stream,
+        tty=False,
+        clock=lambda: current[0],
+        wall_clock=_v06_wall_clock,
+    ).start(phase="core", concurrency=8, rate=15, continuous=True)
+    terminal.event(
+        "started",
+        {
+            "generation": 12,
+            "phase": "core",
+            "concurrency": 8,
+            "rate_per_second": 15.0,
+            "company_limit": None,
+            "continuous": True,
+            "idle_seconds": 5.0,
+            "active_endpoints": ["profile"],
+        },
+    )
+    terminal.event(
+        "company_claimed",
+        {"company_id": 42, "registration_no": "0100000000042", "generation": 12},
+    )
+    terminal.event("endpoint_started", {"company_id": 42, "endpoint": "profile"})
+    terminal.event("cycle_waiting", {"idle_seconds": 5.0})
+    current[0] = 101.0
+    terminal.console.print(terminal._render(100))
+    terminal.close()
+
+    output = stream.getvalue()
+    assert terminal.state.status == "WAITING"
+    assert terminal.state.current_company_id is None
+    assert terminal.state.current_endpoint is None
+    assert "NEXT CHECK" not in output.upper()
+    assert "Next check in" in output
+    assert "00:00:04" in output
+    assert "company 42" not in output
+    assert "╺━━" not in output
+
+
+def test_v06_fetch_company_selected_endpoints_are_neutral_until_observed() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "fetch-company",
+        stream=stream,
+        tty=False,
+        clock=lambda: 100.0,
+        wall_clock=_v06_wall_clock,
+    ).start(
+        phase="core",
+        registration_no="0107556000051",
+        juristic_type_code="7",
+    )
+    terminal.event(
+        "started",
+        {
+            "generation": 12,
+            "phase": "core",
+            "concurrency": 1,
+            "rate_per_second": 15.0,
+            "company_limit": 1,
+            "continuous": False,
+            "idle_seconds": 5.0,
+            "active_endpoints": ["profile", "financial_statements"],
+        },
+    )
+
+    assert terminal.state.endpoint_states == {
+        "profile": "SELECTED",
+        "financial_statements": "SELECTED",
+    }
+    terminal.console.print(terminal._render(100))
+    first = stream.getvalue()
+    assert "· profile" in first
+    assert "○ profile" not in first
+
+    terminal.event("endpoint_started", {"company_id": 42, "endpoint": "profile"})
+    assert terminal.state.endpoint_states["profile"] == "ACTIVE"
+    terminal.close()
