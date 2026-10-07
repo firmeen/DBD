@@ -224,7 +224,7 @@ class V06Terminal:
                     self._scene,
                     console=self.console,
                     auto_refresh=True,
-                    refresh_per_second=8,
+                    refresh_per_second=4,
                     transient=False,
                     screen=False,
                     vertical_overflow="visible",
@@ -635,7 +635,7 @@ class V06Terminal:
     def _render_check_db(self, width: int):
         if not self.state.result:
             body = self._centered(
-                f"{self._motion('orbit')}  Checking SQL Server contract",
+                "Checking SQL Server contract",
                 width,
                 "cyan",
             )
@@ -751,7 +751,7 @@ class V06Terminal:
         body = Group(
             self._metric_grid(items, width) if items else Text(),
             Text(),
-            self._centered(f"{self._motion('orbit')}  Reopening failed work", width, "cyan"),
+            self._centered("Reopening failed work", width, "cyan"),
         )
         return self._panel("RETRY", body, "RUNNING", active=True)
 
@@ -1029,7 +1029,7 @@ class V06Terminal:
         result = self.state.result
         if not result:
             body = self._centered(
-                f"{self._motion('orbit')}  Reading durable state",
+                "Reading durable state",
                 width,
                 "cyan",
             )
@@ -1337,10 +1337,9 @@ class V06Terminal:
             "COLLECTING",
             "VERIFYING",
             "FINALIZING",
-            "SNAPSHOT",
         }:
             return "cyan"
-        if normalized in {"IDLE", "N/A", "PENDING", "SKIPPED", "STOPPED"}:
+        if normalized in {"IDLE", "N/A", "PENDING", "SKIPPED", "STOPPED", "SNAPSHOT"}:
             return "dim"
         return "white"
 

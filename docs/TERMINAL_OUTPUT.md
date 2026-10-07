@@ -238,9 +238,10 @@ Motion is presentation-only and is selected by runtime state:
 - Wait clock and determinate rail: `cycle loop` only, because its interval is known.
 - Completion/failure/stop settle: motion stops when work is no longer active.
 
-The interactive renderer may refresh up to roughly eight frames per second from
-process-local state and `time.monotonic()`. Rendering frames never trigger SQL, HTTP
-or Redis work.
+The interactive renderer is intentionally capped at four refreshes per second, below
+the eight-FPS ceiling, using only process-local state and `time.monotonic()`. This
+keeps WAITING scenes within the low-motion cadence without adding a scheduler or
+polling loop. Rendering frames never trigger SQL, HTTP or Redis work.
 
 ### Truth-only values
 

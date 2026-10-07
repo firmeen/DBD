@@ -357,6 +357,7 @@ def test_v06_semantic_complete_with_failures_is_yellow_not_green() -> None:
     assert terminal._status_style("COMPLETE_WITH_FAILURES") == "bold yellow"
     assert terminal._status_style("RETRY_WAIT") == "bold yellow"
     assert terminal._status_style("PARTIAL") == "bold yellow"
+    assert terminal._status_style("SNAPSHOT") == "dim"
     assert terminal._status_style("COMPLETE") == "bold green"
     assert terminal._status_style("FAILED") == "bold red"
 
@@ -513,3 +514,38 @@ def test_v06_completion_settle_uses_static_motion_frame() -> None:
     assert set(terminal._motion("stream", 100)) == {"━"}
     assert terminal._motion("orbit") == "◆"
     terminal.close()
+
+
+
+def test_v06_interactive_live_lifecycle_produces_final_receipt() -> None:
+    current = [100.0]
+    stream = StringIO()
+    terminal = V06Terminal(
+        "check-db",
+        app="DBD DATA",
+        stream=stream,
+        tty=True,
+        clock=lambda: current[0],
+        wall_clock=_v06_wall_clock,
+    ).start()
+    current[0] = 101.0
+    terminal.finish(
+        {
+            "server": "SRVTIPDATAINT",
+            "database": "TIPDataIntelligence",
+            "login": "TIPDataIntelligence",
+            "schema": "READY",
+            "managed_tables": 5,
+            "select": True,
+            "insert": True,
+            "update": True,
+        }
+    )
+    terminal.close()
+
+    output = stream.getvalue()
+    assert "CHECK DB" in output
+    assert "Started" in output
+    assert "Duration" in output
+    assert "DATABASE CONTRACT" in output
+    assert "READY" in output
