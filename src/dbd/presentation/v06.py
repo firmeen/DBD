@@ -64,8 +64,12 @@ def _duration(seconds: float | int | None) -> str:
     return f"{total // 3600:02d}:{total % 3600 // 60:02d}:{total % 60:02d}"
 
 
+def _local_datetime(value: datetime) -> datetime:
+    return value if value.utcoffset() is not None else value.astimezone()
+
+
 def _timestamp(value: datetime) -> str:
-    local = value.astimezone()
+    local = _local_datetime(value)
     offset = local.strftime("%z")
     if len(offset) == 5:
         offset = f"{offset[:3]}:{offset[3:]}"
@@ -73,7 +77,7 @@ def _timestamp(value: datetime) -> str:
 
 
 def _clock_time(value: datetime) -> str:
-    return value.astimezone().strftime("%H:%M:%S")
+    return _local_datetime(value).strftime("%H:%M:%S")
 
 
 def _mapping(value: Any) -> dict[str, Any]:
@@ -143,10 +147,17 @@ class _Scene:
             yield self.terminal._render(max(40, int(options.max_width)))
         except Exception:
             self.terminal._renderer_failed = True
-            yield Text(
+            state = self.terminal.state
+            label = _COMMAND_LABELS.get(state.command, state.command.upper())
+            fallback = Text()
+            fallback.append(f"{state.app}  /  {label}\n", style="bold white")
+            if state.started_at is not None:
+                fallback.append(f"Started  {_timestamp(state.started_at)}\n", style="dim")
+            fallback.append(
                 "Terminal rendering unavailable; runtime continues.",
                 style="bold yellow",
             )
+            yield fallback
 
 
 class V06Terminal:
@@ -573,6 +584,25 @@ class V06Terminal:
 
     def _render_command(self, width: int) -> list[Any]:
         command = self.state.command
+        if (
+            self.state.finished_monotonic is not None
+            and not self.state.result
+            and self.state.status in {"FAILED", "STOPPED"}
+        ):
+            status = self.state.status
+            message = (
+                self.state.last_error
+                if status == "FAILED" and self.state.last_error
+                else "Command stopped before completion."
+            )
+            title = "ERROR" if status == "FAILED" else "STOPPED"
+            return [
+                self._panel(
+                    title,
+                    Text(message, style=self._status_style(status)),
+                    status,
+                )
+            ]
         if command == "check-db":
             return [self._render_check_db(width)]
         if command == "migrate":
@@ -887,7 +917,7 @@ class V06Terminal:
             cycle_body.append(Text("   ·   ".join(context), style="white"))
             cycle_body.append(Text())
         cycle_body.append(self._phase_rail(width))
-        cycle_status = self.state.status if result else "RUNNING"
+        cycle_status = self.state.status if result else self._active_status()
         cycle_panel = self._panel(
             "CYCLE",
             Group(*cycle_body),
@@ -1267,10 +1297,10 @@ class V06Terminal:
         return None
 
     def _active_status(self) -> str:
+        if self.state.status in {"FAILED", "STOPPED", "STOPPING"}:
+            return self.state.status
         if self._transient("retry") or self._transient("warning"):
             return "DEGRADED"
-        if self.state.status == "STOPPING":
-            return "STOPPING"
         return "RUNNING"
 
     def _status_style(self, status: str) -> str:
