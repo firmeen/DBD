@@ -70,13 +70,13 @@ MSSQL_PASSWORD=<PASSWORD>
 MSSQL_PORT=1433
 ~~~
 
-ตรวจการเชื่อมต่อ:
+ถ้าเป็น environment ที่มี Production schema อยู่แล้ว ให้ตรวจด้วย:
 
 ~~~powershell
 dbd-data check-db
 ~~~
 
-ถ้าเป็นการเตรียม schema ครั้งแรกหรือ source code มี schema ใหม่:
+ถ้าเป็น environment ใหม่ หรือ source code มี schema contract ใหม่ ให้ converge schema ก่อนแล้วตรวจ:
 
 ~~~powershell
 dbd-data migrate
