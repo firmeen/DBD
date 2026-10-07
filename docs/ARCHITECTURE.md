@@ -1,273 +1,375 @@
-# Architecture
+# Production Architecture
 
-## Ownership and dependencies
+เอกสารนี้อธิบายโครงสร้าง Production v0.6 เท่านั้น โดยเน้นว่าแต่ละส่วนมีหน้าที่อะไร ข้อมูลไหลอย่างไร และระบบรักษาความถูกต้องอย่างไร
 
-- `cli/`: arguments, commands, exit policy and manager-lock boundaries.
-- `client/`: browser-like session/auth, crypto, retries and adaptive admission.
-- `contracts/`: identity/root-shape validation and pure normalization.
-- `runtime/`: endpoint definitions, staged bulk orchestration and replay.
-- `pipelines/`: discovery orchestration and compatibility pipelines.
-- `storage/mysql/`: durable queue/archive metadata, projections and migrations.
-- `storage/archive_codec.py`: deterministic JSON/zstd archive encoding.
-- `storage/archive_backend.py`: optional client-side encrypted S3-compatible payload storage.
-- `core/`: validated settings, exceptions and low-cardinality telemetry.
+## ภาพรวม
 
-Default collection scope is tabs 1-2: seven endpoints. Tabs 3-4 remain opt-in.
+~~~text
+DBD DataWarehouse
+        |
+        | Search
+        v
+    DISCOVERY
+        |
+        v
+dbo.DBD_COMPANY
+        |
+        | prepare unresolved work
+        v
+     COLLECTOR
+        |
+        +-----------------------------+
+        |             |               |
+        v             v               v
+DBD_COMPANY    DBD_COMPANY_RELATION  DBD_COMPANY_EVENT
+        |
+        +-----------------------------+
+        |                             |
+        v                             v
+DBD_FINANCIAL                   DBD_INDUSTRY
+        |
+        v
+      VERIFY
+        |
+        v
+     FINALIZE
+~~~
 
-## Standalone Deep path
+Production storage คือ SQL Server
 
-Standalone `dbd-deep` เป็นอีก execution path ที่แยกจาก Campaign/Fabric runtime โดยตั้งใจ และไม่ใช้ Redis, Supervisor, Guardian หรือ Campaign run ID เป็น dependency
+## หน้าที่ของ 5 ตาราง
 
-```text
-DBD upstream
-    │
-    ▼
-Discovery
-    │
-    ├── companies / company_master / discovery_sightings
-    │
-    ▼
-Deep bridge
-    │
-    ▼
-dbd_company_master
-waiting population
-    │
-    │ bounded promotion
-    ▼
+### dbo.DBD_COMPANY
+
+เป็นตารางหลักหนึ่ง row ต่อบริษัท
+
+เก็บทั้ง:
+
+- identity ของบริษัท
+- profile ล่าสุด
+- generation ที่พบ
+- generation ที่ finalize แล้ว
+- รายการ endpoint ที่ต้องเก็บ
+- endpoint ที่สำเร็จ
+- endpoint ที่ไม่มีข้อมูล
+- endpoint ที่ล้มเหลว
+- lease ของงานที่กำลังถูก claim
+- ข้อมูล error ล่าสุดที่จำเป็นต่อการตรวจปัญหา
+
+Natural identity คือคู่:
+
+~~~text
+juristic_type_code + registration_no
+~~~
+
+### dbo.DBD_COMPANY_RELATION
+
+เก็บข้อมูลที่เป็นรายการความสัมพันธ์ เช่น กรรมการและผู้มีอำนาจลงนาม
+
+แต่ละรายการมี source key ของตัวเอง เพื่อให้ upsert ซ้ำได้โดยไม่สร้างข้อมูลซ้ำ
+
+### dbo.DBD_COMPANY_EVENT
+
+เก็บเหตุการณ์ที่เกี่ยวกับบริษัท เช่น การแปรสภาพหรือการควบรวม
+
+หนึ่งบริษัทมีได้หลาย event
+
+### dbo.DBD_FINANCIAL
+
+เก็บข้อมูลการเงินตาม fiscal year
+
+financial submissions และ financial statements เขียนลง grain เดียวกันตามบริษัทและปี แต่แต่ละ endpoint มี ownership ของ column ของตัวเอง
+
+### dbo.DBD_INDUSTRY
+
+เก็บ industry benchmark และข้อมูล scope ของอุตสาหกรรม
+
+ตารางนี้มี semantics ต่างจาก child table ของบริษัททั่วไป จึงไม่ควรมองเป็น relation row ธรรมดา
+
+## Production workflow
+
+คำสั่งหลัก:
+
+~~~powershell
+dbd-data cycle run --phase core
+~~~
+
+ระบบทำตามลำดับ:
+
+~~~text
+PRECHECK
+  |
+  v
+DISCOVER
+  |
+  v
+PREPARE
+  |
+  v
+COLLECT
+  |
+  v
+VERIFY
+  |
+  v
+FINALIZE
+~~~
+
+### PRECHECK
+
+ตรวจ SQL Server ก่อนเริ่มงาน และถือ manager application lock สำหรับ cycle นั้น
+
+ถ้า database contract ไม่พร้อม งานจะหยุดก่อนทำ collection
+
+### DISCOVER
+
+ค้นหา company identity จาก DBD Search แล้ว upsert เข้า dbo.DBD_COMPANY
+
+Discovery แยก query ที่ใหญ่เกินขีดจำกัดของ upstream เป็น partition ที่เล็กลง
+
+ข้อจำกัดที่ระบบรู้:
+
+- 10 rows ต่อ page
+- สูงสุด 1,000 pages ต่อ query
+- สูงสุด 10,000 rows ต่อ query
+
+ถ้า partition ยังใหญ่เกิน 10,000 ระบบจะแบ่งต่อโดยใช้ juristic type, province และ business size ตามลำดับ
+
+ถ้าแบ่งจนหมดมิติแล้วยังเกินขีดจำกัด ระบบจะหยุดด้วย contract error แทนการแกล้งถือว่าครบ
+
+### PREPARE
+
+คำนวณ required endpoint ของบริษัทใน Generation ปัจจุบัน
+
+บริษัทที่มี fiscal year จะมี financial endpoint ที่เกี่ยวข้องเพิ่มตามข้อมูลที่พบ
+
+ถ้า profile เปลี่ยน latest fiscal year ระบบสามารถเปิดงาน financial ที่เกี่ยวข้องใหม่ได้
+
+### COLLECT
+
+collector claim บริษัทจาก SQL Server แล้วดึงเฉพาะ endpoint ที่ยัง unresolved
+
+การ claim ใช้ database locking และ lease เพื่อไม่ให้ worker สองตัวเขียนบริษัทเดียวกันพร้อมกันแบบไม่มี ownership
+
+### VERIFY
+
+ตรวจ consistency ก่อน Finalize
+
+ตัวอย่างสิ่งที่ตรวจ:
+
+- required endpoint ยัง unresolved หรือไม่
+- mask ชนกันหรือไม่
+- มี RETRY_WAIT ค้างอยู่หรือไม่
+- มี lease ที่ยัง active หรือหมดอายุค้างอยู่หรือไม่
+- generation ordering ถูกต้องหรือไม่
+- child row orphan หรือไม่
+- ยังมี row ของ Generation ปัจจุบันที่ไม่เสร็จหรือไม่
+
+VERIFY มาก่อน FINALIZE
+
+ถ้า verification ไม่ผ่าน ระบบจะคืน FAILED และไม่ finalize Generation นั้น
+
+### FINALIZE
+
+เมื่อ verification ผ่าน ระบบจะ finalize row เป็น batch
+
+แต่ละ batch commit แยกกัน ดังนั้นถ้า process หยุดระหว่าง Finalize batch ที่ commit แล้วจะยังอยู่
+
+หลัง Finalize ระบบ verify อีกครั้งก่อนคืนสถานะสุดท้าย
+
+## Generation model
+
+Generation คือหมายเลขรอบข้อมูล
+
+field สำคัญใน dbo.DBD_COMPANY:
+
+| Field | ความหมาย |
+| --- | --- |
+| first_seen_generation | รอบแรกที่ระบบพบบริษัท |
+| last_seen_generation | รอบล่าสุดที่ Discovery พบบริษัท |
+| dataset_generation | รอบล่าสุดที่ข้อมูลบริษัทถูก finalize |
+
+ถ้ามี Generation ที่ยัง unfinished generation นั้นถือว่า active
+
+cycle run ครั้งถัดไปจะ resume active generation เดิม
+
+เมื่อไม่มี active generation ระบบจึงเลือก next generation
+
+ฐานข้อมูลใหม่ที่ยังไม่มีข้อมูลจะเริ่ม Production cycle ที่ Generation 2 เพื่อสงวน Generation 1 สำหรับ initial dataset/cutover
+
+## Endpoint state
+
+ระบบใช้ bit mask เพื่อบันทึกสถานะ endpoint โดยไม่ต้องสร้าง task row แยกสำหรับทุก endpoint
+
+แนวคิดหลัก:
+
+~~~text
+required_mask
+   = endpoint ที่บริษัทนี้ต้องมี
+
+done_mask
+   = endpoint ที่เก็บสำเร็จ
+
+not_available_mask
+   = endpoint ที่ upstream ยืนยันว่าไม่มีข้อมูล
+
+failed_mask
+   = endpoint ที่จบด้วย terminal failure
+~~~
+
+endpoint ถือว่า unresolved เมื่ออยู่ใน required_mask แต่ยังไม่อยู่ใน done, not available หรือ failed
+
+## Endpoint scope
+
+Core:
+
+| Bit | Endpoint |
+| ---: | --- |
+| 1 | profile |
+| 2 | financial_submissions |
+| 4 | financial_statements |
+| 8 | industry_benchmark |
+| 16 | committees |
+| 32 | committee_signs |
+| 64 | transformations |
+
+Core mask = 127
+
+Extended เพิ่ม:
+
+| Bit | Endpoint |
+| ---: | --- |
+| 128 | nations |
+| 256 | nation_history |
+| 512 | name_history |
+| 1024 | capital_history |
+
+All mask = 2047
+
+## Claim และ lease
+
+เมื่อ collector จะทำงานกับบริษัทหนึ่งราย:
+
+1. SQL Server เลือก row ที่พร้อมทำงาน
+2. collector สร้าง claim token ของตัวเอง
+3. row ถูกผูกกับ lease owner และ lease expiry
+4. ระหว่างทำงาน collector heartbeat lease
+5. การเขียนผลต้องพิสูจน์ว่า claim token และ lease ยังเป็นของ collector ตัวเดิม
+
+ถ้า ownership หาย write จะถูกปฏิเสธ
+
+ถ้า process หายไป lease จะหมดอายุและถูก recover ในการทำงานครั้งต่อไป
+
+หลักนี้ทำให้ไม่ต้องใช้การลบ lock หรือ reset row ด้วยมือในเหตุการณ์ปกติ
+
+## Transaction boundary
+
+ผล endpoint หนึ่งครั้งถูกเขียนเป็น transaction เดียวที่รวม:
+
+- domain rows ที่ normalize แล้ว
+- done / not available / failed state
+- endpoint metadata
+- collection status ที่เกี่ยวข้อง
+
+ดังนั้นไม่ควรเกิดกรณีที่ domain data commit แล้วแต่ checkpoint ไม่ commit หรือกลับกันจาก transaction เดียวกัน
+
+## HTTP behavior
+
+Production collector ใช้ fixed aggregate request rate ร่วมกับ concurrency limit
+
+พฤติกรรมหลัก:
+
+| เหตุการณ์ | ผล |
+| --- | --- |
+| 2xx | normalize และ commit |
+| 401 | refresh authentication |
+| 403 | rebuild authentication session |
+| 404 | NOT_AVAILABLE |
+| 429 | transient retry และ shared cooldown |
+| 500/502/503/504 | transient retry |
+| timeout / transport error | transient retry |
+| HTTP error อื่นที่ไม่ retry | permanent failure |
+
+429 และ 503 ที่มี Retry-After จะทำให้ collector ชะลอร่วมกันตามเวลาที่ upstream แจ้ง
+
+ระบบไม่ลด configured rate แบบ adaptive จนกลายเป็น rate ต่ำถาวรจาก penalty รุ่นก่อน
+
+## Failure semantics
+
+### NOT_AVAILABLE
+
+404 ไม่ถือเป็น collection failure
+
+endpoint ถูก mark ว่าไม่มีข้อมูลและถือว่า resolved
+
+### RETRY_WAIT
+
+ใช้เมื่อ upstream มีปัญหาชั่วคราวและ retry budget ในรอบนั้นหมด
+
+ยังไม่ถือเป็น terminal failed endpoint
+
+### Terminal failure
+
+failed bit หมายถึง endpoint นั้นจบด้วย failure ที่ระบบถือว่า terminal ในสถานะปัจจุบัน
+
+operator สามารถเปิดเฉพาะ failed bit กลับมาได้ด้วย:
+
+~~~powershell
+dbd-deep retry --phase core
+~~~
+
+## Manager ownership
+
+งานที่เปลี่ยน Production workflow ทั้งรอบใช้ SQL Server application lock เพื่อป้องกัน manager สองตัวทำหน้าที่เดียวกันพร้อมกัน
+
+lock นี้เป็น safety boundary ของ orchestration ไม่ใช่ตัวแทนของ row lease
+
+manager lock ป้องกันการควบคุม workflow ซ้ำ ส่วน row lease ป้องกัน ownership ของบริษัทแต่ละราย
+
+## Ctrl+C และ process crash
+
+ระบบถูกออกแบบให้ process หยุดได้โดยไม่ต้องสร้าง workflow ใหม่
+
+สิ่งที่ commit แล้วอยู่ต่อ
+
+สิ่งที่ยังไม่ commit จะถูกทำใหม่
+
+lease ที่หมดอายุ recover ได้
+
+Generation ที่ยัง unfinished จะถูกเลือกกลับมาทำต่อ
+
+## Generation 1 Cutover boundary
+
+Generation 1 Cutover เป็นเส้นทางครั้งเดียว:
+
+~~~text
+MySQL Dataset 1
 dbd_company_deep
-authoritative Deep row + 7 endpoint state
-    │
-    ├── dbd_deep_runtime   active lease / retry state only
-    │
-    └── COMPLETE rows only
-             │
-             ▼
-       dbd_master_deep
-       flat MySQL serving
-             │
-             ▼
-TIPDataIntelligence.dbo.DBD_MASTER_DEEP
-```
+        |
+        v
+transform + validate
+        |
+        v
+SQL Server 5-table model
+Generation 1
+~~~
 
-Key invariants:
+cutover ไม่ใช่ส่วนหนึ่งของ normal Production cycle
 
-- company identity is `(jp_type_code, jp_no)`;
-- `dbd_company_master ∩ dbd_company_deep = 0`;
-- active standalone scope is exactly 7 endpoints: profile, committees, committee_signs, transformations, financial_submissions, financial_statements and industry_benchmark;
-- legacy nations/history endpoints remain compatibility data and are not scheduled by standalone Deep;
-- `dbd_company_deep` remains the authoritative current Deep state;
-- `dbd_master_deep` is derived output only, contains scalar/human-readable fields and no endpoint JSON blobs;
-- serving projection uses only `deep_status='COMPLETE'`; when an ACTIVE company is reopened for refresh, its previous serving row remains until a new COMPLETE snapshot is available;
-- SQL Server synchronization is INSERT + UPDATE + SKIP by `row_hash`; target-only rows are reported and are not automatically deleted;
-- `TIPDataIntelligence.dbo.DBD_COMPANY` is outside this serving pipeline.
+หลัง Generation 1 สมบูรณ์ Production cycle ถัดไปจึงเริ่ม Generation 2
 
-Standalone Deep separates preparation from collection. `dbd-deep prepare` bulk-stages waiting Master companies into `dbd_company_deep`; `dbd-deep collect` then claims unresolved Deep rows directly. The collector does not promote Master rows, scan stale ACTIVE rows, or run serving projection in its hot path. `dbd_deep_runtime` stores only active lease/retry state, not a prefilled work buffer.
+cutover ใช้ natural-key upsert และ commit เป็น batch จึงสามารถ rerun หลัง interruption ได้ ตราบใดที่ safety preconditions ยังผ่านและ Production ยังไม่เดินไป Generation 2 หรือสูงกว่า
 
-### Standalone presentation boundary
+## Presentation boundary
 
-`src/dbd/deep/presentation.py` renders `dbd-deep` commands. `src/dbd/presentation/master_deep.py` renders bootstrap, MySQL serving and SQL Server sync. Both consume structured state only; neither owns MySQL/HTTP/scheduling decisions.
+Terminal UI เป็น presentation layer เท่านั้น
 
-Interactive TTY output may use Rich colors and live repaint. Redirected output remains plain newline text, and explicit JSON modes remain machine-readable.
+การวาดหน้าจอไม่ควรเป็นเจ้าของ:
 
-## V2 staged bulk path
+- SQL transaction
+- HTTP scheduling
+- lease
+- authentication
+- generation decision
 
-```text
-endpoint_tasks
-  -> batch claim + lease/version fence
-  -> bounded fetch queue
-  -> async DBD HTTP + endpoint/global admission
-  -> bounded archive queue
-  -> durable archive boundary
-  -> stage=project
-  -> bounded project queue
-  -> strict normalization + natural-key freshness
-  -> projection + terminal acknowledgement
-```
-
-Fetch and projection are intentionally decoupled so local database work does not
-have to complete inside the HTTP acquisition loop. Queue sizes are bounded so a
-fast producer cannot create unbounded memory growth.
-
-Project backlog is scheduled before new fetch work because it is already durable and
-requires no additional DBD request.
-
-## Durable task lifecycle
-
-`endpoint_tasks` deduplicates `(run_id, company_id, endpoint)` and has two durable
-pipeline stages: `fetch` and `project`.
-
-```text
-fetch/pending -> fetch/running
-              -> project/running -> done | not_available | retry_wait | failed
-```
-
-Claims use `FOR UPDATE SKIP LOCKED`, increment attempts and lease version, and record
-owner/expiry. Heartbeat only extends leases still owned and unexpired. Expired leases
-are recovered by maintenance. Owner + version + expiry is checked again before archive
-transition and projection commit, fencing stale workers.
-
-Projection and terminal acknowledgement commit in the same outer transaction. HTTP
-delivery is at-least-once before the durable archive boundary, while project-stage
-recovery is archive-first and must not refetch upstream.
-
-## Archive durability boundary
-
-### Inline MySQL
-
-The encoded payload and `stage=project/raw_response_id` transition commit in one
-MySQL transaction.
-
-### External encrypted object storage
-
-The encoded payload is uploaded first, encrypted client-side with AES-256-GCM. MySQL
-then commits archive metadata/object reference and `stage=project` together. This
-ordering prefers an encrypted orphan after an ambiguous DB failure over a committed
-reference to an object that was never uploaded.
-
-External archive metadata includes backend, object key, nonce, key id, ciphertext
-SHA-256, canonical plaintext SHA-256, codec and size metadata. The decoded response
-body is not stored inline for external rows.
-
-External reads verify ciphertext SHA, AES-GCM authentication with object key as AAD,
-plaintext SHA and JSON/zstd decode before projection. Missing/corrupt/unreadable
-archive data never silently falls back to DBD refetch.
-
-New objects use the active encryption key/id. A read-only decryption key ring keeps
-retained archives from older key ids replayable during rotation.
-
-Archive backend/key-shape configuration is validated before the bulk HTTP client
-opens or claims work. Remote object-store permission/network failures remain runtime
-archive failures and cannot advance a task to `project`.
-
-## Database paths
-
-Queue/archive metadata uses SQLAlchemy asyncio + asyncmy. Existing projection SQL
-uses synchronous PyMySQL in bounded threads. A ContextVar binds nested projection
-repositories to the outer transaction so apparent nested commits become no-ops until
-the projection transaction decides to commit.
-
-Projection concurrency is bounded by both configured projection workers and DB pool
-size. Identity import/master scheduling are paged; million-row populations are not
-materialized in one Python collection.
-
-## Manager and distributed ownership
-
-Discovery, run creation and ordinary single-process bulk use a MySQL
-connection-scoped named manager lock. Long-running locked operations verify that the
-same connection still owns it; lock loss is terminal.
-
-Distributed bulk is a deliberate exception after run creation. Multiple processes
-join the same run without the singleton manager lock and coordinate task ownership
-through row leases/version fencing. Redis coordinates aggregate admission.
-
-## HTTP/auth/rate path
-
-The V2 bulk request path is:
-
-```text
-concurrency semaphore
-  -> endpoint local adaptive gate
-  -> optional shared endpoint Redis gate
-  -> global local adaptive gate
-  -> optional shared global Redis gate
-  -> token ensure/refresh
-  -> curl_cffi request
-  -> status penalty/cooldown
-  -> decrypt/wrapper decode
-  -> healthy recovery
-```
-
-401/token expiry refreshes through one auth lock. 403 is terminal. 429/503 penalizes
-the endpoint and global safety layer.
-
-In distributed mode Redis stores the aggregate schedule plus effective-rate,
-cooldown and last-penalty state. A 429/503 seen by one process therefore constrains
-other workers using the same namespace rather than only the process that received
-it. Healthy decoded responses recover gradually toward the configured target.
-
-Redis is a coordination/safety mechanism, not a rate-limit bypass.
-
-## Identity model
-
-`company_master.company_id` is the internal stable identity. Source identity is
-unique on `(jp_type_code, jp_no)`.
-
-Numeric types require 13-digit strings. Production evidence showed type `A` can be
-11-13 digits, so those strings are preserved exactly rather than padded.
-
-Legacy projection tables still key many rows by `jp_no`; projection rejects a type
-conflict before writing them. Identity conflicts remain durable quarantine state.
-
-Latest scheduling status lives in `company_master.observed_jp_stat_code` /
-`observed_status_at`, separate from the richer company projection.
-
-## Discovery architecture
-
-```text
-seed -> bucket count/archive -> split if oversized -> page archive
-     -> row normalization -> valid projection + quarantine -> checkpoint
-```
-
-Search exposes 10 rows/page and at most 1000 pages/query. Oversized buckets split by
-juristic type, province then business size. An exhausted leaf still above the cap is
-a hard failure.
-
-Count page 1 can be reused as page 1. Normalization is row-granular: valid neighbors
-survive rejected rows, rejected rows are durable, and a page remains `partial` until
-resolved. A normal full discovery is incomplete while failed buckets, partial pages,
-unresolved quarantine or known lossy split partitions remain.
-
-Seed/prefix checks describe observed rows only and cannot prove external population
-completeness.
-
-## Replay and evidence
-
-`response_archive` is the durable endpoint evidence boundary before normalization.
-Payload bytes may be inline or externally encrypted; MySQL keeps archive/request/task
-metadata either way.
-
-Legacy `raw_responses` remains because projection tables still retain historical
-foreign keys to it.
-
-Endpoint replay uses the archive without network access. Search-page correction uses
-discovery retry instead.
-
-## Natural-key freshness
-
-`company_endpoint_state` records request-scope observability. It is not the write
-fence because request scope and mutated natural keys can differ.
-
-`projection_write_state` fences actual write keys:
-
-- profile/details collections: company + endpoint;
-- submissions: whole company collection;
-- statements: company + each returned fiscal year;
-- benchmark: TSIC + fiscal year + business size + location type + location number.
-
-Projection locks these keys before mutation. Older responses can be archived and
-acknowledged stale but cannot overwrite newer natural-key state, including shared
-benchmark rows across companies.
-
-## Collection safety
-
-Replace-on-refresh is allowed only after strict root-shape validation. Malformed
-transformation, nation-history and benchmark roots cannot masquerade as legitimate
-empty/no-data responses. Explicit valid empty collections can clear current data;
-profile explicit null remains authoritative while absent fields do not erase data.
-
-## Deliberate boundaries
-
-- no exactly-once claim for pre-archive live HTTP delivery;
-- no claim that seed coverage alone proves the complete DBD population;
-- no claim that a short probe equals sustainable seven-endpoint capacity;
-- no automatic destructive migration downgrade;
-- Redis is optional and used only for distributed pacing coordination;
-- external object storage is optional and does not replace MySQL task/archive metadata;
-- object retention/orphan cleanup is an explicit operational policy, not automatic deletion;
-- production 48-hour acceptance, authoritative population reconciliation and backup/restore drills require live evidence.
-
-The correctness model remains conservative: unknown status is not guessed, malformed
-data is quarantined/failed rather than converted to absence, project-stage archive
-failure never silently becomes a new upstream fetch, and request-saving optimizations
-are accepted only when their full natural scope is provable before HTTP.
+ถ้า renderer มีปัญหา collector logic ไม่ควรถูกเปลี่ยนเพียงเพราะ presentation failure
