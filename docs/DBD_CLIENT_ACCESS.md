@@ -1,81 +1,64 @@
-# DBD Client Access
+# Production Database Access
 
-DBD รองรับการเชื่อม MySQL จากเครื่องอื่น 2 แบบ
+Production v0.6 เก็บข้อมูลใน SQL Server
 
-## 1. Direct LAN
+เอกสารนี้อธิบายหลักการเข้าถึงข้อมูลสำหรับผู้ใช้หรือเครื่องมือภายนอก โดยไม่ผูกกับ network transport เฉพาะองค์กร
 
-ใช้เมื่อ Client อยู่บน network ที่เข้าถึง MySQL Server ได้โดยตรง
+## Production target
 
-ตัวอย่าง:
+~~~text
+Database: TIPDataIntelligence
+Storage : SQL Server
+~~~
 
-```text
-Host      172.16.4.49
-Port      3307
-Database  dbd
-Username  dbd-tipdi
-```
+ตารางหลัก:
 
-MySQL account จะผูกกับ source IP เช่น:
+~~~text
+dbo.DBD_COMPANY
+dbo.DBD_COMPANY_RELATION
+dbo.DBD_COMPANY_EVENT
+dbo.DBD_FINANCIAL
+dbo.DBD_INDUSTRY
+~~~
 
-```text
-dbd-tipdi@172.24.114.41
-```
+## สิทธิ์ที่แนะนำ
 
-เหมาะกับ Client ที่อยู่ใน private network เดียวกันและมี route/firewall ที่อนุญาต
+สำหรับ analyst, BI tool หรือผู้ใช้ที่ต้องอ่านข้อมูล:
 
-## 2. Python Remote Gateway
+- ใช้ account แยกจาก runtime account
+- ให้ read-only เป็นค่าเริ่มต้น
+- จำกัด database/schema ตามหน้าที่
+- จำกัด network source ตาม policy ขององค์กร
+- ไม่แชร์ runtime credential
 
-ใช้เมื่อไม่ต้องการเปิด MySQL public และ Client จะต่อผ่าน local port:
+## DBeaver
 
-```text
-Host      127.0.0.1
-Port      13307
-Database  dbd
-Username  dbd-tipdi
-```
+ดูตัวอย่าง setup ที่:
 
-flow:
+~~~text
+docs/setup/DBEAVER.md
+~~~
 
-```text
-VS Code / DBeaver / PyMySQL
-        ↓
-127.0.0.1:13307
-        ↓
-dbd_client.py
-        ↓
-Cloudflare
-        ↓
-dbd_gateway.py
-        ↓
-MySQL dbd
-```
+## Application access
 
-Gateway mode ทำให้ MySQL match account ฝั่ง Server แบบ:
+application ที่ต้องอ่าน Production data ควรใช้ SQL Server connection ที่องค์กรอนุมัติ
 
-```text
-dbd-tipdi@127.0.0.1
-```
+อย่าสร้าง dependency ไปยัง Dataset 1 MySQL เพียงเพราะข้อมูลเดิมยังอยู่
 
-## คู่มือ
+## Generation 1 source
 
-สำหรับผู้ใช้ Client:
+MySQL connection ใช้เฉพาะงาน cutover/test ที่ระบุไว้ใน docs/setup/MYSQL.md
 
-[DBD Remote Client Guide](DBD_REMOTE_CLIENT.md)
+หลัง cutover Production data truth อยู่ที่ SQL Server
 
-สำหรับผู้ดูแล Server:
+## Safety
 
-[DBD Remote Server Guide](DBD_REMOTE_SERVER.md)
+client account ทั่วไปไม่ควรมีสิทธิ์:
 
-ภาพรวมระบบ:
+- ALTER schema
+- DROP/TRUNCATE Production tables
+- reset collection masks
+- reset generation
+- แก้ lease ownership
 
-[DBD Remote MySQL Gateway](DBD_REMOTE_GATEWAY.md)
-
-## Default privilege
-
-Client ปกติควรเป็น read-only:
-
-```text
-SELECT ON dbd.*
-```
-
-หลีกเลี่ยง `dbd-<team>@%` และอย่าให้ `ALL PRIVILEGES` / `GRANT OPTION` กับ client account โดยไม่จำเป็น
+การเปลี่ยน Production state ควรผ่าน application workflow หรือ maintenance procedure ที่มีเหตุผลและตรวจสอบได้

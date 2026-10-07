@@ -1,3 +1,9 @@
+> [!WARNING]
+> **LEGACY / HISTORICAL DOCUMENT**
+>
+> เนื้อหานี้เป็น snapshot/แผนงานของ architecture รุ่นก่อนและไม่ใช่ Production runbook ของ v0.6
+> Source of truth สำหรับระบบปัจจุบันคือ README.md, docs/ARCHITECTURE.md, docs/RUNBOOK.md, docs/OPERATIONS.md และ docs/VALIDATION.md
+
 # แผนที่ระบบและผลตรวจโครงการ DBD หลัง Hardening
 
 ตรวจล่าสุด: 15 กันยายน 2026 — branch `fix/execution-plan-p0-p2`, PR #1

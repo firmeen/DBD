@@ -1,353 +1,209 @@
-# Standalone Deep Quick Start
+# Direct SQL Server Collector Quick Start
 
-คู่มือนี้อธิบายเส้นทาง `dbd-deep` แบบใช้งานจริง โดยแยก Discovery, preparation,
-HTTP collection และ downstream export ออกจากกันชัดเจน
+dbd-deep คือเครื่องมือสำหรับควบคุม Production endpoint collector โดยตรง
 
-## เข้าใจระบบใน 1 นาที
+สำหรับการทำงาน Production ปกติ ให้ใช้:
 
-Deep collection มี 3 ขั้นหลัก:
+~~~powershell
+dbd-data cycle run --phase core
+~~~
 
-```text
-1. Discovery
-   หา "รายชื่อบริษัท"
-        ↓
-   dbd_company_master
+เพราะ cycle run จัดการ Discovery, Prepare, Collect, Verify และ Finalize ให้ครบ
 
-2. Prepare
-   bulk-stage บริษัทที่ค้นพบทั้งหมด
-        ↓
-   dbd_company_deep
+ใช้ dbd-deep เมื่อ operator ต้องการตรวจหรือควบคุมเฉพาะส่วน collection
 
-3. Collect
-   claim จาก dbd_company_deep โดยตรง
-        ↓
-   ยิง 7 endpoints + durable checkpoint
-        ↓
-   COMPLETE
-```
+## ภาพรวม
 
-`dbd_master_deep` และ SQL Server เป็น **downstream/export flow แยกต่างหาก** ไม่ได้อยู่ใน
-`dbd-deep prepare`, `dbd-deep collect` หรือ `scripts/run_deep_auto.py`
+~~~text
+SQL Server DBD_COMPANY
+        |
+        v
+     PREPARE
+        |
+        v
+      COLLECT
+        |
+        v
+endpoint results + masks + domain rows
+~~~
 
-ตารางหลัก:
+dbd-deep ไม่ใช่ workflow สำหรับสร้าง Generation ใหม่
 
-| Table | ความหมาย |
-| --- | --- |
-| `dbd_company_master` | บริษัทที่ Discovery พบและยังไม่ได้ stage เข้า Deep |
-| `dbd_company_deep` | Deep source of truth: payload + endpoint state หนึ่งแถวต่อบริษัท |
-| `dbd_deep_runtime` | lease/retry state เฉพาะบริษัทที่กำลังทำงานหรือรอ retry |
-| `dbd_master_deep` | downstream flat projection สำหรับ export เมื่อสั่ง explicit command |
-| `dbo.DBD_MASTER_DEEP` | SQL Server target ของ downstream projection |
+## 1. ดูสถานะ
 
-`dbo.DBD_COMPANY` เป็นคนละ target และ pipeline นี้ไม่ลบหรือแทนที่มัน
+~~~powershell
+dbd-deep status --phase core
+~~~
 
-## Active Deep scope
+เป็น read-only command
 
-Standalone Deep เก็บ exactly 7 endpoints:
+ถ้าต้องการ row coverage ของ 5 production tables:
 
-```text
-profile
-committees
-committee_signs
-transformations
-financial_submissions
-financial_statements
-industry_benchmark
-```
+~~~powershell
+dbd-deep status --phase core --coverage
+~~~
 
-`nations`, `nation_history`, `name_history`, `capital_history` อยู่เพื่อ compatibility
-แต่ inactive ใน standalone Deep
+ใช้ status ก่อน manual collector operation ทุกครั้ง
 
-## 1. เตรียม environment
+## 2. Prepare
 
-จาก repository:
+~~~powershell
+dbd-deep prepare --phase core
+~~~
 
-```powershell
-git switch main
-git pull --ff-only
+Prepare จะคำนวณ endpoint requirement ของบริษัทใน Generation ที่ระบบเลือก
 
-.\.venv\Scripts\Activate.ps1
-python -m pip install -e .
-```
+มันไม่ดึง HTTP endpoint
 
-ตรวจ MySQL config ใน `.env` อย่างน้อย:
+มันไม่สร้าง Production cycle ใหม่
 
-```env
-DB_HOST=127.0.0.1
-DB_PORT=3307
-DB_NAME=dbd
-DB_USER=dbd-data
-DB_PASSWORD=<YOUR_PASSWORD>
-```
+มันไม่ finalize Generation
 
-ห้าม commit credential
+## 3. Collect
 
-## 2. ตรวจสถานะ
+~~~powershell
+dbd-deep collect --phase core
+~~~
 
-```powershell
-dbd-data check-db
-dbd-deep --version
-dbd-deep status
-```
+ค่าหลักที่ปรับได้:
 
-`dbd-deep status` เป็น read-only view โดยดู Master waiting, Deep total/complete/unresolved,
-runtime lease/retry state และ overlap
+~~~powershell
+dbd-deep collect --phase core --concurrency 8 --rate 15 --http-retries 3
+~~~
 
-ถ้าต้องการ endpoint-wide coverage:
+rate คือ fixed aggregate HTTP requests per second
 
-```powershell
-dbd-deep status --coverage
-```
+429/503 สามารถทำให้เกิด cooldown ได้ แต่ configured rate ไม่ถูกลดแบบ adaptive ถาวร
 
-`--coverage` หนักกว่า status ปกติ เพราะอ่าน endpoint state เพิ่ม
+## 4. Canary
 
-## 3. Prepare หลัง Discovery ทุกครั้ง
+ถ้าต้องการทดสอบ collector ด้วยจำนวนบริษัทจำกัด:
 
-หลัง Discovery เสร็จ ให้ stage งานก่อนเริ่ม collector:
+~~~powershell
+dbd-deep collect --phase core --limit 20 --concurrency 4 --rate 5
+~~~
 
-```powershell
-dbd-deep prepare
-```
+limit คือจำนวน company claims สูงสุดในการ invocation นั้น
 
-Prepare ทำสองหน้าที่:
+หลัง canary:
 
-1. normalize/adopt Deep model เก่าเมื่อจำเป็น;
-2. bulk-stage `dbd_company_master` ทั้งหมดเข้า `dbd_company_deep`
+~~~powershell
+dbd-deep status --phase core
+~~~
 
-Prepare rerun ได้ หลัง Discovery รอบใหม่ก็เรียกคำสั่งเดิมอีกครั้ง
+## 5. Continuous mode
 
-สิ่งที่ prepare **ไม่ทำ**:
+~~~powershell
+dbd-deep collect --phase core --continuous --idle-seconds 5
+~~~
 
-- ไม่ยิง DBD HTTP endpoints;
-- ไม่สร้าง bounded runtime queue;
-- ไม่อัปเดต `dbd_master_deep`;
-- ไม่ sync SQL Server.
+เมื่อไม่มีงาน collector จะรอและตรวจใหม่ตาม idle interval
 
-หลัง prepare:
+continuous mode ไม่ทำ Discovery และไม่สร้าง Generation ใหม่เอง
 
-```powershell
-dbd-deep status
-```
+## 6. Retry terminal failures
 
-ก่อน collect ค่า `Master waiting` ควรเป็น `0`
+ดูสถานะก่อน:
 
-## 4. Canary collection
+~~~powershell
+dbd-deep status --phase core
+~~~
 
-หลัง source/environment เปลี่ยน ให้เริ่ม canary:
+เปิด failed endpoint กลับมา:
 
-```powershell
-dbd-deep collect --limit 20 --concurrency 4 --rate 5 --http-retries 3
-```
+~~~powershell
+dbd-deep retry --phase core
+~~~
 
-Collector จะ claim จาก `dbd_company_deep` โดยตรงทีละบริษัท ไม่มี refill batch
+จำกัดจำนวนบริษัทได้:
 
-หลังจบ:
+~~~powershell
+dbd-deep retry --phase core --limit 500
+~~~
 
-```powershell
-dbd-deep status
-```
+จากนั้น collect โดยตรง:
 
-## 5. Long-running collection
+~~~powershell
+dbd-deep collect --phase core
+~~~
 
-เมื่อ canary ผ่าน:
+หรือกลับไปใช้ full production orchestration:
 
-```powershell
-dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --idle-seconds 5
-```
+~~~powershell
+dbd-data cycle run --phase core
+~~~
 
-หรือใช้ supervisor:
+retry ไม่ล้าง DONE หรือ NOT_AVAILABLE
 
-```powershell
-python scripts\run_deep_auto.py
-```
+## 7. Core / Extended
 
-ความหมาย:
+Core เป็น default และครอบคลุม 7 endpoint หลัก
 
-- `--continuous` — process อยู่ต่อเมื่อ Deep work หมด เพื่อรองรับ durable retry;
-- `--concurrency 8` — สูงสุด 8 บริษัท in-flight;
-- `--rate 15` — fixed aggregate HTTP requests/second;
-- `--idle-seconds 5` — no-work polling interval.
+~~~powershell
+dbd-deep status --phase core
+~~~
 
-ไม่มี `--buffer-size` และไม่มี 32-company scheduling boundary
+Extended เพิ่ม history/nation endpoints:
 
-worker flow:
+~~~powershell
+dbd-deep status --phase extended
+~~~
 
-```text
-claim Deep row
-  ↓
-create one RUNNING lease
-  ↓
-request unresolved endpoint
-  ↓
-commit endpoint checkpoint
-  ↓
-finish / retry_wait
-  ↓
-claim next Deep row immediately
-```
+prepare, collect และ retry ทุกคำสั่งมี phase scope
 
-Ctrl+C เป็น graceful stop; endpoint checkpoints ที่ commit แล้วอยู่ใน MySQL และ RUNNING
-lease จะ recover ใน collect ครั้งถัดไป
+## 8. Claim และ lease
 
-## 6. Runtime semantics
+collector claim บริษัทโดยใช้ SQL Server row locking
 
-`dbd_deep_runtime` ไม่ใช่ work queue แบบ prefilled อีกต่อไป
+แต่ละ claim มี owner token และ lease
 
-ใช้เฉพาะ:
+ขณะทำงาน collector heartbeat lease
 
-```text
-RUNNING     = worker กำลังถือบริษัท
-RETRY_WAIT  = durable backoff หลัง transient failure
-PENDING     = recovery compatibility สำหรับ RUNNING จาก process ก่อนหน้า
-```
+การ commit ผลต้องยังเป็น owner ของ claim เดิม
 
-งานใหม่ไม่ได้ถูก seed เข้า runtime ล่วงหน้าทีละ 32/64/etc.
+ถ้า process หาย lease จะหมดอายุและ recover ได้ใน collector รอบถัดไป
 
-## 7. Retry terminal Deep failures
+## 9. Ctrl+C
 
-เปิด failure กลับมาแบบ bounded:
+กด Ctrl+C ได้
 
-```powershell
-dbd-deep retry --limit 500
-```
+สิ่งที่ commit แล้วจะอยู่
 
-จากนั้น collector จะ claim row ที่ reopen จาก `dbd_company_deep` โดยตรง
+endpoint ที่ยังไม่ commit จะไม่มี partial checkpoint ที่ทำให้ระบบเข้าใจผิดว่าสำเร็จ
 
-## 8. ACTIVE refresh
+หลังหยุด:
 
-`dbd-deep collect` ไม่ scan/reopen stale ACTIVE rows ระหว่างยิงอีกแล้ว
+~~~powershell
+dbd-deep status --phase core
+~~~
 
-refresh เป็น maintenance concern แยกจาก collector hot path เพื่อไม่ให้ multi-million-row scan
-หรือ refresh scheduling มาหยุด HTTP collection
+แล้วเริ่ม collector ใหม่เมื่อพร้อม:
 
-## 9. Current-model bootstrap/backfill
+~~~powershell
+dbd-deep collect --phase core
+~~~
 
-คำสั่งนี้เป็น maintenance tool ไม่ใช่ normal collector:
+## 10. Status ที่ควรเข้าใจ
 
-```powershell
-python -m dbd.deep.bootstrap --batch-size 5000
-```
+- PENDING — พร้อมรอทำ
+- COLLECTING — ถูก claim และกำลังทำ
+- RETRY_WAIT — รอ retry หลังปัญหาชั่วคราว
+- COMPLETE — required endpoint ถูก resolve
+- failed bit — endpoint จบด้วย terminal failure
+- NOT_AVAILABLE — upstream ระบุว่าไม่มีข้อมูล ไม่ใช่ failure
 
-หน้าที่คือ ensure current model/catalog/indexes, backfill identity/Master จาก Discovery history,
-reconcile model และ validate current schema
+## 11. สิ่งที่ dbd-deep ไม่ทำแทน cycle
 
-หลัง bootstrap/Discovery ให้รัน `dbd-deep prepare` ก่อน collect
+dbd-deep direct commands ไม่ควรถูกมองว่าเป็นตัวแทนของ full cycle เพราะ full cycle ยังมี:
 
-## 10. Downstream projection: explicit เท่านั้น
+~~~text
+DISCOVER
+VERIFY
+FINALIZE
+~~~
 
-`dbd_master_deep` ไม่อยู่ใน Deep collector pipeline
+ถ้าจุดประสงค์คือ “รัน Production รอบหนึ่งให้ครบ” ใช้ cycle run
 
-ถ้าต้องการสร้าง/อัปเดต flat projection ให้สั่งเอง:
-
-```powershell
-python -m dbd.deep.serving --ensure --backfill --batch-size 100 --limit 100
-```
-
-จากนั้นถ้าต้องการ full backfill:
-
-```powershell
-python -m dbd.deep.serving --backfill --batch-size 1000
-```
-
-การรัน `dbd-deep prepare`, `dbd-deep collect` หรือ `run_deep_auto.py` จะไม่อ่านหรือเขียน
-`dbd_master_deep`
-
-## 11. Sync ไป SQL Server
-
-ตั้งค่า environment:
-
-```env
-MSSQL_SERVER=<SERVER>
-MSSQL_PORT=1433
-MSSQL_DATABASE=TIPDataIntelligence
-MSSQL_USER=<USER>
-MSSQL_PASSWORD=<PASSWORD>
-```
-
-เริ่ม canary:
-
-```powershell
-python -m dbd.pipelines.sqlserver_sync --batch-size 100 --limit 100
-```
-
-target คือ:
-
-```text
-TIPDataIntelligence.dbo.DBD_MASTER_DEEP
-```
-
-ไม่มี automatic DELETE
-
-หลัง canary ผ่าน:
-
-```powershell
-python -m dbd.pipelines.sqlserver_sync --batch-size 1000
-```
-
-## 12. Terminal UI
-
-collector UI แสดง state ที่ตรงกับ direct pipeline:
-
-```text
-Concurrency
-Rate
-Limit
-Mode
-Claimed
-Finished
-In flight
-Retry wait
-Endpoint done
-N/A
-Endpoint failed
-Recovered
-```
-
-ไม่มี Buffer, Cycle, Promoted, ACTIVE refresh หรือ Serving Projection panel
-
-## 13. สิ่งที่ไม่ควรทำ
-
-- อย่า DROP/TRUNCATE Deep tables เพื่อเริ่มใหม่;
-- อย่า reset payload/masks เพียงเพราะ process หยุด;
-- อย่าใช้ Campaign/Redis ควบคุม standalone Deep;
-- อย่ารัน collect ก่อน stage Master ด้วย `dbd-deep prepare`;
-- อย่าเอา `dbd_master_deep` หรือ SQL Server sync เข้ามาใน collector hot path;
-- อย่า auto-delete SQL Server target-only rows;
-- อย่ารัน long load ก่อน bounded canary.
-
-## 14. Flow ที่ควรจำ
-
-```text
-Discovery
-   ↓
-dbd_company_master
-   ↓
-dbd-deep prepare
-   ↓
-dbd_company_deep
-   ↓
-dbd-deep collect
-   ↓
-COMPLETE
-
------------------------------
-explicit downstream only
------------------------------
-
-dbd_company_deep
-   ↓
-dbd.deep.serving
-   ↓
-dbd_master_deep
-   ↓
-SQL Server
-```
-
-ถ้ามี Discovery รอบใหม่:
-
-```text
-stop collector if running
-→ Discovery
-→ dbd-deep prepare
-→ start/resume collector
-```
+~~~powershell
+dbd-data cycle run --phase core
+~~~

@@ -1,520 +1,322 @@
 # DBD Data Platform
 
-ระบบสำหรับเก็บและจัดการข้อมูลจาก DBD DataWarehouse แบบทำงานต่อเนื่องได้ แม้ process หยุดหรือเครื่อง restart โดยใช้ **MySQL เป็นข้อมูลหลักที่เชื่อถือได้**, ใช้ queue/task state สำหรับ resume งาน และสามารถใช้ **Redis** เพื่อควบคุม Campaign/worker หลาย process ร่วมกัน
+ระบบ Production สำหรับค้นหาและเก็บข้อมูลบริษัทจาก DBD DataWarehouse ลง SQL Server แบบทำงานต่อเนื่อง ตรวจสอบได้ และกลับมาทำต่อได้เมื่อ process หยุดกลางทาง
 
-ถ้าคุณเพิ่งเข้ามาในโปรเจกต์นี้ ไม่จำเป็นต้องอ่าน architecture ทั้งหมดก่อน ให้เริ่มจากหัวข้อ **เริ่มใช้งานแบบสั้นที่สุด** ด้านล่าง
+เอกสารหน้าแรกนี้อธิบายเฉพาะเส้นทาง Production ปัจจุบัน หากต้องการรายละเอียดเชิงลึกให้ไปยังเอกสารที่ลิงก์ไว้ท้ายหน้า
 
----
+## ระบบทำอะไร
 
-## ระบบนี้ทำอะไร
+Production workflow มีลำดับเดียวที่ควรจำ:
 
-ระบบมี 2 เส้นทางการเก็บข้อมูลที่อยู่ร่วมกัน:
-
-**Standalone Deep** — เส้นทางปัจจุบันสำหรับเก็บ 7 endpoints ต่อบริษัทแบบตรงไปตรงมา:
-
-```text
+~~~text
 DBD DataWarehouse
-       │
-       ▼
-Discovery
-       │
-       ▼
-dbd_company_master
-บริษัทที่รอเข้า Deep
-       │
-       ▼
-dbd_company_deep
-ข้อมูล Deep + durable endpoint state
-       │
-       │ COMPLETE เท่านั้น
-       ▼
-dbd_master_deep
-ตารางแบน อ่านง่าย ไม่มี JSON
-       │
-       ▼
-TIPDataIntelligence.dbo.DBD_MASTER_DEEP
-```
+        |
+        v
+     DISCOVER
+        |
+        v
+     PREPARE
+        |
+        v
+     COLLECT
+        |
+        v
+      VERIFY
+        |
+        v
+     FINALIZE
+        |
+        v
+SQL Server Production Dataset
+~~~
 
-**Campaign / Bulk** — เส้นทาง distributed เดิมสำหรับ run/task/archive/worker fleet และงานที่ต้องใช้ Redis coordination
+ความหมายแบบสั้น:
 
-MySQL เป็น durable source of truth ของทั้งสองเส้นทาง ส่วน Redis ใช้เฉพาะงาน Campaign/distributed coordination; standalone `dbd-deep` ไม่พึ่ง Redis control plane
+- DISCOVER — ค้นหาบริษัทและบันทึก identity ที่พบ
+- PREPARE — คำนวณว่าบริษัทแต่ละรายยังต้องเก็บข้อมูลอะไร
+- COLLECT — ดึงข้อมูล endpoint ที่ยังไม่เสร็จ
+- VERIFY — ตรวจว่ารอบข้อมูลไม่มีงานค้างหรือความผิดปกติที่ขัดกับกติกา
+- FINALIZE — ปิด Generation เมื่อรอบนั้นผ่านการตรวจแล้ว
 
----
+## Production Storage
 
-## เริ่มใช้งานแบบสั้นที่สุด
+Production ใช้ SQL Server เป็นฐานข้อมูลหลัก
 
-### 1. เตรียมโปรเจกต์
+ฐานข้อมูลที่ตั้งค่าโดยทั่วไปคือ TIPDataIntelligence และระบบ v0.6 ดูแล 5 ตาราง:
 
-ต้องมีอย่างน้อย:
-
-- Git
-- Python 3.11+
-- MySQL 8+
-
-บน Windows:
-
-```powershell
-git clone https://github.com/firmeen/DBD.git
-cd DBD
-
-.\scripts\bootstrap.ps1 -Dev -InstallCommand
-.\.venv\Scripts\Activate.ps1
-```
-
-ถ้า repository มีอยู่แล้ว:
-
-```powershell
-git switch main
-git pull --ff-only
-```
-
-### 2. ตั้งค่า .env
-
-ไฟล์จริงคือ:
-
-```text
-.env
-```
-
-ตัวอย่างขั้นต่ำ:
-
-```env
-DB_HOST=127.0.0.1
-DB_PORT=3307
-DB_NAME=dbd
-DB_USER=dbd-data
-DB_PASSWORD=<YOUR_MYSQL_PASSWORD>
-```
-
-ห้าม commit `.env`
-
-ตรวจว่า Git ignore แล้ว:
-
-```powershell
-git check-ignore .env
-```
-
-### 3. ตรวจ database
-
-```powershell
-dbd-data --version
-dbd-data check-db
-dbd-data migrate
-```
-
-ถ้าพร้อมควรเห็น migration จบด้วย:
-
-```text
-Schema is current
-```
-
-### 4. ดูสถานะข้อมูล
-
-```powershell
-dbd-data master-status
-dbd-data discover-status
-```
-
-จากจุดนี้ Discovery ใช้งานได้แล้ว
-
-ถ้าจะใช้ **Standalone Deep** ให้ตรวจสถานะก่อน:
-
-```powershell
-dbd-deep --version
-dbd-deep status
-```
-
-ถ้าระบบยังต้อง adopt Deep rows เดิมเข้าสู่ seven-endpoint runtime ให้รัน:
-
-```powershell
-dbd-deep prepare
-```
-
-จากนั้นเริ่มแบบ canary ก่อน:
-
-```powershell
-dbd-deep collect --limit 20 --concurrency 4 --rate 5 --http-retries 3
-```
-
-ดูขั้นตอนเต็มที่ [Standalone Deep quick start](docs/DEEP_QUICKSTART.md)
-
-ถ้าจะใช้ **Campaign / distributed workers** ให้ตั้ง Redis เพิ่มตาม [Redis setup](docs/setup/REDIS.md)
-
----
-
-## คู่มือติดตั้งและเครื่องมือ
-
-ถ้าเป็นเครื่องใหม่ แนะนำทำตาม [Setup guides](docs/setup/README.md) ตามลำดับ
-
-| คู่มือ | ใช้เมื่อ |
+| Table | หน้าที่ |
 | --- | --- |
-| [Windows project setup](docs/setup/WINDOWS_PROJECT_SETUP.md) | เตรียม Git, Python, venv และติดตั้งโปรเจกต์ |
-| [MySQL setup](docs/setup/MYSQL.md) | เตรียม database, user และ migration |
-| [Redis setup](docs/setup/REDIS.md) | ใช้ Campaign หรือ distributed mode |
-| [DBeaver setup](docs/setup/DBEAVER.md) | ต้องการเปิดดูฐานข้อมูลและรัน SQL ผ่าน GUI |
-| [Web app setup](docs/setup/WEB_APP.md) | ต้องการรัน/พัฒนา `apps/web` |
-| [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) | เลือก Direct LAN หรือ Remote Gateway |
-| [DBD Remote Client](docs/DBD_REMOTE_CLIENT.md) | คู่มือฝั่ง Client ตั้งแต่ clone repo ถึงต่อ VS Code/DBeaver |
-| [DBD Remote Server](docs/DBD_REMOTE_SERVER.md) | คู่มือฝั่ง Server สำหรับ MySQL + cloudflared + gateway |
-| [DBD Remote Gateway](docs/DBD_REMOTE_GATEWAY.md) | ภาพรวม architecture และเลือกคู่มือ Client/Server |
-| [Standalone Deep quick start](docs/DEEP_QUICKSTART.md) | ใช้ `dbd-deep prepare` + direct Deep collect และ downstream export แบบแยกขั้น |
-| [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md) | Canary, production campaign, status, stop และ resume |
+| dbo.DBD_COMPANY | ข้อมูลหลักบริษัท สถานะการเก็บข้อมูล lease และ Generation |
+| dbo.DBD_COMPANY_RELATION | กรรมการ ผู้มีอำนาจลงนาม และความสัมพันธ์แบบรายการ |
+| dbo.DBD_COMPANY_EVENT | เหตุการณ์เปลี่ยนแปลง โอน แปรสภาพ หรือควบรวม |
+| dbo.DBD_FINANCIAL | ข้อมูลการนำส่งและงบการเงินแยกตามปี |
+| dbo.DBD_INDUSTRY | ข้อมูล benchmark และข้อมูลอุตสาหกรรม |
 
----
+## เริ่มใช้งาน
 
-## Discovery คืออะไร
+ติดตั้ง package จาก repository:
 
-Discovery มีหน้าที่ค้นหา company identity จาก DBD และสร้าง/อัปเดต `company_master`
+~~~powershell
+python -m pip install -e .
+~~~
 
-คำสั่งหลัก:
+ตั้งค่า SQL Server ใน .env:
 
-```powershell
-dbd-data discover
-dbd-data discover-status
-dbd-data discover-retry
-dbd-data discover-refresh
-dbd-data master-status
-```
+~~~text
+MSSQL_SERVER=<SERVER>
+MSSQL_DATABASE=TIPDataIntelligence
+MSSQL_USER=<USER>
+MSSQL_PASSWORD=<PASSWORD>
+MSSQL_PORT=1433
+~~~
 
-Discovery มี durable checkpoint ดังนั้นไม่ควร reset ใหม่เพียงเพราะ network error ชั่วคราว
+ถ้าเป็น environment ที่มี Production schema อยู่แล้ว ให้ตรวจด้วย:
 
-ระบบเก็บ valid rows ที่ผ่าน validation และ quarantine row ที่ผิด contract แยกไว้ ไม่ทิ้งทั้ง page เพียงเพราะมีบาง row ผิด
-
-`discover-status` บอก coverage ที่ระบบสังเกตได้ แต่ไม่ได้หมายความโดยอัตโนมัติว่า upstream ส่งบริษัททั้งหมดครบ 100%
-
----
-
-## ข้อมูลเชิงลึกที่เก็บต่อบริษัท
-
-default production scope ปัจจุบันมี **7 endpoints/company**
-
-```text
-profile
-committees
-committee_signs
-transformations
-financial_submissions
-financial_statements
-industry_benchmark
-```
-
-สำหรับ **Standalone Deep** ขอบเขต active มีเท่านี้ exactly 7 endpoints เท่านั้น
-
-`nations`, `nation_history`, `name_history`, `capital_history` ยังอยู่เพื่อ compatibility แต่ไม่ถูก schedule โดย standalone Deep ส่วน Campaign/Bulk เดิมอาจมี scope อื่นตามโหมดที่เลือก
-
-Financial endpoints ต้องพึ่งข้อมูลจาก profile ก่อน ถ้า source ยืนยันว่าไม่มี fiscal year ที่ต้องใช้ task สามารถจบเป็น `not_available` ได้ ซึ่งไม่ถือเป็น failure
-
----
-
-## Standalone Deep
-
-Standalone Deep ใช้ MySQL เป็น durable state โดยตรงและไม่ใช้ Campaign/Fabric/Guardian/Redis scheduler
-
-ลำดับปกติ:
-
-```text
-Discovery
-→ dbd_company_master
-→ dbd-deep prepare
-→ dbd_company_deep
-→ dbd-deep collect
-→ 7 endpoints
-→ COMPLETE
-```
-
-คำสั่งหลัก:
-
-```powershell
-dbd-deep status
-dbd-deep prepare
-dbd-deep collect
-dbd-deep retry
-```
-
-รันต่อเนื่อง:
-
-```powershell
-dbd-deep collect --continuous --concurrency 8 --rate 15 --http-retries 3 --idle-seconds 5
-```
-
-เมื่อ Deep row เป็น `COMPLETE` สามารถสั่ง downstream projection ไป `dbd_master_deep` แบบ explicit ได้; `prepare`/`collect` ไม่เรียกขั้นนี้เอง:
-
-```powershell
-python -m dbd.deep.serving --ensure --backfill --batch-size 100 --limit 100
-```
-
-หลัง canary ผ่านจึงค่อยเพิ่ม batch หรือทำ full backfill
-
-ถ้าต้อง sync ไป SQL Server target ใหม่ `TIPDataIntelligence.dbo.DBD_MASTER_DEEP`:
-
-```powershell
-python -m dbd.pipelines.sqlserver_sync --batch-size 100 --limit 100
-```
-
-pipeline นี้ไม่ใช้และไม่ลบ `dbo.DBD_COMPANY` อัตโนมัติ รายละเอียดทั้งหมดอยู่ที่ [Standalone Deep quick start](docs/DEEP_QUICKSTART.md)
-
----
-
-## Campaign
-
-Campaign เป็นวิธีที่ง่ายที่สุดในการเปิด worker fleet ที่ coordinated ผ่าน Redis
-
-ก่อน production ให้รัน canary ก่อน ดูขั้นตอนเต็มใน [Campaign quick start](docs/CAMPAIGN_QUICKSTART.md)
-
-ตัวอย่าง production all-status campaign:
-
-```powershell
-$env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
-
-dbd-data campaign start `
-  --master `
-  --all-statuses `
-  --workers 6 `
-  --workers-min 3 `
-  --workers-max 6 `
-  --worker-concurrency 12 `
-  --worker-rate 2 `
-  --rate-mode adaptive `
-  --max-restarts 3 `
-  --headless
-```
-
-ค่าด้านบนเป็น operational example ไม่ใช่การรับประกันว่า upstream จะรับ rate นี้ได้เสมอ ต้องดู canary, 429/503 และ throughput จริง
-
-เมื่อได้ run ID เช่น:
-
-```text
-Campaign run 12 prepared
-```
-
-ให้จำ `12` ไว้
-
-ดูสถานะ:
-
-```powershell
-dbd-data campaign status 12
-dbd-data bulk-status 12
-```
-
-หยุดแบบ graceful:
-
-```powershell
-dbd-data campaign stop 12
-```
-
-resume run เดิม:
-
-```powershell
-dbd-data campaign resume 12 `
-  --workers 6 `
-  --workers-min 3 `
-  --workers-max 6 `
-  --worker-concurrency 12 `
-  --worker-rate 2 `
-  --rate-mode adaptive `
-  --max-restarts 3 `
-  --headless
-```
-
-ถ้า process หยุด **อย่าใช้ `campaign start` เพื่อ resume** เพราะจะสร้าง run ใหม่
-
----
-
-## Bulk mode
-
-Bulk V2 ยังใช้งานได้โดยตรงโดยไม่ผ่าน Campaign supervisor
-
-สร้าง immutable all-status run:
-
-```powershell
-dbd-data bulk --master --all-statuses --enqueue-only
-```
-
-จากนั้นใช้ run ID เดิม:
-
-```powershell
-dbd-data bulk --run-id N --concurrency <CONCURRENCY> --rate <RATE>
-dbd-data bulk-status N
-```
-
-ถ้ามี failed task ที่ retry ได้:
-
-```powershell
-dbd-data bulk-retry N
-```
-
-อย่าใช้ `bulk --master` เป็นคำสั่ง resume เพราะมันสร้าง run ใหม่
-
----
-
-## Redis
-
-Redis จำเป็นสำหรับ:
-
-- Campaign supervisor
-- distributed bulk workers
-- distributed discovery
-- shared adaptive rate/cooldown
-- worker heartbeat/control
-
-ตัวแปร:
-
-```env
-DBD_REDIS_URL="rediss://<USERNAME>:<PASSWORD>@<ENDPOINT>:<PORT>/0"
-DBD_REDIS_RATE_KEY=dbd:dev:global-rate
-```
-
-สำหรับ production:
-
-```env
-DBD_REDIS_RATE_KEY=dbd:production:global-rate
-```
-
-รายละเอียด TLS, user, ACL และ preflight อยู่ที่ [Redis setup](docs/setup/REDIS.md)
-
----
-
-## Response archive และ recovery
-
-pipeline แยกงานเป็น:
-
-```text
-fetch → archive → project
-```
-
-response ที่ fetch สำเร็จต้องผ่าน durable archive boundary ก่อน projection
-
-เพราะฉะนั้นถ้า process crash หลัง archive แล้ว ระบบสามารถกลับมา project จาก archive โดยไม่จำเป็นต้องยิง DBD ซ้ำ
-
-default archive backend คือ MySQL:
-
-```powershell
-$env:DBD_ARCHIVE_BACKEND = "mysql"
-```
-
-ระบบรองรับ S3-compatible external archive แบบ encrypted ด้วย แต่เป็น advanced deployment ดู [High-throughput V2](docs/HIGH_THROUGHPUT_V2.md)
-
-Replay archive โดยไม่เรียก upstream:
-
-```powershell
-dbd-data replay ARCHIVE_ID
-```
-
----
-
-## Web app
-
-หน้าเว็บอยู่ที่:
-
-```text
-apps/web
-```
-
-เริ่ม development:
-
-```powershell
-cd apps\web
-npm ci
-npm run dev
-```
-
-รายละเอียดอยู่ที่ [Web app setup](docs/setup/WEB_APP.md)
-
----
-
-## คำสั่งที่ใช้บ่อย
-
-```powershell
-# Database
+~~~powershell
 dbd-data check-db
+~~~
+
+ถ้าเป็น environment ใหม่ หรือ source code มี schema contract ใหม่ ให้ converge schema ก่อนแล้วตรวจ:
+
+~~~powershell
 dbd-data migrate
+dbd-data check-db
+~~~
 
-# Discovery
-dbd-data discover
-dbd-data discover-status
-dbd-data master-status
+migrate จะสร้างหรือเพิ่มสิ่งที่ระบบรองรับอย่างปลอดภัย และจะปฏิเสธ schema ที่ไม่เข้ากันแทนการแก้แบบทำลายข้อมูลอัตโนมัติ
 
-# Campaign
-dbd-data campaign start --help
-dbd-data campaign status RUN_ID
-dbd-data campaign stop RUN_ID
-dbd-data campaign resume RUN_ID
+## 3 กรณีที่ใช้บ่อยที่สุด
 
-# Bulk queue
-dbd-data bulk-status RUN_ID
-dbd-data bulk-retry RUN_ID
+### 1. รัน Production รอบปกติ
 
-# Archive
-dbd-data replay ARCHIVE_ID
-```
+~~~powershell
+dbd-data check-db
+dbd-data cycle status --phase core
+dbd-data cycle run --phase core
+dbd-data cycle status --phase core
+~~~
 
----
+cycle run เป็นคำสั่งหลักของ Production และจัดการลำดับนี้ให้เอง:
 
-## Development validation
+~~~text
+PRECHECK -> DISCOVER -> PREPARE -> COLLECT -> VERIFY -> FINALIZE
+~~~
 
-Python:
+ไม่จำเป็นต้องสั่งแต่ละขั้นเองในการทำงานปกติ
 
-```powershell
-.\.venv\Scripts\python.exe -m compileall -q src scripts tests
-.\.venv\Scripts\python.exe -m ruff check .
-.\.venv\Scripts\python.exe -m pytest tests -q
-```
+### 2. Process หยุด, ปิด Terminal หรือกด Ctrl+C แล้วต้องการทำต่อ
 
-Web:
+ใช้คำสั่งเดิม:
 
-```powershell
-cd apps\web
+~~~powershell
+dbd-data check-db
+dbd-data cycle status --phase core
+dbd-data cycle run --phase core
+dbd-data cycle status --phase core
+~~~
 
-npm run typecheck
-npm run lint
-npm run test
-npm run build
-```
+ไม่มีคำสั่ง resume แยกสำหรับ Production cycle
 
-Integration tests ต้องใช้ disposable test database ที่ชื่อขึ้นต้นด้วย `dbd_test_` และ Redis test URL ต้องชี้ไปที่ disposable Redis database
+ถ้า Generation เดิมยังไม่เสร็จ ระบบจะใช้ durable state ใน SQL Server แล้วทำ Generation เดิมต่อ ไม่สร้าง Generation ใหม่เพียงเพราะ process ถูกเปิดใหม่
 
----
+งานที่ commit สำเร็จแล้วจะไม่ถูกย้อนกลับเพียงเพราะ Terminal หรือ process หยุด
+
+### 3. รอบจบแล้วแต่มี endpoint ที่เป็น terminal failure และต้องการลองใหม่
+
+~~~powershell
+dbd-data cycle status --phase core
+dbd-deep retry --phase core
+dbd-data cycle run --phase core
+dbd-data cycle status --phase core
+~~~
+
+retry จะเปิดเฉพาะ endpoint ที่เคยล้มเหลวให้กลับมาทำงานได้อีกครั้ง
+
+ข้อมูล endpoint ที่สำเร็จแล้วและ endpoint ที่ DBD ยืนยันว่าไม่มีข้อมูลจะไม่ถูกล้าง
+
+## Generation คืออะไร
+
+Generation คือหมายเลขรอบข้อมูล
+
+ตัวอย่าง:
+
+~~~text
+Generation 1  = Dataset เริ่มต้นที่ถูกนำเข้ามาตอน cutover
+Generation 2  = Production cycle ถัดไป
+Generation 3  = Production cycle หลังจากนั้น
+~~~
+
+บริษัทหนึ่งรายมีข้อมูลเพื่อบอกว่า:
+
+- พบครั้งแรกใน Generation ไหน
+- พบล่าสุดใน Generation ไหน
+- ข้อมูลถูก finalize ถึง Generation ไหนแล้ว
+
+ถ้า Generation 2 หยุดกลางทาง การรัน cycle run อีกครั้งจะทำ Generation 2 ต่อ ไม่ข้ามไป Generation 3
+
+Generation ใหม่จะเริ่มเมื่อรอบเดิมไม่มีงาน unfinished แล้ว
+
+## Core และ Extended
+
+ค่า default คือ core
+
+Core เก็บ 7 กลุ่มข้อมูลหลัก:
+
+1. profile
+2. financial_submissions
+3. financial_statements
+4. industry_benchmark
+5. committees
+6. committee_signs
+7. transformations
+
+Extended เพิ่ม:
+
+1. nations
+2. nation_history
+3. name_history
+4. capital_history
+
+ตัวอย่าง:
+
+~~~powershell
+dbd-data cycle run --phase core
+dbd-data cycle run --phase extended
+~~~
+
+ไม่ควรเปลี่ยน phase ระหว่างการแก้ incident โดยไม่เข้าใจก่อนว่าขอบเขตข้อมูลที่ต้อง resolve เปลี่ยนตาม phase
+
+## ดูสถานะ
+
+สถานะ Production cycle:
+
+~~~powershell
+dbd-data cycle status --phase core
+~~~
+
+สถานะ collector แบบละเอียด:
+
+~~~powershell
+dbd-deep status --phase core
+~~~
+
+ถ้าต้องการอ่านจำนวน row ของ 5 production tables เพิ่ม:
+
+~~~powershell
+dbd-deep status --phase core --coverage
+~~~
+
+coverage เป็นข้อมูลประกอบการตรวจ ไม่ใช่คำสั่งแก้ไขข้อมูล
+
+## ดึงบริษัทเดียว
+
+ใช้เมื่อจำเป็นต้องตรวจหรือเก็บบริษัทเฉพาะราย:
+
+~~~powershell
+dbd-data fetch-company <COMPANY_CODE> --phase core
+~~~
+
+คำสั่งนี้ใช้ Production SQL Server workflow เช่นเดียวกับระบบหลัก แต่ทำกับบริษัทเป้าหมายแทน full-universe cycle
+
+## Direct collector
+
+dbd-deep เป็นเครื่องมือระดับ operator สำหรับควบคุม collector โดยตรง
+
+คำสั่งหลัก:
+
+~~~powershell
+dbd-deep status --phase core
+dbd-deep prepare --phase core
+dbd-deep collect --phase core
+dbd-deep retry --phase core
+~~~
+
+สำหรับการรัน Production ปกติ ให้ใช้ dbd-data cycle run ก่อน เพราะคำสั่งนั้นจัดการ Discovery, Prepare, Collect, Verify และ Finalize ให้ครบลำดับ
+
+ดูรายละเอียดที่ docs/DEEP_QUICKSTART.md
+
+## การหยุดอย่างปลอดภัย
+
+กด Ctrl+C ได้เมื่อจำเป็น
+
+หลักที่ระบบยึดคือ:
+
+- transaction ที่ commit แล้วคงอยู่
+- endpoint ที่ยังไม่ commit จะถูกทำใหม่ภายหลัง
+- lease มีวันหมดอายุ
+- collector ตรวจและ recover expired lease
+- การหยุด process ไม่ใช่เหตุผลให้ลบหรือ reset Production state
+
+หลังหยุด ให้ดูสถานะก่อน แล้วรัน cycle เดิมอีกครั้ง
+
+## Generation 1 Cutover
+
+Generation 1 Cutover เป็นงานครั้งเดียวสำหรับนำ Dataset 1 เดิมจาก MySQL เข้าสู่ SQL Server Production model
+
+ไม่ใช่ Production cycle ปกติ
+
+ลำดับหลัก:
+
+~~~powershell
+dbd-data migrate
+dbd-data check-db
+python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
+dbd-data cycle status --phase core
+dbd-deep status --phase core --coverage
+~~~
+
+หลัง cutover อย่ารัน cycle run เพียงเพื่อทดสอบว่า Generation 1 อยู่หรือไม่ เพราะ cycle run จะเริ่ม Production workflow ถัดไป และเมื่อ Generation 1 สมบูรณ์แล้ว รอบถัดไปคือ Generation 2
+
+อ่านเงื่อนไขและ safety checks ก่อน cutover ที่ docs/RUNBOOK.md
+
+## คำสั่งตามระดับการใช้งาน
+
+### ใช้ประจำ
+
+~~~powershell
+dbd-data check-db
+dbd-data cycle status --phase core
+dbd-data cycle run --phase core
+~~~
+
+### ใช้เมื่อมีเหตุผลเฉพาะ
+
+~~~powershell
+dbd-deep status --phase core --coverage
+dbd-deep retry --phase core
+dbd-data fetch-company <COMPANY_CODE> --phase core
+~~~
+
+### งานดูแลระบบหรือขั้นตอนพิเศษ
+
+~~~powershell
+dbd-data migrate
+dbd-data discover --phase core
+dbd-deep prepare --phase core
+dbd-deep collect --phase core
+python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
+~~~
 
 ## หลักความปลอดภัย
 
-- อย่า commit `.env`
-- อย่าใส่ MySQL/Redis password ใน source code, README, Issue หรือ PR
-- Redis Cloud public endpoint ควรใช้ TLS
-- แยก runtime credential ออกจาก analyst/client credential
-- Remote MySQL user ควรถูกจำกัดด้วย `user@host` และสิทธิ์เท่าที่จำเป็น
-- อย่าแก้ task/run state ด้วย SQL manual บน production ถ้าไม่มี maintenance procedure รองรับ
-- backup ก่อน schema maintenance
-- migration เป็น forward-only; rollback ที่รองรับคือ restore จาก backup
+- ใช้ SQL Server state เป็นความจริงของ Production workflow
+- ดูสถานะก่อนแก้ incident
+- อย่าลบ row หรือ reset mask เพื่อทำให้สถานะดูเหมือนสำเร็จ
+- อย่าปล่อย collector สองชุดที่ตั้งใจทำหน้าที่เดียวกันโดยไม่ตรวจ manager ownership
+- อย่าใส่ password หรือ connection secret ใน source, README, Issue, PR หรือ log
+- ถ้า schema ไม่ตรง ให้แก้สาเหตุหรือใช้ migrate ตาม contract อย่าแก้ตาราง Production แบบเดาสุ่ม
+- ถ้ารอบถูกขัดจังหวะ ให้ resume ด้วย cycle run เดิมก่อนคิดถึง manual repair
 
----
+## เอกสารที่ควรอ่าน
 
-## เอกสารเชิงลึก
+| เอกสาร | ใช้เมื่อ |
+| --- | --- |
+| docs/RUNBOOK.md | ต้องรัน Production หรือทำ cutover ตามลำดับ |
+| docs/ARCHITECTURE.md | ต้องเข้าใจโครงสร้างและเหตุผลของระบบ |
+| docs/DEEP_QUICKSTART.md | ต้องควบคุม direct collector |
+| docs/OPERATIONS.md | เจอปัญหาและต้องตัดสินใจว่าควรทำอะไรต่อ |
+| docs/VALIDATION.md | ต้องตรวจว่ารอบข้อมูลถูกต้องและปิดได้ |
+| docs/TERMINAL_OUTPUT.md | ต้องอ่านสถานะบน Terminal ให้ถูก |
+| docs/setup/README.md | เตรียมเครื่องและ Production environment |
 
-หลังจากใช้งานพื้นฐานได้แล้ว เอกสารเหล่านี้อธิบายรายละเอียดระดับระบบ:
-
-- [Architecture](docs/ARCHITECTURE.md) — design และ correctness invariants
-- [Standalone Deep quick start](docs/DEEP_QUICKSTART.md) — ตั้งแต่ Deep status/prepare/collect ถึง serving และ SQL Server sync
-- [High-throughput V2](docs/HIGH_THROUGHPUT_V2.md) — staged pipeline, Redis และ archive backend
-- [Runbook](docs/RUNBOOK.md) — ขั้นตอน operation
-- [Operations](docs/OPERATIONS.md) — configuration และ failure handling
-- [Validation](docs/VALIDATION.md) — สิ่งที่พิสูจน์แล้วและสิ่งที่ยังต้องวัดจริง
-- [Execution plan](docs/EXECUTION_PLAN_TH.md) — production acceptance / 48-hour plan
-- [DBD Client Access](docs/DBD_CLIENT_ACCESS.md) — เลือก Direct LAN หรือ Python Remote Gateway
-- [DBD Remote Client](docs/DBD_REMOTE_CLIENT.md) — คู่มือใช้งานฝั่ง Client แบบ step-by-step
-- [DBD Remote Server](docs/DBD_REMOTE_SERVER.md) — คู่มือใช้งานฝั่ง Server และ security boundary
-- [DBD Remote Gateway](docs/DBD_REMOTE_GATEWAY.md) — ภาพรวม Python gateway ผ่าน WSS/Cloudflare Tunnel
-
----
-
-## หลักการสำคัญของระบบ
-
-```text
-MySQL = durable source of truth
-Standalone Deep = ไม่ต้องใช้ Redis scheduler
-Redis = coordination สำหรับ Campaign / distributed mode
-dbd_company_deep = Deep source of truth
-dbd_master_deep = flat serving output จาก COMPLETE rows
-Canary = ต้องผ่านก่อนเพิ่ม load
-```
-
-แยกให้ออกว่า **Deep source of truth** กับ **serving/output table** เป็นคนละหน้าที่ จะช่วยให้ operate ระบบได้ถูกต้องและไม่เผลอใช้ตารางปลายทางเป็น runtime state
+เอกสารรุ่นเก่าที่อาจยังอยู่ใน repository ไม่ใช่คู่มือสำหรับ Production v0.6 เว้นแต่เอกสารนั้นระบุชัดว่าถูกใช้ในขั้นตอนเฉพาะของระบบปัจจุบัน

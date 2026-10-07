@@ -1,71 +1,63 @@
-# Web app setup
+# Web App Setup
 
-หน้าเว็บอยู่ที่ `apps/web` และแยก dependency จาก Python collector
+web app อยู่ใน apps/web และรันแยกจาก Python Production collector
 
-## 1. ตรวจ Node.js และ npm
+การเปิด web app ไม่ได้เริ่ม DBD collection และการเปิด collector ไม่ได้เริ่ม web app
 
-```powershell
+## 1. เข้าโฟลเดอร์
+
+~~~powershell
+cd apps\web
+~~~
+
+## 2. ตรวจ Node.js
+
+~~~powershell
 node --version
 npm --version
-```
+~~~
 
-ถ้ายังไม่มี Node.js ให้ติดตั้ง Node.js รุ่นที่รองรับ Next.js ของโปรเจกต์ก่อน แล้วเปิด PowerShell ใหม่
+## 3. ติดตั้ง dependencies
 
-## 2. ติดตั้ง dependencies
-
-จาก root repository:
-
-```powershell
-cd .\apps\web
-npm ci
-```
-
-ถ้า checkout ไม่มี lockfile หรือกำลังแก้ dependency โดยตั้งใจ ให้ใช้:
-
-```powershell
+~~~powershell
 npm install
-```
+~~~
 
-## 3. รัน development server
+## 4. Development
 
-```powershell
+~~~powershell
 npm run dev
-```
+~~~
 
-จากนั้นเปิด URL ที่ Next.js แสดงใน terminal โดยปกติ local development จะใช้ port 3000 ถ้า port ว่าง
+เปิด URL ที่ Next.js แสดงใน Terminal
 
-## 4. Validation
+## 5. Production build
 
-ก่อนเปิด PR ที่แก้ web app ให้รันอย่างน้อย:
-
-```powershell
-npm run typecheck
-npm run lint
-npm run test
+~~~powershell
 npm run build
-```
+npm run start
+~~~
 
-ถ้ามีการแก้ flow ที่มี end-to-end coverage:
+## 6. Validation
 
-```powershell
-npm run test:e2e
-```
+~~~powershell
+npm run lint
+npm run build
+~~~
 
-## 5. Scripts สำคัญ
+ใช้ script ที่มีอยู่จริงใน package.json ของ apps/web เป็น source of truth ถ้าชื่อ script เปลี่ยน
 
-| Command | ใช้ทำอะไร |
-| --- | --- |
-| `npm run dev` | development server |
-| `npm run build` | production build |
-| `npm run start` | start production build |
-| `npm run typecheck` | TypeScript validation |
-| `npm run lint` | ESLint |
-| `npm run test` | Vitest |
-| `npm run test:e2e` | Playwright |
-| `npm run db:studio` | Drizzle Studio |
+## 7. Responsibility boundary
 
-## 6. แยกความรับผิดชอบจาก collector
+Python Production collector เป็นเจ้าของ:
 
-การรัน `npm run dev` ไม่ได้เริ่ม Python collector, MySQL หรือ Redis ให้อัตโนมัติ
+~~~text
+DBD Search / HTTP collection
+Generation
+Verification
+SQL Server writes
+~~~
 
-ถ้าหน้าเว็บต้องอ่านข้อมูลจาก backend/database ให้เตรียม service และ environment ของส่วนนั้นให้พร้อมตาม configuration ของ web app ก่อน
+web app เป็น consumer/UI layer
+
+อย่าออกแบบให้การเปิดหน้า web เป็นเงื่อนไขที่ collector ต้องพึ่ง และอย่าให้ UI แก้ generation/lease/mask โดยตรงเพื่อแก้ operational incident

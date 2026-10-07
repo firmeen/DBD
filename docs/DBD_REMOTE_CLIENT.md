@@ -1,3 +1,10 @@
+> [!WARNING]
+> **LEGACY / HISTORICAL DOCUMENT**
+>
+> เอกสารนี้อธิบายการเข้าถึง MySQL รุ่นเดิม ไม่ใช่ Production data access ของ v0.6
+> Production v0.6 ใช้ SQL Server ดู docs/DBD_CLIENT_ACCESS.md และ docs/setup/DBEAVER.md
+> ใช้ข้อมูลในไฟล์นี้เฉพาะเมื่อทำงานกับ Dataset 1/ระบบเดิมโดยตั้งใจ
+
 # DBD Remote Client Guide
 
 คู่มือนี้สำหรับผู้ใช้ที่ต้องการเปิดฐานข้อมูล MySQL `dbd` จากเครื่องของตัวเองผ่าน VS Code Database Client, DBeaver หรือ Python

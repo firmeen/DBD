@@ -1,34 +1,86 @@
-# Setup guides
+# Production Setup Guides
 
-คู่มือนี้รวมการติดตั้งและตั้งค่าเครื่องมือที่ใช้กับโครงการ DBD โดยแยกตามหน้าที่ เพื่อให้คนที่เพิ่งเริ่มใช้งานไม่ต้องอ่านเอกสารเชิงสถาปัตยกรรมทั้งหมดก่อน
+เอกสารในโฟลเดอร์นี้ใช้เตรียมเครื่องสำหรับ Production v0.6
+
+Production backend คือ SQL Server
 
 ## เริ่มจากตรงไหน
 
-ถ้าเป็นเครื่องใหม่ ให้ทำตามลำดับนี้:
+ทำตามลำดับ:
 
-1. [ติดตั้งและเตรียมโปรเจกต์บน Windows](WINDOWS_PROJECT_SETUP.md)
-2. [ตั้งค่า MySQL](MYSQL.md)
-3. รัน `dbd-data check-db` และ `dbd-data migrate`
-4. ถ้าจะใช้ Campaign หรือ distributed workers ให้ [ตั้งค่า Redis](REDIS.md)
-5. ถ้าต้องการเปิดดูฐานข้อมูลแบบ GUI ให้ [ตั้งค่า DBeaver](DBEAVER.md)
-6. ถ้าจะพัฒนา/รันหน้าเว็บ ให้ [ตั้งค่า Web app](WEB_APP.md)
-7. เมื่อระบบพื้นฐานผ่านแล้ว ไปที่ [Campaign quick start](../CAMPAIGN_QUICKSTART.md)
+1. เตรียม Python environment
+2. clone repository
+3. install package
+4. ตั้งค่า SQL Server ใน .env
+5. รัน migrate เมื่อเป็นการติดตั้งครั้งแรกหรือ schema contract เปลี่ยน
+6. รัน check-db
+7. ตรวจ cycle status
+8. เริ่ม Production cycle เมื่อพร้อม
 
-## เครื่องมือไหนจำเป็น
+บน Windows ให้อ่าน WINDOWS_PROJECT_SETUP.md ก่อน
+
+## Minimum Production Setup
+
+~~~powershell
+python -m pip install -e .
+dbd-data migrate
+dbd-data check-db
+dbd-data cycle status --phase core
+~~~
+
+ถ้า Production schema มีอยู่และตรง contract อยู่แล้ว สามารถเริ่มจาก dbd-data check-db ได้
+
+ถ้า schema พร้อมอยู่แล้ว migrate จะ converge ตาม contract ที่รองรับ
+
+## Environment ที่ Production ต้องใช้
+
+อย่างน้อย:
+
+~~~text
+MSSQL_SERVER=<SERVER>
+MSSQL_DATABASE=TIPDataIntelligence
+MSSQL_USER=<USER>
+MSSQL_PASSWORD=<PASSWORD>
+MSSQL_PORT=1433
+~~~
+
+ค่าด้าน HTTP/collector สามารถใช้ default หรือกำหนดใน .env ตาม environment จริง
+
+## เครื่องมือ
 
 | เครื่องมือ | จำเป็นเมื่อ | หมายเหตุ |
 | --- | --- | --- |
-| Git | clone / update source code | ใช้ `git pull --ff-only` เพื่ออัปเดต `main` |
-| Python 3.11+ | ใช้งาน collector/CLI | เป็น runtime หลักของ `dbd-data` |
-| MySQL 8+ | ทุกโหมด | เป็น durable source of truth |
-| Redis | Campaign / distributed mode | ไม่จำเป็นสำหรับ single-process แบบปกติ |
-| DBeaver | ต้องการ GUI สำหรับ SQL | ไม่จำเป็นต่อ runtime |
-| Node.js + npm | Web app เท่านั้น | อยู่ใน `apps/web` |
+| Python 3.11+ | Production collector/CLI | runtime หลัก |
+| SQL Server access | Production ทุกครั้ง | durable production storage |
+| Git | ใช้ source repository | ใช้ update source |
+| DBeaver | ต้องการดู database ผ่าน GUI | optional |
+| Node.js | ใช้ web app | ไม่เกี่ยวกับ collector runtime |
+| MySQL | Generation 1 cutover หรือ test ที่ต้องใช้ | ไม่ใช่ v0.6 production backend |
+
+## คู่มือ
+
+- WINDOWS_PROJECT_SETUP.md — เตรียม Windows project
+- DBEAVER.md — เปิด Production SQL Server แบบ GUI อย่างปลอดภัย
+- MYSQL.md — ใช้เฉพาะ Generation 1 source และ test
+- WEB_APP.md — รัน web app แยกจาก collector
+
+## หลัง Setup
+
+Production flow ปกติ:
+
+~~~powershell
+dbd-data check-db
+dbd-data cycle status --phase core
+dbd-data cycle run --phase core
+dbd-data cycle status --phase core
+~~~
+
+รายละเอียดอยู่ที่ ../RUNBOOK.md
 
 ## สิ่งที่ไม่ควรทำ
 
-- อย่า commit ไฟล์ `.env` หรือ secret เข้า Git
-- อย่าใส่ MySQL/Redis password ลง README, Issue, PR หรือ log
-- อย่าลบ task/run เดิมเพื่อแก้ปัญหา resume; ใช้คำสั่ง resume/status ของระบบ
-- อย่าเพิ่ม rate/concurrency โดยไม่ดู 429/503 และผล canary
-- อย่าใช้ Redis namespace คนละตัวสำหรับ workers ที่ต้องควบคุม rate ร่วมกัน
+- อย่าใส่ password ลง Git
+- อย่าใช้ local test database เป็น Production target
+- อย่าแก้ Production schema ด้วยคำสั่ง destructive เพื่อให้ migrate ผ่าน
+- อย่าคิดว่า MySQL เป็น Production backend ของ v0.6
+- อย่าเริ่ม cycle run ถ้าต้องการเพียงตรวจสถานะ

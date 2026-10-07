@@ -1,3 +1,10 @@
+> [!WARNING]
+> **LEGACY / HISTORICAL DOCUMENT**
+>
+> เอกสารนี้อธิบายการเข้าถึง MySQL รุ่นเดิม ไม่ใช่ Production data access ของ v0.6
+> Production v0.6 ใช้ SQL Server ดู docs/DBD_CLIENT_ACCESS.md และ docs/setup/DBEAVER.md
+> ใช้ข้อมูลในไฟล์นี้เฉพาะเมื่อทำงานกับ Dataset 1/ระบบเดิมโดยตั้งใจ
+
 # DBD Remote MySQL Gateway
 
 ระบบนี้ใช้สำหรับให้เครื่อง Client เชื่อม MySQL `dbd` จากภายนอก network โดยไม่เปิด MySQL สู่ Internet โดยตรง
