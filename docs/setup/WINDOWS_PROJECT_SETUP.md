@@ -1,105 +1,150 @@
-# Windows project setup
+# Windows Production Project Setup
 
-คู่มือนี้ใช้สำหรับเตรียมเครื่อง Windows เพื่อรัน `dbd-data` จาก source code
+คู่มือนี้ใช้เตรียมเครื่อง Windows เพื่อรัน DBD Production v0.6 จาก source code โดยไม่ต้องพึ่ง installer แบบ Administrator
 
-## 1. ตรวจเครื่องมือพื้นฐาน
+## 1. ตรวจเครื่องมือ
 
-เปิด PowerShell แล้วตรวจ:
-
-```powershell
+~~~powershell
 git --version
 python --version
-py --version
-```
+~~~
 
-โครงการต้องใช้ Python 3.11 ขึ้นไป
+ต้องใช้ Python 3.11 ขึ้นไป
 
-ถ้า `python` หรือ `py` ยังใช้งานไม่ได้ ให้ติดตั้ง Python ก่อน แล้วเปิด PowerShell ใหม่
+ถ้าใช้ Python แบบ portable ให้ตรวจว่า python.exe ที่ต้องการอยู่ใน PATH ของ Terminal ปัจจุบัน
+
+~~~powershell
+Get-Command python
+~~~
 
 ## 2. Clone repository
 
-```powershell
-cd C:\Users\<YOUR_USER>\project
-
+~~~powershell
 git clone https://github.com/firmeen/DBD.git
 cd DBD
-```
+~~~
 
 ถ้ามี repository อยู่แล้ว:
 
-```powershell
+~~~powershell
+git fetch origin
 git switch main
-git pull --ff-only
-```
+git pull --ff-only origin main
+~~~
 
-## 3. Bootstrap Python environment
+## 3. สร้าง virtual environment
 
-Repository มี script สำหรับสร้าง virtual environment, ติดตั้ง dependencies และสร้าง `.env` จาก `.env.example`
-
-```powershell
-.\scripts\bootstrap.ps1 -Dev -InstallCommand
-```
-
-ถ้า PowerShell policy ของเครื่องไม่ยอมให้รัน script สามารถใช้ process-local bypass โดยไม่แก้ policy ถาวร:
-
-```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\scripts\bootstrap.ps1 -Dev -InstallCommand
-```
-
-หลัง bootstrap:
-
-```powershell
+~~~powershell
+python -m venv .venv
 .\.venv\Scripts\Activate.ps1
+~~~
 
-dbd-data --version
-```
+ติดตั้ง project:
 
-หรือเรียก Python ใน venv โดยไม่ activate:
+~~~powershell
+python -m pip install --upgrade pip
+python -m pip install -e .
+~~~
 
-```powershell
-.\.venv\Scripts\python.exe --version
-```
+ตรวจ command:
 
-## 4. ตั้งค่า .env
-
-ถ้า bootstrap สร้าง `.env` ให้แล้ว ให้แก้ไฟล์นี้:
-
-```text
-DBD\.env
-```
-
-อย่างน้อยต้องกำหนด MySQL:
-
-```env
-DB_HOST=127.0.0.1
-DB_PORT=3307
-DB_NAME=dbd
-DB_USER=dbd-data
-DB_PASSWORD=<YOUR_MYSQL_PASSWORD>
-```
-
-ถ้าจะใช้ Campaign หรือ distributed mode ต้องเพิ่ม Redis ด้วย ดู [Redis setup](REDIS.md)
-
-ตรวจว่า Git ignore `.env` จริง:
-
-```powershell
-git check-ignore .env
-```
-
-ควรได้:
-
-```text
-.env
-```
-
-## 5. ตรวจ project installation
-
-```powershell
-dbd-data --version
+~~~powershell
 dbd-data --help
-```
+dbd-deep --help
+~~~
 
-ถ้าสองคำสั่งนี้ทำงานได้ แปลว่า Python package/CLI พร้อมแล้ว
+## 4. สร้าง .env
 
-ขั้นต่อไปคือ [ตั้งค่า MySQL](MYSQL.md)
+คัดลอกตัวอย่าง:
+
+~~~powershell
+Copy-Item .env.example .env
+~~~
+
+กำหนด SQL Server:
+
+~~~text
+MSSQL_SERVER=SRVTIPDATAINT
+MSSQL_DATABASE=TIPDataIntelligence
+MSSQL_USER=<USER>
+MSSQL_PASSWORD=<PASSWORD>
+MSSQL_PORT=1433
+MSSQL_LOGIN_TIMEOUT=15
+MSSQL_TIMEOUT=60
+~~~
+
+อย่า commit .env
+
+## 5. ตรวจ Production SQL Server
+
+~~~powershell
+dbd-data check-db
+~~~
+
+ถ้า connection ไม่ผ่าน ให้หยุดตรงนี้และแก้ network/credential/database ก่อน
+
+## 6. Converge schema
+
+สำหรับเครื่องหรือ environment ที่ต้องเตรียม schema:
+
+~~~powershell
+dbd-data migrate
+dbd-data check-db
+~~~
+
+migrate เป็น fail-closed ถ้า schema เดิมขัดกับ contract ที่แก้อัตโนมัติไม่ได้
+
+อย่า DROP/TRUNCATE table เพื่อบังคับให้ผ่าน
+
+## 7. ตรวจสถานะก่อนรัน
+
+~~~powershell
+dbd-data cycle status --phase core
+dbd-deep status --phase core
+~~~
+
+## 8. รัน Production
+
+~~~powershell
+dbd-data cycle run --phase core
+~~~
+
+หลังจบ:
+
+~~~powershell
+dbd-data cycle status --phase core
+~~~
+
+## 9. เปิด Terminal ครั้งถัดไป
+
+~~~powershell
+cd <PATH_TO_DBD>
+.\.venv\Scripts\Activate.ps1
+dbd-data check-db
+dbd-data cycle status --phase core
+~~~
+
+ถ้าต้องการทำ cycle ที่ค้างต่อ:
+
+~~~powershell
+dbd-data cycle run --phase core
+~~~
+
+## 10. MySQL ใช้เมื่อใด
+
+v0.6 Production ไม่ใช้ MySQL เป็น backend หลัก
+
+ต้องตั้ง DB_* เมื่อ:
+
+- ทำ Generation 1 cutover จาก Dataset 1 เดิม
+- รัน development/integration test ที่ระบุว่าต้องใช้ MySQL
+
+รายละเอียด: MYSQL.md
+
+## 11. Safe Windows usage
+
+- ไม่ต้องรัน PowerShell as Administrator สำหรับ project workflow ปกติ
+- ใช้ path ที่ user account เขียนได้
+- เก็บ virtual environment ใน project หรือ path ของ user
+- อย่าใส่ credential ลง PowerShell history ถ้าไม่จำเป็น
+- ตรวจ branch ก่อนใช้คำสั่ง production หลัง update source
