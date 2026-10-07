@@ -207,6 +207,10 @@ class _DirectClient:
 async def test_direct_discovery_persists_valid_rows_without_mysql_runtime(monkeypatch):
     persisted = []
     legacy_called = []
+    events = []
+
+    def event(name, payload):
+        events.append((name, payload))
 
     async def direct_page(_client, filters, page_no):
         assert filters.keyword == "010"
@@ -241,8 +245,13 @@ async def test_direct_discovery_persists_valid_rows_without_mysql_runtime(monkey
             generation=2,
             repository=object(),
             verbose=False,
+            event=event,
         )
 
+    progress = [payload for name, payload in events if name == "discovery_progress"]
+    assert progress
+    assert progress[-1]["companies_written"] == 1
+    assert progress[-1]["invalid_rows"] == 1
     assert legacy_called == []
     assert len(persisted) == 1
     assert persisted[0]["juristic_type_code"] == "7"
@@ -254,6 +263,10 @@ async def test_direct_discovery_persists_valid_rows_without_mysql_runtime(monkey
 async def test_direct_discovery_splits_oversized_partition_and_reconciles_counts(monkeypatch):
     persisted = []
     child_calls = []
+    events = []
+
+    def event(name, payload):
+        events.append((name, payload))
 
     async def direct_page(_client, filters, page_no):
         assert page_no == 1
@@ -288,8 +301,15 @@ async def test_direct_discovery_splits_oversized_partition_and_reconciles_counts
         generation=2,
         repository=object(),
         verbose=False,
+        event=event,
     )
 
+    split_events = [payload for name, payload in events if name == "discovery_split"]
+    assert len(split_events) == 1
+    assert split_events[0]["rows"] == 16000
+    assert split_events[0]["children"] == len(discovery.JP_TYPES)
+    progress = [payload for name, payload in events if name == "discovery_progress"]
+    assert progress[-1]["companies_written"] == len(discovery.JP_TYPES)
     assert set(child_calls) == set(discovery.JP_TYPES)
     assert result.buckets_processed == 1 + len(discovery.JP_TYPES)
     assert result.pages_fetched == 1 + len(discovery.JP_TYPES)

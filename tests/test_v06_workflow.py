@@ -519,3 +519,130 @@ async def test_fetch_company_does_not_finalize_when_other_required_scope_is_unre
 
     assert result.status == "PENDING"
     assert repo.finalize_company_ids == []
+
+
+
+@pytest.mark.asyncio
+async def test_discover_forwards_event_and_reports_real_final_counters(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=1, unresolved=0)
+    events = []
+    captured = {}
+
+    def event(name, payload):
+        events.append((name, payload))
+
+    async def fake_discovery_run(*_args, **kwargs):
+        captured["event"] = kwargs.get("event")
+        kwargs["event"](
+            "discovery_progress",
+            {
+                "buckets_processed": 3,
+                "pages_fetched": 4,
+                "companies_written": 5,
+                "requests_made": 6,
+                "invalid_rows": 0,
+            },
+        )
+        return DiscoveryResult(3, 4, 5, 6, 0)
+
+    monkeypatch.setattr(workflow.discovery, "run", fake_discovery_run)
+
+    generation, result = await workflow.discover(
+        ["010"],
+        phase="core",
+        repository=repo,
+        verbose=False,
+        event=event,
+    )
+
+    assert generation == 2
+    assert result == DiscoveryResult(3, 4, 5, 6, 0)
+    assert captured["event"] is event
+    completed = [
+        payload
+        for name, payload in events
+        if name == "phase_completed" and payload.get("phase") == "DISCOVER"
+    ]
+    assert completed == [
+        {
+            "phase": "DISCOVER",
+            "generation": 2,
+            "companies": 5,
+            "partitions": 3,
+            "pages": 4,
+            "requests": 6,
+            "invalid_rows": 0,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_cycle_forwards_discovery_event_and_preserves_phase_order(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=1, unresolved=0)
+    events = []
+    captured = {}
+
+    def event(name, payload):
+        events.append((name, payload))
+
+    async def fake_discovery_run(*_args, **kwargs):
+        captured["event"] = kwargs.get("event")
+        return DiscoveryResult(3, 4, 5, 6, 0)
+
+    async def fake_collect(**_kwargs):
+        return {
+            "companies_claimed": 5,
+            "companies_finished": 5,
+            "endpoints_failed": 0,
+        }
+
+    async def fake_verify(**kwargs):
+        return VerifyResult(
+            generation=kwargs["generation"],
+            phase=kwargs["phase"],
+            status="COMPLETE",
+            details={
+                "ok": True,
+                "status": "COMPLETE",
+                "terminal_failures": 0,
+            },
+        )
+
+    monkeypatch.setattr(workflow.discovery, "run", fake_discovery_run)
+    monkeypatch.setattr(workflow, "collect", fake_collect)
+    monkeypatch.setattr(workflow, "verify", fake_verify)
+
+    result = await workflow.cycle_run(
+        phase="core",
+        repository=repo,
+        verbose=False,
+        event=event,
+    )
+
+    assert result.status == "COMPLETE"
+    assert captured["event"] is event
+    started = [payload["phase"] for name, payload in events if name == "phase_started"]
+    assert started == [
+        "PRECHECK",
+        "DISCOVER",
+        "PREPARE",
+        "COLLECT",
+        "VERIFY",
+        "FINALIZE",
+    ]
+    discovery_completed = [
+        payload
+        for name, payload in events
+        if name == "phase_completed" and payload.get("phase") == "DISCOVER"
+    ]
+    assert discovery_completed == [
+        {
+            "phase": "DISCOVER",
+            "generation": 2,
+            "companies": 5,
+            "partitions": 3,
+            "pages": 4,
+            "requests": 6,
+            "invalid_rows": 0,
+        }
+    ]

@@ -36,6 +36,11 @@ dbd-data discover-status --json
 JSON mode is intended for PowerShell parsing, jq, CI, automation and external tools.
 It preserves the structured payload rather than re-parsing human terminal text.
 
+The SQL Server v0.6 production commands use the unified human terminal only and do
+not expose `--json`. This applies to `dbd-data check-db`, `migrate`, `discover`,
+`fetch-company`, the `cycle` commands, and all four `dbd-deep` commands.
+Legacy/general JSON surfaces listed above remain unchanged.
+
 ### Extended diagnostics
 
 ```powershell
@@ -175,69 +180,122 @@ Terminal rendering must not change:
 - Redis coordination semantics
 
 
-## Standalone dbd-deep
+## SQL Server v0.6 unified terminal
 
-`dbd-deep` has its own presentation boundary and does not import Campaign, Fabric,
-Guardian, Supervisor or Redis fleet state.
+The production v0.6 commands share one presentation boundary:
+`src/dbd/presentation/v06.py`. The renderer consumes existing workflow results and
+events only. It does not query SQL Server, call DBD HTTP endpoints, use Redis, schedule
+work or persist terminal state.
+
+The redesigned command surface is:
+
+```text
+dbd-data check-db
+dbd-data migrate
+dbd-data discover
+dbd-data fetch-company
+dbd-data cycle run
+dbd-data cycle loop
+dbd-data cycle status
+
+dbd-deep prepare
+dbd-deep collect
+dbd-deep retry
+dbd-deep status
+```
+
+Every command prints its local, timezone-aware start time outside the blocks. Active
+commands use monotonic elapsed time; after completion the same field becomes Duration.
+
+Interactive TTY output uses inline Rich `Live` rendering rather than an alternate
+screen. The final static receipt remains in normal terminal scrollback. Redirected or
+captured output is plain newline text: no ANSI repaint, carriage-return progress,
+spinner frames or animation-frame logging.
+
+### Live scene and motion
+
+The interactive scene contains an outside header, one or more information blocks when
+they represent distinct real domains, and an optional outside footer. Cycle commands
+keep a stable CYCLE block plus one active-work block that morphs through the existing
+workflow phases:
+
+```text
+PRECHECK -> DISCOVER -> PREPARE -> COLLECT -> VERIFY -> FINALIZE
+```
+
+Motion is presentation-only and is selected by runtime state:
+
+- Orbit: opaque active work such as PRECHECK, database checks and retry.
+- Sweep: discovery traversal with no claimed denominator.
+- Stream: concurrent collection activity.
+- Stitch: PREPARE.
+- Radar: VERIFY.
+- Seal: FINALIZE/schema application.
+- Phase handoff: short completed-to-next-phase transition.
+- Value flash: a real counter changed in an event; numbers are never interpolated.
+- Endpoint baton: the real active endpoint for `fetch-company`; selected endpoints stay
+  neutral until an endpoint event establishes ACTIVE / COMPLETE / N/A / RETRY / FAILED truth.
+- Split/retry/warning cues: transient emphasis only when the matching real event occurs.
+- Wait clock and determinate rail: `cycle loop` and continuous-collect idle waits, because
+  those intervals are known locally.
+- Completion/failure/stop settle: motion stops when work is no longer active.
+
+The interactive renderer is intentionally capped at four refreshes per second, below
+the eight-FPS ceiling, using only process-local state and `time.monotonic()`. This
+keeps WAITING scenes within the low-motion cadence without adding a scheduler or
+polling loop. Rendering frames never trigger SQL, HTTP or Redis work.
+
+### Truth-only values
+
+The UI displays only values already supplied by command results/events or locally
+truthful command timing. In particular it does not invent ETA, percent completion,
+remaining companies, actual throughput, DB/network latency, worker utilization or
+company names absent from the current result contract.
+
+Collector rate is labelled `Configured rate`; it is not presented as observed
+throughput. Final HTTP request/retry/rate-limit counters appear only when the collector
+final result supplies them.
 
 ### Semantic color contract
 
-สีใน interactive Deep Terminal UI เป็น state/priority signal ไม่ใช่ decoration และใช้กับ **value/state** เป็นหลัก:
+| Color | Meaning |
+| --- | --- |
+| cyan | RUNNING / ACTIVE / DISCOVERING / PREPARING / COLLECTING / VERIFYING / FINALIZING |
+| green | READY / COMPLETE only |
+| yellow | WAITING / RETRY / DEGRADED / STOPPING / COMPLETE_WITH_FAILURES |
+| red | FAILED / ERROR / schema failure |
+| dim | PENDING / N/A / IDLE / SKIPPED / non-active context |
 
-| Color | Meaning | Examples |
-| --- | --- | --- |
-| bold red | critical/failure/operator attention | FAILED, ERROR, overlap > 0, missing identity > 0 |
-| yellow / bold yellow | warning/degraded/retry | DEGRADED, RETRY_WAIT, 429 > 0, normalization error > 0 |
-| green / bold green | healthy/completed/success | READY, COMPLETE, finished, successful inserts |
-| cyan | active execution/throughput/configured work | RUNNING, ACTIVE, requests, rate, concurrency |
-| blue | queued/scheduled/promoted work | claimed, pending, Master promoted, recovered runtime |
-| magenta | refresh/change semantics | ACTIVE refresh, updated serving rows |
-| bold white | primary totals/important values | total/scanned/limits |
-| dim | secondary/context/no-change | IDLE, unchanged, elapsed, table/context labels |
+Status is always written as text as well as color. `COMPLETE_WITH_FAILURES` is never
+rendered as green.
 
-Alarm-like counters are conditional: zero failures/429/overlap/missing-identity/normalization-errors are not rendered as alarms; color appears only when the value is non-zero.
+### Responsive layout
 
-This styling exists only in the interactive Rich render path. Redirected/non-TTY output remains plain newline text without ANSI repaint sequences, and JSON output remains unstyled structured JSON.
+The renderer recomposes from the current terminal width on each render. Wide terminals
+may use paired metric columns; standard layouts stack blocks with compact paired
+metrics; compact layouts stack exact values without converting numbers to abbreviated
+forms such as `14.8k`.
 
-Normal one-shot collection:
+### Command-specific boundaries
 
-```powershell
-dbd-deep collect --concurrency 12 --rate 20 --buffer-size 64
-```
+`dbd-data cycle status` is a durable snapshot with GENERATION and WORK blocks only;
+it does not add a coverage option. `dbd-deep status --coverage` may add a COVERAGE
+block using the existing companies/relations/events/financials/industries summary.
 
-Continuous collection keeps one standalone manager process alive and checks MySQL
-again after the idle interval when work drains:
+`dbd-deep prepare` and `retry` render directly from their typed results. They do
+not issue an additional status read solely for presentation. `dbd-deep collect`
+uses existing collector events and its final result; the collector event contract is
+not expanded by this UI.
 
-```powershell
-dbd-deep collect --continuous --concurrency 12 --rate 20 --buffer-size 64 --idle-seconds 5
-```
+### Ctrl+C and failures
 
-`--limit N` remains a whole-command company budget, including continuous mode.
-It is not reset on every internal refill cycle.
+The presentation layer does not alter cancellation or durability semantics.
+Ctrl+C remains exit code 130. The live view may show STOPPING before it freezes as
+STOPPED, and it reminds the operator that committed checkpoints remain durable and
+unfinished work is resumable where applicable. Fatal command errors remain exit code
+1. Presentation failures are best-effort and must not become collection failures.
 
-Interactive terminals use a compact Rich live view. Redirected output is newline
-based and does not use cursor-return repainting. Explicit `--json` remains machine
-readable and does not mix Rich output into stdout.
-
-Static/status commands use the same Deep presentation layer:
-
-```powershell
-dbd-deep prepare
-dbd-deep status
-dbd-deep status --coverage
-dbd-deep retry --limit 500
-```
-
-Version identities are intentionally separate:
-
-```text
-dbd-data --version  -> dbd-data 0.5.0
-dbd-deep --version  -> dbd-deep 0.1.0
-```
-
-Both console scripts are still shipped by the single `dbd-data` Python
-distribution.
-
+Version identities remain source-controlled and are not changed by this terminal work.
 
 ### Bootstrap, serving and SQL Server terminal views
 
