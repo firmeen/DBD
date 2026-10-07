@@ -1,301 +1,320 @@
-# Operations
-
-The real deployment commonly uses MySQL port 3307. `.env` is private and untracked.
-Use `DBD_ENV_FILE` only for an explicit alternative configuration file.
-
-## Configuration
-
-Core controls:
-
-| Setting | Purpose |
-| --- | --- |
-| `DBD_CONCURRENCY` | Maximum concurrent HTTP work; runtime guard 1..256 |
-| `DBD_RATE_PER_SECOND` | Global target admission ceiling |
-| `DBD_ENDPOINT_RATES` / CLI `--endpoint-rates` | Optional per-endpoint ceilings |
-| `DB_POOL_SIZE` | Per-process DB pool default; campaign supervisor may derive a lower worker cap |
-| `DBD_FLEET_DB_CONNECTIONS_MAX` / `--fleet-db-connections-max` | Hard MySQL connection budget for one campaign fleet; default `96` |
-| `DBD_FLEET_ARCHIVE_WORKERS_MAX` / `--fleet-archive-workers-max` | Archive-worker budget across `workers-max`; default `24` |
-| `DBD_FLEET_PROJECTION_WORKERS_MAX` / `--fleet-projection-workers-max` | Projection-worker budget across `workers-max`; default `48` |
-| `DBD_REDIS_MAX_CONNECTIONS` | Maximum connections in the single shared Redis pool per worker |
-| `DBD_REDIS_POOL_WAIT_SECONDS` | Maximum wait for a free shared Redis connection |
-| `DBD_REDIS_SOCKET_TIMEOUT_SECONDS` | Redis command/read timeout |
-| `DBD_REDIS_CONNECT_TIMEOUT_SECONDS` | Redis connect timeout |
-| `DBD_REDIS_HEALTH_CHECK_INTERVAL_SECONDS` | Redis connection health-check interval |
-| `DBD_REDIS_RECOVERY_INTERVAL_SECONDS` | Minimum interval between shared adaptive recovery writes |
-| `DBD_FLEET_REDIS_CONNECTIONS_MAX` / `--fleet-redis-connections-max` | Redis connection budget for the long-lived campaign fleet; default `128` |
-| `DBD_PIPELINE_QUEUE_SIZE` | Bounded fetch/archive/project backpressure |
-| `DBD_CLAIM_BATCH_SIZE` | Queue claims per transaction |
-| `DBD_ARCHIVE_BATCH_SIZE` | Archive responses handled per batch |
-| `DBD_ARCHIVE_WORKERS` | Archive consumers |
-| `DBD_PROJECTION_WORKERS` | Projection consumers |
-| `DBD_LEASE_SECONDS` | Task lease duration |
-| `DBD_HTTP_RETRIES` | HTTP retries after the first attempt |
-| `DBD_MAX_TASK_ATTEMPTS` | Independent durable retry ceiling for fetch and project stages |
-| `DBD_METRICS_PORT` | `0` disables; nonzero binds localhost |
-| `DBD_ENV_FILE` | Absolute alternative environment file |
-
-Concurrency and admission rate are different controls. More concurrency helps only
-until enough in-flight work exists to sustain the accepted upstream rate.
-
-Campaign can explicitly decouple worker capacity from upstream admission with
-`--fleet-rate-initial` and `--fleet-rate-max`. When those flags are present,
-changing `workers` / `workers-max` does not change the shared HTTP ceiling.
-When they are omitted, the legacy `shared`, `multiply`, and `adaptive`
-worker-rate derivation remains compatible.
-
-Fleet resource limits are calculated before workers start. Defaults are global
-fleet caps rather than per-worker multipliers: 96 MySQL connections, 24 archive
-workers, 48 projection workers and 128 Redis connections. The supervisor reserves
-its own DB pool, then derives identical per-worker DB/archive/projection/Redis caps
-for the configured `workers-max`. A budget that cannot support at least one unit
-per maximum worker fails closed instead of allowing connection or writer growth to
-become unbounded. The sync MySQL pool uses zero overflow so the configured pool size
-is a real upper bound rather than a soft target.
-## Campaign live dashboard
-
-Interactive campaign supervisors render a fixed terminal dashboard instead of a
-single growing debug line. The dashboard is presentation-only: it consumes values
-already present in the supervisor loop and does not own Redis/MySQL/HTTP clients or
-issue additional runtime queries.
-
-The live view includes:
-
-- overall durable/live progress and load bar;
-- fetch/archive/project queue pressure and active stage counts;
-- worker active/draining/stale/restart/capacity state;
-- observed/effective/target/ceiling HTTP rate plus retries and 429/503;
-- shared Redis pool occupancy and command pressure;
-- control-plane health, heartbeat age, moving throughput and ETA;
-- bounded latest-event and latest-warning slots.
-
-Interactive output redraws the same ANSI terminal region at no more than about
-2 Hz. Events replace the bounded event/warning slots instead of permanently
-appending one console line per runtime change.
-
-Redirected output and CI automatically use compact newline-delimited snapshots, for
-example:
-
-```text
-CAMPAIGN 7 | RUNNING | 68.41% | 6,298,144/9,206,715 | remaining=2,908,571 | workers=6/6 | q=286/74/153 | rate=11.80/s | 429/503=0 | failed=128
-```
-
-Worker files under `data/logs` remain structured runtime logs and are independent
-from the dashboard. A terminal-rendering failure is isolated and degrades to compact
-output; it is never allowed to terminate a campaign.
-
-The CI timing guard exercises the full wide renderer without terminal I/O:
-
-```powershell
-python scripts/benchmark_terminal_dashboard.py `
-  --iterations 2000 `
-  --max-average-ms 2 `
-  --max-p95-ms 5
-```
-
-## Rate control and distributed workers
-
-Single-process V2 uses endpoint-local adaptive buckets plus a global safety bucket.
-429/503 backs off the affected endpoint and global safety rate; healthy decoded
-responses recover conservatively toward the configured ceiling.
-
-Distributed mode additionally requires one shared Redis URL/key. Redis stores the
-aggregate pacing schedule, effective rate, cooldown and last-penalty state. A
-rejection observed by one process therefore constrains all workers using that same
-namespace.
-
-Each worker owns exactly one bounded async Redis pool. Campaign heartbeat/control,
-endpoint/global pacing and circuit protection share that pool for the worker
-lifetime. Healthy endpoint admission uses one registered Lua script (EVALSHA) to
-evaluate global + endpoint circuits and reserve both pacing schedules for the same
-future timestamp. This replaces the previous four healthy-path Redis round trips
-(global circuit, endpoint circuit, endpoint pacer, global pacer) with one logical
-round trip.
+# Production Operations and Troubleshooting
 
-A successful healthy request does not write Redis recovery state on every response.
-Local recovery remains immediate; shared recovery is gated and batched, except a
-HALF_OPEN probe success which closes its owned probe promptly. A 429/503 penalty is
-still published immediately so other workers observe the reduced shared rate.
+เอกสารนี้ใช้เมื่อต้องตอบคำถามว่า “ตอนนี้เกิดอะไรขึ้น และควรทำอะไรต่อ”
 
-Prometheus exposes Redis RTT, logical command pressure, pool connection counts and
-estimated Redis commands per HTTP attempt. The worker heartbeat also carries
-`redis_commands`, `redis_admissions` and shared pool occupancy.
+หลักแรกคือดู durable state ใน SQL Server ก่อนแก้ไขอะไร
 
-The CI benchmark compares the legacy four-RTT admission sequence with the atomic
-fast path:
+## คำสั่งตรวจพื้นฐาน
 
-```powershell
-python scripts/benchmark_redis_fast_path.py `
-  --redis-url $env:DBD_REDIS_URL `
-  --iterations 100
-```
+~~~powershell
+dbd-data check-db
+dbd-data cycle status --phase core
+dbd-deep status --phase core
+~~~
 
-The command model is deterministic: legacy healthy endpoint admission is 4 Redis
-round trips/request and the fast path is 1, a 75% reduction. RTT p50/p95 are measured
-on the Redis instance used for the benchmark rather than treated as a universal
-latency guarantee.
+ถ้าต้องการ row coverage:
 
-```powershell
-$env:DBD_REDIS_URL = "redis://127.0.0.1:6379/0"
-$env:DBD_REDIS_RATE_KEY = "dbd:production:global-rate"
+~~~powershell
+dbd-deep status --phase core --coverage
+~~~
 
-dbd-data bulk --run-id N --distributed --concurrency 32 --rate <MEASURED_RATE>
-```
-
-Do not split workers across independent rate keys, proxies, sessions or IP rotation
-to bypass upstream throttling.
-
-## Manager ownership and task leases
-
-Discovery, run creation and normal single-process bulk use the MySQL named manager
-lock. Distributed bulk deliberately joins an already-created run without that lock
-and relies on `FOR UPDATE SKIP LOCKED`, lease owner/version/expiry fencing and Redis
-for aggregate admission control.
+## 1. Cycle หยุดกลางทาง
 
-Ctrl+C releases process-owned unfinished leases. Process death is recovered after
-lease expiry. A project-stage task retains its archive reference and must resume
-from archive rather than source HTTP.
+### ความหมาย
 
-`endpoint_tasks.attempts` is the fetch retry budget; `project_attempts` is the
-projection retry budget. `DBD_MAX_TASK_ATTEMPTS` applies independently to each stage.
-Once fetch crosses the durable archive boundary, exhaustion of `attempts` cannot
-prevent recovery of the archived project task. Generic retry resets only the failed
-stage's counter.
-
-## Archive backend operations
+process หยุดไม่ได้แปลว่าข้อมูลที่ commit แล้วหาย
 
-Default inline archive mode:
+Generation เดิมยังอยู่ใน SQL Server
 
-```powershell
-$env:DBD_ARCHIVE_BACKEND = "mysql"
-```
-
-Optional external encrypted mode:
+### ทำอย่างไร
 
-```powershell
-$env:DBD_ARCHIVE_BACKEND = "s3"
-$env:DBD_ARCHIVE_S3_BUCKET = "dbd-response-archive"
-$env:DBD_ARCHIVE_S3_PREFIX = "production/response-archive"
-$env:DBD_ARCHIVE_S3_REGION = "ap-southeast-1"
-$env:DBD_ARCHIVE_ENCRYPTION_KEY_B64 = "<base64-32-byte-key>"
-$env:DBD_ARCHIVE_ENCRYPTION_KEY_ID = "v2"
-```
+~~~powershell
+dbd-data check-db
+dbd-data cycle status --phase core
+dbd-data cycle run --phase core
+~~~
 
-For MinIO/S3-compatible storage set `DBD_ARCHIVE_S3_ENDPOINT_URL`. Use boto3's
-normal credential chain; prefer workload identity/IAM role. Do not commit credentials
-or archive keys.
+### อย่าทำ
 
-Backend/bucket/key-shape validation occurs before opening the DBD HTTP client or
-claiming work. Actual storage permission/network failure happens during upload and
-cannot advance a task to `project`.
+- อย่าสร้างวิธี resume แยกเอง
+- อย่าลบ row
+- อย่า reset generation
+- อย่า clear lease ด้วย SQL ถ้ายังไม่ได้พิสูจน์ว่า lease ผิดปกติจริง
 
-External objects are encrypted client-side with AES-256-GCM. Reads verify ciphertext
-SHA-256, AES-GCM authentication using object key as AAD, restore canonical serialized
-JSON bytes from the storage codec, verify payload SHA-256 and then parse JSON.
+## 2. Cycle status แสดง Generation เดิมอยู่
 
-### Encryption-key rotation
+นี่เป็นพฤติกรรมปกติเมื่อ Generation เดิมยัง unfinished
 
-New writes use only the active key/id. Keep older retained rows readable with:
+cycle run จะทำ Generation นั้นต่อ
 
-```powershell
-$env:DBD_ARCHIVE_DECRYPTION_KEYS = '{"v1":"<old-v1-key>"}'
-```
+Generation จะเพิ่มเมื่อรอบเดิมผ่านเงื่อนไขที่ต้องใช้เพื่อจบรอบแล้ว
 
-Remove an old key only after no retained archive references that key id or after a
-verified re-encryption migration. Treat the key ring as backup-critical secret data.
+## 3. COMPLETE_WITH_FAILURES
 
-### Backup and restore
+### ความหมาย
 
-Inline mode requires the MySQL backup containing archive payloads.
+Generation ผ่าน integrity/resolve rules และ finalize ได้ แต่มี endpoint บางตัวเป็น terminal failure
 
-External mode requires all three components:
+### ถ้ายอมรับผล
 
-1. MySQL metadata/task/projection backup;
-2. referenced bucket/prefix objects;
-3. active + retained decryption key material for every referenced key id.
+ไม่จำเป็นต้องแก้ state เพียงเพื่อให้ตัวเลข failure เป็นศูนย์
 
-A restore drill is complete only when an archive can be loaded, decrypted,
-integrity-checked and replayed without contacting DBD.
+### ถ้าต้องการลอง endpoint เหล่านั้นใหม่
 
-Upload occurs before the MySQL reference commits. A DB failure after upload may
-leave an encrypted orphan. Do not eagerly delete recent unreferenced objects during
-an ambiguous DB commit window. Use a deliberate lifecycle/orphan reconciliation
-policy after the database backup/commit safety window.
+~~~powershell
+dbd-deep retry --phase core
+dbd-data cycle run --phase core
+dbd-data cycle status --phase core
+~~~
 
-## Failure inspection
+## 4. FAILED
 
-```sql
-SELECT t.id,t.stage,t.endpoint,t.status,t.attempts,t.project_attempts,
-       t.last_error,t.raw_response_id,m.jp_no,m.jp_type_code
-FROM endpoint_tasks t
-JOIN company_master m USING(company_id)
-WHERE t.run_id=:run AND t.status='failed'
-ORDER BY t.id;
+FAILED หมายถึง cycle ยังไม่ผ่าน verification หรือ final verification
 
-SELECT id,task_id,endpoint,payload_backend,payload_key_id,
-       processing_status,error_code,requested_at
-FROM response_archive
-WHERE processing_status IN ('invalid','failed')
-ORDER BY id;
+เริ่มจาก:
 
-SELECT bucket_id,page_no,row_index,jp_type_code,jp_no,error_code,error_message
-FROM discovery_rejections
-WHERE resolved_at IS NULL
-ORDER BY bucket_id,page_no,row_index;
-```
+~~~powershell
+dbd-data cycle status --phase core
+dbd-deep status --phase core --coverage
+~~~
 
-Safe diagnostics omit auth tokens, cookies, archive encryption keys and response
-bodies.
+มองหา:
 
-## Retry and replay
+- unresolved work
+- RETRY_WAIT
+- active lease
+- expired lease
+- generation mismatch
+- orphan rows
+- mask overlap
+- unfinished rows
 
-```powershell
-dbd-data bulk-retry RUN_ID
-dbd-data bulk --run-id RUN_ID
-dbd-data replay ARCHIVE_ID
-```
+อย่า retry ทุกอย่างทันทีถ้ายังไม่รู้ว่า FAILED มาจากอะไร
 
-Replay makes no source request. Natural-key freshness prevents older archives from
-overwriting newer data across statement years, replace-all submissions, shared
-benchmark scope and other company/endpoint collections.
+## 5. RETRY_WAIT
 
-If an external archive object/key/integrity check fails, fix archive availability or
-configuration; do not convert that project-stage task back into an upstream refetch.
-The durable archive is the recovery boundary.
+### ความหมาย
 
-## Discovery operations
+upstream มีปัญหาชั่วคราวและงานถูก defer ไว้
 
-`discover-status` is incomplete while any failed bucket, partial page, unresolved
-rejection or known lossy split remains. Zero blockers still does not prove external
-population completeness; reconcile against an authoritative source before claiming
-“all companies”.
+RETRY_WAIT ไม่ใช่ terminal failed bit
 
-`bulk --master` selects latest observed operating status only. `bulk --master
---all-statuses` ignores status while excluding explicit identity conflicts.
+### ทำอย่างไร
 
-## Capacity measurement
+ตรวจสถานะและรัน cycle เดิมอีกครั้งเมื่อ retry window พร้อม:
 
-Stop collectors first. The profile-only diagnostic remains available, but V2
-production planning should use `scripts/probe_mixed_capacity.py` followed by a
-persisted bounded canary. A short probe does not establish a sustained seven-endpoint
-ceiling or 48-hour ETA.
+~~~powershell
+dbd-data cycle status --phase core
+dbd-data cycle run --phase core
+~~~
 
-## Queue and storage growth
+ถ้า upstream ยังผิดปกติ ระบบอาจกลับมา RETRY_WAIT อีกจนกว่าสาเหตุภายนอกจะหาย
 
-Watch stage backlog rather than HTTP RPS alone. Rising archive/project queues with
-an empty fetch queue indicate local persistence/projection pressure. Falling shared
-effective rate with 429/503 indicates upstream pressure.
+## 6. 404 จาก endpoint
 
-`response_archive` remains the durable archive metadata boundary. `raw_responses`
-continues to exist because historical projection foreign keys still depend on it.
-External archive mode can reduce MySQL payload growth but adds object-store latency,
-cost, retention and restore obligations that must be measured in canaries.
+404 ถูกแปลงเป็น NOT_AVAILABLE
 
-## Database safety and CI
+ไม่ใช่ collector failure
 
-Back up MySQL before schema maintenance. Alembic migrations are additive/forward-only
-and automatic downgrade is disabled. Current schema head is
-`0008_campaign_runtime`; restore a backup to roll back.
+endpoint นั้นถือว่า resolved ว่า “ไม่มีข้อมูลจาก upstream”
 
-Local/CI integration tests require `DBD_INTEGRATION=1` and a database name beginning
-`dbd_test_`. Redis tests use a disposable Redis database. A green workflow on the
-**exact current PR head** is required before merge.
+ไม่ควร retry 404 ทุกครั้งเพียงเพื่อให้ endpoint กลายเป็น DONE
+
+## 7. 429 หรือ 503
+
+เป็น transient upstream condition
+
+collector ใช้ bounded retry และ shared cooldown
+
+ถ้ามี Retry-After ระบบจะเคารพเวลาที่ upstream แจ้ง
+
+ไม่ควรเพิ่ม concurrency/rate ระหว่าง upstream กำลัง throttle เพื่อบังคับให้เร็วขึ้น
+
+## 8. Authentication error
+
+401 ทำให้ client พยายาม refresh authentication
+
+403 ทำให้ client rebuild session
+
+ถ้าปัญหายังเกิดซ้ำ ให้ตรวจ DBD upstream/session behavior ก่อนเปลี่ยน Production database state
+
+## 9. Active lease
+
+active lease หมายถึงมี collector เป็นเจ้าของบริษัทนั้นอยู่หรือ lease ยังไม่หมดเวลา
+
+อย่า force-clear lease เพียงเพราะเห็น row เป็น COLLECTING
+
+ถ้า process เจ้าของหายจริง lease จะหมดอายุและ collector รอบถัดไป recover ได้
+
+## 10. Expired lease
+
+collector จะ recover expired lease ก่อนทำงาน
+
+ถ้ายังพบ expired lease ค้างหลัง collector เริ่มใหม่ ให้ตรวจ database transaction/error log ก่อน manual mutation
+
+## 11. check-db ไม่ผ่าน
+
+ตรวจตามลำดับ:
+
+1. SQL Server process/network
+2. MSSQL_SERVER
+3. MSSQL_PORT
+4. MSSQL_DATABASE
+5. MSSQL_USER / MSSQL_PASSWORD
+6. login permission
+7. schema contract
+
+รัน:
+
+~~~powershell
+dbd-data check-db
+~~~
+
+ถ้าปัญหาเป็น schema และ migration เป็นสิ่งที่ต้องใช้:
+
+~~~powershell
+dbd-data migrate
+dbd-data check-db
+~~~
+
+## 12. migrate ปฏิเสธ schema
+
+migrate เป็น fail-closed
+
+ถ้า existing table ไม่เข้ากับ contract ระบบสามารถปฏิเสธแทนการ rebuild destructive อัตโนมัติ
+
+กรณีนี้ต้องตรวจ schema mismatch ก่อน
+
+อย่า DROP/TRUNCATE table เพื่อให้ migrate ผ่าน
+
+## 13. Discovery ใหญ่เกินขีดจำกัด
+
+Discovery แบ่ง query โดยอัตโนมัติเมื่อจำนวนผลเกิน upstream limit
+
+ลำดับ split:
+
+~~~text
+juristic type
+-> province
+-> business size
+~~~
+
+ถ้า split ครบทุกมิติแล้วยังมากกว่า 10,000 rows จะเกิด ContractError
+
+นี่เป็น safety failure เพราะระบบไม่ควรอ้างว่าค้นหาครบเมื่อ upstream query ถูก truncate
+
+## 14. Discovery ถูกขัดจังหวะ
+
+v0.6 Discovery state ของ partition/page อยู่ใน process memory
+
+ถ้า process crash การ traversal ของ Discovery จะเริ่มใหม่ได้
+
+บริษัทที่เขียนเข้า SQL Server ไปแล้วไม่จำเป็นต้องลบ เพราะ upsert ใช้ natural identity
+
+## 15. Collect แล้วข้อมูลไม่ขยับ
+
+ตรวจ:
+
+~~~powershell
+dbd-deep status --phase core
+~~~
+
+ดูว่า:
+
+- มี unresolved work จริงหรือไม่
+- row อยู่ RETRY_WAIT หรือไม่
+- มี active lease หรือไม่
+- phase ที่รันตรงกับ phase ที่ต้องการหรือไม่
+- Generation ที่เลือกเป็น Generation ที่คาดไว้หรือไม่
+
+ถ้าไม่มี unresolved work collector ไม่มีเหตุผลต้องยิง endpoint เพิ่ม
+
+## 16. ต้องการตรวจบริษัทเดียว
+
+~~~powershell
+dbd-data fetch-company <COMPANY_CODE> --phase core
+~~~
+
+ใช้สำหรับ targeted check ไม่ใช่การแทน full Production cycle
+
+## 17. Cutover ไม่ยอมเริ่ม
+
+Generation 1 Cutover จะปฏิเสธถ้า source ยังไม่พร้อม เช่น:
+
+- Master ยังมี waiting rows
+- Deep runtime ยัง RUNNING
+- Discovery ยังมี active lease
+- Deep source ยัง PENDING
+- Deep source ยัง COLLECTING
+
+และจะปฏิเสธถ้า SQL Server เดินไป Generation 2 หรือสูงกว่าแล้ว
+
+อย่าปิด safety check เพื่อบังคับ cutover
+
+## 18. Cutover หยุดกลางทาง
+
+batch ที่ commit ไป SQL Server แล้วคงอยู่
+
+ตรวจว่าสาเหตุของ interruption ถูกแก้แล้วและ source snapshot ยังปลอดภัย จากนั้น rerun cutover เดิมได้
+
+~~~powershell
+python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
+~~~
+
+อย่าล้าง target tables เพื่อเริ่มใหม่โดยอัตโนมัติ
+
+## 19. Terminal UI มีปัญหา
+
+Terminal renderer เป็น presentation-only
+
+ถ้า UI ไม่แสดงตามคาด ให้แยกก่อนว่า:
+
+- command จบด้วย exit code อะไร
+- durable SQL Server state เป็นอย่างไร
+- collector มี error จริงหรือเป็นเพียง display problem
+
+ใช้ status command ตรวจความจริงของข้อมูล:
+
+~~~powershell
+dbd-data cycle status --phase core
+dbd-deep status --phase core
+~~~
+
+## 20. Decision flow
+
+~~~text
+มีปัญหา
+  |
+  v
+check-db ผ่านไหม?
+  | no
+  -> แก้ SQL Server connection/schema
+  |
+ yes
+  v
+cycle status
+  |
+  +-> unfinished generation
+  |      -> cycle run เดิม
+  |
+  +-> RETRY_WAIT
+  |      -> รอ retry window / cycle run
+  |
+  +-> terminal failed endpoints
+  |      -> dbd-deep retry
+  |      -> cycle run
+  |
+  +-> COMPLETE
+         -> ไม่ต้องแก้ state
+~~~
+
+## สิ่งที่ไม่ควรทำในเหตุการณ์ปกติ
+
+- DELETE Production rows
+- TRUNCATE Production tables
+- reset generation ด้วย SQL
+- reset masks ด้วย SQL
+- clear lease โดยไม่ตรวจ ownership
+- เปลี่ยน rate/concurrency เพื่อกลบ upstream failure
+- เริ่ม cycle ใหม่เพียงเพื่อหลบ FAILED เดิม
+- rerun Generation 1 cutover หลัง Production ไป Generation 2+
