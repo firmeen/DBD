@@ -233,9 +233,11 @@ Motion is presentation-only and is selected by runtime state:
 - Seal: FINALIZE/schema application.
 - Phase handoff: short completed-to-next-phase transition.
 - Value flash: a real counter changed in an event; numbers are never interpolated.
-- Endpoint baton: the real active endpoint for `fetch-company`.
+- Endpoint baton: the real active endpoint for `fetch-company`; selected endpoints stay
+  neutral until an endpoint event establishes ACTIVE / COMPLETE / N/A / RETRY / FAILED truth.
 - Split/retry/warning cues: transient emphasis only when the matching real event occurs.
-- Wait clock and determinate rail: `cycle loop` only, because its interval is known.
+- Wait clock and determinate rail: `cycle loop` and continuous-collect idle waits, because
+  those intervals are known locally.
 - Completion/failure/stop settle: motion stops when work is no longer active.
 
 The interactive renderer is intentionally capped at four refreshes per second, below
