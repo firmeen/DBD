@@ -676,7 +676,6 @@ def test_v06_continuous_collect_waits_without_stream_or_stale_activity() -> None
     assert terminal.state.status == "WAITING"
     assert terminal.state.current_company_id is None
     assert terminal.state.current_endpoint is None
-    assert "NEXT CHECK" not in output.upper()
     assert "Next check in" in output
     assert "00:00:04" in output
     assert "company 42" not in output
