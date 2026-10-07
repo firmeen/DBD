@@ -96,14 +96,14 @@ migrate เป็น fail-closed ถ้า schema เดิมขัดกับ
 
 อย่า DROP/TRUNCATE table เพื่อบังคับให้ผ่าน
 
-## 7. ตรวจสถานะก่อนรัน
+## 6. ตรวจสถานะก่อนรัน
 
 ~~~powershell
 dbd-data cycle status --phase core
 dbd-deep status --phase core
 ~~~
 
-## 8. รัน Production
+## 7. รัน Production
 
 ~~~powershell
 dbd-data cycle run --phase core
@@ -115,7 +115,7 @@ dbd-data cycle run --phase core
 dbd-data cycle status --phase core
 ~~~
 
-## 9. เปิด Terminal ครั้งถัดไป
+## 8. เปิด Terminal ครั้งถัดไป
 
 ~~~powershell
 cd <PATH_TO_DBD>
@@ -130,7 +130,7 @@ dbd-data cycle status --phase core
 dbd-data cycle run --phase core
 ~~~
 
-## 10. MySQL ใช้เมื่อใด
+## 9. MySQL ใช้เมื่อใด
 
 v0.6 Production ไม่ใช้ MySQL เป็น backend หลัก
 
@@ -141,7 +141,7 @@ v0.6 Production ไม่ใช้ MySQL เป็น backend หลัก
 
 รายละเอียด: MYSQL.md
 
-## 11. Safe Windows usage
+## 10. Safe Windows usage
 
 - ไม่ต้องรัน PowerShell as Administrator สำหรับ project workflow ปกติ
 - ใช้ path ที่ user account เขียนได้
