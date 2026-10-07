@@ -1,3 +1,10 @@
+> [!WARNING]
+> **LEGACY / HISTORICAL DOCUMENT**
+>
+> เอกสารนี้ไม่ใช่คู่มือสำหรับ SQL Server v0.6 Production workflow ปัจจุบัน
+> สำหรับการรัน Production ให้เริ่มจาก README.md และ docs/RUNBOOK.md
+> เก็บไฟล์นี้ไว้เพื่ออ้างอิง runtime รุ่นเดิมเท่านั้น และไม่ควรนำ command หรือ state model ในไฟล์นี้มาปะปนกับ v0.6
+
 # High-throughput pipeline V2
 
 V2 is the production bulk path for campaigns where the discovered population can reach millions of companies and the default tabs 1-2 workload is seven endpoints per company.
