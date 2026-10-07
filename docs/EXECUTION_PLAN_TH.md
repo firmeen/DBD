@@ -1,3 +1,9 @@
+> [!WARNING]
+> **LEGACY / HISTORICAL DOCUMENT**
+>
+> เนื้อหานี้เป็น snapshot/แผนงานของ architecture รุ่นก่อนและไม่ใช่ Production runbook ของ v0.6
+> Source of truth สำหรับระบบปัจจุบันคือ README.md, docs/ARCHITECTURE.md, docs/RUNBOOK.md, docs/OPERATIONS.md และ docs/VALIDATION.md
+
 # แผนดำเนินงาน DBD: ทุกบริษัทภายใน 48 ชั่วโมง
 
 อัปเดต: 15 กันยายน 2026
