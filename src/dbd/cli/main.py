@@ -11,6 +11,7 @@ from ..core.prepare_dashboard import LiveCampaignPrepareDashboard
 from ..core.settings import settings
 from ..core.telemetry import configure
 from ..presentation import TerminalPresenter
+from ..presentation.v06 import V06Terminal
 from ..runtime.collection_fabric import mask_for_endpoints
 from ..runtime.locking import assert_manager_lock, manager_lock
 from ..runtime.resources import PARTS, endpoints
@@ -69,12 +70,13 @@ def parts(value):
     return selected
 
 
-def _add_output_options(parser):
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Emit machine-readable JSON instead of the human terminal view",
-    )
+def _add_output_options(parser, *, json_enabled=True):
+    if json_enabled:
+        parser.add_argument(
+            "--json",
+            action="store_true",
+            help="Emit machine-readable JSON instead of the human terminal view",
+        )
     parser.add_argument(
         "--verbose",
         action="store_true",
@@ -86,43 +88,6 @@ def _add_output_options(parser):
         help="Show diagnostic detail; implies --verbose for terminal presentation",
     )
     return parser
-
-
-def _v06_event_sink(presenter):
-    def event(name, payload):
-        if presenter.json_mode:
-            return
-        if name == "phase_started":
-            phase = str(payload.get("phase") or "WORK")
-            generation = payload.get("generation")
-            suffix = f" · generation {generation}" if generation is not None else ""
-            presenter.message(f"{phase}{suffix}", kind="info")
-        elif name == "cycle_waiting":
-            seconds = float(
-                payload.get("interval_seconds")
-                or payload.get("idle_seconds")
-                or 0
-            )
-            presenter.message(f"Cycle waiting · next check in {seconds:g}s", kind="warning")
-        elif name == "cycle_completed":
-            status = str(payload.get("status") or "FAILED")
-            kind = (
-                "success"
-                if status == "COMPLETE"
-                else "warning"
-                if status == "COMPLETE_WITH_FAILURES"
-                else "error"
-            )
-            presenter.message(
-                f"Cycle {status} · generation {payload.get('generation')}",
-                kind=kind,
-            )
-        elif name == "warning":
-            presenter.message(str(payload.get("message") or "warning"), kind="warning")
-        elif name == "error":
-            presenter.message(str(payload.get("message") or "error"), kind="error")
-
-    return event
 
 
 def endpoint_rate_map(value):
@@ -611,8 +576,14 @@ def main():
     _add_output_options(
         sub.add_parser("about", help="Inspect package, Python and installation integrity")
     )
-    _add_output_options(sub.add_parser("check-db", help="Check database connectivity"))
-    _add_output_options(sub.add_parser("migrate", help="Converge the SQL Server production schema"))
+    _add_output_options(
+        sub.add_parser("check-db", help="Check database connectivity"),
+        json_enabled=False,
+    )
+    _add_output_options(
+        sub.add_parser("migrate", help="Converge the SQL Server production schema"),
+        json_enabled=False,
+    )
     _add_output_options(sub.add_parser("master-status", help="Count discovered and verified company identities"))
     _add_output_options(sub.add_parser("discover-status", help="Show discovery coverage"))
     _add_output_options(sub.add_parser("discover-retry", help="Requeue failed discovery buckets"))
@@ -713,7 +684,8 @@ def main():
     campaign_stop.add_argument("run_id", type=positive)
 
     fetch = _add_output_options(
-        sub.add_parser("fetch-company", help="Collect one company through the v0.6 SQL Server workflow")
+        sub.add_parser("fetch-company", help="Collect one company through the v0.6 SQL Server workflow"),
+        json_enabled=False,
     )
     fetch.add_argument("company_code")
     fetch.add_argument("--phase", choices=("core", "extended"), default="core")
@@ -769,7 +741,8 @@ def main():
     legacy.add_argument("--run-id", type=positive)
     legacy.add_argument("--limit", type=positive)
     disc = _add_output_options(
-        sub.add_parser("discover", help="Discover companies directly into SQL Server DBD_COMPANY")
+        sub.add_parser("discover", help="Discover companies directly into SQL Server DBD_COMPANY"),
+        json_enabled=False,
     )
     disc.add_argument("seeds", nargs="*")
     disc.add_argument("--seed-file")
@@ -816,6 +789,7 @@ def main():
         json_mode=bool(getattr(args, "json", False)),
         verbose=bool(getattr(args, "verbose", False) or getattr(args, "debug", False)),
     )
+    v06_terminal = None
     try:
         if args.command == "about":
             from ..core.package_info import package_environment_snapshot
@@ -824,20 +798,15 @@ def main():
         elif args.command == "migrate":
             from ..storage.sqlserver.repository import ProductionSqlServerRepository
 
+            v06_terminal = V06Terminal("migrate", app="DBD DATA").start()
             result = ProductionSqlServerRepository().ensure_schema()
-            presenter.command_result(
-                "DBD · SQL SERVER MIGRATION",
-                {
-                    "status": result["status"],
-                    "managed_tables": result["managed_tables"],
-                    "created": len(result["created"]),
-                    "altered": len(result["altered"]),
-                },
-            )
+            v06_terminal.finish(result)
         elif args.command == "check-db":
             from ..storage.sqlserver.repository import ProductionSqlServerRepository
 
-            presenter.check_db(ProductionSqlServerRepository().check_database())
+            v06_terminal = V06Terminal("check-db", app="DBD DATA").start()
+            result = ProductionSqlServerRepository().check_database()
+            v06_terminal.finish(result)
         elif args.command == "master-status":
             from ..storage.mysql.engine import connect
 
@@ -880,6 +849,11 @@ def main():
 
             configure(args.metrics_port)
             parsed = parse_code(args.company_code)
+            v06_terminal = V06Terminal("fetch-company", app="DBD DATA").start(
+                phase=args.phase,
+                registration_no=parsed.jp_no,
+                juristic_type_code=parsed.jp_type_code,
+            )
             result = asyncio.run(
                 fetch_company(
                     parsed,
@@ -887,21 +861,10 @@ def main():
                     concurrency=args.concurrency,
                     rate=args.rate,
                     http_retries=args.http_retries,
-                    event=_v06_event_sink(presenter),
+                    event=v06_terminal.event,
                 )
             )
-            presenter.command_result(
-                "DBD · FETCH COMPANY",
-                {
-                    "status": result.status,
-                    "generation": result.generation,
-                    "phase": result.phase,
-                    "company_id": result.company_id,
-                    "juristic_type_code": result.juristic_type_code,
-                    "registration_no": result.registration_no,
-                    "collection": asdict(result)["collection"],
-                },
-            )
+            v06_terminal.finish(asdict(result))
         elif args.command == "bulk":
             configure(args.metrics_port)
             if args.distributed:
@@ -961,6 +924,9 @@ def main():
             if any(len(seed) < 3 for seed in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
             configure(args.metrics_port)
+            v06_terminal = V06Terminal("discover", app="DBD DATA").start(
+                phase=args.phase,
+            )
             generation, result = asyncio.run(
                 discover(
                     seeds,
@@ -970,11 +936,11 @@ def main():
                     concurrency=args.concurrency,
                     rate=args.rate,
                     max_buckets=args.max_buckets,
-                    verbose=not bool(getattr(args, "json", False)),
+                    verbose=False,
+                    event=v06_terminal.event,
                 )
             )
-            presenter.command_result(
-                "DBD · DISCOVERY RESULT",
+            v06_terminal.finish(
                 {
                     "generation": generation,
                     "phase": args.phase,
@@ -983,7 +949,7 @@ def main():
                     "companies": result.companies_written,
                     "invalid_rows": result.invalid_rows,
                     "requests": result.requests_made,
-                },
+                }
             )
         elif args.command == "cycle":
             from dataclasses import asdict
@@ -991,31 +957,24 @@ def main():
             from ..workflow import cycle_loop, cycle_run, status
 
             if args.cycle_command == "status":
-                current = asyncio.run(status(phase=args.phase, coverage=False))
-                payload = asdict(current)
-                presenter.command_result(
-                    "DBD · CYCLE STATUS",
-                    {
-                        "generation": payload["generation"],
-                        "phase": payload["phase"],
-                        "finalized_generation": payload["generation_state"].get(
-                            "finalized_generation"
-                        ),
-                        "active_generation": payload["generation_state"].get(
-                            "active_generation"
-                        ),
-                        **payload["summary"],
-                    },
+                v06_terminal = V06Terminal("cycle-status", app="DBD DATA").start(
+                    phase=args.phase,
                 )
+                current = asyncio.run(status(phase=args.phase, coverage=False))
+                v06_terminal.finish(asdict(current))
             else:
+                command = "cycle-run" if args.cycle_command == "run" else "cycle-loop"
+                v06_terminal = V06Terminal(command, app="DBD DATA").start(
+                    phase=args.phase,
+                )
                 common = {
                     "phase": args.phase,
                     "refresh": args.refresh,
                     "concurrency": args.concurrency,
                     "rate": args.rate,
                     "http_retries": args.http_retries,
-                    "verbose": True,
-                    "event": _v06_event_sink(presenter),
+                    "verbose": False,
+                    "event": v06_terminal.event,
                 }
                 if args.cycle_command == "run":
                     result = asyncio.run(cycle_run(**common))
@@ -1027,33 +986,22 @@ def main():
                         )
                     )
                 payload = asdict(result)
-                presenter.command_result(
-                    "DBD · CYCLE RESULT",
-                    {
-                        "status": payload["status"],
-                        "generation": payload["generation"],
-                        "phase": payload["phase"],
-                        "resumed": payload["resumed"],
-                        "finalized_rows": payload["finalized_rows"],
-                        "companies_claimed": payload["collection"].get(
-                            "companies_claimed", 0
-                        ),
-                        "companies_finished": payload["collection"].get(
-                            "companies_finished", 0
-                        ),
-                        "endpoint_failed": payload["collection"].get(
-                            "endpoints_failed", 0
-                        ),
-                        "terminal_failures": payload["verification"].get(
-                            "terminal_failures", 0
-                        ),
-                    },
-                )
+                v06_terminal.finish(payload)
                 if result.status == "FAILED":
                     raise SystemExit(1)
     except KeyboardInterrupt:
-        presenter.message("Interrupted. Durable checkpoints remain recoverable.", kind="warning")
+        if v06_terminal is not None:
+            v06_terminal.interrupt()
+        else:
+            presenter.message("Interrupted. Durable checkpoints remain recoverable.", kind="warning")
         raise SystemExit(130) from None
     except Exception as exc:
-        presenter.message(safe_error(exc), kind="error")
+        message = safe_error(exc)
+        if v06_terminal is not None:
+            v06_terminal.fail(message)
+        else:
+            presenter.message(message, kind="error")
         raise SystemExit(1) from None
+    finally:
+        if v06_terminal is not None:
+            v06_terminal.close()

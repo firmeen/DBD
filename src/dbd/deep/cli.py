@@ -3,13 +3,12 @@ from __future__ import annotations
 import argparse
 import asyncio
 import math
-import sys
 from dataclasses import asdict
 
 from ..core.settings import settings
+from ..presentation.v06 import V06Terminal
 from ..workflow import collect, prepare, retry, status
 from ._version import __version__ as DEEP_VERSION
-from .presentation import DeepPresenter, DeepTerminalEvents
 
 
 def _positive_int(value: str) -> int:
@@ -40,62 +39,44 @@ def _idle_seconds(value: str) -> float:
     return parsed
 
 
-async def _status(args) -> int:
+async def _status(args, terminal: V06Terminal) -> int:
     result = await status(phase=args.phase, coverage=args.coverage)
-    DeepPresenter(json_mode=args.json).status(asdict(result))
+    terminal.finish(asdict(result))
     return 0
 
 
-async def _prepare(args) -> int:
-    events = None if args.json else DeepTerminalEvents("prepare")
-    try:
-        result = await prepare(
-            phase=args.phase,
-            event=events,
-        )
-        current = await status(phase=args.phase, coverage=False)
-    finally:
-        if events is not None:
-            events.close()
-    DeepPresenter(json_mode=args.json).prepare(
-        asdict(result),
-        asdict(current),
+async def _prepare(args, terminal: V06Terminal) -> int:
+    result = await prepare(
+        phase=args.phase,
+        event=terminal.event,
     )
+    terminal.finish(asdict(result))
     return 0
 
 
-async def _retry(args) -> int:
+async def _retry(args, terminal: V06Terminal) -> int:
     result = await retry(
         phase=args.phase,
         limit=args.limit,
+        event=terminal.event,
     )
-    current = await status(phase=args.phase, coverage=False)
-    DeepPresenter(json_mode=args.json).retry(
-        asdict(result),
-        asdict(current),
-    )
+    terminal.finish(asdict(result))
     return 0
 
 
-async def _collect(args) -> int:
-    events = None if args.json else DeepTerminalEvents("collect")
-    try:
-        result = await collect(
-            phase=args.phase,
-            concurrency=args.concurrency,
-            rate=args.rate,
-            http_retries=args.http_retries,
-            limit=args.limit,
-            continuous=args.continuous,
-            idle_seconds=args.idle_seconds,
-            event=events,
-        )
-    finally:
-        if events is not None:
-            events.close()
-    DeepPresenter(json_mode=args.json).collect(result)
+async def _collect(args, terminal: V06Terminal) -> int:
+    result = await collect(
+        phase=args.phase,
+        concurrency=args.concurrency,
+        rate=args.rate,
+        http_retries=args.http_retries,
+        limit=args.limit,
+        continuous=args.continuous,
+        idle_seconds=args.idle_seconds,
+        event=terminal.event,
+    )
+    terminal.finish(result)
     return 0
-
 
 def _phase(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
@@ -123,7 +104,6 @@ def parse_args(argv: list[str] | None = None):
         help="Prepare endpoint masks directly in SQL Server DBD_COMPANY",
     )
     _phase(prepare_parser)
-    prepare_parser.add_argument("--json", action="store_true")
 
     collect_parser = sub.add_parser(
         "collect",
@@ -162,7 +142,6 @@ def parse_args(argv: list[str] | None = None):
         default=5.0,
         help="Continuous-mode no-work check interval (default: 5 seconds)",
     )
-    collect_parser.add_argument("--json", action="store_true")
 
     status_parser = sub.add_parser(
         "status",
@@ -174,7 +153,6 @@ def parse_args(argv: list[str] | None = None):
         action="store_true",
         help="Also read heavier five-table row coverage",
     )
-    status_parser.add_argument("--json", action="store_true")
 
     retry_parser = sub.add_parser(
         "retry",
@@ -182,30 +160,40 @@ def parse_args(argv: list[str] | None = None):
     )
     _phase(retry_parser)
     retry_parser.add_argument("--limit", type=_positive_int)
-    retry_parser.add_argument("--json", action="store_true")
 
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
+    terminal = V06Terminal(args.command, app="DBD DEEP")
+    context = {"phase": args.phase}
+    if args.command == "collect":
+        context.update(
+            {
+                "concurrency": args.concurrency,
+                "rate": args.rate,
+                "continuous": args.continuous,
+                "idle_seconds": args.idle_seconds,
+                "limit": args.limit,
+            }
+        )
+    elif args.command == "status":
+        context["coverage"] = args.coverage
+    terminal.start(**context)
     try:
         if args.command == "prepare":
-            code = asyncio.run(_prepare(args))
+            code = asyncio.run(_prepare(args, terminal))
         elif args.command == "collect":
-            code = asyncio.run(_collect(args))
+            code = asyncio.run(_collect(args, terminal))
         elif args.command == "status":
-            code = asyncio.run(_status(args))
+            code = asyncio.run(_status(args, terminal))
         elif args.command == "retry":
-            code = asyncio.run(_retry(args))
+            code = asyncio.run(_retry(args, terminal))
         else:
             raise RuntimeError(f"Unknown command {args.command}")
     except KeyboardInterrupt:
-        print(
-            "\nINTERRUPTED: committed SQL Server endpoint checkpoints are durable; "
-            "the next collect/cycle safely reclaims expired work.",
-            file=sys.stderr,
-        )
+        terminal.interrupt()
         raise SystemExit(130) from None
     except BaseExceptionGroup as exc:
         messages: list[str] = []
@@ -213,11 +201,13 @@ def main(argv: list[str] | None = None) -> None:
             message = f"{type(child).__name__}: {child}"
             if message not in messages:
                 messages.append(message)
-        print("ERROR: " + "; ".join(messages), file=sys.stderr)
+        terminal.fail("; ".join(messages))
         raise SystemExit(1) from None
     except Exception as exc:
-        print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+        terminal.fail(f"{type(exc).__name__}: {exc}")
         raise SystemExit(1) from None
+    finally:
+        terminal.close()
 
     raise SystemExit(code)
 
