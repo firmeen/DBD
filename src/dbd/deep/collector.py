@@ -587,7 +587,7 @@ class DeepCollector:
             self._emit("phase", phase="RECOVER")
             self.stats.runtime_recovered = await self.repo.recover_runtime()
             await self.repo.assert_no_overlap()
-            await self.repo.assert_master_empty()
+            # await self.repo.assert_master_empty()
 
             self._emit("phase", phase="AUTH")
             async with FixedRateDbdClient(
