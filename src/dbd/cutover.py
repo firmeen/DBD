@@ -848,6 +848,8 @@ def source_preflight(conn) -> dict[str, Any]:
         raise CutoverSafetyError(
             "Generation 1 source is not terminal; cutover refused: " + details
         )
+    if total == 0:
+        raise CutoverSafetyError("Generation 1 source dbd_company_deep is empty")
     return {
         "source_rows": total,
         "source_updated_at": stability["source_updated_at"],
@@ -978,7 +980,11 @@ def _attach_company_id(rows: list[dict[str, Any]], company_id: int) -> list[dict
     return [{"company_id": company_id, **row} for row in rows]
 
 
-def verify_generation_one(source_rows: int) -> dict[str, int]:
+def verify_generation_one(
+    source_rows: int,
+    *,
+    expected_domain_counts: dict[str, int] | None = None,
+) -> dict[str, int]:
     queries = {
         "companies": (
             "SELECT COUNT(*) FROM dbo.DBD_COMPANY WHERE dataset_generation=1",
@@ -1069,6 +1075,15 @@ def verify_generation_one(source_rows: int) -> dict[str, int]:
     ):
         if result[key]:
             raise CutoverSafetyError(f"Generation 1 verification failed: {key}={result[key]}")
+    if expected_domain_counts is not None:
+        for table in ("relations", "events", "financial", "industries"):
+            expected = int(expected_domain_counts[table])
+            actual = result[table]
+            if actual != expected:
+                raise CutoverSafetyError(
+                    f"Generation 1 {table} count mismatch: "
+                    f"mapped={expected}, target={actual}"
+                )
     result["missing_company_mapping"] = 0
     return result
 
@@ -1080,13 +1095,6 @@ def run_generation1_cutover(
 ) -> dict[str, Any]:
     repository = ProductionSqlServerRepository()
     repository.validate_schema()
-
-    max_generation = repository.max_generation()
-    if max_generation is not None and max_generation >= 2:
-        raise CutoverSafetyError(
-            f"SQL Server already contains dataset_generation={max_generation}; "
-            "legacy Generation 1 cutover is permanently refused"
-        )
 
     published_at = datetime.now(timezone.utc).replace(tzinfo=None)
     started = time.monotonic()
@@ -1111,8 +1119,28 @@ def run_generation1_cutover(
         "contract_errors": 0,
         "batches": 0,
     }
+    # DBD_INDUSTRY has a shared natural key; many companies can map to one row.
+    industry_keys: set[tuple[str | None, ...]] = set()
 
-    with source_fence() as fence_conn:
+    # Hold the same SQL Server writer fence as the production v0.6 cycle
+    # for the *whole* migration, not just for its opening generation check.
+    with repository.manager_lock() as manager_conn, source_fence() as fence_conn:
+        repository.assert_manager_lock(manager_conn)
+        state = repository.generation_state(manager_conn)
+        highest_generation = max(
+            int(state.get(key) or 0)
+            for key in (
+                "finalized_generation",
+                "last_seen_generation",
+                "active_generation",
+            )
+        )
+        if highest_generation >= 2:
+            raise CutoverSafetyError(
+                f"SQL Server already contains Generation {highest_generation}; "
+                "legacy Generation 1 cutover is permanently refused"
+            )
+
         preflight = source_preflight(fence_conn)
         stats["source_rows"] = int(preflight["source_rows"])
         if event is not None:
@@ -1160,6 +1188,7 @@ def run_generation1_cutover(
                     stats["benchmark_source_companies"] += 1
 
             _assert_source_snapshot(fence_conn, preflight)
+            repository.assert_manager_lock(manager_conn)
 
             with repository.transaction() as target_conn:
                 company_ids = repository.upsert_companies(
@@ -1183,8 +1212,20 @@ def run_generation1_cutover(
                     target_conn, industry_rows, reject_conflicts=True
                 )
                 _assert_source_snapshot(fence_conn, preflight)
+                repository.assert_manager_lock(manager_conn)
 
             _assert_source_snapshot(fence_conn, preflight)
+            repository.assert_manager_lock(manager_conn)
+            industry_keys.update(
+                (
+                    row["submit_objective_code"],
+                    row["fiscal_year"],
+                    row["business_size_code"],
+                    row["location_type"],
+                    row["location_no"],
+                )
+                for row in industry_rows
+            )
             stats["companies"] += len(prepared)
             stats["profile_mapped_companies"] += sum(
                 1 for source in source_rows_batch if source.get("profile_data") is not None
@@ -1217,8 +1258,23 @@ def run_generation1_cutover(
                 "Generation 1 source snapshot changed before final verification"
             )
 
-        verification = verify_generation_one(int(stats["source_rows"]))
+        if stats["companies"] != int(stats["source_rows"]):
+            raise CutoverSafetyError(
+                f"Generation 1 source traversal mismatch: "
+                f"expected={stats['source_rows']}, scanned={stats['companies']}"
+            )
+        repository.assert_manager_lock(manager_conn)
+        verification = verify_generation_one(
+            int(stats["source_rows"]),
+            expected_domain_counts={
+                "relations": stats["relations"],
+                "events": stats["events"],
+                "financial": stats["financial"],
+                "industries": len(industry_keys),
+            },
+        )
         _assert_source_snapshot(fence_conn, preflight)
+        repository.assert_manager_lock(manager_conn)
         stats["verification"] = verification
         stats["industries"] = verification["industries"]
         stats["elapsed_seconds"] = time.monotonic() - started
