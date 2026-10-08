@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import inspect
 import json
+from contextlib import contextmanager
 from datetime import datetime
+from types import SimpleNamespace
 from decimal import Decimal
 
 import pytest
@@ -197,18 +199,48 @@ def test_generation1_domain_mapping_uses_five_table_grains() -> None:
     assert benchmark_items[0]["avg_amount"] == "100.50"
 
 
-def test_cutover_refuses_generation_two_before_touching_mysql(monkeypatch) -> None:
+@pytest.mark.parametrize(
+    ("finalized", "seen"),
+    [
+        (2, 2),
+        (1, 2),  # Generation 2 Discovery has started, but G2 is not finalized.
+        (2, 1),
+    ],
+)
+def test_cutover_refuses_generation_two_before_touching_mysql(
+    monkeypatch, finalized, seen
+) -> None:
+    opened_mysql = []
+
     class Repository:
         def validate_schema(self):
             return {"status": "READY"}
 
-        def max_generation(self):
-            return 2
+        @contextmanager
+        def manager_lock(self):
+            yield object()
+
+        def assert_manager_lock(self, _conn):
+            pass
+
+        def generation_state(self, _conn):
+            return {
+                "finalized_generation": finalized,
+                "last_seen_generation": seen,
+                "active_generation": seen if seen > finalized else None,
+            }
+
+    @contextmanager
+    def mysql_must_not_open():
+        opened_mysql.append(True)
+        yield object()
 
     monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "source_fence", mysql_must_not_open)
 
     with pytest.raises(CutoverSafetyError, match="permanently refused"):
         cutover.run_generation1_cutover(batch_size=500)
+    assert not opened_mysql
 
 
 def test_cutover_mysql_source_functions_contain_no_data_mutation_sql() -> None:
@@ -366,3 +398,167 @@ def test_cutover_rechecks_source_around_every_target_transaction() -> None:
     assert before_transaction >= 0
     assert transaction < inside_transaction < after_transaction
     assert source.count("_assert_source_snapshot(fence_conn, preflight)") >= 5
+
+
+def test_source_preflight_refuses_empty_deep_table(monkeypatch) -> None:
+    monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
+    monkeypatch.setattr(
+        cutover,
+        "_source_columns",
+        lambda _conn, table: (
+            set(cutover.SOURCE_COLUMNS) if table == cutover.SOURCE_TABLE
+            else {"status"} if table == cutover.SOURCE_RUNTIME_TABLE
+            else {"lease_owner", "lease_version", "lease_expires_at"}
+            if table == cutover.SOURCE_DISCOVERY_TABLE
+            else {"jp_type_code", "jp_no"}
+        ),
+    )
+    monkeypatch.setattr(cutover, "_count", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(
+        cutover,
+        "_source_stability_state",
+        lambda _conn: {
+            "master_waiting": 0,
+            "runtime_running": 0,
+            "discovery_active_leases": 0,
+            "deep_active": 0,
+            "source_updated_at": None,
+        },
+    )
+    with pytest.raises(CutoverSafetyError, match="source dbd_company_deep is empty"):
+        source_preflight(object())
+
+
+@pytest.mark.parametrize(
+    ("changed_domain", "actual"),
+    [
+        ("relations", 1),
+        ("events", 3),
+        ("financial", 0),
+        ("industries", 4),
+    ],
+)
+def test_generation1_verification_rejects_missing_or_extra_domain_rows(
+    monkeypatch, changed_domain, actual
+) -> None:
+    # Verify count parity without a live SQL Server connection.
+    expected = {"relations": 2, "events": 2, "financial": 2, "industries": 2}
+    query_counts = [1, 0, 0, 0, 0, 0] + [
+        actual if key == changed_domain else expected[key]
+        for key in ("relations", "events", "financial", "industries")
+    ]
+    seen = iter(query_counts)
+
+    class Cursor:
+        def execute(self, _sql, _params=()):
+            pass
+
+        def fetchone(self):
+            return (next(seen),)
+
+        def close(self):
+            pass
+
+    @contextmanager
+    def fake_sqlserver_connection():
+        yield SimpleNamespace(cursor=Cursor)
+
+    monkeypatch.setattr(cutover, "sqlserver_connection", fake_sqlserver_connection)
+    with pytest.raises(CutoverSafetyError, match=changed_domain + " count mismatch"):
+        cutover.verify_generation_one(1, expected_domain_counts=expected)
+
+
+def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
+    monkeypatch,
+) -> None:
+    events = []
+    current = {"locked": False}
+    one_source = _source_row()
+
+    class Repository:
+        def validate_schema(self):
+            return {"status": "READY"}
+
+        @contextmanager
+        def manager_lock(self):
+            events.append("lock-acquired")
+            current["locked"] = True
+            try:
+                yield object()
+            finally:
+                current["locked"] = False
+                events.append("lock-released")
+
+        def assert_manager_lock(self, _conn):
+            assert current["locked"], "Cutover used the target without its manager lock"
+
+        def generation_state(self, _conn):
+            return {
+                "finalized_generation": 1,
+                "last_seen_generation": 1,
+                "active_generation": None,
+            }
+
+        @contextmanager
+        def transaction(self):
+            assert current["locked"]
+            events.append("transaction-start")
+            yield object()
+            assert current["locked"]
+            events.append("transaction-commit")
+
+        def upsert_companies(self, _conn, rows):
+            return {
+                (row["juristic_type_code"], row["registration_no"]): 10
+                for row in rows
+            }
+
+        def upsert_relations(self, _conn, _rows):
+            pass
+
+        def upsert_events(self, _conn, _rows):
+            pass
+
+        def upsert_financials(self, _conn, _rows):
+            pass
+
+        def upsert_industries(self, _conn, _rows, *, reject_conflicts):
+            assert reject_conflicts
+
+    @contextmanager
+    def fake_source_fence():
+        assert current["locked"]
+        events.append("source-open")
+        yield object()
+        events.append("source-closed")
+
+    def fake_verification(count, *, expected_domain_counts):
+        assert count == 1
+        assert expected_domain_counts == {
+            "relations": 0, "events": 0, "financial": 0, "industries": 0
+        }
+        assert current["locked"]
+        return {"industries": 0, "companies": 1}
+
+    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
+    monkeypatch.setattr(
+        cutover, "source_preflight",
+        lambda _conn: {"source_rows": 1, "source_updated_at": None},
+    )
+    monkeypatch.setattr(cutover, "source_batches", lambda _conn, **_kw: iter([[one_source]]))
+    monkeypatch.setattr(cutover, "_assert_source_snapshot", lambda *_args: None)
+    monkeypatch.setattr(cutover, "transform_relations", lambda *_args, **_kw: [])
+    monkeypatch.setattr(cutover, "transform_events", lambda *_args, **_kw: [])
+    monkeypatch.setattr(cutover, "transform_financials", lambda *_args, **_kw: [])
+    monkeypatch.setattr(cutover, "transform_industries", lambda *_args, **_kw: [])
+    monkeypatch.setattr(cutover, "verify_generation_one", fake_verification)
+
+    result = cutover.run_generation1_cutover(batch_size=500)
+
+    assert result["companies"] == 1
+    assert events == [
+        "lock-acquired", "source-open",
+        "transaction-start", "transaction-commit",
+        "source-closed", "lock-released",
+    ]
