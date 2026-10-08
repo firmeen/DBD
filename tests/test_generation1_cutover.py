@@ -562,3 +562,107 @@ def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
         "transaction-start", "transaction-commit",
         "source-closed", "lock-released",
     ]
+
+
+def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
+    monkeypatch,
+) -> None:
+    stored: dict[tuple[str, str], int] = {}
+    state = {"committed_batches": 0, "interrupted": False}
+    source = [
+        {"jp_type_code": "5", "jp_no": "0105550000001"},
+        {"jp_type_code": "5", "jp_no": "0105550000002"},
+    ]
+
+    class Repository:
+        def validate_schema(self):
+            return {}
+
+        @contextmanager
+        def manager_lock(self):
+            yield object()
+
+        def assert_manager_lock(self, _conn):
+            pass
+
+        def generation_state(self, _conn):
+            return {
+                "finalized_generation": 1 if stored else None,
+                "last_seen_generation": 1 if stored else None,
+                "active_generation": None,
+            }
+
+        @contextmanager
+        def transaction(self):
+            if state["committed_batches"] == 1 and not state["interrupted"]:
+                state["interrupted"] = True
+                raise ConnectionError("interrupted after one committed batch")
+            yield object()
+            state["committed_batches"] += 1
+
+        def upsert_companies(self, _conn, rows):
+            for row in rows:
+                key = (row["juristic_type_code"], row["registration_no"])
+                stored.setdefault(key, len(stored) + 1)
+            return {
+                (row["juristic_type_code"], row["registration_no"]):
+                    stored[(row["juristic_type_code"], row["registration_no"])]
+                for row in rows
+            }
+
+        def upsert_relations(self, _conn, _rows):
+            pass
+
+        def upsert_events(self, _conn, _rows):
+            pass
+
+        def upsert_financials(self, _conn, _rows):
+            pass
+
+        def upsert_industries(self, _conn, _rows, *, reject_conflicts):
+            assert reject_conflicts
+
+    @contextmanager
+    def fake_source_fence():
+        yield object()
+
+    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
+    monkeypatch.setattr(
+        cutover, "source_preflight",
+        lambda _conn: {"source_rows": 2, "source_updated_at": None},
+    )
+    monkeypatch.setattr(
+        cutover, "source_batches",
+        lambda _conn, **_kw: iter([[source[0]], [source[1]]]),
+    )
+    monkeypatch.setattr(cutover, "_assert_source_snapshot", lambda *_args: None)
+    monkeypatch.setattr(
+        cutover, "transform_company",
+        lambda row, **_kw: {
+            "juristic_type_code": row["jp_type_code"],
+            "registration_no": row["jp_no"],
+        },
+    )
+    for method in (
+        "transform_relations", "transform_events", "transform_financials",
+        "transform_industries",
+    ):
+        monkeypatch.setattr(cutover, method, lambda *_args, **_kw: [])
+
+    def verify(source_rows, *, expected_domain_counts):
+        assert source_rows == 2
+        assert len(stored) == 2
+        assert all(not count for count in expected_domain_counts.values())
+        return {"companies": len(stored), "industries": 0}
+
+    monkeypatch.setattr(cutover, "verify_generation_one", verify)
+
+    with pytest.raises(ConnectionError, match="one committed batch"):
+        cutover.run_generation1_cutover(batch_size=1)
+    assert len(stored) == 1
+
+    result = cutover.run_generation1_cutover(batch_size=1)
+    assert result["companies"] == 2
+    assert len(stored) == 2
+    assert state["committed_batches"] == 3  # first run: 1; resumed run: 2
