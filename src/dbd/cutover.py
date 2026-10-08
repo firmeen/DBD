@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import time
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Any, Callable, Iterator
@@ -1124,7 +1124,8 @@ def run_generation1_cutover(
 
     # Hold the same SQL Server writer fence as the production v0.6 cycle
     # for the *whole* migration, not just for its opening generation check.
-    with repository.manager_lock() as manager_conn, source_fence() as fence_conn:
+    with ExitStack() as stack:
+        manager_conn = stack.enter_context(repository.manager_lock())
         repository.assert_manager_lock(manager_conn)
         state = repository.generation_state(manager_conn)
         highest_generation = max(
@@ -1141,6 +1142,8 @@ def run_generation1_cutover(
                 "legacy Generation 1 cutover is permanently refused"
             )
 
+        # No MySQL connection is opened until the SQL Server generation gate passes.
+        fence_conn = stack.enter_context(source_fence())
         preflight = source_preflight(fence_conn)
         stats["source_rows"] = int(preflight["source_rows"])
         if event is not None:
