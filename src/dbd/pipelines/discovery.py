@@ -625,6 +625,133 @@ async def _validated_children(
     return []
 
 
+async def recover_discovery(
+    *,
+    parent_id: int | None = None,
+    limit: int = 10,
+    execute: bool = False,
+    rate: float = 1.0,
+    health=None,
+) -> dict:
+    """Preview or selectively recover historical count failures.
+
+    Preview is DB SELECT only. Execution shares the CLI's MySQL manager lock;
+    never deletes pages and never resets already collected child pages.
+    """
+    from ..storage.mysql.repositories.discovery_repository import (
+        apply_recovery_recount,
+        get_bucket,
+        mark_search_archive,
+        recovery_candidates,
+        recovery_family,
+    )
+
+    candidates = await asyncio.to_thread(recovery_candidates, limit, parent_id)
+    report: dict = {
+        "mode": "execute" if execute else "preview",
+        "candidates": len(candidates),
+        "stale_zero": sum(item["reason"] == "stale_zero" for item in candidates),
+        "overflow": sum(item["reason"] == "overflow" for item in candidates),
+        "bucket_ids": ",".join(str(item["bucket_id"]) for item in candidates),
+    }
+    if not execute or not candidates:
+        return report
+    if rate <= 0:
+        raise ValueError("Recovery rate must be positive")
+
+    reopened = split = recovered = 0
+    failures: list[str] = []
+    async with AsyncDbdClient(
+        concurrency=1,
+        rate_per_second=rate,
+        endpoint_rates={"search": rate},
+    ) as client:
+        statuses = await asyncio.to_thread(observed_status_codes)
+        provinces = None
+        for item in candidates:
+            bucket_id = int(item["bucket_id"])
+            if health is not None:
+                await asyncio.to_thread(health)
+            try:
+                if item["reason"] == "stale_zero":
+                    parent, children = await asyncio.to_thread(recovery_family, bucket_id)
+                    if parent["status"] != "split":
+                        raise ContractError("Recovery candidate no longer split")
+                    filters = _filters_from_row(parent)
+                    page, archive_id, _, _ = await _count(client, bucket_id, filters)
+                    await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+                    if page.current_page != 1 or not page.rows:
+                        raise ContractError("Parent recount returned an invalid page")
+                    current_parent = page.total_items
+                    observations: dict[int, int] = {}
+                    for child in children:
+                        child_filters = _filters_from_row(child)
+                        cp, child_archive, _, _ = await _count(
+                            client, int(child["id"]), child_filters
+                        )
+                        await asyncio.to_thread(mark_search_archive, child_archive, "processed")
+                        if cp.current_page != 1 or (cp.total_items > 0 and not cp.rows):
+                            raise ContractError("Recovery child count response is invalid")
+                        # Verify the sample actually satisfies the child filter.
+                        for raw in cp.rows:
+                            for field, raw_key in (
+                                ("jp_types", "jpTypeCode"),
+                                ("pv_codes", "pvCode"),
+                                ("jp_statuses", "jpStatCode"),
+                                ("business_sizes", "businessSizeCode"),
+                            ):
+                                selected = getattr(child_filters, field)
+                                if selected and raw_key in raw and str(raw[raw_key]) not in selected:
+                                    raise ContractError("Recovery child filter returned mismatched rows")
+                        observations[int(child["id"])] = cp.total_items
+                    confirm, confirm_archive, _, _ = await _count(client, bucket_id, filters)
+                    await asyncio.to_thread(mark_search_archive, confirm_archive, "processed")
+                    if confirm.current_page != 1 or confirm.total_items != current_parent:
+                        raise ContractError("Parent count drifted while recounting children")
+                    outcome = await asyncio.to_thread(
+                        apply_recovery_recount, bucket_id, current_parent, observations
+                    )
+                    reopened += int(outcome["reopened"])
+                    recovered += 1
+                    if not outcome["count_consistent"] or outcome["changed_nonzero"]:
+                        failures.append(f"{bucket_id}: counts cannot yet be reconciled")
+                else:
+                    row = await asyncio.to_thread(get_bucket, bucket_id)
+                    if row is None or row["status"] != "failed":
+                        continue
+                    if row.get("lease_owner") is not None and row.get("lease_expires_at") is not None:
+                        if row["lease_expires_at"] > _now():
+                            raise DiscoveryLeaseLost("Overflow bucket has an active lease")
+                    if provinces is None:
+                        provinces = await fetch_provinces(client)
+                    await _process_bucket(
+                        client, row, provinces, master_cache={},
+                        progress_line=None, status_codes=statuses,
+                    )
+                    state = await asyncio.to_thread(get_bucket, bucket_id)
+                    if state["status"] == "split":
+                        split += 1
+                    elif state["status"] == "done":
+                        recovered += 1
+                    else:
+                        failures.append(f"{bucket_id}: no validated split available")
+            except DiscoveryLeaseLost:
+                raise
+            except Exception as exc:
+                failures.append(f"{bucket_id}: {type(exc).__name__}: {str(exc)[:120]}")
+    # Never make the return receipt green based only on sampled count parity.
+    checked = await asyncio.to_thread(validate_splits, False)
+    report.update({
+        "reopened": reopened,
+        "split": split,
+        "recovered": recovered,
+        "partitions_checked": checked,
+        "unresolved": len(failures),
+        "sample_errors": "; ".join(failures[:5]),
+    })
+    return report
+
+
 async def _run_work(
     client,
     seeds,
