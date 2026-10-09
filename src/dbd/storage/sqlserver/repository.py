@@ -1507,12 +1507,30 @@ class ProductionSqlServerRepository:
         if (
             int(generation) >= 2
             and int(phase_mask) & CORE_ENDPOINT_MASK
-            and company_id is None
             and node_id is None
         ):
-            raise SqlServerWriteError(
-                "SQL Server Core claim requires an authorized node; run dbd-data setup"
-            )
+            if company_id is None:
+                raise SqlServerWriteError(
+                    "SQL Server Core claim requires an authorized node; run dbd-data setup"
+                )
+            # Targeted single-company collection is an Admin-only legacy
+            # escape hatch. It is never a way for a Worker to omit node_id.
+            # It must not race a scheduled monthly Generation.
+            from ...presentation.setup import local_node_id
+            admin_node = local_node_id()
+            control = ControlRepository()
+            if (
+                admin_node is None
+                or not control._has_admin_permission(conn)
+            ):
+                raise SqlServerWriteError(
+                    "Targeted SQL Server Core claim requires Admin authorization"
+                )
+            control.require_node(conn, admin_node, role="ADMIN", lock=True)
+            if control.active_generation(conn) is not None:
+                raise SqlServerWriteError(
+                    "Targeted Core claim cannot bypass an active monthly Generation"
+                )
         token = f"{worker_prefix}:{uuid4().hex}"
         active_filter = (
             "AND status_code=N'1'"
