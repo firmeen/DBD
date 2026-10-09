@@ -1346,7 +1346,7 @@ class ProductionSqlServerRepository:
                     endpoint_meta=old_meta,
                     first_observation=first_observation,
                     force_refresh_mask=int(refresh_mask),
-                    stale_hours=settings.dbd_refresh_stale_hours,
+                    stale_hours=settings.dbd_monthly_core_stale_hours,
                     now=datetime.now(timezone.utc),
                 )
                 if first_observation:
