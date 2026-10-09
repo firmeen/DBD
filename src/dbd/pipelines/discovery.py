@@ -842,10 +842,16 @@ async def run(
     if getattr(repo, "backend", None) == "sqlserver":
         from ..presentation.setup import local_node_id
         from ..storage.sqlserver.control_repository import ControlRepository
-        node_id = local_node_id()
-        if node_id is None:
-            raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
-        admission = lambda: ControlRepository().admit(node_id, int(generation))
+        control = ControlRepository()
+        active = await asyncio.to_thread(control.active_generation)
+        if active is not None:
+            if active.get("state") != "DISCOVERING" or int(active.get("generation") or 0) != int(generation):
+                raise RuntimeError("SQL Server Discovery conflicts with the active monthly cycle")
+            node_id = local_node_id()
+            if node_id is None:
+                raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
+            await asyncio.to_thread(control.require_admin, node_id)
+            admission = lambda: control.admit(node_id, int(generation))
 
     buckets_processed = 0
     pages_fetched = 0
