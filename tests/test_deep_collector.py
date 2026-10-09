@@ -768,3 +768,9 @@ async def test_inactive_profile_stops_rest_of_core_without_erasing_history() -> 
     assert repo.state["done_mask"] & ENDPOINT_BITS["transformations"]
     assert repo.state["collect_status"] == "DISCOVERED"
     assert repo.released == 1
+
+
+def test_worker_machine_identity_is_in_durable_claim_prefix() -> None:
+    collector = _collector(node_id="node-test123")
+    assert collector._worker_prefix.startswith("node-test123:")
+    assert collector.node_id == "node-test123"
