@@ -8,16 +8,7 @@ from .discovery_repository import assert_bucket_lease
 
 
 def _bucket_key(filters: SearchFilters) -> str:
-    return "|".join(
-        [
-            f"k={filters.keyword}",
-            f"t={filters.search_type}",
-            f"pv={','.join(filters.pv_codes)}",
-            f"st={','.join(filters.jp_statuses)}",
-            f"jt={','.join(filters.jp_types)}",
-            f"sz={','.join(filters.business_sizes)}",
-        ]
-    )
+    return filters.key()
 
 
 def split_bucket(
@@ -42,6 +33,35 @@ def split_bucket(
             cur.execute("SELECT id FROM discovery_buckets WHERE id=%s FOR UPDATE", (int(parent_id),))
             if cur.fetchone() is None:
                 raise ValueError(f"Discovery bucket {parent_id} not found")
+
+        keys = [_bucket_key(filters) for filters in children]
+        if len(set(keys)) != len(keys):
+            raise ValueError("Split candidate has duplicate child filter identities")
+
+        cur.execute(
+            "SELECT id,bucket_key FROM discovery_buckets WHERE parent_id=%s FOR UPDATE",
+            (int(parent_id),),
+        )
+        existing = cur.fetchall()
+        if existing:
+            if {row["bucket_key"] for row in existing} != set(keys):
+                raise RuntimeError(
+                    "Parent already has another split plan; mixing child dimensions "
+                    "would double-count search coverage"
+                )
+            return [int(row["id"]) for row in existing]
+
+        placeholders = ",".join(["%s"] * len(keys))
+        cur.execute(
+            f"SELECT id,parent_id,bucket_key FROM discovery_buckets "
+            f"WHERE bucket_key IN ({placeholders}) FOR UPDATE",
+            tuple(keys),
+        )
+        for row in cur.fetchall():
+            if row["parent_id"] is None or int(row["parent_id"]) != int(parent_id):
+                raise RuntimeError(
+                    "A candidate child already belongs to a different parent"
+                )
 
         for filters in children:
             key = _bucket_key(filters)
