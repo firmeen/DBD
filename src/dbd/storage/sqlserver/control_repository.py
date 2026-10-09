@@ -156,7 +156,7 @@ class ControlRepository:
                 "FROM sys.columns AS c "
                 "WHERE c.object_id=OBJECT_ID(N'dbo.DBD_CONTROL')"
             )
-            actual = {str(name): (str(dtype).lower(), int(nullable))
+            actual = {str(name): (str(dtype).lower().replace("rowversion", "timestamp"), int(nullable))
                       for name, dtype, nullable in cur.fetchall()}
             expected = {
                 "control_id": ("bigint", 0),
