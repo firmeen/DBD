@@ -343,3 +343,6 @@ compare by `juristic_type_code + registration_no`.
 When running both backends at once, coordinate the aggregate DBD upstream
 request rate. Never bypass an application lock or retry by deleting data.
 
+## Monthly control recovery
+
+`--auto` exits without starting when not due/already completed; this is not a failure. Manual early start requires confirmation and audit. If a Generation was interrupted, run the same Core cycle to resume before the next month. An Admin may approve/revoke a Worker node using `dbd-data setup`; revocation blocks new claims and in-flight commits at the SQL gate. Remote workers do not acquire Coordinator locks. During `DRAINING` the Coordinator waits for live company leases, then verifies before Finalize. Shared Rate admission failure must **not** fall back to local rate. A Windows Task that runs under a noninteractive logon does not show the Terminal UI; use current-user interactive principal without highest privileges. See [Admin setup](ADMIN_SETUP.md) and [Worker setup](WORKER_SETUP.md).
