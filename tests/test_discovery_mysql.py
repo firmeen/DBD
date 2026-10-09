@@ -77,3 +77,65 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
             (bucket,),
         )
         assert cur.fetchone()["n"] == 0
+
+
+def test_false_zero_recount_reopens_only_proven_positive_child_and_preserves_pages():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        apply_recovery_recount, recovery_family, update_bucket,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    parent_filters = SearchFilters("recount-" + uuid4().hex)
+    parent = upsert_bucket(parent_filters)
+    children = [
+        SearchFilters(parent_filters.keyword, jp_types=["2"]),
+        SearchFilters(parent_filters.keyword, jp_types=["5"]),
+    ]
+    first, second = split_bucket(parent, children, 1)
+    update_bucket(parent, total_items=11, partition_lossless=0)
+    update_bucket(first, status="done", total_items=0, pages_total=0, pages_done=0)
+    update_bucket(second, status="done", total_items=0, pages_total=0, pages_done=0)
+
+    result = apply_recovery_recount(parent, 11, {first: 11, second: 0})
+    assert result["reopened"] == 1
+    assert result["count_consistent"] is True
+    p, family = recovery_family(parent)
+    by_id = {int(row["id"]): row for row in family}
+    assert p["status"] == "split"
+    assert by_id[first]["status"] == "pending"
+    assert by_id[first]["total_items"] is None
+    assert by_id[second]["status"] == "done"
+    assert by_id[second]["total_items"] == 0
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM discovery_pages WHERE bucket_id IN (%s,%s)",
+            (first, second),
+        )
+        assert int(cur.fetchone()["n"]) == 0
+
+    # Recount replay cannot re-open or duplicate the already pending leaf.
+    again = apply_recovery_recount(parent, 11, {first: 11, second: 0})
+    assert again["reopened"] == 0
+
+
+def test_recount_does_not_reset_completed_nonzero_child_when_count_drifts():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        apply_recovery_recount, recovery_family, update_bucket,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    parent_filters = SearchFilters("recount-drift-" + uuid4().hex)
+    parent = upsert_bucket(parent_filters)
+    child = split_bucket(
+        parent, [SearchFilters(parent_filters.keyword, jp_types=["5"])], 1
+    )[0]
+    update_bucket(parent, total_items=10, partition_lossless=0)
+    update_bucket(child, status="done", total_items=10, pages_total=1, pages_done=1)
+    outcome = apply_recovery_recount(parent, 11, {child: 11})
+    assert outcome["reopened"] == 0
+    assert outcome["changed_nonzero"] == 1
+    assert outcome["parent_updated"] is False
+    saved_parent, family = recovery_family(parent)
+    assert saved_parent["total_items"] == 10
+    assert family[0]["total_items"] == 10
+    assert family[0]["pages_done"] == 1
