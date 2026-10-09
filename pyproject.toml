@@ -30,6 +30,7 @@ dependencies = [
   "zstandard>=0.23,<1",
   "boto3>=1.35,<2",
   "rich>=14,<15",
+  "tzdata>=2025.2,<2028",
   "prompt_toolkit>=3.0,<4",
 ]
 
