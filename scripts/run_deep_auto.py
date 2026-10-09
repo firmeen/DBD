@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import shutil
+import argparse
 import subprocess
 import sys
 import time
 from datetime import datetime
-from pathlib import Path
 
 # ============================================================
 # CONFIG
@@ -44,38 +43,7 @@ def log(message: str) -> None:
     print(flush=True)
 
 
-def find_dbd_deep() -> str:
-    """
-    Prefer dbd-deep.exe from the same virtual environment
-    as the Python interpreter currently running this script.
-    """
-
-    python_path = Path(sys.executable)
-
-    candidates = [
-        python_path.with_name("dbd-deep.exe"),
-        python_path.with_name("dbd-deep"),
-    ]
-
-    for candidate in candidates:
-        if candidate.exists():
-            return str(candidate)
-
-    found = shutil.which("dbd-deep")
-
-    if found:
-        return found
-
-    raise SystemExit(
-        "ERROR: dbd-deep executable not found.\n"
-        "Activate .venv and run: python -m pip install -e ."
-    )
-
-
-DBD_DEEP = find_dbd_deep()
-
-
-def run_dbd_deep(arguments: list[str]) -> int:
+def run_dbd_deep(arguments: list[str], *, backend: str) -> int:
     """
     Run dbd-deep directly in the current console.
 
@@ -84,8 +52,8 @@ def run_dbd_deep(arguments: list[str]) -> int:
     """
 
     command = [
-        DBD_DEEP,
-        *arguments,
+        sys.executable, "-m", "dbd.deep.cli",
+        *arguments, "--backend", backend,
     ]
 
     print(
@@ -115,7 +83,7 @@ def run_dbd_deep(arguments: list[str]) -> int:
 # CANARY RECOVERY LOOP
 # ============================================================
 
-def wait_until_canary_passes() -> None:
+def wait_until_canary_passes(*, backend: str) -> None:
     attempt = 0
 
     while True:
@@ -127,7 +95,7 @@ def wait_until_canary_passes() -> None:
         )
 
         return_code = run_dbd_deep(
-            CANARY_COMMAND
+            CANARY_COMMAND, backend=backend
         )
 
         if return_code == 0:
@@ -152,6 +120,13 @@ def wait_until_canary_passes() -> None:
 # ============================================================
 
 def main() -> int:
+    from dbd.core.settings import settings
+
+    parser = argparse.ArgumentParser(description="Backend-aware v0.6 Deep recovery")
+    parser.add_argument("--backend", choices=("sqlserver", "mysql"),
+                        default=settings.dbd_production_backend)
+    args = parser.parse_args()
+    backend = args.backend
     restart_count = 0
 
     log(
@@ -159,7 +134,8 @@ def main() -> int:
     )
 
     print(f"Python   : {sys.executable}")
-    print(f"dbd-deep : {DBD_DEEP}")
+    print(f"dbd-deep : {sys.executable} -m dbd.deep.cli")
+    print(f"Backend  : {backend}")
     print()
     print(
         "Policy   : "
@@ -180,7 +156,7 @@ def main() -> int:
         )
 
         return_code = run_dbd_deep(
-            LONG_RUN_COMMAND
+            LONG_RUN_COMMAND, backend=backend
         )
 
         # ----------------------------------------------------
@@ -206,7 +182,7 @@ def main() -> int:
         # RECOVERY
         # ----------------------------------------------------
 
-        wait_until_canary_passes()
+        wait_until_canary_passes(backend=backend)
 
         log(
             "RECOVERY CONFIRMED "
