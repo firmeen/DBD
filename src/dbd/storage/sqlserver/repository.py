@@ -21,6 +21,7 @@ from .engine import transaction as sqlserver_transaction
 from .schema import MANAGED_TABLES, TABLE_COLUMNS
 from .schema import ensure_schema as ensure_production_schema
 from .schema import validate_schema as validate_production_schema
+from .control_repository import ControlRepository
 
 TARGET_TABLE = "dbo.DBD_MASTER_DEEP"
 
@@ -765,11 +766,15 @@ class ProductionSqlServerRepository:
 
     def ensure_schema(self) -> dict[str, object]:
         with self.transaction() as conn:
-            return ensure_production_schema(conn)
+            result = ensure_production_schema(conn)
+            ControlRepository().ensure_schema(conn)
+            return result
 
     def validate_schema(self) -> dict[str, object]:
         with connection() as conn:
-            return validate_production_schema(conn)
+            result = validate_production_schema(conn)
+            ControlRepository().validate_schema(conn)
+            return result
 
     def check_database(self) -> dict[str, object]:
         info = check_connection()
@@ -785,6 +790,7 @@ class ProductionSqlServerRepository:
         )
         with connection() as conn:
             schema = validate_production_schema(conn)
+            ControlRepository().validate_schema(conn)
             cur = conn.cursor()
             try:
                 cur.execute(
@@ -1495,6 +1501,7 @@ class ProductionSqlServerRepository:
         lease_seconds: int,
         worker_prefix: str,
         company_id: int | None = None,
+        node_id: str | None = None,
     ) -> dict[str, Any] | None:
         token = f"{worker_prefix}:{uuid4().hex}"
         active_filter = (
@@ -1512,6 +1519,8 @@ class ProductionSqlServerRepository:
             company_filter = " AND company_id=%s"
             params.append(int(company_id))
         params.extend([token, int(lease_seconds)])
+        if node_id is not None:
+            ControlRepository().require_collection_access(conn, node_id, generation)
         cur = conn.cursor()
         try:
             cur.execute(
@@ -1591,6 +1600,11 @@ class ProductionSqlServerRepository:
         claim_token: str,
         claim_generation: int,
     ) -> dict[str, Any]:
+        node_id = claim_token.split(":", 1)[0]
+        if node_id.startswith("node-") and int(claim_generation) >= 2:
+            ControlRepository().require_collection_access(
+                conn, node_id, claim_generation, finishing=True,
+            )
         cur = conn.cursor()
         try:
             cur.execute(
