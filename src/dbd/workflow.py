@@ -404,9 +404,22 @@ async def collect(
     repository: Any | None = None,
     backend: str | None = None,
     event: EventCallback | None = None,
+    allow_targeted_sql: bool = False,
 ) -> dict[str, Any]:
     repo = _repo(repository, backend)
-    is_shared_core = getattr(repo, "backend", None) == "sqlserver" and phase == "core"
+    targeted_sql = (
+        bool(allow_targeted_sql) and company_id is not None
+        and getattr(repo, "backend", None) == "sqlserver"
+    )
+    if targeted_sql:
+        _require_sql_admin(repo)
+        from .storage.sqlserver.control_repository import ControlRepository
+        if await asyncio.to_thread(ControlRepository().active_generation) is not None:
+            raise RuntimeError("Targeted SQL Server Deep cannot bypass an active monthly generation")
+    is_shared_core = (
+        getattr(repo, "backend", None) == "sqlserver"
+        and phase == "core" and not targeted_sql
+    )
     node_id = None
     control = None
     if is_shared_core:
@@ -671,6 +684,7 @@ async def fetch_company(
                 company_id=company_id,
                 repository=repo,
                 event=event,
+                allow_targeted_sql=True,
             ),
         )
         repo.assert_manager_lock(lock_conn)
