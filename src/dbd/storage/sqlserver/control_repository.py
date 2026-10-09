@@ -101,8 +101,11 @@ BEGIN
 
     IF @delay_ms > 5000
     BEGIN
-        ROLLBACK TRANSACTION;
-        THROW 51004, 'Global request budget saturated; retry after cooldown', 1;
+        -- No slot allocated. Client waits and retries; never releases an
+        -- HTTP request without a real atomic reservation.
+        COMMIT TRANSACTION;
+        SET @delay_ms = -1000;
+        RETURN;
     END;
 
     UPDATE dbo.DBD_CONTROL
@@ -452,18 +455,26 @@ class ControlRepository:
             raise ControlError("Generation is not accepting company work")
 
     def admit(self, node_id: str, generation: int) -> float:
-        """Reserve an upstream slot; return seconds until it may be used."""
-        with transaction() as conn:
-            cur = conn.cursor()
-            try:
-                cur.execute(
-                    "DECLARE @delay BIGINT; EXEC dbo.DBD_CONTROL_ADMIT "
-                    "@node_id=%s,@generation=%s,@delay_ms=@delay OUTPUT; SELECT @delay",
-                    (node_id, int(generation)),
-                )
-                row = cur.fetchone()
-                if row is None:
-                    raise ControlError("No HTTP admission result")
-                return max(0.0, int(row[0]) / 1000.0)
-            finally:
-                cur.close()
+        """Reserve an upstream slot, waiting for capacity without bypassing SQL.
+
+        A negative result means a saturated (unreserved) queue, not permission
+        to send an HTTP request. SQL/network/authorization errors fail closed.
+        """
+        while True:
+            with transaction() as conn:
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "DECLARE @delay BIGINT; EXEC dbo.DBD_CONTROL_ADMIT "
+                        "@node_id=%s,@generation=%s,@delay_ms=@delay OUTPUT; SELECT @delay",
+                        (node_id, int(generation)),
+                    )
+                    row = cur.fetchone()
+                    if row is None:
+                        raise ControlError("No HTTP admission result")
+                    milliseconds = int(row[0])
+                finally:
+                    cur.close()
+            if milliseconds >= 0:
+                return milliseconds / 1000.0
+            time.sleep(min(5.0, max(0.1, -milliseconds / 1000.0)))
