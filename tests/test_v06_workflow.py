@@ -696,3 +696,52 @@ def test_core_cycle_resumes_same_generation_without_skipping_ineligible_rows() -
     repo.finalized = 2
     repo.unfinished = 0
     assert workflow._cycle_generation(repo, phase="core") == (3, False)
+
+
+@pytest.mark.asyncio
+async def test_sqlserver_auto_cycle_not_due_skips_all_http_and_finalize(monkeypatch) -> None:
+    from dbd.presentation import setup as setup_module
+    from dbd.storage.sqlserver import control_repository
+
+    class FakeControl:
+        def select_cycle(self, _node, _state, **kwargs):
+            assert kwargs["auto"] is True
+            return "NOT_DUE", None
+
+    repo = _WorkflowRepo(finalized=1)
+    repo.backend = "sqlserver"
+    monkeypatch.setattr(setup_module, "local_node_id", lambda: "node-test")
+    monkeypatch.setattr(control_repository, "ControlRepository", FakeControl)
+
+    async def never_discover(*_args, **_kwargs):
+        raise AssertionError("NOT_DUE must never issue upstream Search")
+
+    monkeypatch.setattr(workflow.discovery, "run", never_discover)
+    result = await workflow.cycle_run(
+        phase="core", auto=True, repository=repo, verbose=False,
+    )
+    assert result.status == "NOT_DUE"
+    assert result.finalized_rows == 0
+    assert repo.finalize_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sqlserver_manual_before_due_requires_confirmation(monkeypatch) -> None:
+    from dbd.control import EarlyStartConfirmationRequired
+    from dbd.presentation import setup as setup_module
+    from dbd.storage.sqlserver import control_repository
+
+    class FakeControl:
+        def select_cycle(self, _node, _state, **kwargs):
+            assert not kwargs["auto"]
+            assert not kwargs["manual_confirmed"]
+            return "NOT_DUE", None
+
+    repo = _WorkflowRepo(finalized=1)
+    repo.backend = "sqlserver"
+    monkeypatch.setattr(setup_module, "local_node_id", lambda: "node-test")
+    monkeypatch.setattr(control_repository, "ControlRepository", FakeControl)
+
+    with pytest.raises(EarlyStartConfirmationRequired):
+        await workflow.cycle_run(phase="core", repository=repo, verbose=False)
+    assert repo.finalize_calls == 0
