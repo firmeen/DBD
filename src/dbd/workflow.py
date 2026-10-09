@@ -207,7 +207,8 @@ async def prepare(
     generation: int | None = None,
     company_id: int | None = None,
     repository: Any | None = None,
-    backend: str | None = None,\n    event: EventCallback | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
 ) -> PrepareResult:
     repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
@@ -273,7 +274,8 @@ async def retry(
     phase: str = "core",
     limit: int | None = None,
     repository: Any | None = None,
-    backend: str | None = None,\n    event: EventCallback | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
 ) -> RetryResult:
     repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
@@ -303,7 +305,8 @@ async def status(
     phase: str = "core",
     coverage: bool = False,
     repository: Any | None = None,
-    backend: str | None = None,\n) -> StatusResult:
+    backend: str | None = None,
+) -> StatusResult:
     repo = _repo(repository, backend)
     generation_state = await asyncio.to_thread(repo.generation_state)
     generation = (
@@ -344,7 +347,8 @@ async def collect(
     continuous: bool = False,
     idle_seconds: float = 5.0,
     repository: Any | None = None,
-    backend: str | None = None,\n    event: EventCallback | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
 ) -> dict[str, Any]:
     repo = _repo(repository, backend)
     selected_generation = int(
@@ -381,7 +385,8 @@ async def discover(
     max_buckets: int | None = None,
     verbose: bool = True,
     repository: Any | None = None,
-    backend: str | None = None,\n    event: EventCallback | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
 ) -> tuple[int, DiscoveryResult]:
     repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
@@ -428,7 +433,8 @@ async def verify(
     generation: int,
     phase: str = "core",
     repository: Any | None = None,
-    backend: str | None = None,\n) -> VerifyResult:
+    backend: str | None = None,
+) -> VerifyResult:
     repo = _repo(repository, backend)
     details = await asyncio.to_thread(
         repo.verify_generation,
@@ -530,7 +536,8 @@ async def fetch_company(
     rate: float | None = None,
     http_retries: int | None = None,
     repository: Any | None = None,
-    backend: str | None = None,\n    event: EventCallback | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
 ) -> FetchCompanyResult:
     repo = _repo(repository, backend)
 
@@ -622,7 +629,8 @@ async def cycle_run(
     http_retries: int | None = None,
     max_buckets: int | None = None,
     repository: Any | None = None,
-    backend: str | None = None,\n    event: EventCallback | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
     verbose: bool = True,
 ) -> CycleResult:
     if seeds or search_type or max_buckets is not None:
@@ -793,7 +801,8 @@ async def cycle_loop(
     http_retries: int | None = None,
     max_buckets: int | None = None,
     repository: Any | None = None,
-    backend: str | None = None,\n    event: EventCallback | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
     verbose: bool = True,
     max_iterations: int | None = None,
 ) -> CycleResult:
@@ -813,6 +822,7 @@ async def cycle_loop(
             http_retries=http_retries,
             max_buckets=max_buckets,
             repository=repository,
+            backend=backend,
             event=event,
             verbose=verbose,
         )
