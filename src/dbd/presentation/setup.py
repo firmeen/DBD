@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -96,6 +97,11 @@ Register-ScheduledTask -TaskName '{name}' -Action $action -Trigger $triggers -Se
         )
 
 
+def _env_value(value: str) -> str:
+    # Quote whitespace and #/quote characters without exposing a password in logs.
+    return value if re.fullmatch(r"[A-Za-z0-9_./:@-]+", value) else json.dumps(value, ensure_ascii=False)
+
+
 def _save_env(changes: dict[str, str]) -> None:
     """Preserve unrelated env lines and replace only selected known keys."""
     existing = ENV_FILE.read_text(encoding="utf-8") if ENV_FILE.is_file() else ""
@@ -107,11 +113,11 @@ def _save_env(changes: dict[str, str]) -> None:
         key = stripped.split("=", 1)[0].strip() if "=" in stripped and not stripped.startswith("#") else None
         if key in changes:
             if key not in found:
-                output.append(f"{key}={changes[key]}")
+                output.append(f"{key}={_env_value(changes[key])}")
                 found.add(key)
         else:
             output.append(line)
-    output.extend(f"{key}={value}" for key, value in changes.items() if key not in found)
+    output.extend(f"{key}={_env_value(value)}" for key, value in changes.items() if key not in found)
     ENV_FILE.parent.mkdir(parents=True, exist_ok=True)
     fd, temp = tempfile.mkstemp(prefix=".dbd-env-", dir=ENV_FILE.parent)
     try:
@@ -228,7 +234,25 @@ class SetupWizard:
                 _reload_settings()
 
             self.console.print("[cyan]Checking SQL Server...[/cyan]")
-            info = check_connection()
+            try:
+                info = check_connection()
+            except Exception as first_error:
+                self.console.print(f"[yellow]Connection validation failed: {first_error}[/yellow]")
+                if not self.confirm("Edit existing SQL Server connection values and retry?"):
+                    return 2
+                repaired = {}
+                for key in ("MSSQL_SERVER", "MSSQL_DATABASE", "MSSQL_USER"):
+                    repaired[key] = self.ask(key, str(present.get(key) or edits.get(key) or ""))
+                password = self.ask("MSSQL_PASSWORD (masked; empty keeps existing)", secret=True)
+                if password:
+                    repaired["MSSQL_PASSWORD"] = password
+                if not all(repaired.values()):
+                    raise ControlError("SQL Server host/database/user cannot be empty")
+                if not self.confirm("Save corrected connection settings to the local .env and retry?"):
+                    return 2
+                _save_env(repaired)
+                _reload_settings()
+                info = check_connection()
             self.console.print(f"[green]Connected[/green]  {info.get('database', 'TIPDataIntelligence')}")
             repo = ControlRepository()
             try:
@@ -319,16 +343,31 @@ class SetupWizard:
             if self.confirm(f"Revoke {worker}? Existing in-flight work will lose authorization."):
                 repo.revoke_worker(node, worker)
 
-        if sys.platform == "win32" and self.confirm("Enable/update Windows Auto Run (Daily + At Logon) for Admin?"):
-            time_value = self.ask("Daily check time (HH:MM)", "09:00")
+        if sys.platform == "win32":
+            task_action = self.choice("Windows Auto Run", [
+                ("keep", "Leave current Windows Task unchanged"),
+                ("enable", "Enable/update Daily + At Logon Task"),
+                ("disable", "Disable existing DBD Monthly Core Task"),
+            ])
             try:
-                hour, minute = [int(x) for x in time_value.split(":")]
-                validate_schedule(15, hour, minute)
-                register_windows_task(check_hour=hour, check_minute=minute)
-                self.console.print("[green]Task Scheduler registered for current Windows user.[/green]")
+                if task_action == "enable":
+                    time_value = self.ask("Daily check time (HH:MM)", "09:00")
+                    hour, minute = [int(x) for x in time_value.split(":")]
+                    validate_schedule(15, hour, minute)
+                    if self.confirm("Register/update the one per-user non-elevated Windows Task?"):
+                        register_windows_task(check_hour=hour, check_minute=minute)
+                        self.console.print("[green]Windows Task registered.[/green]")
+                elif task_action == "disable" and self.confirm("Disable the DBD Monthly Core Task?"):
+                    result = subprocess.run(
+                        ["schtasks.exe", "/Change", "/TN", TASK_NAME, "/DISABLE"],
+                        capture_output=True, text=True, check=False, timeout=30,
+                    )
+                    if result.returncode:
+                        raise ControlError((result.stderr or result.stdout).strip())
+                    self.console.print("[green]Windows Task disabled.[/green]")
             except Exception as exc:
-                self.console.print(f"[yellow]Windows Task not registered: {exc}[/yellow]")
-                self.console.print("You can configure it manually using docs/ADMIN_SETUP.md")
+                self.console.print(f"[yellow]Task Scheduler not changed: {exc}[/yellow]")
+                self.console.print("Manual instructions: docs/ADMIN_SETUP.md")
 
 
 def repo_connection():
