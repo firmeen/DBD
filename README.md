@@ -344,3 +344,8 @@ legacy `DB_*` remains the Generation 1 source and campaign runtime.
 Use `dbd-data cutover --backend mysql` only for the one-time legacy G1 import
 before the selected target begins G2. Full details: `docs/RUNBOOK.md`.
 
+## SQL Server monthly Core control (v0.6)
+
+After the Admin has applied the control schema, use `dbd-data setup` once to configure the operator/node and monthly schedule. The normal command remains `dbd-data cycle run --phase core`; Windows Task Scheduler invokes the same command with the single `--auto` switch. A finished generation cannot restart in the same month. SQL Server is the shared production backend, the Admin can run alone, and optionally approved Worker machines join using `dbd-deep collect --phase core --backend sqlserver --continuous`. The five business table contracts and MySQL v0.6 backend are not changed by this control feature.
+
+See [Admin setup](docs/ADMIN_SETUP.md) and [Worker setup](docs/WORKER_SETUP.md) for Windows Task Scheduler, SQL permissions and safe resume.
