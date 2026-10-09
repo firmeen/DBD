@@ -703,6 +703,7 @@ class DeepCollector:
         continuous: bool = False,
         idle_seconds: float = 5.0,
         event: EventCallback | None = None,
+        node_id: str | None = None,
     ) -> None:
         if generation < 1:
             raise ValueError("generation must be positive")
@@ -729,13 +730,17 @@ class DeepCollector:
         self.continuous = bool(continuous)
         self.idle_seconds = float(idle_seconds)
         self.event = event
+        self.node_id = node_id
 
         self.stats = CollectorStats()
         self._stats_lock = asyncio.Lock()
         self._claim_lock = asyncio.Lock()
         self._stop = asyncio.Event()
         self._specs = static_endpoint_specs(phase)
-        self._worker_prefix = f"{socket.gethostname()}:{os.getpid()}"
+        self._worker_prefix = (
+            f"{node_id}:{socket.gethostname()}:{os.getpid()}" if node_id
+            else f"{socket.gethostname()}:{os.getpid()}"
+        )
 
     def _emit(self, name: str, **payload: object) -> None:
         if self.event is not None:
@@ -776,6 +781,7 @@ class DeepCollector:
                 lease_seconds=settings.dbd_lease_seconds,
                 worker_prefix=self._worker_prefix,
                 company_id=self.company_id,
+                **({"node_id": self.node_id} if self.node_id and getattr(self.repo, "backend", None) == "sqlserver" else {}),
             )
 
     async def _claim(self) -> dict[str, Any] | None:
@@ -1342,13 +1348,21 @@ class DeepCollector:
     async def run(self) -> dict[str, Any]:
         self._emit("phase_started", phase="PREFLIGHT")
         await asyncio.to_thread(self.repo.validate_schema)
+        if self.node_id and getattr(self.repo, "backend", None) == "sqlserver":
+            from ..storage.sqlserver.control_repository import ControlRepository
+            await asyncio.to_thread(ControlRepository().validate_schema)
         self.stats.leases_recovered = await self._db_call(self._recover_sync)
 
         self._emit("phase_started", phase="AUTH")
+        admission = None
+        if self.node_id and getattr(self.repo, "backend", None) == "sqlserver":
+            from ..storage.sqlserver.control_repository import ControlRepository
+            admission = lambda: ControlRepository().admit(self.node_id, self.generation)
         async with FixedRateDbdClient(
             concurrency=self.concurrency,
             rate_per_second=self.rate_per_second,
             max_retries=self.http_retries,
+            admission=admission,
         ) as client:
             self._emit(
                 "phase_started",
