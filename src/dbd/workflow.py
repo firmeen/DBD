@@ -410,7 +410,9 @@ async def collect(
         if generation is not None and int(generation) != int(active["generation"]):
             raise RuntimeError("Collector generation does not match SQL Server coordinator")
         selected_generation = int(active["generation"])
-        await asyncio.to_thread(control.node_status, node_id)
+        node = await asyncio.to_thread(control.node_status, node_id)
+        if node is None or not node.get("authorized"):
+            raise RuntimeError("Unapproved node or mismatched SQL Server login")
     collector = DeepCollector(
         repository=repo,
         generation=selected_generation,
