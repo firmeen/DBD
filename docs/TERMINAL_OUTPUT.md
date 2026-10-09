@@ -185,3 +185,7 @@ cutover แสดง:
 ถ้า cutover ถูก interrupt หน้าจอจะบอกว่า committed SQL Server batches ถูกเก็บไว้
 
 ความจริงสุดท้ายยังต้องตรวจจาก durable target state ไม่ใช่อาศัย animation เพียงอย่างเดียว
+
+## Setup / Monthly Auto Mode
+
+`dbd-data setup` provides the single interactive Admin/Worker readiness wizard (Rich output and prompt_toolkit input). `↑/↓` move through choices, `Enter` confirms, `Esc` backs out, `Ctrl+C` cancels; Password entry is masked. In non-TTY mode Setup prints readiness without waiting for input. `cycle run --auto` uses the existing v0.6 Terminal only when the monthly cycle is due; statuses `NOT_DUE` and `ALREADY_COMPLETED` are successful no-work results and close the Task console. The Admin can still execute the exact old Manual cycle command. See [Admin](ADMIN_SETUP.md) / [Worker](WORKER_SETUP.md).
