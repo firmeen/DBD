@@ -966,6 +966,7 @@ async def cycle_loop(
             backend=backend,
             event=event,
             verbose=verbose,
+            auto=(phase == "core" and (backend or settings.dbd_production_backend) == "sqlserver"),
         )
         if last.status == "FAILED":
             return last
