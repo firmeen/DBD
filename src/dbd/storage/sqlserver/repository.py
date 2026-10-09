@@ -1500,6 +1500,19 @@ class ProductionSqlServerRepository:
         company_id: int | None = None,
         node_id: str | None = None,
     ) -> dict[str, Any] | None:
+        # Core G2+ is always a coordinated node claim.  A missing node_id
+        # must not bypass SQL control merely because a caller invokes the
+        # repository directly.  Explicit targeted Admin-only claims are
+        # handled separately through company_id.
+        if (
+            int(generation) >= 2
+            and int(phase_mask) & CORE_ENDPOINT_MASK
+            and company_id is None
+            and node_id is None
+        ):
+            raise SqlServerWriteError(
+                "SQL Server Core claim requires an authorized node; run dbd-data setup"
+            )
         token = f"{worker_prefix}:{uuid4().hex}"
         active_filter = (
             "AND status_code=N'1'"
