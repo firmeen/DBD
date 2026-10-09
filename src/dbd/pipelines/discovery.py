@@ -36,7 +36,7 @@ from ..storage.mysql.repositories.discovery_repository import (
 from ..storage.mysql.repositories.discovery_split_repository import split_bucket
 
 JP_TYPES = ("0", "2", "3", "5", "7", "8", "9", "A")
-BUSINESS_SIZES = ("S", "M", "L")
+BUSINESS_SIZES = ("S", "M", "L", "X")
 EXTRA_PREFIX_SEEDS = ("099",)
 
 
@@ -86,44 +86,51 @@ def _filters_from_row(row: dict) -> SearchFilters:
     )
 
 
-def _children_for(filters: SearchFilters, provinces: list[str]) -> list[SearchFilters]:
-    if not filters.jp_types:
-        return [
-            SearchFilters(
-                keyword=filters.keyword,
-                search_type=filters.search_type,
-                pv_codes=filters.pv_codes,
-                jp_statuses=filters.jp_statuses,
-                jp_types=[kind],
-                business_sizes=filters.business_sizes,
-            )
-            for kind in JP_TYPES
-        ]
-    if not filters.pv_codes and provinces:
-        return [
-            SearchFilters(
-                keyword=filters.keyword,
-                search_type=filters.search_type,
-                pv_codes=[province],
-                jp_statuses=filters.jp_statuses,
-                jp_types=filters.jp_types,
-                business_sizes=filters.business_sizes,
-            )
-            for province in provinces
-        ]
-    if not filters.business_sizes:
-        return [
-            SearchFilters(
-                keyword=filters.keyword,
-                search_type=filters.search_type,
-                pv_codes=filters.pv_codes,
-                jp_statuses=filters.jp_statuses,
-                jp_types=filters.jp_types,
-                business_sizes=[size],
-            )
-            for size in BUSINESS_SIZES
-        ]
-    return []
+def _partition_plans(
+    filters: SearchFilters, provinces: list[str], status_codes: list[str]
+) -> list[list[SearchFilters]]:
+    """Suggest categorical filters; API count parity must validate every plan."""
+    plans = []
+    dimensions = (
+        ("jp_types", JP_TYPES),
+        ("pv_codes", provinces),
+        ("jp_statuses", status_codes),
+        ("business_sizes", BUSINESS_SIZES),
+    )
+    for field, values in dimensions:
+        if getattr(filters, field) or not values:
+            continue
+        options = []
+        for value in values:
+            kwargs = {
+                "keyword": filters.keyword,
+                "search_type": filters.search_type,
+                "pv_codes": list(filters.pv_codes),
+                "jp_statuses": list(filters.jp_statuses),
+                "jp_types": list(filters.jp_types),
+                "business_sizes": list(filters.business_sizes),
+            }
+            kwargs[field] = [value]
+            options.append(SearchFilters(**kwargs))
+        plans.append(options)
+    return plans
+
+
+def observed_status_codes() -> list[str]:
+    """Candidates, not an authoritative enumeration of all DBD status codes."""
+    from ..storage.mysql.engine import connect
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT DISTINCT observed_jp_stat_code AS code
+            FROM company_master
+            WHERE observed_jp_stat_code IS NOT NULL
+              AND observed_jp_stat_code <> ''
+            ORDER BY observed_jp_stat_code
+            """
+        )
+        return [str(row["code"]) for row in cur.fetchall()]
 
 
 async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
@@ -424,6 +431,7 @@ async def _process_bucket(
     progress_line: ProgressLine | None,
     lease_owner: str | None = None,
     lease_version: int | None = None,
+    status_codes: list[str] | None = None,
 ) -> tuple[int, int]:
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
@@ -445,9 +453,14 @@ async def _process_bucket(
                 **fields,
             )
 
-    if total_items is None:
+    # Oversized cached counts must also be refreshed: retry() preserves them.
+    if total_items is None or int(total_items) > MAX_ROWS_PER_QUERY:
         page, count_archive_id, data, requested = await _count(client, bucket_id, filters)
+        if page.current_page != 1:
+            raise ContractError("Invalid Discovery count page")
         total_items, pages_total = page.total_items, page.total_pages
+        if int(row.get("pages_done") or 0) and row["total_items"] != total_items:
+            raise ContractError("Search total changed after pages were committed")
         first_page = (count_archive_id, data, requested)
         owned_update(total_items=total_items, pages_total=pages_total, status="counted")
 
@@ -460,12 +473,15 @@ async def _process_bucket(
     if total_items > MAX_ROWS_PER_QUERY:
         if count_archive_id is not None:
             await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
-        children = _children_for(filters, provinces)
+        children = await _validated_children(
+            client, bucket_id, filters, provinces, status_codes or [], int(total_items)
+        )
         if not children:
             owned_update(
                 status="failed",
                 last_error=(
-                    f"{total_items} rows exceeds the {MAX_ROWS_PER_QUERY} ceiling and no split dimension remains"
+                    f"{total_items} rows exceeds the {MAX_ROWS_PER_QUERY} ceiling; "
+                    "no count-validated, non-overlapping split is available"
                 ),
             )
             return 0, 0
@@ -499,38 +515,114 @@ async def _process_bucket(
 
 
 def validate_splits(verbose: bool = True) -> int:
+    """Reconcile from the leaves upward, never count unfinished descendants as complete."""
     from ..storage.mysql.engine import connect
 
-    checked = 0
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT p.id,p.total_items,COUNT(c.id) AS child_count,
-                   SUM(c.total_items IS NULL) AS uncounted,
-                   COALESCE(SUM(c.total_items),0) AS child_sum
-            FROM discovery_buckets p JOIN discovery_buckets c ON c.parent_id=p.id
-            WHERE p.status='split' AND p.total_items IS NOT NULL
-            GROUP BY p.id,p.total_items
+            SELECT id,parent_id,depth,status,total_items,pages_total,pages_done,
+                   partition_lossless
+            FROM discovery_buckets
+            ORDER BY depth DESC,id
             """
         )
         rows = cur.fetchall()
+
+    children_by_parent: dict[int, list[dict]] = {}
     for row in rows:
-        if int(row["uncounted"] or 0) > 0:
+        if row["parent_id"] is not None:
+            children_by_parent.setdefault(int(row["parent_id"]), []).append(row)
+
+    verified: dict[int, bool] = {}
+    checked = 0
+    for parent in rows:
+        if parent["status"] != "split":
             continue
-        parent_total = int(row["total_items"])
-        children = int(row["child_sum"])
-        lossless = 1 if children == parent_total else 0
-        update_bucket(int(row["id"]), partition_lossless=lossless)
+        parent_id = int(parent["id"])
+        children = children_by_parent.get(parent_id, [])
+        countable = bool(children) and parent["total_items"] is not None and all(
+            child["total_items"] is not None for child in children
+        )
+        count_equal = countable and sum(int(child["total_items"]) for child in children) == int(
+            parent["total_items"]
+        )
+        def child_ready(child: dict) -> bool:
+            if child["status"] == "split":
+                return verified.get(int(child["id"]), False)
+            if child["status"] != "done" or child["total_items"] is None:
+                return False
+            count = int(child["total_items"])
+            done = int(child["pages_done"] or 0)
+            total = int(child["pages_total"] or 0)
+            return (count == 0 and total == 0 and done == 0) or (
+                count > 0 and 0 < total <= 1000 and done == total
+            )
+
+        lossless = bool(count_equal) and all(child_ready(c) for c in children)
+        verified[parent_id] = lossless
+        if parent["partition_lossless"] is None or int(parent["partition_lossless"]) != int(lossless):
+            update_bucket(parent_id, partition_lossless=int(lossless))
         checked += 1
         if verbose and not lossless:
             from ..presentation import TerminalPresenter
-
             TerminalPresenter().message(
-                f"Bucket {row['id']}: SUM(children)={children:,} vs parent={parent_total:,}; "
+                f"Bucket {parent_id}: counts or descendant pages are not complete; "
                 "completeness blocked",
                 kind="error",
             )
     return checked
+
+
+async def _probe_partition(
+    client: AsyncDbdClient,
+    bucket_id: int,
+    filters: SearchFilters,
+    parent_count: int,
+    candidates: list[SearchFilters],
+) -> bool:
+    """Count every proposed child and recheck parent before admitting a split."""
+    from ..storage.mysql.repositories.discovery_repository import mark_search_archive
+
+    child_counts = []
+    for child in candidates:
+        page, archive_id, _, _ = await _count(client, bucket_id, child)
+        await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+        if page.current_page != 1 or (page.total_items > 0 and not page.rows):
+            raise ContractError("Invalid Discovery split count response")
+        # Check sampled search rows against the proposed categorical constraints.
+        for raw in page.rows:
+            for field, key in (
+                ("jp_types", "jpTypeCode"),
+                ("pv_codes", "pvCode"),
+                ("jp_statuses", "jpStatCode"),
+                ("business_sizes", "businessSizeCode"),
+            ):
+                selected = getattr(child, field)
+                if selected and key in raw and str(raw[key]) not in selected:
+                    return False
+        child_counts.append(page.total_items)
+
+    if sum(child_counts) != parent_count or max(child_counts, default=0) >= parent_count:
+        return False
+    # Count metadata may drift while children are probed; fail closed.
+    latest, archive_id, _, _ = await _count(client, bucket_id, filters)
+    await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+    return latest.current_page == 1 and latest.total_items == parent_count
+
+
+async def _validated_children(
+    client: AsyncDbdClient,
+    bucket_id: int,
+    filters: SearchFilters,
+    provinces: list[str],
+    statuses: list[str],
+    parent_count: int,
+) -> list[SearchFilters]:
+    for options in _partition_plans(filters, provinces, statuses):
+        if await _probe_partition(client, bucket_id, filters, parent_count, options):
+            return options
+    return []
 
 
 async def _run_work(
@@ -546,6 +638,7 @@ async def _run_work(
     buckets_processed = pages_fetched = companies_written = 0
     provinces = await fetch_provinces(client)
     master_cache: dict[tuple[str, str], str] = {}
+    status_codes = await asyncio.to_thread(observed_status_codes)
 
     if not seeds:
         seeds = await province_seeds(client)
@@ -581,6 +674,7 @@ async def _run_work(
                     progress_line=progress_line,
                     lease_owner=owner if distributed else None,
                     lease_version=lease_version,
+                    status_codes=status_codes,
                 )
             except DiscoveryLeaseLost:
                 progress_line.event(
