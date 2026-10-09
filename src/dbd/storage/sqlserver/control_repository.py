@@ -447,6 +447,39 @@ class ControlRepository:
             key = month_key(now)
             current = self._read(conn, "GENERATION", f"core:{key}", lock=True)
             active = self.active_generation(conn)
+            business_active = generation_state.get("active_generation")
+            if business_active is not None and active is None:
+                # Migration/upgrade can encounter an unfinished production
+                # Generation whose business rows predate DBD_CONTROL. Do not
+                # let the calendar guard silently skip its recovery.
+                generation = int(business_active)
+                if generation < 2:
+                    raise ControlError(
+                        "Generation 1 cutover is unfinished; resolve it before "
+                        "starting SQL Server monthly Core"
+                    )
+                if current is not None:
+                    raise ControlError(
+                        "Cannot adopt unfinished business Generation: a monthly "
+                        "control record already exists for this calendar month"
+                    )
+                day, hour, minute = (
+                    int(schedule["day"]), int(schedule["hour"]),
+                    int(schedule["minute"]),
+                )
+                adopted = {
+                    "generation": generation, "cycle_month": key,
+                    "scheduled_at": iso(scheduled_utc(key, day, hour, minute)),
+                    "actual_started_at": None,
+                    "state": "SCHEDULED", "finished_at": None,
+                    "adopted_existing_business_generation": True,
+                    "adopted_at": iso(now),
+                }
+                self._put(conn, "GENERATION", f"core:{key}", adopted)
+                self._audit(conn, "generation_adopted", {
+                    "generation": generation, "month": key,
+                })
+                return "RESUME", adopted
             # A process can crash after all business rows have been durably
             # finalized but before the control record is marked terminal.
             # Reconcile from DBD_COMPANY truth rather than rediscovering and
