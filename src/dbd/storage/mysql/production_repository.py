@@ -119,16 +119,10 @@ class ProductionMySqlRepository:
     def check_database(self) -> dict[str, object]:
         info = check_connection()
         result = self.validate_schema()
-        with connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("SELECT CURRENT_USER()")
-                login = cur.fetchone()[0]
-                cur.execute("SHOW GRANTS FOR CURRENT_USER()")
-                grants = [str(row[0]) for row in cur.fetchall()]
-        # Actual privilege enforcement is performed by the target operations;
-        # never incorrectly declare DML permission on SHOW GRANTS alone.
-        return {**info, "login": login, "schema": result["status"],
-                "managed_tables": len(TABLES), "grants": grants}
+        # Privilege listings may expose account information; do not include
+        # them in terminal output. Write privileges are enforced by operations.
+        return {**info, "schema": result["status"],
+                "managed_tables": len(TABLES)}
 
     @contextmanager
     def manager_lock(self):
