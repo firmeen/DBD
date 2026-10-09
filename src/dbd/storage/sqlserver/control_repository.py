@@ -306,10 +306,15 @@ class ControlRepository:
             else:
                 result = dict(previous)
                 active = self.active_generation(conn)
-                if active is not None:
+                business_active = generation_state.get("active_generation")
+                if active is not None or business_active is not None:
+                    current_generation = (
+                        int(active["generation"])
+                        if active is not None else int(business_active)
+                    )
                     result["pending"] = {
                         "day": day, "hour": hour, "minute": minute,
-                        "generation": int(active["generation"]) + 1,
+                        "generation": current_generation + 1,
                     }
                 else:
                     result.update(day=day, hour=hour, minute=minute)
