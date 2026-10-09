@@ -770,3 +770,10 @@ def test_v06_plain_continuous_wait_uses_next_check_not_next_cycle() -> None:
     output = stream.getvalue()
     assert "WAITING next_check=00:00:05" in output
     assert "next_cycle" not in output
+
+
+def test_v06_monthly_no_work_statuses_are_neutral_not_failures() -> None:
+    terminal = V06Terminal("cycle-run", stream=StringIO(), tty=False)
+    assert terminal._status_style("NOT_DUE") == "dim"
+    assert terminal._status_style("ALREADY_COMPLETED") == "dim"
+    assert terminal._final_status({"status": "NOT_DUE"}) == "NOT_DUE"
