@@ -33,6 +33,7 @@ from ..core.exceptions import ContractError, IdentityConflict
 from ..core.settings import settings
 from ..storage.production import ProductionLeaseLost
 from .catalog import (
+    CORE_ENDPOINT_MASK,
     FINANCIAL_ENDPOINTS,
     FINANCIAL_MASK,
     EndpointSpec,
@@ -929,7 +930,16 @@ class DeepCollector:
                         if fiscal_present
                         else old_fiscal
                     )
-                    if fiscal_present and new_fiscal != old_fiscal:
+                    # Profile is authoritative once fetched. Stop all other
+                    # Core requests if it explicitly says the entity is no
+                    # longer active; keep outcome masks and historical payload.
+                    is_inactive = (
+                        "status_code" in values
+                        and str(values["status_code"] or "").strip() != "1"
+                    )
+                    if is_inactive:
+                        required &= ~CORE_ENDPOINT_MASK
+                    elif fiscal_present and new_fiscal != old_fiscal:
                         done &= ~FINANCIAL_MASK
                         not_available &= ~FINANCIAL_MASK
                         failed &= ~FINANCIAL_MASK
@@ -974,7 +984,10 @@ class DeepCollector:
                     raise ValueError(f"Unsupported domain write kind {kind!r}")
 
             resolved = (done | not_available | failed) & required
-            if resolved != required:
+            if required == 0:
+                status = "DISCOVERED"
+                completed_at = None
+            elif resolved != required:
                 status = "COLLECTING"
                 completed_at = None
             elif (failed & required) == 0:
@@ -1253,6 +1266,11 @@ class DeepCollector:
                     fail_unresolved=fail_unresolved,
                 )
                 if fail_unresolved:
+                    break
+                if spec.key == "profile" and not (
+                    int(company["required_mask"]) & CORE_ENDPOINT_MASK
+                ):
+                    # Profile just made this company ineligible for Core.
                     break
 
             await self._db_call(self._release_sync, company)
