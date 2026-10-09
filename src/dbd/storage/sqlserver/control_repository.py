@@ -368,10 +368,26 @@ class ControlRepository:
             if decision.action != "START":
                 return decision.action, current if decision.action == "ALREADY_COMPLETED" else active
             generation = int(decision.generation or 0)
+            from ...control import datetime_from_json, recommend_gap
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f"SELECT TOP (1) payload FROM {_TABLE} "
+                    "WHERE record_type='GENERATION' ORDER BY control_id DESC"
+                )
+                previous = cur.fetchone()
+            finally:
+                cur.close()
+            previous_started = (
+                datetime_from_json(json.loads(previous[0]).get("actual_started_at"))
+                if previous is not None else None
+            )
+            spacing_warning = recommend_gap(previous_started, now)
             row = {
                 "generation": generation, "cycle_month": decision.cycle_month,
                 "scheduled_at": iso(decision.scheduled_at), "actual_started_at": iso(now),
                 "state": "SCHEDULED", "finished_at": None,
+                "start_warning": spacing_warning,
             }
             if current is not None:
                 raise ControlError("Monthly generation already exists")
