@@ -1003,11 +1003,17 @@ def main():
             from dataclasses import asdict
 
             from ..workflow import cycle_loop, cycle_run, status
+            from ..presentation.setup import local_node_id
+            identity = {
+                "operator_name": settings.dbd_operator_name,
+                "node_id": local_node_id(),
+            }
 
             if args.cycle_command == "status":
                 v06_terminal = V06Terminal("cycle-status", app="DBD DATA").start(
                     phase=args.phase,
                     backend=args.backend or settings.dbd_production_backend,
+                    **identity,
                 )
                 current = asyncio.run(status(phase=args.phase, coverage=False, backend=args.backend))
                 v06_terminal.finish(asdict(current))
@@ -1016,6 +1022,8 @@ def main():
                 v06_terminal = V06Terminal(command, app="DBD DATA").start(
                     phase=args.phase,
                     backend=args.backend or settings.dbd_production_backend,
+                    auto=bool(getattr(args, "auto", False)),
+                    **identity,
                 )
                 common = {
                     "phase": args.phase,
@@ -1039,6 +1047,7 @@ def main():
                             raise SystemExit(2)
                         v06_terminal = V06Terminal(command, app="DBD DATA").start(
                             phase=args.phase, backend=args.backend or settings.dbd_production_backend,
+                            **identity,
                         )
                         common["event"] = v06_terminal.event
                         result = asyncio.run(cycle_run(**common, manual_confirmed=True))
