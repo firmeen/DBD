@@ -1132,7 +1132,7 @@ class DeepCollector:
                 if (unresolved & spec.bit) == 0:
                     continue
                 if lease_lost.is_set():
-                    raise SqlServerLeaseLost(
+                    raise ProductionLeaseLost(
                         f"Lease lost for company_id={company['company_id']}"
                     )
 
@@ -1152,7 +1152,7 @@ class DeepCollector:
                     )
                 except DeepNotAvailable as exc:
                     if lease_lost.is_set():
-                        raise SqlServerLeaseLost(
+                        raise ProductionLeaseLost(
                             f"Lease lost for company_id={company['company_id']}"
                         )
                     await self._commit_outcome(
@@ -1167,7 +1167,7 @@ class DeepCollector:
                     continue
                 except DeepTransientHttpError as exc:
                     if lease_lost.is_set():
-                        raise SqlServerLeaseLost(
+                        raise ProductionLeaseLost(
                             f"Lease lost for company_id={company['company_id']}"
                         )
                     error = f"{spec.key}: {exc}"
@@ -1187,7 +1187,7 @@ class DeepCollector:
                     return
                 except (DeepPermanentHttpError, DeepDecodeError) as exc:
                     if lease_lost.is_set():
-                        raise SqlServerLeaseLost(
+                        raise ProductionLeaseLost(
                             f"Lease lost for company_id={company['company_id']}"
                         )
                     await self._commit_outcome(
@@ -1237,7 +1237,7 @@ class DeepCollector:
                     error = None
 
                 if lease_lost.is_set():
-                    raise SqlServerLeaseLost(
+                    raise ProductionLeaseLost(
                         f"Lease lost for company_id={company['company_id']}"
                     )
                 await self._commit_outcome(
@@ -1307,7 +1307,7 @@ class DeepCollector:
 
             try:
                 await self._process_company(company, client)
-            except SqlServerLeaseLost as exc:
+            except ProductionLeaseLost as exc:
                 self._emit(
                     "warning",
                     worker=worker_no,
