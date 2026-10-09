@@ -586,6 +586,7 @@ def main():
     _add_output_options(
         sub.add_parser("about", help="Inspect package, Python and installation integrity")
     )
+    sub.add_parser("setup", help="Interactive SQL Server admin/worker readiness and schedule setup")
     _add_output_options(
         sub.add_parser("check-db", help="Check database connectivity"),
         json_enabled=False,
@@ -776,6 +777,10 @@ def main():
     )
     cycle_run_parser.add_argument("--phase", choices=("core", "extended"), default="core")
     cycle_run_parser.add_argument("--refresh", action="store_true")
+    cycle_run_parser.add_argument(
+        "--auto", action="store_true",
+        help="Task Scheduler mode: start only when the monthly generation is due",
+    )
     cycle_run_parser.add_argument("--concurrency", type=positive)
     cycle_run_parser.add_argument("--rate", type=positive_rate)
     cycle_run_parser.add_argument("--http-retries", type=non_negative)
@@ -815,7 +820,11 @@ def main():
     )
     v06_terminal = None
     try:
-        if args.command == "about":
+        if args.command == "setup":
+            from ..presentation.setup import SetupWizard
+            code = SetupWizard().run()
+            raise SystemExit(code)
+        elif args.command == "about":
             from ..core.package_info import package_environment_snapshot
 
             presenter.package_about(package_environment_snapshot())
@@ -1019,7 +1028,20 @@ def main():
                     "event": v06_terminal.event,
                 }
                 if args.cycle_command == "run":
-                    result = asyncio.run(cycle_run(**common))
+                    from ..control import EarlyStartConfirmationRequired
+                    from ..presentation.setup import confirm_early_cycle
+                    try:
+                        result = asyncio.run(cycle_run(**common, auto=args.auto))
+                    except EarlyStartConfirmationRequired:
+                        v06_terminal.close()
+                        v06_terminal = None
+                        if not confirm_early_cycle():
+                            raise SystemExit(2)
+                        v06_terminal = V06Terminal(command, app="DBD DATA").start(
+                            phase=args.phase, backend=args.backend or settings.dbd_production_backend,
+                        )
+                        common["event"] = v06_terminal.event
+                        result = asyncio.run(cycle_run(**common, manual_confirmed=True))
                 else:
                     result = asyncio.run(
                         cycle_loop(
