@@ -74,7 +74,8 @@ BEGIN
       AND JSON_VALUE(payload,'$.state') NOT IN ('COMPLETED','COMPLETE_WITH_FAILURES')
     ORDER BY control_id DESC;
 
-    IF @active_generation <> @generation
+    IF @active_generation IS NULL OR @state IS NULL
+       OR @active_generation <> @generation
        OR NOT (@state = 'COLLECTING' OR (@state = 'DISCOVERING' AND @role = 'ADMIN'))
     BEGIN
         ROLLBACK TRANSACTION;
@@ -255,10 +256,11 @@ class ControlRepository:
                 }
             else:
                 result = dict(previous)
-                if generation_state.get("active_generation") is not None:
+                active = self.active_generation(conn)
+                if active is not None:
                     result["pending"] = {
                         "day": day, "hour": hour, "minute": minute,
-                        "generation": int(generation_state["active_generation"]) + 1,
+                        "generation": int(active["generation"]) + 1,
                     }
                 else:
                     result.update(day=day, hour=hour, minute=minute)
@@ -377,6 +379,7 @@ class ControlRepository:
             self._audit(conn, "generation_started", {
                 "generation": generation, "month": decision.cycle_month,
                 "mode": "auto" if auto else "manual",
+                "early_override": bool(manual_confirmed),
             })
             pending = schedule.get("pending")
             if isinstance(pending, dict) and generation >= int(pending["generation"]):
