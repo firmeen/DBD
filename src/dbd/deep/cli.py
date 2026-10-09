@@ -41,7 +41,10 @@ def _idle_seconds(value: str) -> float:
 
 async def _status(args, terminal: V06Terminal) -> int:
     result = await status(
-        backend=args.backend,phase=args.phase, coverage=args.coverage)
+        backend=args.backend,
+        phase=args.phase,
+        coverage=args.coverage,
+    )
     terminal.finish(asdict(result))
     return 0
 
