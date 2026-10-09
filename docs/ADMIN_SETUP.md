@@ -13,6 +13,8 @@ dbd-data check-db --backend sqlserver
 
 Setup loads .env, prompts for missing values, creates a stable per-machine Node ID, checks the SQL login and offers monthly schedule / Worker approval. DBD_OPERATOR_NAME is a display label only. Never share the Admin SQL credentials with Workers. Schema migration requires adequate SQL Server CREATE/ALTER privileges; no Windows elevation is requested.
 
+The Admin SQL Server database user must be authorized to read and update `dbo.DBD_CONTROL`, write the five existing business tables as the current production workflow requires, and execute `dbo.DBD_CONTROL_ADMIT`. Initial migration of the control table/procedure needs the appropriate SQL Server schema permissions. `dbd-data setup` now checks admission EXECUTE permission before declaring READY. Do not grant Workers the Admin control-table permissions; see [Worker setup](WORKER_SETUP.md) for the exact restricted grants.
+
 ## Manual Core cycle (unchanged)
 
 ```powershell
