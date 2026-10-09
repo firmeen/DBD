@@ -76,7 +76,7 @@ BEGIN
 
     IF @active_generation IS NULL OR @state IS NULL
        OR @active_generation <> @generation
-       OR NOT (@state = 'COLLECTING' OR (@state = 'DISCOVERING' AND @role = 'ADMIN'))
+       OR NOT (@state IN ('COLLECTING','DRAINING') OR (@state = 'DISCOVERING' AND @role = 'ADMIN'))
     BEGIN
         ROLLBACK TRANSACTION;
         THROW 51002, 'Generation is not admitting HTTP work', 1;
