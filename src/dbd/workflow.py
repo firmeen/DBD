@@ -133,6 +133,17 @@ def _repo(repository: Any | None, backend: str | None = None) -> Any:
     return repository
 
 
+def _require_sql_admin(repo: Any) -> None:
+    if getattr(repo, "backend", None) != "sqlserver":
+        return
+    from .presentation.setup import local_node_id
+    from .storage.sqlserver.control_repository import ControlRepository
+    node = local_node_id()
+    if node is None:
+        raise RuntimeError("Admin setup is required for this SQL Server mutation")
+    ControlRepository().require_admin(node)
+
+
 def _manual_generation(
     repository: Any,
     *,
@@ -253,6 +264,7 @@ async def prepare(
     event: EventCallback | None = None,
 ) -> PrepareResult:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
         selected = int(generation or _manual_generation(repo, phase=phase))
         _emit(event, "phase_started", phase="PREPARE", generation=selected)
@@ -320,6 +332,7 @@ async def retry(
     event: EventCallback | None = None,
 ) -> RetryResult:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
         generation = _manual_generation(repo, phase=phase)
         _emit(event, "phase_started", phase="RETRY", generation=generation)
@@ -467,6 +480,7 @@ async def discover(
     event: EventCallback | None = None,
 ) -> tuple[int, DiscoveryResult]:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
         generation, resumed = _cycle_generation(repo, phase=phase)
         repo.assert_manager_lock(lock_conn)
@@ -618,6 +632,7 @@ async def fetch_company(
     event: EventCallback | None = None,
 ) -> FetchCompanyResult:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
 
     with repo.manager_lock() as lock_conn:
         state = repo.generation_state()
