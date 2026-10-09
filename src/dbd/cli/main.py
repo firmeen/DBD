@@ -952,8 +952,8 @@ def main():
                 raise ValueError("Search keywords must contain at least 3 characters")
             configure(args.metrics_port)
             v06_terminal = V06Terminal("discover", app="DBD DATA").start(
-                phase=args.phase
-            backend=args.backend or settings.dbd_production_backend,
+                phase=args.phase,
+                backend=args.backend or settings.dbd_production_backend,
             )
             generation, result = asyncio.run(
                 discover(
@@ -987,16 +987,16 @@ def main():
 
             if args.cycle_command == "status":
                 v06_terminal = V06Terminal("cycle-status", app="DBD DATA").start(
-                    phase=args.phase
-                backend=args.backend or settings.dbd_production_backend,
+                    phase=args.phase,
+                    backend=args.backend or settings.dbd_production_backend,
                 )
                 current = asyncio.run(status(phase=args.phase, coverage=False, backend=args.backend))
                 v06_terminal.finish(asdict(current))
             else:
                 command = "cycle-run" if args.cycle_command == "run" else "cycle-loop"
                 v06_terminal = V06Terminal(command, app="DBD DATA").start(
-                    phase=args.phase
-                backend=args.backend or settings.dbd_production_backend,
+                    phase=args.phase,
+                    backend=args.backend or settings.dbd_production_backend,
                 )
                 common = {
                     "phase": args.phase,
