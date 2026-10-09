@@ -777,3 +777,20 @@ def test_v06_monthly_no_work_statuses_are_neutral_not_failures() -> None:
     assert terminal._status_style("NOT_DUE") == "dim"
     assert terminal._status_style("ALREADY_COMPLETED") == "dim"
     assert terminal._final_status({"status": "NOT_DUE"}) == "NOT_DUE"
+
+
+def test_v06_terminal_shows_operator_node_and_auto_mode_without_leaking_secret() -> None:
+    from io import StringIO
+    output = StringIO()
+    terminal = V06Terminal("cycle-run", stream=output, tty=False)
+    terminal.start(
+        phase="core", backend="sqlserver",
+        operator_name="operator-test", node_id="node-test-123", auto=True,
+    )
+    terminal.console.print(terminal._render(104))
+    terminal.close()
+    text = output.getvalue()
+    assert "operator-test" in text
+    assert "node-test-123" in text
+    assert "AUTO" in text
+    assert "MSSQL_PASSWORD" not in text
