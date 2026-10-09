@@ -114,8 +114,28 @@ class FixedRateDbdClient:
         self.retries_made = 0
         self.rate_limit_hits = 0
 
+    def _new_auth_session(self):
+        """Account for upstream warm-up and token refresh HTTP in fleet budget.
+
+        The API client's asynchronous requests already reserve slots in
+        _admit(); the synchronous auth session needs the same admission gate.
+        Every retry performed inside warm_up/get_token goes through request().
+        """
+        session = create_session()
+        if self._shared_admission is not None:
+            original_request = session.request
+
+            def admitted_request(*args, **kwargs):
+                delay = float(self._shared_admission())
+                if delay > 0:
+                    time.sleep(delay)
+                return original_request(*args, **kwargs)
+
+            session.request = admitted_request
+        return session
+
     async def __aenter__(self) -> "FixedRateDbdClient":
-        self._auth_session = create_session()
+        self._auth_session = self._new_auth_session()
         self._session = AsyncSession(
             impersonate="chrome",
             max_clients=self.concurrency,
@@ -158,7 +178,7 @@ class FixedRateDbdClient:
 
             if reset_session:
                 self._auth_session.close()
-                self._auth_session = create_session()
+                self._auth_session = self._new_auth_session()
                 self._auth = DbdAuth()
                 self._token = None
             elif force or (
