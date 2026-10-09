@@ -1385,7 +1385,7 @@ class ProductionSqlServerRepository:
                         new_required, unresolved, remaining_failures,
                         remaining_failures, new_required,
                     ])
-                    if unresolved:
+                    if unresolved and not reopen_mask:
                         assignments.append("collection_completed_at=NULL")
                 assignments.append("last_seen_generation=%s")
                 params.append(int(generation))
@@ -1426,8 +1426,9 @@ class ProductionSqlServerRepository:
             predicate += " AND company_id=%s"
             params.append(int(company_id))
         core_required = (
-            f"({int(base_mask)} | "
-            f"CASE WHEN latest_fiscal_year IS NULL THEN 0 ELSE {int(financial_mask)} END)"
+            f"(CASE WHEN status_code=N\'1\' THEN ({int(base_mask)} | "
+            f"CASE WHEN latest_fiscal_year IS NULL THEN 0 ELSE {int(financial_mask)} END) "
+            f"ELSE 0 END)"
         )
         if phase == "core":
             required = (
@@ -1493,6 +1494,7 @@ class ProductionSqlServerRepository:
         company_id: int | None = None,
     ) -> dict[str, Any] | None:
         token = f"{worker_prefix}:{uuid4().hex}"
+        active_filter = "AND status_code=N'1'" if int(phase_mask) & CORE_ENDPOINT_MASK else ""
         company_filter = ""
         params: list[Any] = [
             int(generation),
@@ -1515,7 +1517,7 @@ class ProductionSqlServerRepository:
                           N'DISCOVERED',N'PENDING',N'COLLECTING',
                           N'RETRY_WAIT',N'PARTIAL'
                       )
-                      AND status_code=N'1'
+                      {active_filter}
                       AND (required_mask & %s) <> 0
                       AND ((required_mask & %s)
                            & ~(done_mask | not_available_mask | failed_mask)) <> 0
