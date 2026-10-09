@@ -727,3 +727,164 @@ def reset_discovery(refresh=False, bucket_id=None):
             result["buckets_updated"] = int(cur.rowcount or 0)
         conn.commit()
     return result
+
+
+def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[dict]:
+    """Read-only shortlist of historical zero-count children and capped leaves.
+
+    One item represents one parent/overflow bucket, not one child. No API
+    requests, archive writes or state changes occur during preview.
+    """
+    limit = max(1, int(limit))
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.id AS bucket_id,p.keyword,'stale_zero' AS reason,
+                   COUNT(c.id) AS children,
+                   SUM(c.status='done' AND c.total_items=0
+                       AND c.pages_total=0 AND c.pages_done=0) AS zero_children
+            FROM discovery_buckets p
+            JOIN discovery_buckets c ON c.parent_id=p.id
+            WHERE p.status='split' AND p.partition_lossless=0
+              AND (%s IS NULL OR p.id=%s)
+            GROUP BY p.id,p.keyword
+            HAVING zero_children>0
+            ORDER BY p.id LIMIT %s
+            """,
+            (parent_id, parent_id, limit),
+        )
+        candidates = [dict(row) for row in cur.fetchall()]
+        if len(candidates) < limit:
+            cur.execute(
+                """
+                SELECT p.id AS bucket_id,p.keyword,'overflow' AS reason,
+                       0 AS children,0 AS zero_children
+                FROM discovery_buckets p
+                WHERE p.status='failed' AND p.total_items>10000
+                  AND NOT EXISTS (
+                      SELECT 1 FROM discovery_buckets c WHERE c.parent_id=p.id
+                  )
+                  AND (%s IS NULL OR p.id=%s)
+                ORDER BY p.id LIMIT %s
+                """,
+                (parent_id, parent_id, limit-len(candidates)),
+            )
+            candidates.extend(dict(row) for row in cur.fetchall())
+        return candidates
+
+
+def recovery_family(parent_id: int) -> tuple[dict, list[dict]]:
+    """Read the exact persisted filters/children for one partition."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT * FROM discovery_buckets WHERE id=%s", (parent_id,))
+        parent = cur.fetchone()
+        if parent is None:
+            raise ValueError(f"Discovery parent {parent_id} not found")
+        cur.execute(
+            "SELECT * FROM discovery_buckets WHERE parent_id=%s ORDER BY id",
+            (parent_id,),
+        )
+        return dict(parent), [dict(row) for row in cur.fetchall()]
+
+
+def apply_recovery_recount(
+    parent_id: int,
+    fresh_parent_count: int,
+    child_counts: dict[int, int],
+) -> dict[str, int | bool]:
+    """Atomically reopen only proven false-zero leaves, without deleting pages.
+
+    Every sibling must have a fresh count before this method may run. Already
+    collected nonzero siblings are never reset on a changed count: they remain
+    visible as a reconciliation blocker for a separate controlled recovery.
+    """
+    reopened = 0
+    changed_nonzero = 0
+    with connect() as conn:
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM discovery_buckets WHERE id=%s FOR UPDATE",
+                    (parent_id,),
+                )
+                parent = cur.fetchone()
+                if parent is None or parent["status"] != "split":
+                    raise RuntimeError("Recovery parent is no longer a split bucket")
+                cur.execute(
+                    "SELECT * FROM discovery_buckets WHERE parent_id=%s ORDER BY id FOR UPDATE",
+                    (parent_id,),
+                )
+                children = cur.fetchall()
+                if not children or {int(c["id"]) for c in children} != set(child_counts):
+                    raise RuntimeError("Recovery children changed during recount")
+                for child in children:
+                    if child["lease_owner"] is not None and child["lease_expires_at"] is not None:
+                        if child["lease_expires_at"] > _now():
+                            raise DiscoveryLeaseLost("Recovery child has an active worker lease")
+                if parent["lease_owner"] is not None and parent["lease_expires_at"] is not None:
+                    if parent["lease_expires_at"] > _now():
+                        raise DiscoveryLeaseLost("Recovery parent has an active worker lease")
+
+                counts_match = sum(child_counts.values()) == int(fresh_parent_count)
+                for child in children:
+                    current = int(child["total_items"] or 0)
+                    fresh = int(child_counts[int(child["id"])])
+                    if child["status"] == "done" and current == 0 and fresh > 0:
+                        if int(child["pages_done"] or 0) or int(child["pages_total"] or 0):
+                            raise RuntimeError("False-zero child has existing completed pages")
+                        cur.execute(
+                            "SELECT COUNT(*) AS n FROM discovery_pages WHERE bucket_id=%s",
+                            (child["id"],),
+                        )
+                        if int(cur.fetchone()["n"]):
+                            raise RuntimeError("False-zero child has page checkpoints; refused to reset")
+                        cur.execute(
+                            """
+                            UPDATE discovery_buckets
+                            SET status='pending',total_items=NULL,pages_total=NULL,
+                                pages_done=0,rows_seen=0,partition_lossless=NULL,
+                                last_error=NULL,lease_owner=NULL,lease_expires_at=NULL,
+                                lease_version=lease_version+1,updated_at=UTC_TIMESTAMP(6)
+                            WHERE id=%s
+                            """,
+                            (child["id"],),
+                        )
+                        reopened += 1
+                    elif child["total_items"] is not None and current != fresh:
+                        changed_nonzero += 1
+
+                # Do not mix a new parent count with stale completed child counts.
+                if counts_match and changed_nonzero == 0:
+                    cur.execute(
+                        """
+                        UPDATE discovery_buckets
+                        SET total_items=%s,partition_lossless=0,last_error=NULL,
+                            updated_at=UTC_TIMESTAMP(6)
+                        WHERE id=%s
+                        """,
+                        (fresh_parent_count, parent_id),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        UPDATE discovery_buckets
+                        SET partition_lossless=0,
+                            last_error=%s,updated_at=UTC_TIMESTAMP(6)
+                        WHERE id=%s
+                        """,
+                        (
+                            "Recovery recount unresolved: parent/child counts differ "
+                            "or an already-collected child count changed",
+                            parent_id,
+                        ),
+                    )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+    return {
+        "reopened": reopened,
+        "changed_nonzero": changed_nonzero,
+        "count_consistent": counts_match,
+        "parent_updated": counts_match and changed_nonzero == 0,
+    }
