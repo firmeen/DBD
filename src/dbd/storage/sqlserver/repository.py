@@ -1426,13 +1426,13 @@ class ProductionSqlServerRepository:
             predicate += " AND company_id=%s"
             params.append(int(company_id))
         core_required = (
-            f"(CASE WHEN status_code=N\'1\' THEN ({int(base_mask)} | "
-            f"CASE WHEN latest_fiscal_year IS NULL THEN 0 ELSE {int(financial_mask)} END) "
-            f"ELSE 0 END)"
+            f"({int(base_mask)} | "
+            f"CASE WHEN latest_fiscal_year IS NULL THEN 0 ELSE {int(financial_mask)} END)"
         )
         if phase == "core":
             required = (
-                f"((required_mask & ~{int(core_mask)}) | {core_required})"
+                f"((required_mask & ~{int(core_mask)}) | "
+                f"CASE WHEN status_code=N'1' THEN {core_required} ELSE 0 END)"
             )
         else:
             required = (
