@@ -69,6 +69,12 @@ def register_windows_task(*, check_hour: int = 9, check_minute: int = 0, wake: b
     script = _task_script()
     if not script.exists():
         raise ControlError(f"Auto-run script not found: {script}")
+    cli = PROJECT_ROOT / ".venv" / "Scripts" / "dbd-data.exe"
+    if not cli.is_file():
+        raise ControlError(
+            "Windows Auto Run requires the portable project .venv\\Scripts\\dbd-data.exe; "
+            "create the project venv and install the package before enabling Auto Run"
+        )
     task_path = str(script).replace("'", "''")
     root_path = str(PROJECT_ROOT).replace("'", "''")
     name = TASK_NAME.replace("'", "''")
