@@ -412,7 +412,7 @@ def test_generation_state_resumes_partial_finalization(monkeypatch) -> None:
 
 
 def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -> None:
-    first_cursor = _SequenceCursor([(42, 4, None, None)])
+    first_cursor = _SequenceCursor([(42, 4, None, None, '1', 113, 113, 0, 0, None)])
     repo = ProductionSqlServerRepository()
     repo.upsert_discovered_companies(
         _CaptureConnection(first_cursor),
@@ -432,7 +432,7 @@ def test_discovery_refresh_reopens_bits_only_on_first_generation_observation() -
     assert "not_available_mask=(not_available_mask & ~%s)" in first_update
     assert "failed_mask=(failed_mask & ~%s)" in first_update
 
-    rerun_cursor = _SequenceCursor([(42, 5, None, None)])
+    rerun_cursor = _SequenceCursor([(42, 5, None, None, '1', 113, 112, 0, 0, None)])
     repo.upsert_discovered_companies(
         _CaptureConnection(rerun_cursor),
         [
@@ -794,7 +794,7 @@ def test_generation_state_rejects_impossible_global_ordering(monkeypatch) -> Non
 
 
 def test_discovery_preserves_profile_owned_columns_after_profile_collection() -> None:
-    cursor = _SequenceCursor([(42, 4, "{}", "2567")])
+    cursor = _SequenceCursor([(42, 4, "{}", "2567", "1", 127, 127, 0, 0, None)])
     repo = ProductionSqlServerRepository()
     repo.upsert_discovered_companies(
         _CaptureConnection(cursor),
@@ -819,7 +819,7 @@ def test_discovery_preserves_profile_owned_columns_after_profile_collection() ->
 
 
 def test_discovery_fiscal_change_reopens_financial_scope_once() -> None:
-    cursor = _SequenceCursor([(42, 4, "{}", "2567")])
+    cursor = _SequenceCursor([(42, 4, "{}", "2567", "1", 127, 127, 0, 0, None)])
     ProductionSqlServerRepository().upsert_discovered_companies(
         _CaptureConnection(cursor),
         [
@@ -835,13 +835,13 @@ def test_discovery_fiscal_change_reopens_financial_scope_once() -> None:
     )
     sql, params = cursor.executions[-1]
     compact = " ".join(sql.split())
-    assert "required_mask=(required_mask | %s)" in compact
+    assert "required_mask=%s" in compact
     assert "done_mask=(done_mask & ~%s)" in compact
     assert "not_available_mask=(not_available_mask & ~%s)" in compact
     assert "failed_mask=(failed_mask & ~%s)" in compact
-    assert params.count(14) >= 4
+    assert params.count(14) >= 3
 
-    rerun = _SequenceCursor([(42, 5, "{}", "2568")])
+    rerun = _SequenceCursor([(42, 5, "{}", "2568", "1", 127, 113, 0, 0, None)])
     ProductionSqlServerRepository().upsert_discovered_companies(
         _CaptureConnection(rerun),
         [
@@ -860,7 +860,7 @@ def test_discovery_fiscal_change_reopens_financial_scope_once() -> None:
 
 
 def test_discovery_explicit_empty_fiscal_scope_removes_financial_required_bits() -> None:
-    cursor = _SequenceCursor([(42, 4, "{}", "2568")])
+    cursor = _SequenceCursor([(42, 4, "{}", "2568", "1", 127, 127, 0, 0, None)])
     ProductionSqlServerRepository().upsert_discovered_companies(
         _CaptureConnection(cursor),
         [
@@ -875,7 +875,8 @@ def test_discovery_explicit_empty_fiscal_scope_removes_financial_required_bits()
         financial_mask=14,
     )
     sql, _params = cursor.executions[-1]
-    assert "required_mask=(required_mask & ~%s)" in " ".join(sql.split())
+    assert "required_mask=%s" in " ".join(sql.split())
+    assert 113 in _params
 
 
 def test_prepare_rebuilds_core_financial_scope_and_batches() -> None:
@@ -999,3 +1000,58 @@ def test_industry_conflict_without_source_timestamp_cannot_regress_dated_row() -
                 }
             ],
         )
+
+
+def test_core_discovery_inactive_refuses_force_refresh_without_data_loss() -> None:
+    cursor = _SequenceCursor([
+        (42, 1, "{}", "2568", "1", 127, 127, 0, 0, None),
+    ])
+    ProductionSqlServerRepository().upsert_discovered_companies(
+        _CaptureConnection(cursor),
+        [{
+            "juristic_type_code": "7",
+            "registration_no": "0107556000051",
+            "status_code": "2",
+            "status_description": "Inactive",
+        }],
+        generation=2, financial_mask=14, refresh_mask=127,
+    )
+    sql, params = cursor.executions[-1]
+    assert "[status_code]=%s" in sql
+    assert "required_mask=%s" in sql
+    assert 0 in params
+    assert "done_mask=(done_mask & ~%s)" not in sql
+    assert "not_available_mask=(not_available_mask & ~%s)" not in sql
+
+
+def test_core_reactivation_reopens_profile_only_when_other_results_fresh() -> None:
+    cursor = _SequenceCursor([
+        (42, 1, "{}", None, "2", 0, 113, 0, 0, None),
+    ])
+    ProductionSqlServerRepository().upsert_discovered_companies(
+        _CaptureConnection(cursor),
+        [{"juristic_type_code": "7", "registration_no": "0107556000051",
+          "status_code": "1"}],
+        generation=2, financial_mask=14,
+    )
+    sql, params = cursor.executions[-1]
+    assert "required_mask=%s" in sql
+    assert 113 in params
+    assert params.count(1) >= 3  # only Profile bit reopened
+
+
+def test_sqlserver_core_prepare_and_claim_gate_active_status() -> None:
+    repo = ProductionSqlServerRepository()
+    prepare = _SequenceCursor([(0, None)])
+    repo.prepare_companies(
+        _CaptureConnection(prepare), generation=2, core_mask=127,
+        base_mask=113, financial_mask=14, extended_mask=1920,
+        phase="core", limit=500, after_company_id=0,
+    )
+    assert "status_code=N'1'" in prepare.executions[-1][0]
+    claim = _SequenceCursor([None])
+    repo.claim_company(
+        _CaptureConnection(claim), generation=2, phase_mask=127,
+        lease_seconds=300, worker_prefix="test",
+    )
+    assert "AND status_code=N'1'" in claim.executions[-1][0]

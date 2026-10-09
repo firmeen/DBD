@@ -251,3 +251,92 @@ def test_mysql_industry_rejects_duplicate_scope_with_conflicting_payload():
         )
     assert cursor.sql == [] and cursor.bulk == []
 
+
+class _CoreSqlCursor:
+    def __init__(self, existing=None):
+        self.existing = existing
+        self.calls = []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=()):
+        self.calls.append((str(sql), tuple(params)))
+
+    def fetchone(self):
+        return self.existing
+
+    def fetchall(self):
+        return []
+
+
+def test_mysql_core_inactive_does_not_reopen_force_refreshed_results():
+    cursor = _CoreSqlCursor(
+        (42, 1, "{}", "2568", "1", 127, 127, 0, 0, None)
+    )
+    result = ProductionMySqlRepository().upsert_discovered_companies(
+        SimpleNamespace(cursor=lambda: cursor),
+        [{"juristic_type_code": "7", "registration_no": "0107556000051",
+          "status_code": "2", "status_description": "Inactive"}],
+        generation=2, financial_mask=14, refresh_mask=127,
+    )
+    sql, params = cursor.calls[-1]
+    assert result["updated"] == 1
+    assert "`status_code`=%s" in sql
+    assert "required_mask=%s" in sql
+    assert 0 in params
+    assert "done_mask=(done_mask & ~%s)" not in sql
+    assert "not_available_mask=(not_available_mask & ~%s)" not in sql
+
+
+def test_mysql_core_reactivation_reopens_only_profile_for_fresh_history():
+    cursor = _CoreSqlCursor(
+        (42, 1, "{}", None, "2", 0, 113, 0, 0, None)
+    )
+    ProductionMySqlRepository().upsert_discovered_companies(
+        SimpleNamespace(cursor=lambda: cursor),
+        [{"juristic_type_code": "7", "registration_no": "0107556000051",
+          "status_code": "1"}],
+        generation=2, financial_mask=14,
+    )
+    sql, params = cursor.calls[-1]
+    assert "required_mask=%s" in sql
+    assert 113 in params
+    assert params.count(1) >= 3
+
+
+def test_mysql_core_dated_stale_refresh_is_one_endpoint_only():
+    cursor = _CoreSqlCursor(
+        (42, 1, "{}", None, "1", 113, 113, 0, 0,
+         '{"committees":{"status":"done",'
+         '"requested_at":"2020-01-01T00:00:00+00:00"}}')
+    )
+    ProductionMySqlRepository().upsert_discovered_companies(
+        SimpleNamespace(cursor=lambda: cursor),
+        [{"juristic_type_code": "7", "registration_no": "0107556000051",
+          "status_code": "1"}],
+        generation=2, financial_mask=14,
+    )
+    sql, params = cursor.calls[-1]
+    assert "done_mask=(done_mask & ~%s)" in sql
+    assert params.count(16) >= 3
+
+
+def test_mysql_prepare_and_claim_filter_ineligible_core():
+    repo = ProductionMySqlRepository()
+    prepare = _CoreSqlCursor()
+    repo.prepare_companies(
+        SimpleNamespace(cursor=lambda: prepare),
+        generation=2, core_mask=127, base_mask=113, financial_mask=14,
+        extended_mask=1920, phase="core",
+    )
+    assert "status_code=" in prepare.calls[0][0]
+    claim = _CoreSqlCursor()
+    assert repo.claim_company(
+        SimpleNamespace(cursor=lambda: claim), generation=2,
+        phase_mask=127, lease_seconds=300, worker_prefix="test",
+    ) is None
+    assert "status_code=" in claim.calls[0][0]

@@ -11,6 +11,9 @@ from uuid import uuid4
 
 import pymysql
 
+from ...core.settings import settings
+from ...deep.catalog import CORE_ENDPOINT_MASK, core_discovery_plan
+
 from ..production import ProductionLeaseLost
 from ..sqlserver.repository import (
     _COMPANY_STATE_COLUMNS,
@@ -431,7 +434,8 @@ class ProductionMySqlRepository:
                 if unknown:
                     raise MySqlProductionWriteError(f"Unsupported discovery columns: {sorted(unknown)}")
                 cur.execute(
-                    "SELECT company_id,last_seen_generation,profile_payload,latest_fiscal_year "
+                    "SELECT company_id,last_seen_generation,profile_payload,latest_fiscal_year,"
+                    "status_code,required_mask,done_mask,not_available_mask,failed_mask,endpoint_meta "
                     "FROM DBD_COMPANY WHERE juristic_type_code=%s AND registration_no=%s FOR UPDATE",
                     (juristic, number),
                 )
@@ -460,27 +464,46 @@ class ProductionMySqlRepository:
                     )
                     inserted += 1
                     continue
-                pk, seen, has_profile, previous_fiscal = previous
+                (
+                    pk, seen, has_profile, previous_fiscal, previous_status,
+                    old_required, old_done, old_na, old_failed, old_meta,
+                ) = previous
                 if int(seen or 0) > generation:
                     raise MySqlProductionWriteError("Discovery generation regression")
                 first_observation = int(seen or 0) < generation
-                fiscal_present = "latest_fiscal_year" in values
-                changed_fiscal = fiscal_present and values["latest_fiscal_year"] != previous_fiscal
+                current_status = values.get("status_code", previous_status)
+                current_fiscal = values.get("latest_fiscal_year", previous_fiscal)
                 if has_profile is not None:
+                    # Preserve Profile-owned fields; legal status is updated by
+                    # each fresh Search observation to prevent stale eligibility.
                     values = {k: v for k, v in values.items() if k in {
                         "master_payload", "published_at", "latest_fiscal_year",
+                        "status_code", "status_description",
                     }}
-                reopened = int(refresh_mask) if first_observation else 0
-                if changed_fiscal:
-                    reopened |= int(financial_mask)
+                core_required, reopened = core_discovery_plan(
+                    previous_status=previous_status,
+                    current_status=current_status,
+                    previous_fiscal=previous_fiscal,
+                    current_fiscal=current_fiscal,
+                    done_mask=int(old_done or 0),
+                    not_available_mask=int(old_na or 0),
+                    endpoint_meta=old_meta,
+                    first_observation=first_observation,
+                    force_refresh_mask=int(refresh_mask),
+                    stale_hours=settings.dbd_refresh_stale_hours,
+                    now=datetime.now(timezone.utc),
+                )
+                if first_observation:
+                    # Extended --refresh keeps its existing independent bits.
+                    reopened |= int(refresh_mask) & ~CORE_ENDPOINT_MASK
+                required = (int(old_required or 0) & ~CORE_ENDPOINT_MASK) | core_required
+                resolved = (int(old_done or 0) | int(old_na or 0) | int(old_failed or 0)) & ~reopened
+                unresolved = required & ~resolved
+                failed = int(old_failed or 0) & ~reopened & required
                 assignments = [f"`{k}`=%s" for k in values]
                 params = list(values.values())
-                if changed_fiscal:
-                    if values["latest_fiscal_year"] is None:
-                        assignments.append("required_mask=(required_mask & ~%s)")
-                    else:
-                        assignments.append("required_mask=(required_mask | %s)")
-                    params.append(int(financial_mask))
+                assignments.append("required_mask=%s")
+                params.append(required)
                 if reopened:
                     assignments.extend([
                         "done_mask=(done_mask & ~%s)",
@@ -491,10 +514,19 @@ class ProductionMySqlRepository:
                     params.extend([reopened, reopened, reopened])
                     if first_observation and refresh_mask:
                         refresh_reopened += 1
+                if required != int(old_required or 0) or reopened:
                     assignments.append(
                         "collect_status=IF(lease_owner IS NOT NULL "
-                        "AND lease_expires_at>UTC_TIMESTAMP(6), 'COLLECTING', 'PENDING')"
+                        "AND lease_expires_at>UTC_TIMESTAMP(6), 'COLLECTING', %s)"
                     )
+                    new_status = (
+                        "DISCOVERED" if not required else "PENDING" if unresolved else
+                        "COMPLETE" if not failed else
+                        "FAILED" if failed == required else "PARTIAL"
+                    )
+                    params.append(new_status)
+                    if unresolved and not reopened:
+                        assignments.append("collection_completed_at=NULL")
                 assignments.append("last_seen_generation=%s")
                 params.append(int(generation))
                 cur.execute(
@@ -517,7 +549,8 @@ class ProductionMySqlRepository:
             f" 0,{int(financial_mask)}))"
         )
         required = (
-            f"((required_mask & ~{int(core_mask)}) | {required_core})"
+            f"((required_mask & ~{int(core_mask)}) | "
+            f"IF(status_code='1' OR {int(generation)}=1, {required_core}, 0))"
             if phase == "core" else
             f"((IF(required_mask=0, {required_core}, required_mask)) "
             f"| {int(extended_mask)})"
@@ -561,7 +594,8 @@ class ProductionMySqlRepository:
         where = (
             "last_seen_generation=%s AND collect_status IN "
             "('DISCOVERED','PENDING','COLLECTING','RETRY_WAIT','PARTIAL') "
-            "AND (required_mask & %s) <> 0 "
+            "AND " + ("status_code=\'1\' AND " if int(generation) >= 2 and int(phase_mask) & CORE_ENDPOINT_MASK else "")
+            + "(required_mask & %s) <> 0 "
             "AND ((required_mask & %s) & "
             "~(done_mask | not_available_mask | failed_mask)) <> 0 "
             "AND (retry_at IS NULL OR retry_at<=UTC_TIMESTAMP(6)) "

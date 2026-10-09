@@ -646,3 +646,53 @@ async def test_cycle_forwards_discovery_event_and_preserves_phase_order(monkeypa
             "invalid_rows": 0,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_core_cycle_finalizes_when_all_discovered_entities_are_ineligible(
+    monkeypatch,
+) -> None:
+    # Real eligibility lives in the two repository implementations. This
+    # guards the shared Cycle contract: zero eligible HTTP claims is valid.
+    repo = _WorkflowRepo(finalized=1, active=None, unresolved=0)
+    observed = []
+
+    async def fake_discovery(*_args, **kwargs):
+        observed.append(("discover", kwargs["generation"]))
+        return DiscoveryResult(1, 1, 10, 1, 0)
+
+    async def fake_collect(**kwargs):
+        observed.append(("collect", kwargs["generation"]))
+        return {"companies_claimed": 0, "companies_finished": 0}
+
+    async def fake_verify(**kwargs):
+        observed.append(("verify", kwargs["generation"]))
+        return VerifyResult(
+            generation=kwargs["generation"], phase="core", status="COMPLETE",
+            details={"ok": True, "unfinished_rows": 0,
+                     "global_terminal_failures": 0},
+        )
+
+    monkeypatch.setattr(workflow.discovery, "run", fake_discovery)
+    monkeypatch.setattr(workflow, "collect", fake_collect)
+    monkeypatch.setattr(workflow, "verify", fake_verify)
+    result = await workflow.cycle_run(
+        phase="core", repository=repo, verbose=False
+    )
+
+    assert result.status == "COMPLETE"
+    assert result.generation == 2
+    assert result.collection["companies_claimed"] == 0
+    assert result.finalized_rows > 0
+    assert [name for name, _ in observed] == [
+        "discover", "collect", "verify", "verify"
+    ]
+
+
+def test_core_cycle_resumes_same_generation_without_skipping_ineligible_rows() -> None:
+    repo = _WorkflowRepo(finalized=1, active=2, unfinished=17, unresolved=0)
+    assert workflow._cycle_generation(repo, phase="core") == (2, True)
+    repo.active = None
+    repo.finalized = 2
+    repo.unfinished = 0
+    assert workflow._cycle_generation(repo, phase="core") == (3, False)

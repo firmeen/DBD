@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import contextmanager
+from datetime import datetime, timezone
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -15,6 +16,9 @@ from dbd.deep.catalog import (
     ALL_ENDPOINT_MASK,
     BASE_REQUIRED_MASK,
     CORE_ENDPOINTS,
+    core_discovery_plan,
+    core_required_mask,
+    core_stale_mask,
     DESTINATION_COLUMNS,
     ENDPOINT_BITS,
     EXTENDED_ENDPOINT_MASK,
@@ -678,3 +682,89 @@ async def test_transient_sql_call_retries_with_existing_repository_classifier(mo
 
     assert await collector._db_call(flaky) == "ok"
     assert attempts == 3
+
+
+def test_core_policy_active_only_and_fiscal_requirements() -> None:
+    assert core_required_mask("1", None) == BASE_REQUIRED_MASK
+    assert core_required_mask("1", "2568") == ACTIVE_ENDPOINT_MASK
+    assert core_required_mask("2", "2568") == 0
+    assert core_required_mask(None, "2568") == 0
+
+
+def test_core_policy_stale_is_dated_selective_not_mass_reopen() -> None:
+    now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    meta = {
+        "profile": {
+            "status": "done", "requested_at": "2026-10-09T00:00:00+00:00"
+        },
+        "committees": {
+            "status": "done", "requested_at": "2026-09-01T00:00:00+00:00"
+        },
+        "transformations": {"status": "done"},  # G1 unknown: do not refresh
+        "committee_signs": {
+            "status": "failed", "requested_at": "2026-09-01T00:00:00+00:00"
+        },
+    }
+    stale = core_stale_mask(
+        meta, BASE_REQUIRED_MASK,
+        stale_hours={"profile": 24, "committees": 168},
+        now=now,
+    )
+    assert stale == ENDPOINT_BITS["committees"]
+    expected, opened = core_discovery_plan(
+        previous_status="1", current_status="1",
+        previous_fiscal=None, current_fiscal=None,
+        done_mask=BASE_REQUIRED_MASK, not_available_mask=0,
+        endpoint_meta=meta, first_observation=True,
+        force_refresh_mask=0, stale_hours={"profile": 24, "committees": 168},
+        now=now,
+    )
+    assert expected == BASE_REQUIRED_MASK
+    assert opened == ENDPOINT_BITS["committees"]
+
+
+def test_core_policy_resume_force_and_inactive_transition() -> None:
+    now = datetime(2026, 10, 9, tzinfo=timezone.utc)
+    args = dict(
+        previous_status="1", previous_fiscal="2567", current_fiscal="2568",
+        done_mask=ACTIVE_ENDPOINT_MASK, not_available_mask=0,
+        endpoint_meta=None, first_observation=True,
+        force_refresh_mask=127, stale_hours={}, now=now,
+    )
+    assert core_discovery_plan(current_status="2", **args) == (0, 0)
+    assert core_discovery_plan(current_status=None, **args) == (0, 0)
+    assert core_discovery_plan(current_status="1", **args) == (127, 127)
+    args["previous_fiscal"] = "2568"
+    args["first_observation"] = False
+    assert core_discovery_plan(current_status="1", **args) == (127, 0)
+
+
+@pytest.mark.asyncio
+async def test_inactive_profile_stops_rest_of_core_without_erasing_history() -> None:
+    company = _outcome_company(BASE_REQUIRED_MASK)
+    company["done_mask"] = ENDPOINT_BITS["transformations"]
+    repo = _OutcomeRepo(company)
+    collector = _collector(repo)
+    calls = []
+
+    class Client:
+        async def fetch(self, _method, path, **_kwargs):
+            calls.append(path)
+            return SimpleNamespace(
+                data={
+                    "jpNo": company["registration_no"],
+                    "jpTypeCode": company["juristic_type_code"],
+                    "jpStatCode": "2",
+                },
+                status=200,
+                requested_at=datetime(2026, 10, 9, tzinfo=timezone.utc),
+            )
+
+    await collector._process_company(company, Client())
+
+    assert len(calls) == 1
+    assert repo.state["required_mask"] == 0
+    assert repo.state["done_mask"] & ENDPOINT_BITS["profile"]
+    assert repo.state["done_mask"] & ENDPOINT_BITS["transformations"]
+    assert repo.state["collect_status"] == "DISCOVERED"
+    assert repo.released == 1
