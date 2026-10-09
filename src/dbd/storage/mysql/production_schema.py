@@ -105,6 +105,43 @@ def _indexes(conn, table: str) -> set[str]:
         return {str(row[0]) for row in cur.fetchall()}
 
 
+def _verify_indexes(conn, table: str) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT INDEX_NAME,SEQ_IN_INDEX,COLUMN_NAME,NON_UNIQUE,SUB_PART,"
+            "INDEX_TYPE,EXPRESSION FROM information_schema.STATISTICS "
+            "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s "
+            "ORDER BY INDEX_NAME,SEQ_IN_INDEX",
+            (table,),
+        )
+        rows = cur.fetchall()
+    actual = {}
+    for index, seq, col, nonunique, prefix, kind, expression in rows:
+        actual.setdefault(str(index), []).append((
+            int(seq), None if col is None else str(col),
+            int(nonunique), prefix, str(kind), expression,
+        ))
+    pk = actual.get("PRIMARY")
+    if pk is None or len(pk) != 1 or pk[0][1] != TABLE_COLUMNS[f"dbo.{table}"][0].name:
+        raise RuntimeError(f"{table} primary key does not match production contract")
+    for name, unique, columns in INDEXES[f"dbo.{table}"]:
+        parts = actual.get(name)
+        if parts is None or len(parts) != len(columns):
+            raise RuntimeError(f"{table} missing or incompatible index {name}")
+        for part, col in zip(parts, columns, strict=True):
+            seq, stored_column, nonunique, prefix, kind, expression = part
+            if nonunique != (0 if unique else 1) or prefix is not None or kind.upper() != "BTREE":
+                raise RuntimeError(f"{table} incompatible index properties {name}")
+            if table == "DBD_INDUSTRY" and name == "UQ_DBD_INDUSTRY_SCOPE" and col not in {
+                "submit_objective_code", "fiscal_year",
+            }:
+                simplified = re.sub(r"[\\s`()]", "", str(expression or "").lower())
+                if simplified != f"coalesce{col.lower()},''":
+                    raise RuntimeError(f"{table} nullable scope index mismatch {name}")
+            elif str(stored_column or "").lower() != col.lower() or expression is not None:
+                raise RuntimeError(f"{table} index column mismatch {name}")
+
+
 def _columns(conn, table: str) -> dict[str, tuple[str, str, str]]:
     with conn.cursor() as cur:
         cur.execute(
@@ -137,12 +174,7 @@ def validate_schema(conn) -> dict[str, object]:
                 raise RuntimeError(f"{table}.{spec.name} nullability mismatch")
             if spec.identity and "auto_increment" not in actual_extra:
                 raise RuntimeError(f"{table}.{spec.name} missing AUTO_INCREMENT")
-        indexes = _indexes(conn, table)
-        if "PRIMARY" not in indexes:
-            raise RuntimeError(f"{table} missing PRIMARY KEY")
-        for index, _, _ in INDEXES[f"dbo.{table}"]:
-            if index not in indexes:
-                raise RuntimeError(f"{table} missing required index {index}")
+        _verify_indexes(conn, table)
         with conn.cursor() as cur:
             cur.execute(
                 "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
