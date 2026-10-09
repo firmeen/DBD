@@ -194,3 +194,75 @@ def test_optimistic_sql_updates_have_rowversion_guard() -> None:
     conn = Conn()
     ControlRepository._put(conn, "SCHEDULE", "core", _schedule())
     assert any("AND row_version=%s" in sql for sql in conn.cursor_instance.statements)
+
+
+def test_recovery_reconciles_crash_after_business_finalize(monkeypatch) -> None:
+    """Never reopen HTTP work just because Control missed its terminal commit."""
+    from contextlib import contextmanager
+    import dbd.storage.sqlserver.control_repository as control_sql
+
+    class Cursor:
+        def execute(self, query, params=()):
+            assert "required_mask & failed_mask" in query
+            assert tuple(params) == (2,)
+        def fetchone(self):
+            return (0,)
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    @contextmanager
+    def fake_transaction():
+        yield Connection()
+
+    row = {
+        "generation": 2, "cycle_month": "2026-10", "state": "FINALIZING",
+        "scheduled_at": "2026-10-15T02:00:00+00:00",
+        "actual_started_at": "2026-10-15T02:00:00+00:00",
+    }
+    writes = []
+    repo = ControlRepository()
+    monkeypatch.setattr(control_sql, "transaction", fake_transaction)
+    monkeypatch.setattr(repo, "require_admin", lambda _node: None)
+    monkeypatch.setattr(
+        repo, "_read",
+        lambda _conn, kind, key, lock=False: (
+            _schedule() if kind == "SCHEDULE" else
+            row if kind == "GENERATION" and key == "core:2026-10" else None
+        ),
+    )
+    monkeypatch.setattr(repo, "active_generation", lambda _conn: row if row["state"] == "FINALIZING" else None)
+    monkeypatch.setattr(repo, "_put", lambda _conn, kind, key, value: writes.append((kind, key, dict(value))))
+    monkeypatch.setattr(repo, "_audit", lambda _conn, action, detail: writes.append(("AUDIT", action, detail)))
+
+    action, record = repo.select_cycle(
+        "node-admin", {
+            "active_generation": None, "finalized_generation": 2,
+            "last_seen_generation": 2, "next_generation": 3,
+        }, auto=True, manual_confirmed=False,
+        now=datetime(2026, 10, 25, tzinfo=timezone.utc),
+    )
+    assert action == "ALREADY_COMPLETED"
+    assert record["state"] == "COMPLETED"
+    assert record["reconciled_from_durable_generation"] is True
+    assert any(kind == "GENERATION" and key == "core:2026-10" for kind, key, _ in writes)
+    assert any(kind == "AUDIT" and key == "generation_reconciled" for kind, key, _ in writes)
+
+
+def test_distinct_machine_sql_login_required_in_worker_approval(monkeypatch) -> None:
+    from contextlib import contextmanager
+    import dbd.storage.sqlserver.control_repository as control_sql
+
+    @contextmanager
+    def fake_transaction():
+        yield object()
+
+    repo = ControlRepository()
+    monkeypatch.setattr(control_sql, "transaction", fake_transaction)
+    monkeypatch.setattr(repo, "require_node", lambda *_args, **_kwargs: {"role": "ADMIN"})
+    monkeypatch.setattr(repo, "original_login", lambda *_args: "admin-login")
+    with pytest.raises(ControlError, match="distinct from the Admin"):
+        repo.approve_worker("admin-node", "node-worker", "admin-login", "operator")
