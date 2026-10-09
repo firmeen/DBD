@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from contextlib import contextmanager
+from time import monotonic
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -20,6 +23,38 @@ from .pipelines.discovery import DiscoveryResult
 from .storage.production import production_repository
 
 EventCallback = Callable[[str, dict[str, Any]], None]
+
+@contextmanager
+def _keep_system_awake():
+    """Prevent idle sleep only while a foreground production operation runs."""
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    succeeded = ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    )
+    try:
+        yield
+    finally:
+        if succeeded:
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+
+async def _wait_for_remote_claims(repo, *, generation: int) -> None:
+    """Drain active SQL leases before VERIFY without waiting for idle nodes."""
+    deadline = monotonic() + max(90, int(settings.dbd_lease_seconds) * 2)
+    while True:
+        summary = await asyncio.to_thread(
+            repo.status_summary, phase_mask=CORE_ENDPOINT_MASK, generation=generation
+        )
+        if int(summary.get("active_leases") or 0) == 0:
+            return
+        if monotonic() >= deadline:
+            raise RuntimeError("Remote claims did not drain; resume the same generation")
+        await asyncio.sleep(2.0)
 
 
 @dataclass(frozen=True)
@@ -358,9 +393,24 @@ async def collect(
     event: EventCallback | None = None,
 ) -> dict[str, Any]:
     repo = _repo(repository, backend)
+    node_id = None
     selected_generation = int(
         generation or await asyncio.to_thread(_manual_generation, repo, phase=phase)
     )
+    if getattr(repo, "backend", None) == "sqlserver" and phase == "core":
+        from .presentation.setup import local_node_id
+        from .storage.sqlserver.control_repository import ControlRepository
+        node_id = local_node_id()
+        if node_id is None:
+            raise RuntimeError("Run dbd-data setup before SQL Server Deep Collection")
+        control = ControlRepository()
+        active = await asyncio.to_thread(control.active_generation)
+        if active is None or active.get("state") != "COLLECTING":
+            raise RuntimeError("No COLLECTING monthly generation is available to join")
+        if generation is not None and int(generation) != int(active["generation"]):
+            raise RuntimeError("Collector generation does not match SQL Server coordinator")
+        selected_generation = int(active["generation"])
+        await asyncio.to_thread(control.node_status, node_id)
     collector = DeepCollector(
         repository=repo,
         generation=selected_generation,
@@ -374,6 +424,7 @@ async def collect(
         ),
         company_limit=limit,
         company_id=company_id,
+        node_id=node_id,
         continuous=continuous,
         idle_seconds=idle_seconds,
         event=event,
@@ -639,7 +690,11 @@ async def cycle_run(
     backend: str | None = None,
     event: EventCallback | None = None,
     verbose: bool = True,
+    auto: bool = False,
+    manual_confirmed: bool = False,
 ) -> CycleResult:
+    if auto and phase != "core":
+        raise ValueError("--auto is supported only for the SQL Server Core monthly cycle")
     if seeds or search_type or max_buckets is not None:
         raise ValueError(
             "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
@@ -651,6 +706,43 @@ async def cycle_run(
         repo.assert_manager_lock(lock_conn)
 
         generation, resumed = _cycle_generation(repo, phase=phase)
+        control = None
+        control_node = None
+        cycle_month = None
+        if phase == "core" and getattr(repo, "backend", None) == "sqlserver":
+            from .control import EarlyStartConfirmationRequired
+            from .presentation.setup import local_node_id
+            from .storage.sqlserver.control_repository import ControlRepository
+            control_node = local_node_id()
+            if control_node is None:
+                raise RuntimeError("Run dbd-data setup before the monthly cycle")
+            control = ControlRepository()
+            action, record = control.select_cycle(
+                control_node,
+                repo.generation_state(),
+                auto=auto,
+                manual_confirmed=manual_confirmed,
+                now=datetime.now(timezone.utc),
+            )
+            if action == "NOT_DUE" and not auto:
+                raise EarlyStartConfirmationRequired(
+                    "Monthly generation is not due yet; confirmation required to start early"
+                )
+            if action in ("NOT_DUE", "ALREADY_COMPLETED"):
+                result = CycleResult(
+                    status=action, generation=generation, phase=phase, resumed=False,
+                    discovery={}, prepare={}, collection={}, verification={},
+                    finalized_rows=0,
+                )
+                _emit(event, "cycle_completed", **asdict(result))
+                return result
+            assert record is not None
+            generation = int(record["generation"])
+            cycle_month = str(record["cycle_month"])
+            resumed = action == "RESUME"
+            control.transition(control_node, cycle_month, "DISCOVERING")
+        elif auto:
+            raise ValueError("--auto requires the SQL Server production backend")
         _emit(
             event,
             "phase_completed",
@@ -673,11 +765,12 @@ async def cycle_run(
             event=event,
         )
         _emit(event, "phase_started", phase="DISCOVER", generation=generation)
-        discovery_result = await _guard_application_lock(
-            repo,
-            lock_conn,
-            discover_work,
-        )
+        with _keep_system_awake():
+            discovery_result = await _guard_application_lock(
+                repo,
+                lock_conn,
+                discover_work,
+            )
         _emit(
             event,
             "phase_completed",
@@ -690,6 +783,8 @@ async def cycle_run(
             invalid_rows=discovery_result.invalid_rows,
         )
 
+        if control is not None:
+            control.transition(control_node, cycle_month, "PREPARING")
         _emit(event, "phase_started", phase="PREPARE", generation=generation)
         repo.assert_manager_lock(lock_conn)
         prepare_result = await asyncio.to_thread(
@@ -707,6 +802,8 @@ async def cycle_run(
             rows_prepared=prepare_result.rows_prepared,
         )
 
+        if control is not None:
+            control.transition(control_node, cycle_month, "COLLECTING")
         _emit(event, "phase_started", phase="COLLECT", generation=generation)
         collection_work = collect(
             generation=generation,
@@ -718,16 +815,22 @@ async def cycle_run(
             repository=repo,
             event=event,
         )
-        collection_result = await _guard_application_lock(
-            repo,
-            lock_conn,
-            collection_work,
-        )
+        with _keep_system_awake():
+            collection_result = await _guard_application_lock(
+                repo,
+                lock_conn,
+                collection_work,
+            )
         _emit(event, "phase_completed", phase="COLLECT", generation=generation)
 
+        if control is not None:
+            control.transition(control_node, cycle_month, "DRAINING")
+            await _wait_for_remote_claims(repo, generation=generation)
         repo.assert_manager_lock(lock_conn)
         await asyncio.to_thread(_recover_expired, repo)
         repo.assert_manager_lock(lock_conn)
+        if control is not None:
+            control.transition(control_node, cycle_month, "VERIFYING")
 
         _emit(event, "phase_started", phase="VERIFY", generation=generation)
         verification = await verify(
@@ -758,6 +861,8 @@ async def cycle_run(
             _emit(event, "cycle_completed", **asdict(result))
             return result
 
+        if control is not None:
+            control.transition(control_node, cycle_month, "FINALIZING")
         _emit(event, "phase_started", phase="FINALIZE", generation=generation)
         finalized_rows = await _finalize_all(
             repo,
@@ -791,6 +896,11 @@ async def cycle_run(
             verification=final_verification.details,
             finalized_rows=finalized_rows,
         )
+        if control is not None and final_ok:
+            control.transition(
+                control_node, cycle_month,
+                "COMPLETE_WITH_FAILURES" if status_value == "COMPLETE_WITH_FAILURES" else "COMPLETED",
+            )
         _emit(event, "phase_completed", phase="FINALIZE", generation=generation)
         _emit(event, "cycle_completed", **asdict(result))
         return result
