@@ -542,11 +542,12 @@ class ProductionMySqlRepository:
         if phase not in ("core", "extended"):
             raise ValueError("phase must be core or extended")
         required_core = (
-            f"IF(status_code=\'1\', ({int(base_mask)} | "
-            f"IF(latest_fiscal_year IS NULL, 0, {int(financial_mask)})), 0)"
+            f"({int(base_mask)} | IF(latest_fiscal_year IS NULL,"
+            f" 0,{int(financial_mask)}))"
         )
         required = (
-            f"((required_mask & ~{int(core_mask)}) | {required_core})"
+            f"((required_mask & ~{int(core_mask)}) | "
+            f"IF(status_code='1', {required_core}, 0))"
             if phase == "core" else
             f"((IF(required_mask=0, {required_core}, required_mask)) "
             f"| {int(extended_mask)})"
