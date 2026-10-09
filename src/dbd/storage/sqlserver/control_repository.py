@@ -398,6 +398,21 @@ class ControlRepository:
                 row["finished_at"] = iso(datetime.now(timezone.utc))
             self._put(conn, "GENERATION", key, row)
 
+    def require_collection_access(
+        self, conn, node_id: str, generation: int, *, finishing: bool = False,
+    ) -> None:
+        self.require_node(conn, node_id, lock=True)
+        active = self.active_generation(conn)
+        if active is None or int(active.get("generation") or 0) != int(generation):
+            raise ControlError("No matching active generation for this node")
+        # Commit of an already leased HTTP response is allowed during DRAINING;
+        # new claims are not. A revoked NODE is rejected in either state.
+        states = ("COLLECTING", "DRAINING") if finishing else ("COLLECTING",)
+        key = f"core:{active['cycle_month']}"
+        locked = self._read(conn, "GENERATION", key, lock=True)
+        if locked is None or locked.get("state") not in states:
+            raise ControlError("Generation is not accepting company work")
+
     def admit(self, node_id: str, generation: int) -> float:
         """Reserve an upstream slot; return seconds until it may be used."""
         with transaction() as conn:
