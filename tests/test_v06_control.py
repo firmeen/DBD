@@ -307,3 +307,75 @@ def test_windows_task_refuses_missing_portable_cli(tmp_path, monkeypatch) -> Non
     monkeypatch.setattr(setup_ui.sys, "platform", "win32")
     with pytest.raises(ControlError, match="portable project"):
         setup_ui.register_windows_task()
+
+
+def test_unfinished_g2_before_control_migration_is_adopted_not_skipped(monkeypatch) -> None:
+    from contextlib import contextmanager
+    import dbd.storage.sqlserver.control_repository as control_sql
+
+    @contextmanager
+    def transaction_stub():
+        yield object()
+
+    updates = []
+    repo = ControlRepository()
+    monkeypatch.setattr(control_sql, "transaction", transaction_stub)
+    monkeypatch.setattr(repo, "require_admin", lambda node: None)
+    monkeypatch.setattr(
+        repo, "_read",
+        lambda _conn, kind, _key, lock=False: (
+            _schedule(day=28) if kind == "SCHEDULE" else None
+        ),
+    )
+    monkeypatch.setattr(repo, "active_generation", lambda _conn: None)
+    monkeypatch.setattr(
+        repo, "_put",
+        lambda _conn, kind, key, row: updates.append((kind, key, dict(row))),
+    )
+    monkeypatch.setattr(repo, "_audit", lambda *_args: None)
+    decision, record = repo.select_cycle(
+        "node-admin",
+        {
+            "active_generation": 2,
+            "finalized_generation": 1,
+            "last_seen_generation": 2,
+            "next_generation": 2,
+        },
+        auto=True, manual_confirmed=False,
+        now=datetime(2026, 10, 10, tzinfo=timezone.utc),
+    )
+    assert decision == "RESUME"  # still before the configured 28th
+    assert record["generation"] == 2
+    assert record["actual_started_at"] is None  # no fabricated timestamp
+    assert record["adopted_existing_business_generation"] is True
+    assert updates[0][0:2] == ("GENERATION", "core:2026-10")
+
+
+def test_unfinished_g1_cutover_cannot_be_auto_adopted(monkeypatch) -> None:
+    from contextlib import contextmanager
+    import dbd.storage.sqlserver.control_repository as control_sql
+
+    @contextmanager
+    def transaction_stub():
+        yield object()
+
+    repo = ControlRepository()
+    monkeypatch.setattr(control_sql, "transaction", transaction_stub)
+    monkeypatch.setattr(repo, "require_admin", lambda node: None)
+    monkeypatch.setattr(
+        repo, "_read",
+        lambda _conn, kind, _key, lock=False: (
+            _schedule() if kind == "SCHEDULE" else None
+        ),
+    )
+    monkeypatch.setattr(repo, "active_generation", lambda _conn: None)
+    with pytest.raises(ControlError, match="Generation 1 cutover"):
+        repo.select_cycle(
+            "node-admin",
+            {
+                "active_generation": 1, "finalized_generation": None,
+                "last_seen_generation": 1, "next_generation": 1,
+            },
+            auto=True, manual_confirmed=False,
+            now=datetime(2026, 10, 20, tzinfo=timezone.utc),
+        )
