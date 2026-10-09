@@ -361,3 +361,62 @@ dbd-data cycle run --phase extended
 - อย่าแก้ mask ด้วย SQL โดยไม่มี incident plan ที่พิสูจน์สาเหตุแล้ว
 - อย่าเริ่ม Generation ใหม่เพื่อหลบ Generation เดิมที่ยังไม่สมบูรณ์
 - อย่าใช้ cutover หลัง Production เดินไป Generation 2+
+
+---
+
+## Dual-backend v0.6 operation (SQL Server + MySQL)
+
+**Default remains SQL Server.** All `--backend` options below select only
+the named production database, not the legacy campaign source.
+
+1. Create a separate MySQL database (for example `dbd_production`) and grant
+   the production login table DDL/DML rights through your normal database
+   provisioning. Do **not** select the legacy `dbd` database as production.
+2. Fill `PROD_MYSQL_HOST`, `PROD_MYSQL_PORT`,
+   `PROD_MYSQL_DATABASE`, `PROD_MYSQL_USER` and
+   `PROD_MYSQL_PASSWORD`; the old `DB_*` still points to legacy MySQL.
+3. Provision/check the chosen backend; check status independently:
+
+```powershell
+dbd-data migrate --backend mysql
+dbd-data check-db --backend mysql
+dbd-data cycle status --backend mysql --phase core
+
+dbd-data check-db --backend sqlserver
+dbd-data cycle status --backend sqlserver --phase core
+```
+
+4. **Optional one-time Generation 1 import into a fresh MySQL production
+   target:** stop legacy source writers; check the target is not G2+; then:
+
+```powershell
+dbd-data cutover --backend mysql --batch-size 500
+```
+
+   This reads legacy `dbd_company_deep` (via `DB_*`) but writes the five
+   tables using `PROD_MYSQL_*`. Existing SQL Server import works unchanged:
+
+```powershell
+python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
+```
+
+5. Operate the two outputs independently:
+
+```powershell
+dbd-data cycle run --backend mysql --phase core
+dbd-data cycle run --backend sqlserver --phase core
+dbd-deep status --backend mysql --phase core --coverage
+dbd-deep collect --backend mysql --phase core --continuous
+```
+
+Each command reads the target's own Generation, natural-key rows, masks,
+retry-at and leases. It does not reset or fast-forward the other target.
+
+**Guards:** never perform G1 cutover after the selected output has seen G2;
+do not run the standalone collector against the same target during cutover;
+do not run `cycle run` and other same-target writers concurrently. SQL Server
+and MySQL locks are independent; shared DBD API requests still have a combined
+rate limit. The MySQL Production database must exist before `migrate` and
+cannot be the same exact host/port/database as legacy MySQL. Migration creates
+only the five production tables; it does not change Run 9/Redis/Legacy schemas.
+
