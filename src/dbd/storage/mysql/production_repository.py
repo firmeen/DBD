@@ -5,7 +5,7 @@ Never reads or writes legacy DB_* tables. All state lives in PROD_MYSQL_DATABASE
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -529,7 +529,7 @@ class ProductionMySqlRepository:
     ):
         changed = _update(
             conn, "DBD_COMPANY",
-            {"lease_expires_at": _utc() + __import__("datetime").timedelta(seconds=lease_seconds)},
+            {"lease_expires_at": _utc() + timedelta(seconds=lease_seconds)},
             "company_id=%s AND lease_owner=%s AND last_seen_generation=%s "
             "AND lease_expires_at>UTC_TIMESTAMP(6)",
             (int(company_id), claim_token, int(claim_generation)),
