@@ -772,9 +772,7 @@ class ProductionSqlServerRepository:
 
     def validate_schema(self) -> dict[str, object]:
         with connection() as conn:
-            result = validate_production_schema(conn)
-            ControlRepository().validate_schema(conn)
-            return result
+            return validate_production_schema(conn)
 
     def check_database(self) -> dict[str, object]:
         info = check_connection()
@@ -790,7 +788,6 @@ class ProductionSqlServerRepository:
         )
         with connection() as conn:
             schema = validate_production_schema(conn)
-            ControlRepository().validate_schema(conn)
             cur = conn.cursor()
             try:
                 cur.execute(
