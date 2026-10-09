@@ -79,6 +79,20 @@ class Settings(BaseSettings):
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
     dbd_upstream_defer_seconds: int = Field(30, ge=1, le=3600)
+    # SQL Server monthly Core defaults; MySQL/Extended retain legacy policies.
+    # Financial endpoints are refreshed by changed fiscal year or --refresh,
+    # not by the age of an otherwise successfully resolved result.
+    dbd_monthly_core_stale_hours: dict[str, float] = Field(
+        default_factory=lambda: {
+            "profile": 720.0,
+            "committees": 2160.0,
+            "committee_signs": 2160.0,
+            "transformations": 4320.0,
+            "financial_submissions": 876000.0,
+            "financial_statements": 876000.0,
+            "industry_benchmark": 876000.0,
+        }
+    )
     dbd_refresh_stale_hours: dict[str, float] = Field(
         default_factory=lambda: {
             "profile": 24.0,
