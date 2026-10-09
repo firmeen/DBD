@@ -17,7 +17,7 @@ from .deep.catalog import (
 from .deep.collector import DeepCollector
 from .pipelines import discovery
 from .pipelines.discovery import DiscoveryResult
-from .storage.sqlserver.repository import ProductionSqlServerRepository
+from .storage.production import production_repository
 
 EventCallback = Callable[[str, dict[str, Any]], None]
 
@@ -87,12 +87,19 @@ def _emit(event: EventCallback | None, name: str, **payload: object) -> None:
         event(name, dict(payload))
 
 
-def _repo(repository: ProductionSqlServerRepository | None) -> ProductionSqlServerRepository:
-    return repository or ProductionSqlServerRepository()
+def _repo(repository: Any | None, backend: str | None = None) -> Any:
+    if repository is None:
+        return production_repository(backend)
+    actual = getattr(repository, "backend", None)
+    if backend is not None and actual is not None and backend != actual:
+        raise ValueError(
+            f"Production repository backend {actual!r} does not match {backend!r}"
+        )
+    return repository
 
 
 def _manual_generation(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     *,
     phase: str,
 ) -> int:
@@ -112,7 +119,7 @@ def _manual_generation(
 
 
 def _cycle_generation(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     *,
     phase: str,
 ) -> tuple[int, bool]:
@@ -134,7 +141,7 @@ def _cycle_generation(
 
 
 async def _guard_application_lock(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     lock_conn,
     work: Awaitable[Any],
 ) -> Any:
@@ -165,7 +172,7 @@ async def _guard_application_lock(
 
 
 def _prepare_tx(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     *,
     generation: int,
     phase: str,
@@ -206,10 +213,11 @@ async def prepare(
     phase: str = "core",
     generation: int | None = None,
     company_id: int | None = None,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
     event: EventCallback | None = None,
 ) -> PrepareResult:
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
         selected = int(generation or _manual_generation(repo, phase=phase))
         _emit(event, "phase_started", phase="PREPARE", generation=selected)
@@ -233,7 +241,7 @@ async def prepare(
 
 
 def _retry_tx(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     *,
     generation: int,
     phase: str,
@@ -272,10 +280,11 @@ async def retry(
     *,
     phase: str = "core",
     limit: int | None = None,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
     event: EventCallback | None = None,
 ) -> RetryResult:
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
         generation = _manual_generation(repo, phase=phase)
         _emit(event, "phase_started", phase="RETRY", generation=generation)
@@ -302,9 +311,10 @@ async def status(
     *,
     phase: str = "core",
     coverage: bool = False,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
 ) -> StatusResult:
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
     generation_state = await asyncio.to_thread(repo.generation_state)
     generation = (
         generation_state["active_generation"]
@@ -343,10 +353,11 @@ async def collect(
     company_id: int | None = None,
     continuous: bool = False,
     idle_seconds: float = 5.0,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
     event: EventCallback | None = None,
 ) -> dict[str, Any]:
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
     selected_generation = int(
         generation or await asyncio.to_thread(_manual_generation, repo, phase=phase)
     )
@@ -380,10 +391,11 @@ async def discover(
     rate: float | None = None,
     max_buckets: int | None = None,
     verbose: bool = True,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
     event: EventCallback | None = None,
 ) -> tuple[int, DiscoveryResult]:
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
         generation, resumed = _cycle_generation(repo, phase=phase)
         repo.assert_manager_lock(lock_conn)
@@ -427,9 +439,10 @@ async def verify(
     *,
     generation: int,
     phase: str = "core",
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
 ) -> VerifyResult:
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
     details = await asyncio.to_thread(
         repo.verify_generation,
         generation=int(generation),
@@ -444,7 +457,7 @@ async def verify(
 
 
 def _finalize_batch(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     *,
     generation: int,
     batch_size: int,
@@ -462,7 +475,7 @@ def _finalize_batch(
 
 
 async def _finalize_all(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     lock_conn,
     *,
     generation: int,
@@ -490,7 +503,7 @@ async def _finalize_all(
 
 
 def _ensure_fetch_company(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
     company: CompanyIdentity,
     *,
     generation: int,
@@ -516,7 +529,7 @@ def _ensure_fetch_company(
 
 
 def _recover_expired(
-    repository: ProductionSqlServerRepository,
+    repository: Any,
 ) -> int:
     with repository.transaction() as conn:
         return repository.recover_expired_leases(conn)
@@ -529,10 +542,11 @@ async def fetch_company(
     concurrency: int | None = None,
     rate: float | None = None,
     http_retries: int | None = None,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
     event: EventCallback | None = None,
 ) -> FetchCompanyResult:
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
 
     with repo.manager_lock() as lock_conn:
         state = repo.generation_state()
@@ -621,7 +635,8 @@ async def cycle_run(
     rate: float | None = None,
     http_retries: int | None = None,
     max_buckets: int | None = None,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
     event: EventCallback | None = None,
     verbose: bool = True,
 ) -> CycleResult:
@@ -629,7 +644,7 @@ async def cycle_run(
         raise ValueError(
             "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
         )
-    repo = _repo(repository)
+    repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
         _emit(event, "phase_started", phase="PRECHECK")
         await asyncio.to_thread(repo.check_database)
@@ -792,7 +807,8 @@ async def cycle_loop(
     rate: float | None = None,
     http_retries: int | None = None,
     max_buckets: int | None = None,
-    repository: ProductionSqlServerRepository | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
     event: EventCallback | None = None,
     verbose: bool = True,
     max_iterations: int | None = None,
@@ -813,6 +829,7 @@ async def cycle_loop(
             http_retries=http_retries,
             max_buckets=max_buckets,
             repository=repository,
+            backend=backend,
             event=event,
             verbose=verbose,
         )

@@ -13,6 +13,7 @@ from ...contracts.master_deep import (
     mssql_create_table_sql,
     ordered_values,
 )
+from ..production import ProductionLeaseLost
 from .engine import _pymssql, check_connection, connection
 from .engine import transaction as sqlserver_transaction
 from .schema import MANAGED_TABLES, TABLE_COLUMNS
@@ -30,7 +31,7 @@ class SqlServerWriteError(RuntimeError):
     pass
 
 
-class SqlServerLeaseLost(SqlServerWriteError):
+class SqlServerLeaseLost(SqlServerWriteError, ProductionLeaseLost):
     """A stale or superseded company claim attempted to mutate durable state."""
 
 
@@ -748,6 +749,8 @@ class ProductionSqlServerRepository:
     Methods never commit. Callers compose company/checkpoint and domain writes
     inside one transaction through transaction().
     """
+
+    backend = "sqlserver"
 
     @contextmanager
     def transaction(self) -> Iterator[Any]:

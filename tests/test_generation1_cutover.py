@@ -207,8 +207,9 @@ def test_generation1_domain_mapping_uses_five_table_grains() -> None:
         (2, 1),
     ],
 )
+@pytest.mark.parametrize("backend", ("sqlserver", "mysql"))
 def test_cutover_refuses_generation_two_before_touching_mysql(
-    monkeypatch, finalized, seen
+    monkeypatch, finalized, seen, backend
 ) -> None:
     opened_mysql = []
 
@@ -235,11 +236,11 @@ def test_cutover_refuses_generation_two_before_touching_mysql(
         opened_mysql.append(True)
         yield object()
 
-    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
     monkeypatch.setattr(cutover, "source_fence", mysql_must_not_open)
 
     with pytest.raises(CutoverSafetyError, match="permanently refused"):
-        cutover.run_generation1_cutover(batch_size=500)
+        cutover.run_generation1_cutover(batch_size=500, backend=backend)
     assert not opened_mysql
 
 
@@ -468,8 +469,9 @@ def test_generation1_verification_rejects_missing_or_extra_domain_rows(
         cutover.verify_generation_one(1, expected_domain_counts=expected)
 
 
-def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
-    monkeypatch,
+@pytest.mark.parametrize("selected_backend", ("sqlserver", "mysql"))
+def test_cutover_holds_selected_manager_lock_through_target_transactions(
+    monkeypatch, selected_backend,
 ) -> None:
     events = []
     current = {"locked": False}
@@ -532,7 +534,8 @@ def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
         yield object()
         events.append("source-closed")
 
-    def fake_verification(count, *, expected_domain_counts):
+    def fake_verification(count, *, expected_domain_counts, backend):
+        assert backend == selected_backend
         assert count == 1
         assert expected_domain_counts == {
             "relations": 0, "events": 0, "financial": 0, "industries": 0
@@ -540,7 +543,7 @@ def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
         assert current["locked"]
         return {"industries": 0, "companies": 1}
 
-    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -554,7 +557,9 @@ def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
     monkeypatch.setattr(cutover, "transform_industries", lambda *_args, **_kw: [])
     monkeypatch.setattr(cutover, "verify_generation_one", fake_verification)
 
-    result = cutover.run_generation1_cutover(batch_size=500)
+    result = cutover.run_generation1_cutover(
+        batch_size=500, backend=selected_backend,
+    )
 
     assert result["companies"] == 1
     assert events == [
@@ -564,8 +569,9 @@ def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
     ]
 
 
+@pytest.mark.parametrize("selected_backend", ("sqlserver", "mysql"))
 def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
-    monkeypatch,
+    monkeypatch, selected_backend,
 ) -> None:
     stored: dict[tuple[str, str], int] = {}
     state = {"committed_batches": 0, "interrupted": False}
@@ -626,7 +632,7 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
     def fake_source_fence():
         yield object()
 
-    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -650,7 +656,8 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
     ):
         monkeypatch.setattr(cutover, method, lambda *_args, **_kw: [])
 
-    def verify(source_rows, *, expected_domain_counts):
+    def verify(source_rows, *, expected_domain_counts, backend):
+        assert backend == selected_backend
         assert source_rows == 2
         assert len(stored) == 2
         assert all(not count for count in expected_domain_counts.values())
@@ -659,10 +666,14 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
     monkeypatch.setattr(cutover, "verify_generation_one", verify)
 
     with pytest.raises(ConnectionError, match="one committed batch"):
-        cutover.run_generation1_cutover(batch_size=1)
+        cutover.run_generation1_cutover(
+            batch_size=1, backend=selected_backend,
+        )
     assert len(stored) == 1
 
-    result = cutover.run_generation1_cutover(batch_size=1)
+    result = cutover.run_generation1_cutover(
+        batch_size=1, backend=selected_backend,
+    )
     assert result["companies"] == 2
     assert len(stored) == 2
     assert state["committed_batches"] == 3  # first run: 1; resumed run: 2

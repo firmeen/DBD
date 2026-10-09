@@ -373,3 +373,45 @@ Terminal UI เป็น presentation layer เท่านั้น
 - generation decision
 
 ถ้า renderer มีปัญหา collector logic ไม่ควรถูกเปลี่ยนเพียงเพราะ presentation failure
+
+---
+
+## v0.6 Dual production database boundary
+
+```text
+                   DBD Search / Deep endpoints
+                              |
+                    Shared Discovery + HTTP
+                              |
+                   Normalization + Workflow
+                              |
+                   Production Backend Selector
+                     /                  \
+            SQL Server Adapter       MySQL Adapter
+              (5 tables)             (5 tables)
+                state A                 state B
+```
+
+The two databases share logical column semantics, natural company identity,
+mask/lease lifecycle, Generation handling, and API payload normalization.
+They never share production `company_id` values, database transactions,
+application locks, or progress. Both reuse the original engine; only
+database-specific SQL, schema DDL and connections differ.
+
+- `--backend sqlserver`: existing `ProductionSqlServerRepository`.
+- `--backend mysql`: `ProductionMySqlRepository` with its own
+  `PROD_MYSQL_*` connection, separate from legacy `DB_*`.
+- Omission of `--backend` uses `DBD_PRODUCTION_BACKEND=sqlserver`.
+- MySQL `DBD_INDUSTRY` uses a functional unique key over nullable scope
+  fields so nullable business-size/location values cannot duplicate records.
+- Each target separately owns `dataset_generation`,
+  `last_seen_generation`, done/unavailable/failed masks, retry and leases.
+- The one-time MySQL Legacy G1 Cutover uses the existing transformation
+  functions against either production repository, never the active G2+ target.
+- No automatic SQL Server ↔ MySQL synchronization occurs.
+- Legacy campaign/Run 9 commands are outside this selector and unchanged.
+
+Both output backends share the external DBD API; simultaneous collectors must
+respect the **combined** upstream request rate. Backend isolation does not grant
+a separate upstream quota.
+

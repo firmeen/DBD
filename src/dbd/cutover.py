@@ -20,7 +20,7 @@ from .core.exceptions import ContractError
 from .deep.catalog import latest_fiscal_year
 from .storage.mysql.engine import connect as mysql_connection
 from .storage.sqlserver.engine import connection as sqlserver_connection
-from .storage.sqlserver.repository import ProductionSqlServerRepository
+from .storage.production import production_repository
 
 SOURCE_TABLE = "dbd_company_deep"
 SOURCE_MASTER_TABLE = "dbd_company_master"
@@ -984,7 +984,10 @@ def verify_generation_one(
     source_rows: int,
     *,
     expected_domain_counts: dict[str, int] | None = None,
+    backend: str = "sqlserver",
 ) -> dict[str, int]:
+    if backend not in {"sqlserver", "mysql"}:
+        raise ValueError(f"Unknown target backend: {backend}")
     queries = {
         "companies": (
             "SELECT COUNT(*) FROM dbo.DBD_COMPANY WHERE dataset_generation=1",
@@ -1051,8 +1054,17 @@ def verify_generation_one(
         "financial": ("SELECT COUNT(*) FROM dbo.DBD_FINANCIAL", ()),
         "industries": ("SELECT COUNT(*) FROM dbo.DBD_INDUSTRY", ()),
     }
+    if backend == "mysql":
+        queries = {
+            key: (statement.replace("dbo.", ""), parameters)
+            for key, (statement, parameters) in queries.items()
+        }
+        from .storage.mysql.production_engine import connection as target_connection
+    else:
+        target_connection = sqlserver_connection
+
     result: dict[str, int] = {}
-    with sqlserver_connection() as conn:
+    with target_connection() as conn:
         cur = conn.cursor()
         try:
             for key, (sql, params) in queries.items():
@@ -1092,14 +1104,16 @@ def run_generation1_cutover(
     *,
     batch_size: int = 500,
     event: EventCallback | None = None,
+    backend: str = "sqlserver",
 ) -> dict[str, Any]:
-    repository = ProductionSqlServerRepository()
+    repository = production_repository(backend)
     repository.validate_schema()
 
     published_at = datetime.now(timezone.utc).replace(tzinfo=None)
     started = time.monotonic()
     stats: dict[str, Any] = {
         "generation": GENERATION,
+        "backend": backend,
         "source_rows": 0,
         "companies": 0,
         "relations": 0,
@@ -1122,8 +1136,8 @@ def run_generation1_cutover(
     # DBD_INDUSTRY has a shared natural key; many companies can map to one row.
     industry_keys: set[tuple[str | None, ...]] = set()
 
-    # Hold the same SQL Server writer fence as the production v0.6 cycle
-    # for the *whole* migration, not just for its opening generation check.
+    # Hold the selected production writer fence for the entire import.
+    # The legacy MySQL source retains its own independent advisory fences.
     with ExitStack() as stack:
         manager_conn = stack.enter_context(repository.manager_lock())
         repository.assert_manager_lock(manager_conn)
@@ -1138,11 +1152,11 @@ def run_generation1_cutover(
         )
         if highest_generation >= 2:
             raise CutoverSafetyError(
-                f"SQL Server already contains Generation {highest_generation}; "
+                f"{backend} already contains Generation {highest_generation}; "
                 "legacy Generation 1 cutover is permanently refused"
             )
 
-        # No MySQL connection is opened until the SQL Server generation gate passes.
+        # Legacy MySQL source opens only after target generation gate passes.
         fence_conn = stack.enter_context(source_fence())
         preflight = source_preflight(fence_conn)
         stats["source_rows"] = int(preflight["source_rows"])
@@ -1275,6 +1289,7 @@ def run_generation1_cutover(
                 "financial": stats["financial"],
                 "industries": len(industry_keys),
             },
+            backend=backend,
         )
         _assert_source_snapshot(fence_conn, preflight)
         repository.assert_manager_lock(manager_conn)

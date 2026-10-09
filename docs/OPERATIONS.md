@@ -318,3 +318,28 @@ cycle status
 - เปลี่ยน rate/concurrency เพื่อกลบ upstream failure
 - เริ่ม cycle ใหม่เพียงเพื่อหลบ FAILED เดิม
 - rerun Generation 1 cutover หลัง Production ไป Generation 2+
+
+---
+
+## Selected production output
+
+Use `--backend sqlserver` or `--backend mysql` on v0.6 data/deep
+commands. `DBD_PRODUCTION_BACKEND=sqlserver` is the default, keeping old
+commands backward compatible.
+
+MySQL production has a distinct `PROD_MYSQL_*` connection and five managed
+tables. A MySQL Generation 6 cannot advance SQL Server Generation 3, and the
+reverse is also true. Status, attempts, mask progress, leases and retry
+are always read from the selected target.
+
+For a fresh MySQL target, provision the database, run
+`dbd-data migrate --backend mysql` then
+`dbd-data check-db --backend mysql`. Optionally import legacy G1 with
+`dbd-data cutover --backend mysql` **before** any MySQL G2 run.
+Do not change `DB_*` to the new database: those values remain the legacy
+MySQL source. Do not copy identity `company_id` between backends;
+compare by `juristic_type_code + registration_no`.
+
+When running both backends at once, coordinate the aggregate DBD upstream
+request rate. Never bypass an application lock or retry by deleting data.
+

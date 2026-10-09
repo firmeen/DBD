@@ -31,10 +31,7 @@ from ..contracts.identity import identity
 from ..contracts.strict import normalize_industry_benchmark
 from ..core.exceptions import ContractError, IdentityConflict
 from ..core.settings import settings
-from ..storage.sqlserver.repository import (
-    ProductionSqlServerRepository,
-    SqlServerLeaseLost,
-)
+from ..storage.production import ProductionLeaseLost
 from .catalog import (
     FINANCIAL_ENDPOINTS,
     FINANCIAL_MASK,
@@ -694,7 +691,7 @@ class DeepCollector:
     def __init__(
         self,
         *,
-        repository: ProductionSqlServerRepository,
+        repository: Any,
         generation: int,
         phase: str,
         concurrency: int,
@@ -755,7 +752,7 @@ class DeepCollector:
         for attempt in range(1, attempts + 1):
             try:
                 return await asyncio.to_thread(function, *args, **kwargs)
-            except SqlServerLeaseLost:
+            except ProductionLeaseLost:
                 raise
             except Exception as exc:
                 checker = getattr(self.repo, "is_transient_error", None)
@@ -842,7 +839,7 @@ class DeepCollector:
                 pass
             try:
                 await self._db_call(self._renew_sync, company)
-            except SqlServerLeaseLost:
+            except ProductionLeaseLost:
                 lost.set()
                 self._emit(
                     "warning",
@@ -1135,7 +1132,7 @@ class DeepCollector:
                 if (unresolved & spec.bit) == 0:
                     continue
                 if lease_lost.is_set():
-                    raise SqlServerLeaseLost(
+                    raise ProductionLeaseLost(
                         f"Lease lost for company_id={company['company_id']}"
                     )
 
@@ -1155,7 +1152,7 @@ class DeepCollector:
                     )
                 except DeepNotAvailable as exc:
                     if lease_lost.is_set():
-                        raise SqlServerLeaseLost(
+                        raise ProductionLeaseLost(
                             f"Lease lost for company_id={company['company_id']}"
                         )
                     await self._commit_outcome(
@@ -1170,7 +1167,7 @@ class DeepCollector:
                     continue
                 except DeepTransientHttpError as exc:
                     if lease_lost.is_set():
-                        raise SqlServerLeaseLost(
+                        raise ProductionLeaseLost(
                             f"Lease lost for company_id={company['company_id']}"
                         )
                     error = f"{spec.key}: {exc}"
@@ -1190,7 +1187,7 @@ class DeepCollector:
                     return
                 except (DeepPermanentHttpError, DeepDecodeError) as exc:
                     if lease_lost.is_set():
-                        raise SqlServerLeaseLost(
+                        raise ProductionLeaseLost(
                             f"Lease lost for company_id={company['company_id']}"
                         )
                     await self._commit_outcome(
@@ -1240,7 +1237,7 @@ class DeepCollector:
                     error = None
 
                 if lease_lost.is_set():
-                    raise SqlServerLeaseLost(
+                    raise ProductionLeaseLost(
                         f"Lease lost for company_id={company['company_id']}"
                     )
                 await self._commit_outcome(
@@ -1310,7 +1307,7 @@ class DeepCollector:
 
             try:
                 await self._process_company(company, client)
-            except SqlServerLeaseLost as exc:
+            except ProductionLeaseLost as exc:
                 self._emit(
                     "warning",
                     worker=worker_no,
