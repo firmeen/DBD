@@ -493,6 +493,9 @@ class ProductionMySqlRepository:
                     stale_hours=settings.dbd_refresh_stale_hours,
                     now=datetime.now(timezone.utc),
                 )
+                if first_observation:
+                    # Extended --refresh keeps its existing independent bits.
+                    reopened |= int(refresh_mask) & ~CORE_ENDPOINT_MASK
                 required = (int(old_required or 0) & ~CORE_ENDPOINT_MASK) | core_required
                 resolved = (int(old_done or 0) | int(old_na or 0) | int(old_failed or 0)) & ~reopened
                 unresolved = required & ~resolved
