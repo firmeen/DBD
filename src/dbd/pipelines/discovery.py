@@ -838,6 +838,14 @@ async def run(
 
     repo = repository if repository is not None else production_repository()
     global_rate = settings.dbd_rate_per_second if rate is None else rate
+    admission = None
+    if getattr(repo, "backend", None) == "sqlserver":
+        from ..presentation.setup import local_node_id
+        from ..storage.sqlserver.control_repository import ControlRepository
+        node_id = local_node_id()
+        if node_id is None:
+            raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
+        admission = lambda: ControlRepository().admit(node_id, int(generation))
 
     buckets_processed = 0
     pages_fetched = 0
@@ -862,6 +870,7 @@ async def run(
         concurrency=int(concurrency or settings.dbd_concurrency),
         rate_per_second=float(global_rate),
         max_retries=int(settings.dbd_http_retries),
+        admission=admission,
     ) as client:
         province_response = await client.fetch(
             "GET",
