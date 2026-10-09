@@ -1541,6 +1541,12 @@ class ProductionSqlServerRepository:
                       AND (lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME())
                       {company_filter}
                     ORDER BY
+                      CASE
+                        WHEN first_seen_generation=1
+                          AND collection_completed_at IS NULL THEN 0
+                        WHEN (done_mask | not_available_mask | failed_mask)=0 THEN 1
+                        ELSE 2
+                      END,
                       CASE WHEN retry_at IS NULL THEN 0 ELSE 1 END,
                       retry_at,
                       company_id
