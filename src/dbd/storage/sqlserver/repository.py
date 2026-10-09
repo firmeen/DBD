@@ -1432,7 +1432,7 @@ class ProductionSqlServerRepository:
         if phase == "core":
             required = (
                 f"((required_mask & ~{int(core_mask)}) | "
-                f"CASE WHEN status_code=N'1' THEN {core_required} ELSE 0 END)"
+                f"CASE WHEN status_code=N'1' OR {int(generation)}=1 THEN {core_required} ELSE 0 END)"
             )
         else:
             required = (
@@ -1494,7 +1494,11 @@ class ProductionSqlServerRepository:
         company_id: int | None = None,
     ) -> dict[str, Any] | None:
         token = f"{worker_prefix}:{uuid4().hex}"
-        active_filter = "AND status_code=N'1'" if int(phase_mask) & CORE_ENDPOINT_MASK else ""
+        active_filter = (
+            "AND status_code=N'1'"
+            if int(generation) >= 2 and int(phase_mask) & CORE_ENDPOINT_MASK
+            else ""
+        )
         company_filter = ""
         params: list[Any] = [
             int(generation),
