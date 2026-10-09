@@ -1316,18 +1316,27 @@ class DeepCollector:
         client: FixedRateDbdClient,
     ) -> None:
         while not self._stop.is_set():
-            if self.node_id and getattr(self.repo, "backend", None) == "sqlserver":
-                from ..storage.sqlserver.control_repository import ControlRepository
-                control = ControlRepository()
-                active = await asyncio.to_thread(control.active_generation)
-                node = await asyncio.to_thread(control.node_status, self.node_id)
-                if (active is None or active.get("state") != "COLLECTING" or
-                        int(active.get("generation") or 0) != self.generation or
-                        node is None or not node.get("authorized")):
-                    self._stop.set()
-                    return
-            company = await self._claim()
+            try:
+                # The repository checks approved node + generation under the
+                # same SQL transaction as the claim; no extra query per job.
+                company = await self._claim()
+            except Exception as exc:
+                if self.node_id and getattr(self.repo, "backend", None) == "sqlserver":
+                    from ..control import ControlError
+                    if isinstance(exc, ControlError):
+                        from ..storage.sqlserver.control_repository import ControlRepository
+                        active = await asyncio.to_thread(ControlRepository().active_generation)
+                        if active is None or active.get("state") != "COLLECTING":
+                            self._stop.set()
+                            return
+                raise
             if company is None:
+                if self.node_id and getattr(self.repo, "backend", None) == "sqlserver":
+                    from ..storage.sqlserver.control_repository import ControlRepository
+                    active = await asyncio.to_thread(ControlRepository().active_generation)
+                    if active is None or active.get("state") != "COLLECTING":
+                        self._stop.set()
+                        return
                 remaining = await self._remaining_budget()
                 if remaining == 0 or self.company_id is not None:
                     self._stop.set()
