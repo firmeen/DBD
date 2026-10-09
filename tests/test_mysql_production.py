@@ -154,7 +154,7 @@ def test_mysql_batched_upsert_bounds_sql_groups_to_200_rows():
     assert result == 451
     assert [len(values) for _, values in cursor.bulk] == [200, 200, 51]
     assert all("ON DUPLICATE KEY UPDATE" in sql for sql, _ in cursor.bulk)
-    assert all("first_seen_generation\`=VALUES" not in sql for sql, _ in cursor.bulk)
+    assert all("`first_seen_generation`=VALUES" not in sql for sql, _ in cursor.bulk)
 
 
 def test_mysql_batched_upsert_fails_closed_on_conflicting_duplicate_natural_keys():
