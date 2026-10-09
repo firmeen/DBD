@@ -827,7 +827,17 @@ def apply_recovery_recount(
                     if parent["lease_expires_at"] > _now():
                         raise DiscoveryLeaseLost("Recovery parent has an active worker lease")
 
-                counts_match = sum(child_counts.values()) == int(fresh_parent_count)
+                # A shrinking parent can be an unstable API count, not proof
+                # that previously observed companies disappeared. Keep the
+                # partition unresolved until independently reconciled.
+                parent_shrank = (
+                    parent["total_items"] is not None
+                    and int(fresh_parent_count) < int(parent["total_items"])
+                )
+                counts_match = (
+                    not parent_shrank
+                    and sum(child_counts.values()) == int(fresh_parent_count)
+                )
                 for child in children:
                     current = int(child["total_items"] or 0)
                     fresh = int(child_counts[int(child["id"])])
