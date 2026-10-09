@@ -57,7 +57,7 @@ def _task_script() -> Path:
     return PROJECT_ROOT / "scripts" / "dbd-auto.bat"
 
 
-def register_windows_task(*, check_hour: int = 9, check_minute: int = 0) -> None:
+def register_windows_task(*, check_hour: int = 9, check_minute: int = 0, wake: bool = False) -> None:
     """Create a single per-user Task with Daily + Logon triggers.
 
     Registration failures do not alter database state. This is run only after
@@ -71,6 +71,7 @@ def register_windows_task(*, check_hour: int = 9, check_minute: int = 0) -> None
     task_path = str(script).replace("'", "''")
     root_path = str(PROJECT_ROOT).replace("'", "''")
     name = TASK_NAME.replace("'", "''")
+    wake_flag = '-WakeToRun' if wake else ''
     # The principal is the current interactive Windows user, not an elevated
     # service account. No plain-text Windows password is needed.
     ps = f"""
@@ -81,7 +82,7 @@ $triggers = @(
     (New-ScheduledTaskTrigger -Daily -At '{check_hour:02d}:{check_minute:02d}'),
     (New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\\$env:USERNAME")
 )
-$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero)
+$settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) {wake_flag}
 $user = "$env:USERDOMAIN\\$env:USERNAME"
 $principal = New-ScheduledTaskPrincipal -UserId $user -LogonType Interactive -RunLevel Limited
 Register-ScheduledTask -TaskName '{name}' -Action $action -Trigger $triggers -Settings $settings -Principal $principal -Force | Out-Null
@@ -355,7 +356,8 @@ class SetupWizard:
                     hour, minute = [int(x) for x in time_value.split(":")]
                     validate_schedule(15, hour, minute)
                     if self.confirm("Register/update the one per-user non-elevated Windows Task?"):
-                        register_windows_task(check_hour=hour, check_minute=minute)
+                        wake = self.confirm("Wake the computer from Sleep when Windows and hardware support it?")
+                        register_windows_task(check_hour=hour, check_minute=minute, wake=wake)
                         self.console.print("[green]Windows Task registered.[/green]")
                 elif task_action == "disable" and self.confirm("Disable the DBD Monthly Core Task?"):
                     result = subprocess.run(
