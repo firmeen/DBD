@@ -266,3 +266,30 @@ def test_distinct_machine_sql_login_required_in_worker_approval(monkeypatch) -> 
     monkeypatch.setattr(repo, "original_login", lambda *_args: "admin-login")
     with pytest.raises(ControlError, match="distinct from the Admin"):
         repo.approve_worker("admin-node", "node-worker", "admin-login", "operator")
+
+
+def test_windows_auto_task_registers_one_daily_and_logon_non_elevated_job(tmp_path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    script = tmp_path / "dbd-auto.bat"
+    script.write_text("@echo off\nexit /b 0\n", encoding="utf-8")
+    seen = []
+    def fake_run(args, **kwargs):
+        seen.append((args, kwargs))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+    monkeypatch.setattr(setup_ui.sys, "platform", "win32")
+    monkeypatch.setattr(setup_ui, "_task_script", lambda: script)
+    monkeypatch.setattr(setup_ui.subprocess, "run", fake_run)
+    setup_ui.register_windows_task(check_hour=9, check_minute=30, wake=True)
+    assert len(seen) == 1
+    command = seen[0][0][-1]
+    assert "New-ScheduledTaskTrigger -Daily" in command
+    assert "New-ScheduledTaskTrigger -AtLogOn" in command
+    assert "DBD Monthly Core" in command
+    assert "-StartWhenAvailable" in command
+    assert "-MultipleInstances IgnoreNew" in command
+    assert "-LogonType Interactive -RunLevel Limited" in command
+    assert "-WakeToRun" in command
+    assert "RunLevel Highest" not in command
+    with pytest.raises(ControlError, match="start time"):
+        setup_ui.register_windows_task(check_hour=24)
+    assert len(seen) == 1
