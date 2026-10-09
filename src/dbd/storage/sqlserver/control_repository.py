@@ -225,6 +225,18 @@ class ControlRepository:
         with transaction() as conn:
             if not self._has_admin_permission(conn):
                 raise ControlError("SQL Server login lacks DBD_CONTROL UPDATE permission")
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f"SELECT record_key FROM {_TABLE} WITH (UPDLOCK,HOLDLOCK) "
+                    "WHERE record_type='NODE' AND JSON_VALUE(payload,'$.role')='ADMIN' "
+                    "AND JSON_VALUE(payload,'$.approved')='true'"
+                )
+                admins = [str(row[0]) for row in cur.fetchall()]
+            finally:
+                cur.close()
+            if admins and admins != [node_id]:
+                raise ControlError("An Admin Coordinator machine is already enrolled")
             schedule = self._read(conn, "SCHEDULE", "core", lock=True)
             if schedule is not None and schedule.get("admin_node") != node_id:
                 raise ControlError("A different admin machine is already configured")
@@ -309,6 +321,9 @@ class ControlRepository:
             self.require_node(conn, node_id, role="ADMIN")
             if not self._has_admin_permission(conn):
                 raise ControlError("SQL Server login has no admin control permission")
+            schedule = self._read(conn, "SCHEDULE", "core")
+            if schedule is not None and schedule.get("admin_node") != node_id:
+                raise ControlError("This is not the designated Admin Coordinator machine")
 
     def node_status(self, node_id: str) -> dict[str, Any] | None:
         with connection() as conn:
@@ -420,7 +435,11 @@ class ControlRepository:
     def require_collection_access(
         self, conn, node_id: str, generation: int, *, finishing: bool = False,
     ) -> None:
-        self.require_node(conn, node_id, lock=True)
+        node = self.require_node(conn, node_id, lock=True)
+        if node.get("role") == "ADMIN":
+            schedule = self._read(conn, "SCHEDULE", "core", lock=True)
+            if schedule is None or schedule.get("admin_node") != node_id:
+                raise ControlError("Admin node does not match designated Coordinator")
         active = self.active_generation(conn)
         if active is None or int(active.get("generation") or 0) != int(generation):
             raise ControlError("No matching active generation for this node")
