@@ -15,6 +15,14 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore", frozen=True
     )
+    dbd_production_backend: Literal["sqlserver", "mysql"] = "sqlserver"
+    # Separate from DB_* (Legacy Dataset 1 and campaign runtime).
+    prod_mysql_host: str = "127.0.0.1"
+    prod_mysql_port: int = Field(3307, ge=1, le=65535)
+    prod_mysql_database: str = Field("dbd_production", pattern=r"^[A-Za-z0-9_]+$")
+    prod_mysql_user: str | None = None
+    prod_mysql_password: str | None = Field(None, repr=False)
+    prod_mysql_pool_size: int = Field(8, ge=1, le=100)
     db_host: str = "127.0.0.1"
     db_port: int = Field(3307, ge=1, le=65535)
     db_name: str = Field("dbd", pattern=r"^[A-Za-z0-9_]+$")
