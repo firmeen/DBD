@@ -248,15 +248,20 @@ class ControlRepository:
     def _has_admin_permission(conn) -> bool:
         cur = conn.cursor()
         try:
-            cur.execute("SELECT HAS_PERMS_BY_NAME(N'dbo.DBD_CONTROL', N'OBJECT', N'UPDATE')")
-            return bool(cur.fetchone()[0])
+            cur.execute(
+                "SELECT HAS_PERMS_BY_NAME(N'dbo.DBD_CONTROL',N'OBJECT',N'SELECT'),"
+                " HAS_PERMS_BY_NAME(N'dbo.DBD_CONTROL',N'OBJECT',N'INSERT'),"
+                " HAS_PERMS_BY_NAME(N'dbo.DBD_CONTROL',N'OBJECT',N'UPDATE')"
+            )
+            row = cur.fetchone()
+            return bool(row and all(bool(value) for value in row))
         finally:
             cur.close()
 
     def register_admin(self, node_id: str, operator: str) -> None:
         with transaction() as conn:
             if not self._has_admin_permission(conn):
-                raise ControlError("SQL Server login lacks DBD_CONTROL UPDATE permission")
+                raise ControlError("SQL Server login lacks DBD_CONTROL SELECT/INSERT/UPDATE permissions")
             cur = conn.cursor()
             try:
                 cur.execute(
