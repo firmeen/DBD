@@ -559,6 +559,13 @@ def main():
     _add_output_options(sub.add_parser("master-status", help="Count discovered and verified company identities"))
     _add_output_options(sub.add_parser("discover-status", help="Show discovery coverage"))
     _add_output_options(sub.add_parser("discover-retry", help="Requeue failed discovery buckets"))
+    recovery = _add_output_options(
+        sub.add_parser("discover-recover", help="Preview or recover verified Discovery gaps")
+    )
+    recovery.add_argument("--parent-id", type=positive)
+    recovery.add_argument("--limit", type=positive, default=10)
+    recovery.add_argument("--execute", action="store_true")
+    recovery.add_argument("--rate", type=positive_rate, default=1.0)
     reset = _add_output_options(
         sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
     )
@@ -811,6 +818,30 @@ def main():
 
             with manager_lock():
                 command_bulk(None, args.run_id, [], args.limit, presenter=presenter)
+        elif args.command == "discover-recover":
+            from ..pipelines.discovery import recover_discovery
+
+            if args.execute:
+                with manager_lock() as conn:
+                    result = asyncio.run(
+                        recover_discovery(
+                            parent_id=args.parent_id,
+                            limit=args.limit,
+                            execute=True,
+                            rate=args.rate,
+                            health=lambda: assert_manager_lock(conn),
+                        )
+                    )
+            else:
+                result = asyncio.run(
+                    recover_discovery(
+                        parent_id=args.parent_id,
+                        limit=args.limit,
+                        execute=False,
+                        rate=args.rate,
+                    )
+                )
+            presenter.command_result("DBD · DISCOVERY RECOVERY", result)
         elif args.command == "discover-status":
             from ..storage.mysql.repositories.discovery_repository import discovery_summary
 
