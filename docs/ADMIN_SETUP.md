@@ -5,11 +5,18 @@ Production: TIPDataIntelligence. The Admin is the only coordinator. Local collec
 ## One-time preparation
 
 ```powershell
-python -m pip install -e .
-dbd-data migrate --backend sqlserver
-dbd-data setup
-dbd-data check-db --backend sqlserver
+python -m venv .venv
+.\\.venv\\Scripts\\python.exe -m pip install -e .
+.\\.venv\\Scripts\\dbd-data.exe migrate --backend sqlserver
+.\\.venv\\Scripts\\dbd-data.exe setup
+.\\.venv\\Scripts\\dbd-data.exe check-db --backend sqlserver
 ```
+
+The automatic `scripts\\dbd-auto.bat` deliberately uses
+`.venv\\Scripts\\dbd-data.exe` on the Admin machine. If you instead
+installed the CLI globally, manual commands can still work, but automatic
+registration will refuse READY until this portable project `.venv` exists.
+No Windows Administrator access is needed for the venv.
 
 Setup loads .env, prompts for missing values, creates a stable per-machine Node ID, checks the SQL login and offers monthly schedule / Worker approval. DBD_OPERATOR_NAME is a display label only. Never share the Admin SQL credentials with Workers. Schema migration requires adequate SQL Server CREATE/ALTER privileges; no Windows elevation is requested.
 
