@@ -744,6 +744,8 @@ async def cycle_run(
             generation = int(record["generation"])
             cycle_month = str(record["cycle_month"])
             resumed = action == "RESUME"
+            if record.get("start_warning"):
+                _emit(event, "warning", message=str(record["start_warning"]))
             control.transition(control_node, cycle_month, "DISCOVERING")
         elif auto:
             raise ValueError("--auto requires the SQL Server production backend")
