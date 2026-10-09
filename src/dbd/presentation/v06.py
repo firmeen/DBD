@@ -38,6 +38,7 @@ _LONG_RUNNING_COMMANDS = {"discover", "fetch-company", "cycle-run", "cycle-loop"
 _COMMAND_LABELS = {
     "check-db": "CHECK DB",
     "migrate": "MIGRATE",
+    "cutover": "CUTOVER",
     "discover": "DISCOVER",
     "fetch-company": "FETCH COMPANY",
     "cycle-run": "CYCLE RUN",
@@ -101,6 +102,7 @@ def _truthy_count(value: Any) -> bool:
 class V06TerminalState:
     app: str
     command: str
+    backend: str = "sqlserver"
     started_at: datetime | None = None
     started_monotonic: float = 0.0
     finished_at: datetime | None = None
@@ -199,6 +201,8 @@ class V06Terminal:
     def start(self, **context: Any) -> V06Terminal:
         now = self._clock()
         with self._lock:
+            if context.get("backend"):
+                self.state.backend = str(context["backend"])
             self.state.started_at = self._wall_clock()
             self.state.started_monotonic = now
             self.state.status = "RUNNING"
@@ -596,6 +600,7 @@ class V06Terminal:
         title.append(self.state.app, style="bold white")
         title.append("  /  ", style="dim")
         title.append(command, style="bold white")
+        title.append(f"  ·  {self.state.backend.upper()}", style="cyan")
         timing = Text()
         timing.append("Started  ", style="dim")
         timing.append(_timestamp(started), style="white")
@@ -685,7 +690,7 @@ class V06Terminal:
                 self._centered("Applying safe schema contract", width, "cyan"),
                 self._centered(self._motion("seal"), width, "cyan"),
             )
-            return self._panel("SQL SERVER SCHEMA", body, "APPLYING", active=True)
+            return self._panel(f"{self.state.backend.upper()} SCHEMA", body, "APPLYING", active=True)
         result = self.state.result
         created = result.get("created")
         altered = result.get("altered")
@@ -1514,7 +1519,7 @@ class V06Terminal:
     def _plain_start(self) -> None:
         started = self.state.started_at or self._wall_clock()
         label = _COMMAND_LABELS.get(self.state.command, self.state.command.upper())
-        self._plain_write(f"{self.state.app} / {label}")
+        self._plain_write(f"{self.state.app} / {label} / {self.state.backend.upper()}")
         self._plain_write(f"Started: {_timestamp(started)}")
 
     def _plain_event(self, name: str, payload: Mapping[str, Any]) -> None:
