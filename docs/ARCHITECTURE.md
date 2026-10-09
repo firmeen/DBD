@@ -415,3 +415,8 @@ Both output backends share the external DBD API; simultaneous collectors must
 respect the **combined** upstream request rate. Backend isolation does not grant
 a separate upstream quota.
 
+## Monthly SQL Server control plane
+
+The five business tables remain unchanged. The **SQL Server-only** `dbo.DBD_CONTROL` table has `SCHEDULE`, `GENERATION`, `NODE`, `AUDIT`, and `RATE` record types in the existing eight-column key/payload contract. Admin is the single Coordinator, and can perform local Deep Collection without external Workers. An approved Worker may join only the currently `COLLECTING` Generation using existing `DBD_COMPANY` company leases; `DRAINING` stops new claims before verification/finalization. `DBD_CONTROL_ADMIT` reserves one SQL-backed global request slot per HTTP attempt without allowing Worker SQL logins to update the calendar. `DBD_OPERATOR_NAME` is not an authorization credential. Generation dates are Asia/Bangkok, UTC timestamps are stored. `--auto` is a one-shot Task Scheduler entry, not a polling daemon.
+
+See [Admin setup](ADMIN_SETUP.md) / [Worker setup](WORKER_SETUP.md).
