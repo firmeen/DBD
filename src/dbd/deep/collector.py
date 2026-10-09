@@ -31,10 +31,7 @@ from ..contracts.identity import identity
 from ..contracts.strict import normalize_industry_benchmark
 from ..core.exceptions import ContractError, IdentityConflict
 from ..core.settings import settings
-from ..storage.sqlserver.repository import (
-    ProductionSqlServerRepository,
-    SqlServerLeaseLost,
-)
+from ..storage.production import ProductionLeaseLost
 from .catalog import (
     FINANCIAL_ENDPOINTS,
     FINANCIAL_MASK,
@@ -694,7 +691,7 @@ class DeepCollector:
     def __init__(
         self,
         *,
-        repository: ProductionSqlServerRepository,
+        repository: Any,
         generation: int,
         phase: str,
         concurrency: int,
@@ -755,7 +752,7 @@ class DeepCollector:
         for attempt in range(1, attempts + 1):
             try:
                 return await asyncio.to_thread(function, *args, **kwargs)
-            except SqlServerLeaseLost:
+            except ProductionLeaseLost:
                 raise
             except Exception as exc:
                 checker = getattr(self.repo, "is_transient_error", None)
@@ -842,7 +839,7 @@ class DeepCollector:
                 pass
             try:
                 await self._db_call(self._renew_sync, company)
-            except SqlServerLeaseLost:
+            except ProductionLeaseLost:
                 lost.set()
                 self._emit(
                     "warning",
