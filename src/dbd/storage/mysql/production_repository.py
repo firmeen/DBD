@@ -100,8 +100,10 @@ def _upsert_many(conn, table: str, rows: list[dict[str, Any]], *,
         + ") VALUES (" + ",".join(["%s"] * len(columns))
         + ") ON DUPLICATE KEY UPDATE " + ",".join(updates)
     )
+    # Reduce peak SQL packet size; PyMySQL also bounds its executemany SQL.
     with conn.cursor() as cur:
-        cur.executemany(sql, parameters)
+        for offset in range(0, len(parameters), 200):
+            cur.executemany(sql, parameters[offset:offset + 200])
     return len(parameters)
 
 
@@ -245,8 +247,8 @@ class ProductionMySqlRepository:
         ))
         result: dict[tuple[str, str], int] = {}
         with conn.cursor() as cur:
-            for offset in range(0, len(unique), 300):
-                chunk = unique[offset:offset + 300]
+            for offset in range(0, len(unique), 500):
+                chunk = unique[offset:offset + 500]
                 if not chunk:
                     continue
                 placeholders = ",".join(["(%s,%s)"] * len(chunk))
@@ -286,49 +288,135 @@ class ProductionMySqlRepository:
         )
 
     def upsert_industries(self, conn, rows, *, reject_conflicts=False):
-        for row in rows:
-            key = tuple(_production_value(row.get(k)) for k in (
-                "submit_objective_code", "fiscal_year", "business_size_code",
-                "location_type", "location_no",
-            ))
+        """Batch scoped industry lookup and bounded insert/update, preserving conflict rules.
+
+        The first two key columns are non-null; other scope columns are nullable.
+        Existing rows are locked in the current outer transaction. No commit occurs
+        here and no Generation 1 payload conflict is silently overwritten.
+        """
+        if not rows:
+            return 0
+
+        table = "DBD_INDUSTRY"
+        key_columns = (
+            "submit_objective_code", "fiscal_year", "business_size_code",
+            "location_type", "location_no",
+        )
+        columns = _columns(table)
+        unknown = set().union(*(set(row) for row in rows)) - set(columns)
+        if unknown:
+            raise MySqlProductionWriteError(
+                f"{table} unsupported columns: {sorted(unknown)}"
+            )
+
+        def key_for(row):
+            key = tuple(_production_value(row.get(col)) for col in key_columns)
             if key[0] is None or key[1] is None:
                 raise MySqlProductionWriteError("Missing industry natural key")
-            with conn.cursor() as cur:
+            return key
+
+        def select_newer(old, new):
+            """Apply the existing SQL Server freshness/conflict contract."""
+            old_payload = _production_value(old.get("payload"))
+            new_payload = _production_value(new.get("payload"))
+            old_date = _production_value(old.get("source_updated_at"))
+            new_date = _production_value(new.get("source_updated_at"))
+            if old_payload != new_payload:
+                if reject_conflicts:
+                    raise MySqlProductionWriteError(
+                        "Conflicting Generation 1 industry payload"
+                    )
+                if old_date is not None and new_date is None:
+                    raise MySqlProductionWriteError(
+                        "Conflicting industry payload lacks source timestamp"
+                    )
+                if old_date is not None and new_date is not None and new_date < old_date:
+                    return old
+                if new_date == old_date:
+                    raise MySqlProductionWriteError(
+                        "Conflicting industry source timestamp"
+                    )
+            elif old_date is not None and (new_date is None or new_date < old_date):
+                return old
+            return new
+
+        # Deduplicate within this call before any SQL. The logical keys follow
+        # MySQL's functional UNIQUE index (empty optional scopes map to NULL).
+        incoming: dict[tuple[Any, ...], dict[str, Any]] = {}
+        for row in rows:
+            key = key_for(row)
+            previous = incoming.get(key)
+            incoming[key] = (
+                dict(row) if previous is None else select_newer(previous, dict(row))
+            )
+
+        # Fetch by the indexed non-null key prefix; then match nullable
+        # optional scope columns in Python. One locked read per <=200 prefixes,
+        # instead of one SELECT FOR UPDATE per incoming industry row.
+        prefixes = list(dict.fromkeys(key[:2] for key in incoming))
+        existing: dict[tuple[Any, ...], dict[str, Any]] = {}
+        with conn.cursor() as cur:
+            for offset in range(0, len(prefixes), 200):
+                block = prefixes[offset:offset + 200]
+                placeholders = ",".join(["(%s,%s)"] * len(block))
                 cur.execute(
-                    "SELECT industry_id,source_updated_at,payload "
-                    "FROM DBD_INDUSTRY WHERE submit_objective_code=%s "
-                    "AND fiscal_year=%s AND business_size_code <=> %s "
-                    "AND location_type <=> %s AND location_no <=> %s FOR UPDATE",
-                    key,
+                    "SELECT industry_id,submit_objective_code,fiscal_year,"
+                    "business_size_code,location_type,location_no,"
+                    "source_updated_at,payload "
+                    "FROM DBD_INDUSTRY WHERE (submit_objective_code,fiscal_year) "
+                    f"IN ({placeholders}) FOR UPDATE",
+                    tuple(part for key in block for part in key),
                 )
-                existing = cur.fetchone()
-            if existing:
-                pk, old_date, old_payload = existing
-                new_date = _production_value(row.get("source_updated_at"))
-                new_payload = _production_value(row.get("payload"))
-                if old_payload != new_payload:
-                    if reject_conflicts:
-                        raise MySqlProductionWriteError("Conflicting Generation 1 industry payload")
-                    if old_date is not None and (
-                        new_date is None or new_date < old_date
-                    ):
-                        continue
-                    if new_date == old_date:
-                        raise MySqlProductionWriteError("Conflicting industry source timestamp")
-                elif old_date is not None and (new_date is None or new_date < old_date):
-                    continue
-                updates = {
-                    col: _production_value(row.get(col))
-                    for col in _columns("DBD_INDUSTRY")
-                    if col not in {
-                        "submit_objective_code", "fiscal_year", "business_size_code",
-                        "location_type", "location_no", "first_seen_generation",
-                    }
-                }
-                _update(conn, "DBD_INDUSTRY", updates, "industry_id=%s", (int(pk),))
-            else:
-                _insert(conn, "DBD_INDUSTRY", row,
-                        preserve=("first_seen_generation",))
+                for found in cur.fetchall():
+                    pk, objective, year, size, location_type, location_no, updated, payload = found
+                    key = tuple(_production_value(value) for value in (
+                        objective, year, size, location_type, location_no,
+                    ))
+                    if key in incoming:
+                        existing[key] = {
+                            "industry_id": int(pk),
+                            "source_updated_at": updated,
+                            "payload": payload,
+                        }
+
+        insert_rows: list[tuple[Any, ...]] = []
+        update_rows: list[tuple[Any, ...]] = []
+        update_columns = tuple(
+            col for col in columns
+            if col not in key_columns and col != "first_seen_generation"
+        )
+        for key, row in incoming.items():
+            previous = existing.get(key)
+            if previous is None:
+                insert_rows.append(tuple(_production_value(row.get(col)) for col in columns))
+                continue
+            selected = select_newer(previous, row)
+            if selected is previous:
+                continue
+            update_rows.append(
+                tuple(_production_value(row.get(col)) for col in update_columns)
+                + (int(previous["industry_id"]),)
+            )
+
+        # Bulk DML participates in the same micro-transaction as company and
+        # domain writes. Missing-key insert races fail closed (unique index).
+        with conn.cursor() as cur:
+            if insert_rows:
+                insert_sql = (
+                    "INSERT INTO DBD_INDUSTRY ("
+                    + ",".join(f"`{col}`" for col in columns)
+                    + ") VALUES (" + ",".join(["%s"] * len(columns)) + ")"
+                )
+                for offset in range(0, len(insert_rows), 200):
+                    cur.executemany(insert_sql, insert_rows[offset:offset + 200])
+            if update_rows:
+                update_sql = (
+                    "UPDATE DBD_INDUSTRY SET "
+                    + ",".join(f"`{col}`=%s" for col in update_columns)
+                    + " WHERE industry_id=%s"
+                )
+                for offset in range(0, len(update_rows), 200):
+                    cur.executemany(update_sql, update_rows[offset:offset + 200])
         return len(rows)
 
     def update_company_state(self, conn, company_id, values):
