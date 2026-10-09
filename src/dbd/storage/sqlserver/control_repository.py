@@ -326,8 +326,11 @@ class ControlRepository:
         with connection() as conn:
             return self._read(conn, "GENERATION", f"core:{month}")
 
-    def active_generation(self) -> dict[str, Any] | None:
-        with connection() as conn:
+    def active_generation(self, conn=None) -> dict[str, Any] | None:
+        if conn is None:
+            with connection() as own:
+                return self.active_generation(own)
+        else:
             cur = conn.cursor()
             try:
                 cur.execute(
@@ -352,7 +355,7 @@ class ControlRepository:
                 raise ControlError("Monthly schedule not configured: run dbd-data setup")
             key = month_key(now)
             current = self._read(conn, "GENERATION", f"core:{key}", lock=True)
-            active = self.active_generation()
+            active = self.active_generation(conn)
             decision = choose_monthly_generation(
                 now=now, generation_state=generation_state, schedule=schedule,
                 current_month_record=current, active_record=active,
@@ -397,7 +400,7 @@ class ControlRepository:
 
     def admit(self, node_id: str, generation: int) -> float:
         """Reserve an upstream slot; return seconds until it may be used."""
-        with connection() as conn:
+        with transaction() as conn:
             cur = conn.cursor()
             try:
                 cur.execute(
@@ -406,7 +409,6 @@ class ControlRepository:
                     (node_id, int(generation)),
                 )
                 row = cur.fetchone()
-                conn.commit()
                 if row is None:
                     raise ControlError("No HTTP admission result")
                 return max(0.0, int(row[0]) / 1000.0)
