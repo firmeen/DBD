@@ -420,3 +420,6 @@ rate limit. The MySQL Production database must exist before `migrate` and
 cannot be the same exact host/port/database as legacy MySQL. Migration creates
 only the five production tables; it does not change Run 9/Redis/Legacy schemas.
 
+## Monthly and automatic SQL Server Core
+
+Initial setup: `dbd-data migrate --backend sqlserver` (authorized SQL principal), then `dbd-data setup` on the Admin computer. **Manual:** `dbd-data cycle run --phase core --backend sqlserver`. **Automatic:** `dbd-data cycle run --phase core --backend sqlserver --auto` invoked by the single Windows Task Scheduler task. No additional steps are needed for Admin-only operation. A Worker joins only during `COLLECTING` with `dbd-deep collect --phase core --backend sqlserver --continuous`. The existing status/resume commands are unchanged. The SQL Control schema must exist; no Gmail notifier or background Python watcher is installed. For complete setup instructions see [Admin](ADMIN_SETUP.md) and [Worker](WORKER_SETUP.md).
