@@ -65,6 +65,7 @@ def register_windows_task(*, check_hour: int = 9, check_minute: int = 0, wake: b
     """
     if sys.platform != "win32":
         raise ControlError("Windows Task Scheduler is available only on Windows")
+    validate_schedule(1, check_hour, check_minute)
     script = _task_script()
     if not script.exists():
         raise ControlError(f"Auto-run script not found: {script}")
