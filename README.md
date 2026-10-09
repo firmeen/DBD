@@ -320,3 +320,27 @@ python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
 | docs/setup/README.md | เตรียมเครื่องและ Production environment |
 
 เอกสารรุ่นเก่าที่อาจยังอยู่ใน repository ไม่ใช่คู่มือสำหรับ Production v0.6 เว้นแต่เอกสารนั้นระบุชัดว่าถูกใช้ในขั้นตอนเฉพาะของระบบปัจจุบัน
+
+---
+
+## v0.6 Production backends: SQL Server or MySQL
+
+v0.6 uses one Discovery/Deep/Cycle engine with a selectable independent output
+database. SQL Server remains the default. Choosing MySQL does not copy, reset,
+or read SQL Server progress. Each target owns five equivalent production tables
+(`DBD_COMPANY`, `DBD_COMPANY_RELATION`, `DBD_COMPANY_EVENT`,
+`DBD_FINANCIAL`, `DBD_INDUSTRY`) with separate generation, masks and leases.
+
+```powershell
+dbd-data check-db --backend sqlserver
+dbd-data cycle status --backend sqlserver --phase core
+dbd-data check-db --backend mysql
+dbd-data cycle status --backend mysql --phase core
+```
+
+A fresh target requires its database to exist before
+`dbd-data migrate --backend mysql`. Use separate `PROD_MYSQL_*` credentials;
+legacy `DB_*` remains the Generation 1 source and campaign runtime.
+Use `dbd-data cutover --backend mysql` only for the one-time legacy G1 import
+before the selected target begins G2. Full details: `docs/RUNBOOK.md`.
+
