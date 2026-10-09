@@ -784,6 +784,20 @@ def main():
         "status", help="Read durable v0.6 cycle state without mutation"
     )
     cycle_status_parser.add_argument("--phase", choices=("core", "extended"), default="core")
+
+    # Backend is scoped to v0.6 commands, never legacy campaign/bulk.
+    for command_parser in (
+        fetch, disc, cycle_run_parser, cycle_loop_parser, cycle_status_parser,
+    ):
+        command_parser.add_argument("--backend", choices=("sqlserver", "mysql"))
+    # Existing command parser objects were returned anonymously above.
+    for command in ("check-db", "migrate"):
+        sub.choices[command].add_argument("--backend", choices=("sqlserver", "mysql"))
+    cutover = sub.add_parser(
+        "cutover", help="Import legacy MySQL Generation 1 into the selected production target"
+    )
+    cutover.add_argument("--backend", choices=("sqlserver", "mysql"), default="sqlserver")
+    cutover.add_argument("--batch-size", type=positive, default=500)
     args = parser.parse_args()
     presenter = TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
@@ -796,16 +810,27 @@ def main():
 
             presenter.package_about(package_environment_snapshot())
         elif args.command == "migrate":
-            from ..storage.sqlserver.repository import ProductionSqlServerRepository
+            from ..storage.production import production_repository
 
-            v06_terminal = V06Terminal("migrate", app="DBD DATA").start()
-            result = ProductionSqlServerRepository().ensure_schema()
+            backend = args.backend or settings.dbd_production_backend
+            v06_terminal = V06Terminal("migrate", app="DBD DATA").start(backend=backend)
+            result = production_repository(backend).ensure_schema()
             v06_terminal.finish(result)
         elif args.command == "check-db":
-            from ..storage.sqlserver.repository import ProductionSqlServerRepository
+            from ..storage.production import production_repository
 
-            v06_terminal = V06Terminal("check-db", app="DBD DATA").start()
-            result = ProductionSqlServerRepository().check_database()
+            backend = args.backend or settings.dbd_production_backend
+            v06_terminal = V06Terminal("check-db", app="DBD DATA").start(backend=backend)
+            result = production_repository(backend).check_database()
+            v06_terminal.finish(result)
+        elif args.command == "cutover":
+            from ..cutover import run_generation1_cutover
+
+            backend = args.backend
+            v06_terminal = V06Terminal("cutover", app="DBD DATA").start(backend=backend)
+            result = run_generation1_cutover(
+                backend=backend, batch_size=args.batch_size, event=v06_terminal.event,
+            )
             v06_terminal.finish(result)
         elif args.command == "master-status":
             from ..storage.mysql.engine import connect
@@ -852,12 +877,14 @@ def main():
             v06_terminal = V06Terminal("fetch-company", app="DBD DATA").start(
                 phase=args.phase,
                 registration_no=parsed.jp_no,
-                juristic_type_code=parsed.jp_type_code,
+                juristic_type_code=parsed.jp_type_code
+                backend=args.backend or settings.dbd_production_backend,
             )
             result = asyncio.run(
                 fetch_company(
                     parsed,
                     phase=args.phase,
+                    backend=args.backend,
                     concurrency=args.concurrency,
                     rate=args.rate,
                     http_retries=args.http_retries,
@@ -925,12 +952,14 @@ def main():
                 raise ValueError("Search keywords must contain at least 3 characters")
             configure(args.metrics_port)
             v06_terminal = V06Terminal("discover", app="DBD DATA").start(
-                phase=args.phase,
+                phase=args.phase
+            backend=args.backend or settings.dbd_production_backend,
             )
             generation, result = asyncio.run(
                 discover(
                     seeds,
                     phase=args.phase,
+                    backend=args.backend,
                     refresh=args.refresh,
                     search_type=args.type,
                     concurrency=args.concurrency,
@@ -958,17 +987,20 @@ def main():
 
             if args.cycle_command == "status":
                 v06_terminal = V06Terminal("cycle-status", app="DBD DATA").start(
-                    phase=args.phase,
+                    phase=args.phase
+                backend=args.backend or settings.dbd_production_backend,
                 )
-                current = asyncio.run(status(phase=args.phase, coverage=False))
+                current = asyncio.run(status(phase=args.phase, coverage=False, backend=args.backend))
                 v06_terminal.finish(asdict(current))
             else:
                 command = "cycle-run" if args.cycle_command == "run" else "cycle-loop"
                 v06_terminal = V06Terminal(command, app="DBD DATA").start(
-                    phase=args.phase,
+                    phase=args.phase
+                backend=args.backend or settings.dbd_production_backend,
                 )
                 common = {
                     "phase": args.phase,
+                    "backend": args.backend,
                     "refresh": args.refresh,
                     "concurrency": args.concurrency,
                     "rate": args.rate,
