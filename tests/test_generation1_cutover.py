@@ -235,7 +235,7 @@ def test_cutover_refuses_generation_two_before_touching_mysql(
         opened_mysql.append(True)
         yield object()
 
-    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
     monkeypatch.setattr(cutover, "source_fence", mysql_must_not_open)
 
     with pytest.raises(CutoverSafetyError, match="permanently refused"):
@@ -532,7 +532,8 @@ def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
         yield object()
         events.append("source-closed")
 
-    def fake_verification(count, *, expected_domain_counts):
+    def fake_verification(count, *, expected_domain_counts, backend):
+        assert backend == "sqlserver"
         assert count == 1
         assert expected_domain_counts == {
             "relations": 0, "events": 0, "financial": 0, "industries": 0
@@ -540,7 +541,7 @@ def test_cutover_holds_sqlserver_lock_through_all_target_transactions(
         assert current["locked"]
         return {"industries": 0, "companies": 1}
 
-    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -626,7 +627,7 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
     def fake_source_fence():
         yield object()
 
-    monkeypatch.setattr(cutover, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -650,7 +651,8 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
     ):
         monkeypatch.setattr(cutover, method, lambda *_args, **_kw: [])
 
-    def verify(source_rows, *, expected_domain_counts):
+    def verify(source_rows, *, expected_domain_counts, backend):
+        assert backend == "sqlserver"
         assert source_rows == 2
         assert len(stored) == 2
         assert all(not count for count in expected_domain_counts.values())
