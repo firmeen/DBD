@@ -272,6 +272,10 @@ def test_windows_auto_task_registers_one_daily_and_logon_non_elevated_job(tmp_pa
     from types import SimpleNamespace
     script = tmp_path / "dbd-auto.bat"
     script.write_text("@echo off\nexit /b 0\n", encoding="utf-8")
+    cli = tmp_path / ".venv" / "Scripts" / "dbd-data.exe"
+    cli.parent.mkdir(parents=True)
+    cli.write_bytes(b"dummy test executable")
+    monkeypatch.setattr(setup_ui, "PROJECT_ROOT", tmp_path)
     seen = []
     def fake_run(args, **kwargs):
         seen.append((args, kwargs))
@@ -293,3 +297,13 @@ def test_windows_auto_task_registers_one_daily_and_logon_non_elevated_job(tmp_pa
     with pytest.raises(ControlError, match="start time"):
         setup_ui.register_windows_task(check_hour=24)
     assert len(seen) == 1
+
+
+def test_windows_task_refuses_missing_portable_cli(tmp_path, monkeypatch) -> None:
+    script = tmp_path / "dbd-auto.bat"
+    script.write_text("@echo off\n", encoding="utf-8")
+    monkeypatch.setattr(setup_ui, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr(setup_ui, "_task_script", lambda: script)
+    monkeypatch.setattr(setup_ui.sys, "platform", "win32")
+    with pytest.raises(ControlError, match="portable project"):
+        setup_ui.register_windows_task()
