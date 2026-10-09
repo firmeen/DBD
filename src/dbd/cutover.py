@@ -1106,6 +1106,8 @@ def run_generation1_cutover(
     event: EventCallback | None = None,
     backend: str = "sqlserver",
 ) -> dict[str, Any]:
+    if not 1 <= batch_size <= 10000:
+        raise ValueError("batch_size must be between 1 and 10000")
     repository = production_repository(backend)
     repository.validate_schema()
 
