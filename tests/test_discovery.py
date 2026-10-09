@@ -444,3 +444,72 @@ async def test_recovery_parent_count_drift_never_opens_children(monkeypatch):
     assert not applied
     assert report["unresolved"] == 1
     assert "drifted" in report["sample_errors"]
+
+
+@pytest.mark.asyncio
+async def test_validated_children_skip_non_lossless_dimension(monkeypatch):
+    checked = []
+
+    async def fake_probe(_client, _bucket, _filters, _count, options):
+        dimension = (
+            "types" if options[0].jp_types
+            else "province" if options[0].pv_codes
+            else "status" if options[0].jp_statuses
+            else "size"
+        )
+        checked.append(dimension)
+        return dimension == "status"
+
+    monkeypatch.setattr(discovery, "_probe_partition", fake_probe)
+    result = await discovery._validated_children(
+        object(), 42, SearchFilters("010"), ["10", "20"], ["1", "2"], 50000
+    )
+    assert checked == ["types", "province", "status"]
+    assert [f.jp_statuses for f in result] == [["1"], ["2"]]
+
+
+@pytest.mark.asyncio
+async def test_split_overflow_stays_failed_when_no_valid_plan(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository
+
+    class Client:
+        concurrency = 1
+
+    async def fake_count(_client, _id, _filters):
+        page = type("Page", (), {
+            "current_page": 1,
+            "total_items": 10022,
+            "total_pages": 1003,
+            "rows": [{"jpTypeCode": "5"}],
+        })()
+        return page, 42, {"contents": []}, None
+
+    async def no_valid_children(*_args, **_kw):
+        return []
+
+    updates = []
+    split_calls = []
+    monkeypatch.setattr(discovery, "_count", fake_count)
+    monkeypatch.setattr(discovery, "_validated_children", no_valid_children)
+    monkeypatch.setattr(
+        discovery, "update_bucket", lambda _id, **kw: updates.append(kw)
+    )
+    monkeypatch.setattr(
+        discovery, "split_bucket", lambda *_a, **_kw: split_calls.append(True)
+    )
+    monkeypatch.setattr(
+        discovery_repository, "mark_search_archive", lambda *_args: None
+    )
+    row = {
+        "id": 42, "keyword": "010", "search_type": "",
+        "pv_codes": "10", "jp_statuses": "", "jp_types": "5",
+        "business_sizes": "S", "total_items": 10022,
+        "pages_total": 1003, "pages_done": 0, "depth": 3,
+    }
+    fetched, written = await discovery._process_bucket(
+        Client(), row, ["10"], master_cache={}, progress_line=None, status_codes=["1"]
+    )
+    assert (fetched, written) == (0, 0)
+    assert updates[-1]["status"] == "failed"
+    assert "no count-validated" in updates[-1]["last_error"]
+    assert not split_calls
