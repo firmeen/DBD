@@ -1362,6 +1362,16 @@ class DeepCollector:
 
     def _recover_sync(self) -> int:
         with self.repo.transaction() as conn:
+            if (
+                self.node_id is not None
+                and getattr(self.repo, "backend", None) == "sqlserver"
+                and self.generation >= 2
+                and self.phase == "core"
+            ):
+                from ..storage.sqlserver.control_repository import ControlRepository
+                ControlRepository().require_collection_access(
+                    conn, self.node_id, self.generation,
+                )
             return self.repo.recover_expired_leases(conn)
 
     async def run(self) -> dict[str, Any]:
