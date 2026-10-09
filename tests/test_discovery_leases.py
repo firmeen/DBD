@@ -134,3 +134,47 @@ def test_release_is_fenced_by_lease_version_even_for_same_owner() -> None:
     current = get_bucket(bucket_id)
     assert current["lease_owner"] is None
     assert current["lease_expires_at"] is None
+
+
+def test_recovery_cannot_change_a_child_held_by_live_worker() -> None:
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        apply_recovery_recount, update_bucket,
+    )
+
+    parent_filters = SearchFilters("recovery-lease-" + uuid4().hex)
+    parent = upsert_bucket(parent_filters)
+    child = split_bucket(
+        parent, [SearchFilters(parent_filters.keyword, jp_types=["5"])], 1
+    )[0]
+    update_bucket(parent, total_items=5, partition_lossless=0)
+    update_bucket(child, status="done", total_items=0, pages_total=0)
+    _set_lease(child, "busy-worker", 2)
+
+    with pytest.raises(DiscoveryLeaseLost):
+        apply_recovery_recount(parent, 5, {child: 5})
+    current = get_bucket(child)
+    assert current["lease_owner"] == "busy-worker"
+    assert current["total_items"] == 0
+
+
+def test_split_refuses_a_second_incompatible_child_plan() -> None:
+    parent_filters = SearchFilters("split-conflict-" + uuid4().hex)
+    parent = upsert_bucket(parent_filters)
+    original = SearchFilters(parent_filters.keyword, jp_types=["5"])
+    child_id = split_bucket(parent, [original], 1)[0]
+
+    with pytest.raises(RuntimeError, match="another split plan"):
+        split_bucket(
+            parent,
+            [SearchFilters(parent_filters.keyword, jp_types=["2"])],
+            1,
+        )
+
+    # Replaying exactly the same child plan is idempotent.
+    assert split_bucket(parent, [original], 1) == [child_id]
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM discovery_buckets WHERE parent_id=%s",
+            (parent,),
+        )
+        assert int(cur.fetchone()["n"]) == 1
