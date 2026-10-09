@@ -821,10 +821,10 @@ async def run(
     repository=None,
     event=None,
 ) -> DiscoveryResult:
-    """Direct v0.6 Search traversal into SQL Server DBD_COMPANY.
+    """Direct v0.6 Search traversal into selected production DBD_COMPANY.
 
     Split/page state is intentionally transient. A crash restarts Search
-    traversal; natural-key SQL Server upserts make repeated pages safe.
+    traversal; natural-key production upserts make repeated pages safe.
     """
     if distributed:
         raise ValueError(
@@ -834,9 +834,9 @@ async def run(
     if generation is None:
         raise ValueError("v0.6 direct discovery requires an explicit generation")
 
-    from ..storage.sqlserver.repository import ProductionSqlServerRepository
+    from ..storage.production import production_repository
 
-    repo = repository or ProductionSqlServerRepository()
+    repo = repository if repository is not None else production_repository()
     global_rate = settings.dbd_rate_per_second if rate is None else rate
 
     buckets_processed = 0
