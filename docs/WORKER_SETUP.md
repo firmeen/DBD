@@ -12,6 +12,34 @@ dbd-data check-db --backend sqlserver
 
 Use a separate SQL Server login, not the Admin login. The Setup Wizard reads .env and prompts for missing values; DBD_OPERATOR_NAME is a display-only name. Machine ID is created once in the local user's DBDData config and does not belong in the shared .env or Git repository.
 
+## SQL Server permissions (one-time, configured by the database administrator)
+
+Each machine must have its own SQL Server login and mapped database user. The
+Worker needs only the existing production-table permissions required to claim,
+write and release Core Deep results, plus **SELECT on DBD_CONTROL** to read
+its enrollment and Generation state, and **EXECUTE on DBD_CONTROL_ADMIT**
+for the atomic shared HTTP rate gate.
+
+For example, after the SQL Server database user is created and mapped to the
+machine-specific login, the authorized database administrator can grant:
+
+```sql
+USE TIPDataIntelligence;
+GRANT SELECT ON OBJECT::dbo.DBD_CONTROL TO [your_worker_database_user];
+GRANT EXECUTE ON OBJECT::dbo.DBD_CONTROL_ADMIT TO [your_worker_database_user];
+```
+
+Replace the bracketed example with the actual database user. Grant the required
+least-privilege SELECT/INSERT/UPDATE on the five existing business tables
+separately according to the deployed collector contract; **never grant INSERT,
+UPDATE, DELETE, ALTER or CONTROL on dbo.DBD_CONTROL to Workers**, or broad
+`db_owner` / `db_ddladmin` membership. Do not reuse the Admin SQL login
+for Workers, or the same login across two Worker computers.
+
+The Setup Wizard will now refuse READY if the logged-in SQL identity cannot
+execute the admission procedure. A Worker cannot grant these permissions to
+itself through `dbd-data setup`.
+
 ## 2. Enrollment
 
 Setup displays your Machine ID (node-...), your authenticated SQL Server Login and Operator name. Give all three to the Admin. The Admin approves the Machine ID/Login pair using dbd-data setup. Rerun Setup to verify APPROVED. Worker does not create or change its own SQL Server Control record.
