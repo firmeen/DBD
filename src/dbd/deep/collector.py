@@ -1316,6 +1316,16 @@ class DeepCollector:
         client: FixedRateDbdClient,
     ) -> None:
         while not self._stop.is_set():
+            if self.node_id and getattr(self.repo, "backend", None) == "sqlserver":
+                from ..storage.sqlserver.control_repository import ControlRepository
+                control = ControlRepository()
+                active = await asyncio.to_thread(control.active_generation)
+                node = await asyncio.to_thread(control.node_status, self.node_id)
+                if (active is None or active.get("state") != "COLLECTING" or
+                        int(active.get("generation") or 0) != self.generation or
+                        node is None or not node.get("authorized")):
+                    self._stop.set()
+                    return
             company = await self._claim()
             if company is None:
                 remaining = await self._remaining_budget()
