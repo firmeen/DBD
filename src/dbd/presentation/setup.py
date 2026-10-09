@@ -185,7 +185,8 @@ class SetupWizard:
     def run(self) -> int:
         node = local_node_id()
         self._header(node)
-        present = {k: os.environ.get(k) or v for k, v in dotenv_values(ENV_FILE).items()}
+        parsed = dotenv_values(ENV_FILE)
+        present = {k: os.environ.get(k) or parsed.get(k) for k in FIELDS}
         missing = [k for k in FIELDS if not present.get(k)]
         if not self.interactive:
             table = Table(title="Non-interactive setup: read-only")
