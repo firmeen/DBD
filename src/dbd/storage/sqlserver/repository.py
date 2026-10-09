@@ -750,6 +750,8 @@ class ProductionSqlServerRepository:
     inside one transaction through transaction().
     """
 
+    backend = "sqlserver"
+
     @contextmanager
     def transaction(self) -> Iterator[Any]:
         with sqlserver_transaction() as conn:
