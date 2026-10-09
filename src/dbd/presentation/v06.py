@@ -127,6 +127,7 @@ class V06TerminalState:
     wait_seconds: float | None = None
     last_cycle: dict[str, Any] = field(default_factory=dict)
     result: dict[str, Any] = field(default_factory=dict)
+    cutover: dict[str, Any] = field(default_factory=dict)
     last_warning: str | None = None
     last_error: str | None = None
     transient_kind: str | None = None
@@ -333,6 +334,11 @@ class V06Terminal:
     def _apply_event(self, name: str, payload: dict[str, Any]) -> None:
         now = self._clock()
         with self._lock:
+            if self.state.command == "cutover" and name in {"started", "progress", "complete"}:
+                self.state.cutover.update(payload)
+                if name == "complete":
+                    self.state.status = "COMPLETE"
+                return
             generation = payload.get("generation")
             if generation is not None:
                 self.state.generation = int(generation)
@@ -639,6 +645,8 @@ class V06Terminal:
             return [self._render_check_db(width)]
         if command == "migrate":
             return [self._render_migrate(width)]
+        if command == "cutover":
+            return [self._render_cutover(width)]
         if command == "discover":
             return [self._render_discovery(width)]
         if command == "fetch-company":
@@ -660,7 +668,7 @@ class V06Terminal:
     def _render_check_db(self, width: int):
         if not self.state.result:
             body = self._centered(
-                "Checking SQL Server contract",
+                f"Checking {self.state.backend.upper()} production contract",
                 width,
                 "cyan",
             )
@@ -700,6 +708,25 @@ class V06Terminal:
             ("Altered", len(altered) if isinstance(altered, list) else altered, "migrate.altered"),
         ]
         return self._panel("SQL SERVER SCHEMA", self._metric_grid(items, width), "COMPLETE")
+
+    def _render_cutover(self, width: int):
+        snapshot = self.state.result or self.state.cutover
+        items = [
+            ("Generation", snapshot.get("generation", 1), "cutover.generation"),
+            ("Source rows", snapshot.get("source_rows", 0), "cutover.source"),
+            ("Companies", snapshot.get("companies", 0), "cutover.companies"),
+            ("Relations", snapshot.get("relations", 0), "cutover.relations"),
+            ("Events", snapshot.get("events", 0), "cutover.events"),
+            ("Financials", snapshot.get("financial", 0), "cutover.financial"),
+            ("Industries", snapshot.get("industries", snapshot.get("industries_written", 0)), "cutover.industry"),
+            ("Batches", snapshot.get("batches", 0), "cutover.batches"),
+        ]
+        state = "COMPLETE" if self.state.result else "COPYING"
+        return self._panel(
+            f"MYSQL LEGACY → {self.state.backend.upper()} PRODUCTION",
+            self._metric_grid(items, width),
+            state, active=not bool(self.state.result),
+        )
 
     def _render_discovery(self, width: int):
         values = dict(self.state.discovery)
