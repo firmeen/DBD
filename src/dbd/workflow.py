@@ -732,7 +732,9 @@ async def cycle_run(
                 )
             if action in ("NOT_DUE", "ALREADY_COMPLETED"):
                 result = CycleResult(
-                    status=action, generation=generation, phase=phase, resumed=False,
+                    status=action,
+                    generation=int(record["generation"]) if record else generation,
+                    phase=phase, resumed=False,
                     discovery={}, prepare={}, collection={}, verification={},
                     finalized_rows=0,
                 )
