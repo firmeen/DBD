@@ -267,6 +267,8 @@ class SetupWizard:
             )
             if current["role"] == "ADMIN":
                 self._admin_actions(repo, node)
+                if repo.schedule() is None:
+                    raise ControlError("Monthly schedule is required before the Admin is READY")
             else:
                 self.console.print("[dim]Worker cannot change schedules or approve machines.[/dim]")
             self.console.print(Panel(
