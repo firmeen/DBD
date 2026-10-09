@@ -5,6 +5,7 @@ from contextlib import contextmanager
 from functools import lru_cache
 
 from sqlalchemy import URL, create_engine
+from pymysql.constants import CLIENT
 
 from ...core.settings import settings
 
@@ -12,7 +13,11 @@ from ...core.settings import settings
 def _configuration():
     if not settings.prod_mysql_user or not settings.prod_mysql_password:
         raise RuntimeError("PROD_MYSQL_USER and PROD_MYSQL_PASSWORD are required")
-    if settings.prod_mysql_database == settings.db_name:
+    if (
+        settings.prod_mysql_database == settings.db_name
+        and settings.prod_mysql_host == settings.db_host
+        and settings.prod_mysql_port == settings.db_port
+    ):
         raise RuntimeError(
             "Production MySQL database must differ from legacy DB_NAME; "
             "refusing to mix Generation 1 source and production target"
@@ -39,6 +44,7 @@ def pooled_engine():
         isolation_level="READ COMMITTED",
         connect_args={
             "charset": "utf8mb4",
+            "client_flag": CLIENT.FOUND_ROWS,
             "init_command": "SET time_zone = '+00:00'",
             "connect_timeout": settings.db_timeout,
             "read_timeout": settings.db_timeout,
