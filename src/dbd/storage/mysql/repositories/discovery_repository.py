@@ -730,10 +730,10 @@ def reset_discovery(refresh=False, bucket_id=None):
 
 
 def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[dict]:
-    """Read-only shortlist of historical zero-count children and capped leaves.
+    """Read-only shortlist of failed count partitions and capped leaves.
 
-    One item represents one parent/overflow bucket, not one child. No API
-    requests, archive writes or state changes occur during preview.
+    Each call selects the least recently checked candidates of BOTH kinds.
+    This prevents persistent true-zero children from starving overflow work.
     """
     limit = max(1, int(limit))
     with connect() as conn, conn.cursor() as cur:
@@ -742,35 +742,37 @@ def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[d
             SELECT p.id AS bucket_id,p.keyword,'stale_zero' AS reason,
                    COUNT(c.id) AS children,
                    SUM(c.status='done' AND c.total_items=0
-                       AND c.pages_total=0 AND c.pages_done=0) AS zero_children
+                       AND c.pages_total=0 AND c.pages_done=0) AS zero_children,
+                   p.updated_at AS last_checked
             FROM discovery_buckets p
             JOIN discovery_buckets c ON c.parent_id=p.id
             WHERE p.status='split' AND p.partition_lossless=0
               AND (%s IS NULL OR p.id=%s)
-            GROUP BY p.id,p.keyword
+            GROUP BY p.id,p.keyword,p.updated_at
             HAVING zero_children>0
-            ORDER BY p.id LIMIT %s
+            ORDER BY p.updated_at,p.id LIMIT %s
             """,
             (parent_id, parent_id, limit),
         )
         candidates = [dict(row) for row in cur.fetchall()]
-        if len(candidates) < limit:
-            cur.execute(
-                """
-                SELECT p.id AS bucket_id,p.keyword,'overflow' AS reason,
-                       0 AS children,0 AS zero_children
-                FROM discovery_buckets p
-                WHERE p.status='failed' AND p.total_items>10000
-                  AND NOT EXISTS (
-                      SELECT 1 FROM discovery_buckets c WHERE c.parent_id=p.id
-                  )
-                  AND (%s IS NULL OR p.id=%s)
-                ORDER BY p.id LIMIT %s
-                """,
-                (parent_id, parent_id, limit-len(candidates)),
-            )
-            candidates.extend(dict(row) for row in cur.fetchall())
-        return candidates
+        cur.execute(
+            """
+            SELECT p.id AS bucket_id,p.keyword,'overflow' AS reason,
+                   0 AS children,0 AS zero_children,
+                   p.updated_at AS last_checked
+            FROM discovery_buckets p
+            WHERE p.status='failed' AND p.total_items>10000
+              AND NOT EXISTS (
+                  SELECT 1 FROM discovery_buckets c WHERE c.parent_id=p.id
+              )
+              AND (%s IS NULL OR p.id=%s)
+            ORDER BY p.updated_at,p.id LIMIT %s
+            """,
+            (parent_id, parent_id, limit),
+        )
+        candidates.extend(dict(row) for row in cur.fetchall())
+        candidates.sort(key=lambda row: (row["last_checked"], int(row["bucket_id"])))
+        return candidates[:limit]
 
 
 def recovery_family(parent_id: int) -> tuple[dict, list[dict]]:
