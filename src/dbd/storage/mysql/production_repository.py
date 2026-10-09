@@ -46,26 +46,6 @@ def _columns(table: str) -> tuple[str, ...]:
     )
 
 
-def _insert(conn, table: str, row: dict[str, Any], *, preserve: tuple[str, ...] = ()):
-    columns = _columns(table)
-    unknown = set(row) - set(columns)
-    if unknown:
-        raise MySqlProductionWriteError(f"{table} unsupported columns: {sorted(unknown)}")
-    values = [_production_value(row.get(column)) for column in columns]
-    updates = [
-        f"`{col}`=VALUES(`{col}`)"
-        for col in columns if col not in preserve
-    ]
-    with conn.cursor() as cur:
-        cur.execute(
-            f"INSERT INTO `{table}` ("
-            + ",".join(f"`{col}`" for col in columns)
-            + ") VALUES (" + ",".join(["%s"] * len(columns)) + ") "
-            + "ON DUPLICATE KEY UPDATE " + ",".join(updates),
-            tuple(values),
-        )
-
-
 def _upsert_many(conn, table: str, rows: list[dict[str, Any]], *,
                  natural_key: tuple[str, ...]) -> int:
     """Bounded multi-row upserts; PyMySQL splits statements by max packet length."""
