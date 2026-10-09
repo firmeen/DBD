@@ -376,6 +376,46 @@ class ControlRepository:
             key = month_key(now)
             current = self._read(conn, "GENERATION", f"core:{key}", lock=True)
             active = self.active_generation(conn)
+            # A process can crash after all business rows have been durably
+            # finalized but before the control record is marked terminal.
+            # Reconcile from DBD_COMPANY truth rather than rediscovering and
+            # sending completed HTTP requests again after restart.
+            if (
+                active is not None
+                and generation_state.get("active_generation") is None
+                and int(generation_state.get("finalized_generation") or 0)
+                    >= int(active.get("generation") or 0)
+                and int(generation_state.get("last_seen_generation") or 0)
+                    >= int(active.get("generation") or 0)
+                and int(generation_state.get("next_generation") or 0)
+                    > int(active.get("generation") or 0)
+            ):
+                cur = conn.cursor()
+                try:
+                    cur.execute(
+                        "SELECT COUNT(*) FROM dbo.DBD_COMPANY "
+                        "WHERE last_seen_generation=%s "
+                        "AND (required_mask & failed_mask) <> 0",
+                        (int(active["generation"]),),
+                    )
+                    failure_count = int(cur.fetchone()[0] or 0)
+                finally:
+                    cur.close()
+                terminal = (
+                    "COMPLETE_WITH_FAILURES" if failure_count else "COMPLETED"
+                )
+                active["state"] = terminal
+                active["finished_at"] = iso(now)
+                active["reconciled_from_durable_generation"] = True
+                self._put(
+                    conn, "GENERATION", f"core:{active['cycle_month']}", active,
+                )
+                self._audit(conn, "generation_reconciled", {
+                    "generation": active["generation"], "state": terminal,
+                })
+                if active["cycle_month"] == key:
+                    current = active
+                active = None
             decision = choose_monthly_generation(
                 now=now, generation_state=generation_state, schedule=schedule,
                 current_month_record=current, active_record=active,
