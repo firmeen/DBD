@@ -176,3 +176,151 @@ async def test_invalid_or_empty_province_response_fails_loudly(payload):
 
     with pytest.raises(ContractError):
         await discovery.fetch_provinces(Client())
+
+
+def test_partition_plans_try_status_after_existing_filters():
+    filters = SearchFilters(
+        "010", jp_types=["5"], pv_codes=["10"], business_sizes=["S"]
+    )
+    plans = discovery._partition_plans(filters, ["10"], ["1", "2"])
+    assert len(plans) == 1
+    assert [p.jp_statuses for p in plans[0]] == [["1"], ["2"]]
+    assert all(p.business_sizes == ["S"] for p in plans[0])
+
+
+def test_partition_plans_include_observed_x_but_do_not_assume_null_is_filterable():
+    plans = discovery._partition_plans(
+        SearchFilters("050", jp_types=["5"], pv_codes=["10"], jp_statuses=["1"]),
+        ["10"],
+        ["1"],
+    )
+    assert len(plans) == 1
+    assert [row.business_sizes for row in plans[0]] == [
+        ["S"], ["M"], ["L"], ["X"]
+    ]
+
+
+@pytest.mark.asyncio
+async def test_partition_count_parity_is_required_before_split(monkeypatch):
+    class Client:
+        pass
+
+    counts = {"2": 608, "3": 34729, "5": 55804}
+    calls = []
+
+    async def fake_count(_client, _bucket, filters):
+        kind = filters.jp_types[0] if filters.jp_types else None
+        calls.append(kind)
+        value = counts.get(kind, 0) if kind else 91484
+        return (
+            type("Page", (), {
+                "total_items": value,
+                "current_page": 1,
+                "rows": [{"jpTypeCode": kind or "5"}],
+            })(),
+            len(calls), {}, None,
+        )
+
+    from dbd.storage.mysql.repositories import discovery_repository
+
+    monkeypatch.setattr(discovery, "_count", fake_count)
+    monkeypatch.setattr(
+        discovery_repository, "mark_search_archive", lambda *_args: None
+    )
+    ok = await discovery._probe_partition(
+        Client(), 96, SearchFilters("050"), 91484,
+        [SearchFilters("050", jp_types=[x]) for x in discovery.JP_TYPES],
+    )
+    assert not ok  # stale/mock counts do not sum to 91,484
+    assert len(calls) == 8  # seven/all children checked, no parent recheck
+
+    counts["5"] = 56147  # 608 + 34,729 + 56,147 = 91,484
+    calls.clear()
+    ok = await discovery._probe_partition(
+        Client(), 96, SearchFilters("050"), 91484,
+        [SearchFilters("050", jp_types=[x]) for x in discovery.JP_TYPES],
+    )
+    assert ok
+    assert calls[-1] is None  # parent was re-counted for drift
+
+
+@pytest.mark.asyncio
+async def test_recovery_preview_is_read_only_and_does_not_initialize_http(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository
+
+    monkeypatch.setattr(
+        discovery_repository, "recovery_candidates",
+        lambda limit, parent: [
+            {"bucket_id": 96, "reason": "stale_zero"},
+            {"bucket_id": 9147, "reason": "overflow"},
+        ],
+    )
+
+    class ForbiddenClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("Preview must not open the HTTP client")
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", ForbiddenClient)
+    report = await discovery.recover_discovery(limit=2)
+    assert report["mode"] == "preview"
+    assert report["stale_zero"] == 1
+    assert report["overflow"] == 1
+
+
+def test_validate_splits_requires_terminal_children_and_descendants(monkeypatch):
+    from contextlib import contextmanager
+    from dbd.storage.mysql import engine
+
+    def bucket(i, parent, depth, status, items, pages=0, done=0, lossless=None):
+        return dict(
+            id=i, parent_id=parent, depth=depth, status=status, total_items=items,
+            pages_total=pages, pages_done=done, partition_lossless=lossless,
+        )
+
+    rows = [
+        bucket(1, None, 0, "split", 20),
+        bucket(2, 1, 1, "done", 10, 1, 1),
+        bucket(3, 1, 1, "split", 10),
+        bucket(4, 3, 2, "done", 5, 1, 1),
+        bucket(5, 3, 2, "failed", 5),
+    ]
+    # The query is ordered by depth descending, as in the actual SQL.
+    rows.sort(key=lambda r: (-r["depth"], r["id"]))
+
+    class Cursor:
+        def execute(self, sql):
+            assert "ORDER BY depth DESC" in sql
+
+        def fetchall(self):
+            return rows
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+    updates = {}
+    monkeypatch.setattr(engine, "connect", lambda: Connection())
+    monkeypatch.setattr(
+        discovery, "update_bucket",
+        lambda bucket_id, **kw: updates.update({bucket_id: kw["partition_lossless"]}),
+    )
+    assert discovery.validate_splits(verbose=False) == 2
+    assert updates == {3: 0, 1: 0}
+
+    rows[-1]  # preserve fixture shape
+    next(row for row in rows if row["id"] == 5).update(status="done", pages_total=1, pages_done=1)
+    updates.clear()
+    assert discovery.validate_splits(verbose=False) == 2
+    assert updates == {3: 1, 1: 1}
