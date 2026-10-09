@@ -136,6 +136,8 @@ def _verify_indexes(conn, table: str) -> None:
                 "submit_objective_code", "fiscal_year",
             }:
                 simplified = re.sub(r"[\\s`()]", "", str(expression or "").lower())
+                # MySQL may annotate string literals with their charset.
+                simplified = simplified.replace("_utf8mb4", "")
                 if simplified != f"coalesce{col.lower()},''":
                     raise RuntimeError(f"{table} nullable scope index mismatch {name}")
             elif str(stored_column or "").lower() != col.lower() or expression is not None:
