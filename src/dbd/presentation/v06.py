@@ -103,6 +103,9 @@ class V06TerminalState:
     app: str
     command: str
     backend: str = "sqlserver"
+    operator_name: str | None = None
+    node_id: str | None = None
+    automatic: bool = False
     started_at: datetime | None = None
     started_monotonic: float = 0.0
     finished_at: datetime | None = None
@@ -204,6 +207,13 @@ class V06Terminal:
         with self._lock:
             if context.get("backend"):
                 self.state.backend = str(context["backend"])
+            self.state.operator_name = (
+                str(context["operator_name"]) if context.get("operator_name") else None
+            )
+            self.state.node_id = (
+                str(context["node_id"]) if context.get("node_id") else None
+            )
+            self.state.automatic = bool(context.get("auto", False))
             self.state.started_at = self._wall_clock()
             self.state.started_monotonic = now
             self.state.status = "RUNNING"
@@ -618,7 +628,23 @@ class V06Terminal:
             elapsed = self.state.finished_monotonic - self.state.started_monotonic
             timing.append("Duration  ", style="dim")
         timing.append(_duration(elapsed), style="white")
-        return Group(title, timing)
+        identity = Text()
+        if self.state.operator_name:
+            identity.append("Operator  ", style="dim")
+            identity.append(self.state.operator_name, style="white")
+        if self.state.node_id:
+            if identity.plain:
+                identity.append("   ·   ", style="dim")
+            identity.append("Node  ", style="dim")
+            identity.append(self.state.node_id, style="cyan")
+        if self.state.command == "cycle-run":
+            if identity.plain:
+                identity.append("   ·   ", style="dim")
+            identity.append(
+                "AUTO" if self.state.automatic else "MANUAL",
+                style="bold cyan" if self.state.automatic else "dim",
+            )
+        return Group(title, timing, identity) if identity.plain else Group(title, timing)
 
     def _render_command(self, width: int) -> list[Any]:
         command = self.state.command
