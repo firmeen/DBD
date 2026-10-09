@@ -677,3 +677,260 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
     assert result["companies"] == 2
     assert len(stored) == 2
     assert state["committed_batches"] == 3  # first run: 1; resumed run: 2
+
+
+# Large-window cutover regressions: no production database is opened.
+@pytest.mark.parametrize("requested", [0, -1, 10001])
+def test_cutover_rejects_invalid_window_before_target_connection(monkeypatch, requested):
+    monkeypatch.setattr(
+        cutover, "production_repository",
+        lambda _backend: pytest.fail("invalid window opened target database"),
+    )
+    with pytest.raises(ValueError, match="between 1 and 10000"):
+        cutover.run_generation1_cutover(batch_size=requested)
+
+
+@pytest.mark.parametrize("requested", [500, 2000, 4000, 9000, 10000])
+def test_source_keyset_batches_respect_large_window_boundaries(monkeypatch, requested):
+    source = [
+        {"jp_type_code": "5", "jp_no": f"{i:013d}"}
+        for i in range(10001)
+    ]
+    queries = []
+
+    class Cursor:
+        result = ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params):
+            queries.append((sql, params))
+            size = int(params[-1])
+            if len(params) == 1:
+                start = 0
+            else:
+                key = (params[0], params[2])
+                start = next(
+                    (i for i, row in enumerate(source)
+                     if (row["jp_type_code"], row["jp_no"]) > key),
+                    len(source),
+                )
+            self.result = source[start:start + size]
+
+        def fetchall(self):
+            return list(self.result)
+
+    monkeypatch.setattr(cutover, "_assert_source_fence", lambda _conn: None)
+    chunks = list(source_batches(SimpleNamespace(cursor=Cursor), batch_size=requested))
+    assert sum(map(len, chunks)) == 10001
+    assert all(1 <= len(chunk) <= requested for chunk in chunks)
+    assert [row["jp_no"] for chunk in chunks for row in chunk] == [
+        row["jp_no"] for row in source
+    ]
+    assert all(int(params[-1]) == requested for _, params in queries)
+
+
+def _large_cutover_fixture(monkeypatch, count, *, fail_at_commit=None):
+    """In-memory transactional target. Only committed natural keys survive."""
+    source = [
+        {"jp_type_code": "5", "jp_no": f"{i:013d}"}
+        for i in range(1, count + 1)
+    ]
+    state = {
+        "committed": {}, "commits": [], "rollbacks": 0,
+        "attempts": 0, "fail_at_commit": fail_at_commit, "failed_once": False,
+        "lock": False, "fence": False, "snapshots": 0,
+        "expected_industries": [],
+    }
+
+    class Repository:
+        def validate_schema(self):
+            return {"status": "READY"}
+
+        @contextmanager
+        def manager_lock(self):
+            assert not state["lock"]
+            state["lock"] = True
+            try:
+                yield object()
+            finally:
+                state["lock"] = False
+
+        def assert_manager_lock(self, _conn):
+            assert state["lock"], "lost target manager lock"
+
+        def generation_state(self, _conn):
+            return {
+                "finalized_generation": 1 if state["committed"] else None,
+                "last_seen_generation": 1 if state["committed"] else None,
+                "active_generation": None,
+            }
+
+        @contextmanager
+        def transaction(self):
+            assert state["lock"] and state["fence"]
+            state["attempts"] += 1
+            staged = {}
+            try:
+                yield staged
+                if (
+                    state["fail_at_commit"] == state["attempts"]
+                    and not state["failed_once"]
+                ):
+                    state["failed_once"] = True
+                    raise ConnectionError("forced rollback before commit")
+            except BaseException:
+                state["rollbacks"] += 1
+                raise
+            else:
+                state["committed"].update(staged)
+                state["commits"].append(len(staged))
+
+        def upsert_companies(self, txn, rows):
+            assert len(rows) <= 1000
+            for row in rows:
+                key = (row["juristic_type_code"], row["registration_no"])
+                txn[key] = int(row["registration_no"])
+            return {
+                (row["juristic_type_code"], row["registration_no"]):
+                int(row["registration_no"])
+                for row in rows
+            }
+
+        def upsert_relations(self, _conn, _rows):
+            pass
+
+        def upsert_events(self, _conn, _rows):
+            pass
+
+        def upsert_financials(self, _conn, _rows):
+            pass
+
+        def upsert_industries(self, _conn, _rows, *, reject_conflicts):
+            assert reject_conflicts
+
+    @contextmanager
+    def fenced():
+        assert state["lock"]
+        state["fence"] = True
+        try:
+            yield object()
+        finally:
+            state["fence"] = False
+
+    def checked_snapshot(_conn, _baseline):
+        assert state["lock"] and state["fence"]
+        state["snapshots"] += 1
+
+    def verification(rows, *, expected_domain_counts, backend):
+        assert backend in ("mysql", "sqlserver")
+        assert rows == count
+        assert len(state["committed"]) == count
+        assert expected_domain_counts["industries"] == min(count, 10)
+        assert expected_domain_counts["relations"] == 0
+        assert expected_domain_counts["events"] == 0
+        assert expected_domain_counts["financial"] == 0
+        return {"companies": count, "industries": min(count, 10)}
+
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
+    monkeypatch.setattr(cutover, "source_fence", fenced)
+    monkeypatch.setattr(
+        cutover, "source_preflight",
+        lambda _conn: {"source_rows": count, "source_updated_at": None},
+    )
+    monkeypatch.setattr(
+        cutover, "source_batches",
+        lambda _conn, *, batch_size: iter([
+            source[i:i + batch_size] for i in range(0, len(source), batch_size)
+        ]),
+    )
+    monkeypatch.setattr(cutover, "_assert_source_snapshot", checked_snapshot)
+    monkeypatch.setattr(
+        cutover, "transform_company",
+        lambda row, **_kw: {
+            "juristic_type_code": row["jp_type_code"],
+            "registration_no": row["jp_no"],
+        },
+    )
+    for name in (
+        "transform_relations", "transform_events", "transform_financials",
+    ):
+        monkeypatch.setattr(cutover, name, lambda *_args, **_kw: [])
+    monkeypatch.setattr(
+        cutover, "transform_industries",
+        lambda row, **_kw: [{
+            "submit_objective_code": str(int(row["jp_no"]) % 10),
+            "fiscal_year": "2568",
+            "business_size_code": None,
+            "location_type": None,
+            "location_no": None,
+        }],
+    )
+    monkeypatch.setattr(cutover, "verify_generation_one", verification)
+    return state
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "mysql"])
+@pytest.mark.parametrize("size", [500, 2000, 4000, 9000, 10000])
+def test_large_window_uses_at_most_1000_company_atomic_micro_batches(
+    monkeypatch, backend, size
+):
+    state = _large_cutover_fixture(monkeypatch, size)
+    events = []
+    result = cutover.run_generation1_cutover(
+        backend=backend, batch_size=size,
+        event=lambda name, payload: events.append((name, dict(payload))),
+    )
+    expected_batches = (size + 999) // 1000
+    assert result["companies"] == size
+    assert result["windows"] == 1
+    assert result["batches"] == expected_batches
+    assert result["micro_batch_size"] == 1000
+    assert result["industries"] == min(size, 10)
+    assert len(state["committed"]) == size
+    assert state["commits"] == (
+        [1000] * (size // 1000) + ([size % 1000] if size % 1000 else [])
+    )
+    assert state["snapshots"] >= 3 * expected_batches
+    assert len([name for name, _ in events if name == "progress"]) == expected_batches
+
+
+@pytest.mark.parametrize("backend", ["sqlserver", "mysql"])
+def test_large_window_replays_only_uncommitted_micro_batch_after_rollback(
+    monkeypatch, backend
+):
+    state = _large_cutover_fixture(monkeypatch, 2400, fail_at_commit=2)
+    with pytest.raises(ConnectionError, match="forced rollback"):
+        cutover.run_generation1_cutover(backend=backend, batch_size=2400)
+    assert len(state["committed"]) == 1000
+    assert state["rollbacks"] == 1
+    assert state["commits"] == [1000]
+
+    # Re-read from the beginning; replay updates the same natural keys.
+    result = cutover.run_generation1_cutover(backend=backend, batch_size=2400)
+    assert result["companies"] == 2400
+    assert len(state["committed"]) == 2400
+    assert state["commits"] == [1000, 1000, 1000, 400]
+    assert state["lock"] is False
+    assert state["fence"] is False
+
+
+def test_large_window_checks_source_snapshot_before_committing_each_micro_batch(monkeypatch):
+    state = _large_cutover_fixture(monkeypatch, 2100)
+    original = cutover._assert_source_snapshot
+
+    def changed(conn, baseline):
+        original(conn, baseline)
+        if state["snapshots"] == 5:
+            raise CutoverSafetyError("source watermark changed")
+
+    monkeypatch.setattr(cutover, "_assert_source_snapshot", changed)
+    with pytest.raises(CutoverSafetyError, match="source watermark changed"):
+        cutover.run_generation1_cutover(backend="mysql", batch_size=2100)
+    # Fail inside the second transaction, preserving only the first micro-batch.
+    assert len(state["committed"]) == 1000
+
