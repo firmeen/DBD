@@ -774,3 +774,31 @@ def test_worker_machine_identity_is_in_durable_claim_prefix() -> None:
     collector = _collector(node_id="node-test123")
     assert collector._worker_prefix.startswith("node-test123:")
     assert collector.node_id == "node-test123"
+
+
+@pytest.mark.asyncio
+async def test_fleet_rate_admission_is_checked_per_http_attempt() -> None:
+    from dbd.deep.http import FixedRateDbdClient
+    admitted = []
+    client = FixedRateDbdClient(
+        concurrency=1, rate_per_second=1000, max_retries=1,
+        admission=lambda: admitted.append("slot") or 0.0,
+    )
+    await client._admit()
+    await client._admit()
+    assert admitted == ["slot", "slot"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_rate_database_failure_must_not_fallback_to_local_rate() -> None:
+    from dbd.deep.http import FixedRateDbdClient
+
+    def unavailable():
+        raise RuntimeError("SQL Server global admission unavailable")
+
+    client = FixedRateDbdClient(
+        concurrency=1, rate_per_second=1000, max_retries=0,
+        admission=unavailable,
+    )
+    with pytest.raises(RuntimeError, match="global admission"):
+        await client._admit()
