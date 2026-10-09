@@ -1071,3 +1071,17 @@ def test_sqlserver_g2_bulk_core_claim_rejects_missing_node_authorization() -> No
             object(), generation=2, phase_mask=127,
             lease_seconds=300, worker_prefix="unsafe",
         )
+
+
+def test_targeted_sqlserver_core_claim_needs_admin_identity(monkeypatch) -> None:
+    import pytest
+    from dbd.presentation import setup as setup_ui
+    from dbd.storage.sqlserver.repository import SqlServerWriteError
+
+    monkeypatch.setattr(setup_ui, "local_node_id", lambda: None)
+    with pytest.raises(SqlServerWriteError, match="Admin authorization"):
+        ProductionSqlServerRepository().claim_company(
+            object(), generation=2, phase_mask=127,
+            lease_seconds=300, worker_prefix="worker-attempt",
+            company_id=42,
+        )
