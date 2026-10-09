@@ -293,6 +293,29 @@ class ControlRepository:
             raise ControlError("Worker node and distinct SQL login are required")
         with transaction() as conn:
             self.require_node(conn, admin_node, role="ADMIN", lock=True)
+            authenticated_admin_login = self.original_login(conn)
+            if sql_login.strip().casefold() == authenticated_admin_login.casefold():
+                raise ControlError(
+                    "Worker must use a SQL Server login distinct from the Admin"
+                )
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    f"SELECT record_key FROM {_TABLE} WITH (UPDLOCK,HOLDLOCK) "
+                    "WHERE record_type='NODE' AND record_key<>%s "
+                    "AND JSON_VALUE(payload,'$.approved')='true' "
+                    "AND LOWER(JSON_VALUE(payload,'$.sql_login'))=LOWER(%s)",
+                    (worker_node, sql_login.strip()),
+                )
+                if cur.fetchone() is not None:
+                    raise ControlError(
+                        "SQL Server login is already assigned to an approved machine"
+                    )
+            finally:
+                cur.close()
+            existing = self._read(conn, "NODE", worker_node, lock=True)
+            if existing is not None and existing.get("role") == "ADMIN":
+                raise ControlError("Cannot replace an Admin node with a Worker")
             self._put(conn, "NODE", worker_node, {
                 "role": "WORKER", "approved": True,
                 "sql_login": sql_login.strip(), "operator": operator,
