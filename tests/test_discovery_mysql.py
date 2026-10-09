@@ -139,3 +139,26 @@ def test_recount_does_not_reset_completed_nonzero_child_when_count_drifts():
     assert saved_parent["total_items"] == 10
     assert family[0]["total_items"] == 10
     assert family[0]["pages_done"] == 1
+
+
+def test_recount_cannot_mark_parent_lossless_on_shrinking_search_count():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        apply_recovery_recount, recovery_family, update_bucket,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    filters = SearchFilters("recount-shrink-" + uuid4().hex)
+    parent = upsert_bucket(filters)
+    child = split_bucket(
+        parent, [SearchFilters(filters.keyword, jp_types=["5"])], 1
+    )[0]
+    update_bucket(parent, total_items=100, partition_lossless=0)
+    update_bucket(child, status="done", total_items=0, pages_total=0, pages_done=0)
+
+    result = apply_recovery_recount(parent, 10, {child: 10})
+    old_parent, family = recovery_family(parent)
+    assert result["reopened"] == 1  # target data still worth recovering
+    assert result["count_consistent"] is False
+    assert result["parent_updated"] is False
+    assert old_parent["total_items"] == 100  # never certify a lower live count
+    assert family[0]["status"] == "pending"
