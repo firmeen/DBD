@@ -24,6 +24,10 @@ class ControlError(RuntimeError):
     """An unsafe or invalid production control transition."""
 
 
+class EarlyStartConfirmationRequired(ControlError):
+    """Manual cycle starts early only with interactive confirmation."""
+
+
 @dataclass(frozen=True)
 class MonthlyDecision:
     action: str  # RESUME, START, NOT_DUE, ALREADY_COMPLETED
