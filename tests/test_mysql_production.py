@@ -114,3 +114,140 @@ def test_mysql_rejects_unknown_backend_before_database_write():
 
     with pytest.raises(ValueError, match="Unsupported"):
         production_repository("sqlite")
+
+
+class _BulkCursor:
+    def __init__(self, *, fetched=()):
+        self.sql = []
+        self.bulk = []
+        self.fetched = list(fetched)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params=()):
+        self.sql.append((sql, params))
+
+    def executemany(self, sql, values):
+        self.bulk.append((sql, list(values)))
+
+    def fetchall(self):
+        return self.fetched
+
+
+def test_mysql_batched_upsert_bounds_sql_groups_to_200_rows():
+    from dbd.storage.mysql.production_repository import _upsert_many
+
+    cursor = _BulkCursor()
+    conn = SimpleNamespace(cursor=lambda: cursor)
+    rows = [
+        {"juristic_type_code": "5", "registration_no": f"{i:013d}"}
+        for i in range(451)
+    ]
+    result = _upsert_many(
+        conn, "DBD_COMPANY", rows,
+        natural_key=("juristic_type_code", "registration_no"),
+    )
+    assert result == 451
+    assert [len(values) for _, values in cursor.bulk] == [200, 200, 51]
+    assert all("ON DUPLICATE KEY UPDATE" in sql for sql, _ in cursor.bulk)
+    assert all("`first_seen_generation`=VALUES" not in sql for sql, _ in cursor.bulk)
+
+
+def test_mysql_batched_upsert_fails_closed_on_conflicting_duplicate_natural_keys():
+    from dbd.storage.mysql.production_repository import _upsert_many
+
+    cursor = _BulkCursor()
+    with pytest.raises(MySqlProductionWriteError, match="conflicting duplicate"):
+        _upsert_many(
+            SimpleNamespace(cursor=lambda: cursor), "DBD_COMPANY",
+            [
+                {"juristic_type_code": "5", "registration_no": "0000000000001",
+                 "company_name_th": "First"},
+                {"juristic_type_code": "5", "registration_no": "0000000000001",
+                 "company_name_th": "Changed"},
+            ],
+            natural_key=("juristic_type_code", "registration_no"),
+        )
+    assert cursor.bulk == []  # No partial write before validation.
+
+
+def test_mysql_industry_nullable_scopes_are_deduplicated_before_write():
+    cursor = _BulkCursor()
+    repo = ProductionMySqlRepository()
+    row = {
+        "submit_objective_code": "65110", "fiscal_year": "2568",
+        "business_size_code": None, "location_type": None, "location_no": None,
+        "payload": '{"benchmark":1}', "first_seen_generation": 1,
+        "last_seen_generation": 1, "published_at": None,
+    }
+    result = repo.upsert_industries(
+        SimpleNamespace(cursor=lambda: cursor), [row.copy() for _ in range(10)],
+        reject_conflicts=True,
+    )
+    assert result == 10
+    assert len(cursor.sql) == 1
+    assert "FOR UPDATE" in cursor.sql[0][0]
+    assert len(cursor.bulk) == 1
+    assert len(cursor.bulk[0][1]) == 1
+
+
+def test_mysql_industry_uses_bounded_batch_inserts_not_per_row_queries():
+    cursor = _BulkCursor()
+    repo = ProductionMySqlRepository()
+    rows = [
+        {
+            "submit_objective_code": "65110", "fiscal_year": "2568",
+            "business_size_code": None, "location_type": "PV",
+            "location_no": str(i), "payload": "{}",
+            "first_seen_generation": 1, "last_seen_generation": 1,
+        }
+        for i in range(451)
+    ]
+    result = repo.upsert_industries(
+        SimpleNamespace(cursor=lambda: cursor), rows, reject_conflicts=True,
+    )
+    assert result == 451
+    assert len(cursor.sql) == 1  # one indexed prefix lookup, not 451 SELECTs
+    assert [len(group) for _, group in cursor.bulk] == [200, 200, 51]
+    assert all("INSERT INTO DBD_INDUSTRY" in statement for statement, _ in cursor.bulk)
+
+
+def test_mysql_industry_rejects_stale_generation_one_conflict_before_bulk_dml():
+    cursor = _BulkCursor(
+        fetched=[(
+            20, "65110", "2568", None, None, None, None,
+            '{"old":true}',
+        )],
+    )
+    row = {
+        "submit_objective_code": "65110", "fiscal_year": "2568",
+        "business_size_code": None, "location_type": None, "location_no": None,
+        "payload": '{"new":true}', "first_seen_generation": 1,
+        "last_seen_generation": 1,
+    }
+    with pytest.raises(MySqlProductionWriteError, match="Conflicting Generation 1"):
+        ProductionMySqlRepository().upsert_industries(
+            SimpleNamespace(cursor=lambda: cursor), [row],
+            reject_conflicts=True,
+        )
+    assert cursor.bulk == []
+
+
+def test_mysql_industry_rejects_duplicate_scope_with_conflicting_payload():
+    cursor = _BulkCursor()
+    base = {
+        "submit_objective_code": "65110", "fiscal_year": "2568",
+        "business_size_code": None, "location_type": "PV", "location_no": "10",
+    }
+    with pytest.raises(MySqlProductionWriteError, match="Conflicting Generation 1"):
+        ProductionMySqlRepository().upsert_industries(
+            SimpleNamespace(cursor=lambda: cursor),
+            [{**base, "payload": "A"}, {**base, "payload": "B"}],
+            reject_conflicts=True,
+        )
+    assert cursor.sql == [] and cursor.bulk == []
+

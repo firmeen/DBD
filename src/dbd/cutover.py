@@ -937,8 +937,8 @@ def source_batches(
     *,
     batch_size: int,
 ) -> Iterator[list[dict[str, Any]]]:
-    if batch_size < 1 or batch_size > 2000:
-        raise ValueError("batch_size must be between 1 and 2000")
+    if batch_size < 1 or batch_size > 10000:
+        raise ValueError("batch_size must be between 1 and 10000")
     last_type: str | None = None
     last_no: str | None = None
     columns = ", ".join(f"`{column}`" for column in SOURCE_COLUMNS)
@@ -1106,6 +1106,8 @@ def run_generation1_cutover(
     event: EventCallback | None = None,
     backend: str = "sqlserver",
 ) -> dict[str, Any]:
+    if not 1 <= batch_size <= 10000:
+        raise ValueError("batch_size must be between 1 and 10000")
     repository = production_repository(backend)
     repository.validate_schema()
 
@@ -1131,7 +1133,13 @@ def run_generation1_cutover(
         "financial_statement_source_companies": 0,
         "benchmark_source_companies": 0,
         "contract_errors": 0,
-        "batches": 0,
+        "batches": 0,  # durable micro-transactions (old name retained)
+        "windows": 0,  # source reads; can contain multiple micro-batches
+        "micro_batch_size": 1000,
+        "read_window_size": int(batch_size),
+        "read_seconds": 0.0,
+        "transform_seconds": 0.0,
+        "write_seconds": 0.0,
     }
     # DBD_INDUSTRY has a shared natural key; many companies can map to one row.
     industry_keys: set[tuple[str | None, ...]] = set()
@@ -1163,107 +1171,119 @@ def run_generation1_cutover(
         if event is not None:
             event("started", dict(stats))
 
-        for source_rows_batch in source_batches(fence_conn, batch_size=batch_size):
-            prepared: list[
-                tuple[
-                    tuple[str, str],
-                    dict[str, Any],
-                    list[dict[str, Any]],
-                    list[dict[str, Any]],
-                    list[dict[str, Any]],
-                    list[dict[str, Any]],
-                ]
-            ] = []
+        read_started = time.monotonic()
+        for read_window in source_batches(fence_conn, batch_size=batch_size):
+            stats["read_seconds"] += time.monotonic() - read_started
+            stats["windows"] += 1
+            # Only one bounded company group is transformed and committed at a time.
+            # Restart replays natural keys safely; no second in-memory queue.
+            for offset in range(0, len(read_window), stats["micro_batch_size"]):
+                source_rows_batch = read_window[offset:offset + stats["micro_batch_size"]]
+                transform_started = time.monotonic()
+                prepared: list[
+                    tuple[
+                        tuple[str, str],
+                        dict[str, Any],
+                        list[dict[str, Any]],
+                        list[dict[str, Any]],
+                        list[dict[str, Any]],
+                        list[dict[str, Any]],
+                    ]
+                ] = []
 
-            for source in source_rows_batch:
-                identity = (
-                    _required_text(source.get("jp_type_code"), "jp_type_code"),
-                    _required_text(source.get("jp_no"), "jp_no"),
-                )
-                company = transform_company(source, published_at=published_at)
-                relations = transform_relations(source, published_at=published_at)
-                events = transform_events(source, published_at=published_at)
-                financial = transform_financials(source, published_at=published_at)
-                industries = transform_industries(source, published_at=published_at)
-                prepared.append(
-                    (identity, company, relations, events, financial, industries)
-                )
+                for source in source_rows_batch:
+                    identity = (
+                        _required_text(source.get("jp_type_code"), "jp_type_code"),
+                        _required_text(source.get("jp_no"), "jp_no"),
+                    )
+                    company = transform_company(source, published_at=published_at)
+                    relations = transform_relations(source, published_at=published_at)
+                    events = transform_events(source, published_at=published_at)
+                    financial = transform_financials(source, published_at=published_at)
+                    industries = transform_industries(source, published_at=published_at)
+                    prepared.append(
+                        (identity, company, relations, events, financial, industries)
+                    )
 
-                if source.get("profile_data") is not None:
-                    stats["profile_source_companies"] += 1
-                if source.get("committees_data") is not None:
-                    stats["committee_source_companies"] += 1
-                if source.get("committee_signs_data") is not None:
-                    stats["committee_sign_source_companies"] += 1
-                if source.get("transformations_data") is not None:
-                    stats["transformation_source_companies"] += 1
-                if source.get("financial_submissions_data") is not None:
-                    stats["financial_submission_source_companies"] += 1
-                if source.get("financial_statements_data") is not None:
-                    stats["financial_statement_source_companies"] += 1
-                if source.get("industry_benchmark_data") is not None:
-                    stats["benchmark_source_companies"] += 1
+                    if source.get("profile_data") is not None:
+                        stats["profile_source_companies"] += 1
+                    if source.get("committees_data") is not None:
+                        stats["committee_source_companies"] += 1
+                    if source.get("committee_signs_data") is not None:
+                        stats["committee_sign_source_companies"] += 1
+                    if source.get("transformations_data") is not None:
+                        stats["transformation_source_companies"] += 1
+                    if source.get("financial_submissions_data") is not None:
+                        stats["financial_submission_source_companies"] += 1
+                    if source.get("financial_statements_data") is not None:
+                        stats["financial_statement_source_companies"] += 1
+                    if source.get("industry_benchmark_data") is not None:
+                        stats["benchmark_source_companies"] += 1
 
-            _assert_source_snapshot(fence_conn, preflight)
-            repository.assert_manager_lock(manager_conn)
-
-            with repository.transaction() as target_conn:
-                company_ids = repository.upsert_companies(
-                    target_conn, [item[1] for item in prepared]
-                )
-                relation_rows: list[dict[str, Any]] = []
-                event_rows: list[dict[str, Any]] = []
-                financial_rows: list[dict[str, Any]] = []
-                industry_rows: list[dict[str, Any]] = []
-                for identity, _company, relations, events, financial, industries in prepared:
-                    company_id = company_ids[identity]
-                    relation_rows.extend(_attach_company_id(relations, company_id))
-                    event_rows.extend(_attach_company_id(events, company_id))
-                    financial_rows.extend(_attach_company_id(financial, company_id))
-                    industry_rows.extend(industries)
-
-                repository.upsert_relations(target_conn, relation_rows)
-                repository.upsert_events(target_conn, event_rows)
-                repository.upsert_financials(target_conn, financial_rows)
-                repository.upsert_industries(
-                    target_conn, industry_rows, reject_conflicts=True
-                )
+                stats["transform_seconds"] += time.monotonic() - transform_started
                 _assert_source_snapshot(fence_conn, preflight)
                 repository.assert_manager_lock(manager_conn)
 
-            _assert_source_snapshot(fence_conn, preflight)
-            repository.assert_manager_lock(manager_conn)
-            industry_keys.update(
-                (
-                    row["submit_objective_code"],
-                    row["fiscal_year"],
-                    row["business_size_code"],
-                    row["location_type"],
-                    row["location_no"],
+                write_started = time.monotonic()
+                with repository.transaction() as target_conn:
+                    company_ids = repository.upsert_companies(
+                        target_conn, [item[1] for item in prepared]
+                    )
+                    relation_rows: list[dict[str, Any]] = []
+                    event_rows: list[dict[str, Any]] = []
+                    financial_rows: list[dict[str, Any]] = []
+                    industry_rows: list[dict[str, Any]] = []
+                    for identity, _company, relations, events, financial, industries in prepared:
+                        company_id = company_ids[identity]
+                        relation_rows.extend(_attach_company_id(relations, company_id))
+                        event_rows.extend(_attach_company_id(events, company_id))
+                        financial_rows.extend(_attach_company_id(financial, company_id))
+                        industry_rows.extend(industries)
+
+                    repository.upsert_relations(target_conn, relation_rows)
+                    repository.upsert_events(target_conn, event_rows)
+                    repository.upsert_financials(target_conn, financial_rows)
+                    repository.upsert_industries(
+                        target_conn, industry_rows, reject_conflicts=True
+                    )
+                    _assert_source_snapshot(fence_conn, preflight)
+                    repository.assert_manager_lock(manager_conn)
+
+                stats["write_seconds"] += time.monotonic() - write_started
+                _assert_source_snapshot(fence_conn, preflight)
+                repository.assert_manager_lock(manager_conn)
+                industry_keys.update(
+                    (
+                        row["submit_objective_code"],
+                        row["fiscal_year"],
+                        row["business_size_code"],
+                        row["location_type"],
+                        row["location_no"],
+                    )
+                    for row in industry_rows
                 )
-                for row in industry_rows
-            )
-            stats["companies"] += len(prepared)
-            stats["profile_mapped_companies"] += sum(
-                1 for source in source_rows_batch if source.get("profile_data") is not None
-            )
-            stats["relations"] += len(relation_rows)
-            stats["events"] += len(event_rows)
-            stats["financial"] += len(financial_rows)
-            stats["industries_written"] += len(industry_rows)
-            stats["committee_rows"] += sum(
-                1 for relation in relation_rows
-                if relation.get("relation_type") == "COMMITTEE"
-            )
-            stats["committee_sign_rows"] += sum(
-                1 for relation in relation_rows
-                if relation.get("relation_type") == "COMMITTEE_SIGN"
-            )
-            stats["batches"] += 1
-            elapsed = max(0.001, time.monotonic() - started)
-            stats["rate"] = stats["companies"] / elapsed
-            if event is not None:
-                event("progress", dict(stats))
+                stats["companies"] += len(prepared)
+                stats["profile_mapped_companies"] += sum(
+                    1 for source in source_rows_batch if source.get("profile_data") is not None
+                )
+                stats["relations"] += len(relation_rows)
+                stats["events"] += len(event_rows)
+                stats["financial"] += len(financial_rows)
+                stats["industries_written"] += len(industry_rows)
+                stats["committee_rows"] += sum(
+                    1 for relation in relation_rows
+                    if relation.get("relation_type") == "COMMITTEE"
+                )
+                stats["committee_sign_rows"] += sum(
+                    1 for relation in relation_rows
+                    if relation.get("relation_type") == "COMMITTEE_SIGN"
+                )
+                stats["batches"] += 1
+                elapsed = max(0.001, time.monotonic() - started)
+                stats["rate"] = stats["companies"] / elapsed
+                if event is not None:
+                    event("progress", dict(stats))
+            read_started = time.monotonic()
 
         _assert_source_snapshot(fence_conn, preflight)
         final_preflight = source_preflight(fence_conn)
