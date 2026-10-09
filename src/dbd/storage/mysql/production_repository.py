@@ -547,7 +547,7 @@ class ProductionMySqlRepository:
         )
         required = (
             f"((required_mask & ~{int(core_mask)}) | "
-            f"IF(status_code='1', {required_core}, 0))"
+            f"IF(status_code='1' OR {int(generation)}=1, {required_core}, 0))"
             if phase == "core" else
             f"((IF(required_mask=0, {required_core}, required_mask)) "
             f"| {int(extended_mask)})"
@@ -591,7 +591,7 @@ class ProductionMySqlRepository:
         where = (
             "last_seen_generation=%s AND collect_status IN "
             "('DISCOVERED','PENDING','COLLECTING','RETRY_WAIT','PARTIAL') "
-            "AND " + ("status_code=\'1\' AND " if int(phase_mask) & CORE_ENDPOINT_MASK else "")
+            "AND " + ("status_code=\'1\' AND " if int(generation) >= 2 and int(phase_mask) & CORE_ENDPOINT_MASK else "")
             + "(required_mask & %s) <> 0 "
             "AND ((required_mask & %s) & "
             "~(done_mask | not_available_mask | failed_mask)) <> 0 "
