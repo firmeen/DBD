@@ -324,3 +324,123 @@ def test_validate_splits_requires_terminal_children_and_descendants(monkeypatch)
     updates.clear()
     assert discovery.validate_splits(verbose=False) == 2
     assert updates == {3: 1, 1: 1}
+
+
+@pytest.mark.asyncio
+async def test_recovery_execute_checks_live_counts_before_opening_zero_children(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    candidate = {"bucket_id": 96, "reason": "stale_zero"}
+    parent = {
+        "id": 96, "status": "split", "keyword": "050",
+        "search_type": "", "pv_codes": "", "jp_statuses": "",
+        "jp_types": "", "business_sizes": "",
+    }
+    child = {
+        **parent, "id": 439, "parent_id": 96,
+        "jp_types": "5", "total_items": 0,
+        "pages_total": 0, "pages_done": 0,
+    }
+    calls = []
+    applied = []
+
+    class Client:
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def count(_client, _bucket_id, filters):
+        calls.append(filters.jp_types[:])
+        return (
+            type("Page", (), {
+                "current_page": 1,
+                "total_items": 20 if not filters.jp_types else 20,
+                "rows": [{"jpTypeCode": "5"}],
+            })(),
+            len(calls), {}, None,
+        )
+
+    def apply(parent_id, parent_count, counts):
+        applied.append((parent_id, parent_count, counts))
+        return {
+            "reopened": 1,
+            "changed_nonzero": 0,
+            "count_consistent": True,
+            "parent_updated": True,
+        }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    monkeypatch.setattr(discovery, "_count", count)
+    monkeypatch.setattr(discovery, "observed_status_codes", lambda: ["1"])
+    monkeypatch.setattr(discovery, "validate_splits", lambda _verbose: 1)
+    monkeypatch.setattr(repository, "recovery_candidates", lambda *_args: [candidate])
+    monkeypatch.setattr(repository, "recovery_family", lambda _pid: (parent, [child]))
+    monkeypatch.setattr(repository, "apply_recovery_recount", apply)
+    monkeypatch.setattr(repository, "mark_search_archive", lambda *_args: None)
+
+    report = await discovery.recover_discovery(
+        parent_id=96, execute=True, rate=1,
+    )
+    assert applied == [(96, 20, {439: 20})]
+    assert calls == [[], ["5"], []]
+    assert report["reopened"] == 1
+    assert report["unresolved"] == 0
+
+
+@pytest.mark.asyncio
+async def test_recovery_parent_count_drift_never_opens_children(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    parent = {
+        "id": 96, "status": "split", "keyword": "050",
+        "search_type": "", "pv_codes": "", "jp_statuses": "",
+        "jp_types": "", "business_sizes": "",
+    }
+    child = {**parent, "id": 439, "jp_types": "5"}
+    probe = {"count": 0}
+    applied = []
+
+    class Client:
+        def __init__(self, **_kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    async def count(_client, _bucket_id, filters):
+        probe["count"] += 1
+        amount = 21 if probe["count"] == 3 else 20
+        return (
+            type("Page", (), {
+                "current_page": 1,
+                "total_items": amount,
+                "rows": [{"jpTypeCode": "5"}],
+            })(),
+            probe["count"], {}, None,
+        )
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    monkeypatch.setattr(discovery, "_count", count)
+    monkeypatch.setattr(discovery, "observed_status_codes", lambda: ["1"])
+    monkeypatch.setattr(discovery, "validate_splits", lambda _verbose: 1)
+    monkeypatch.setattr(
+        repository, "recovery_candidates",
+        lambda *_args: [{"bucket_id": 96, "reason": "stale_zero"}],
+    )
+    monkeypatch.setattr(repository, "recovery_family", lambda _pid: (parent, [child]))
+    monkeypatch.setattr(
+        repository, "apply_recovery_recount", lambda *_args: applied.append(True)
+    )
+    monkeypatch.setattr(repository, "mark_search_archive", lambda *_args: None)
+    report = await discovery.recover_discovery(parent_id=96, execute=True)
+    assert not applied
+    assert report["unresolved"] == 1
+    assert "drifted" in report["sample_errors"]
