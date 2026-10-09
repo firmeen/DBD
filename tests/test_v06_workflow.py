@@ -745,3 +745,19 @@ async def test_sqlserver_manual_before_due_requires_confirmation(monkeypatch) ->
     with pytest.raises(EarlyStartConfirmationRequired):
         await workflow.cycle_run(phase="core", repository=repo, verbose=False)
     assert repo.finalize_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sqlserver_worker_cannot_bypass_core_node_gate_with_extended_collect(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=1, active=None, unresolved=0)
+    repo.backend = "sqlserver"
+
+    def deny(_repository):
+        raise RuntimeError("Admin authorization required")
+
+    monkeypatch.setattr(workflow, "_require_sql_admin", deny)
+    with pytest.raises(RuntimeError, match="Admin authorization required"):
+        await workflow.collect(
+            phase="extended", backend="sqlserver",
+            repository=repo, continuous=False,
+        )
