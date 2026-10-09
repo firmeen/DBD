@@ -40,13 +40,15 @@ def _idle_seconds(value: str) -> float:
 
 
 async def _status(args, terminal: V06Terminal) -> int:
-    result = await status(phase=args.phase, coverage=args.coverage)
+    result = await status(
+        backend=args.backend,phase=args.phase, coverage=args.coverage)
     terminal.finish(asdict(result))
     return 0
 
 
 async def _prepare(args, terminal: V06Terminal) -> int:
     result = await prepare(
+        backend=args.backend,
         phase=args.phase,
         event=terminal.event,
     )
@@ -56,6 +58,7 @@ async def _prepare(args, terminal: V06Terminal) -> int:
 
 async def _retry(args, terminal: V06Terminal) -> int:
     result = await retry(
+        backend=args.backend,
         phase=args.phase,
         limit=args.limit,
         event=terminal.event,
@@ -66,6 +69,7 @@ async def _retry(args, terminal: V06Terminal) -> int:
 
 async def _collect(args, terminal: V06Terminal) -> int:
     result = await collect(
+        backend=args.backend,
         phase=args.phase,
         concurrency=args.concurrency,
         rate=args.rate,
@@ -90,7 +94,7 @@ def _phase(parser: argparse.ArgumentParser) -> None:
 def parse_args(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(
         prog="dbd-deep",
-        description="Direct SQL Server v0.6 DBD endpoint collector",
+        description="DBD v0.6 production endpoint collector",
     )
     parser.add_argument(
         "--version",
@@ -101,13 +105,13 @@ def parse_args(argv: list[str] | None = None):
 
     prepare_parser = sub.add_parser(
         "prepare",
-        help="Prepare endpoint masks directly in SQL Server DBD_COMPANY",
+        help="Prepare endpoint masks directly in selected production DBD_COMPANY",
     )
     _phase(prepare_parser)
 
     collect_parser = sub.add_parser(
         "collect",
-        help="Claim SQL Server companies and collect unresolved endpoints",
+        help="Claim production companies and collect unresolved endpoints",
     )
     _phase(collect_parser)
     collect_parser.add_argument(
@@ -145,7 +149,7 @@ def parse_args(argv: list[str] | None = None):
 
     status_parser = sub.add_parser(
         "status",
-        help="Fast read-only SQL Server v0.6 collection status",
+        help="Fast read-only production v0.6 collection status",
     )
     _phase(status_parser)
     status_parser.add_argument(
@@ -161,13 +165,23 @@ def parse_args(argv: list[str] | None = None):
     _phase(retry_parser)
     retry_parser.add_argument("--limit", type=_positive_int)
 
+    for command_parser in (
+        prepare_parser, collect_parser, status_parser, retry_parser,
+    ):
+        command_parser.add_argument(
+            "--backend", choices=("sqlserver", "mysql"),
+            help="Production storage backend (default DBD_PRODUCTION_BACKEND)",
+        )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     terminal = V06Terminal(args.command, app="DBD DEEP")
-    context = {"phase": args.phase}
+    context = {
+        "phase": args.phase,
+        "backend": args.backend or settings.dbd_production_backend,
+    }
     if args.command == "collect":
         context.update(
             {
