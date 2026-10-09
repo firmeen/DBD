@@ -215,3 +215,7 @@ AND unfinished rows = 0 after finalization
 ~~~
 
 terminal endpoint failures สามารถมีอยู่ได้และทำให้ผลเป็น COMPLETE_WITH_FAILURES โดยไม่เปลี่ยน integrity rule ข้างต้น
+
+## Monthly control acceptance gates
+
+The v0.6 SQL Server control feature requires unit and integration validation for one Generation per month, manual early confirmation, Resume across month boundaries, admin-only collection with zero remote Workers, distinct SQL logins for Admin/Worker, NODE approval/revocation, SQL permission denials, global HTTP admission across processes (including retry and Search), graceful `DRAINING` before VERIFY, Task Scheduler non-overlap, and unchanged G1/Legacy/MySQL/Extended semantics. Fake SQL tests cannot prove SQL Server grant and concurrency correctness; run disposable SQL Server integration and Windows Task tests before Production. CI jobs with no executed steps do not count as passing tests.
