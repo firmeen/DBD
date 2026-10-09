@@ -1137,6 +1137,7 @@ def run_generation1_cutover(
         "windows": 0,  # source reads; can contain multiple micro-batches
         "micro_batch_size": 1000,
         "read_window_size": int(batch_size),
+        "read_seconds": 0.0,
         "transform_seconds": 0.0,
         "write_seconds": 0.0,
     }
@@ -1170,7 +1171,9 @@ def run_generation1_cutover(
         if event is not None:
             event("started", dict(stats))
 
+        read_started = time.monotonic()
         for read_window in source_batches(fence_conn, batch_size=batch_size):
+            stats["read_seconds"] += time.monotonic() - read_started
             stats["windows"] += 1
             # Only one bounded company group is transformed and committed at a time.
             # Restart replays natural keys safely; no second in-memory queue.
@@ -1280,6 +1283,7 @@ def run_generation1_cutover(
                 stats["rate"] = stats["companies"] / elapsed
                 if event is not None:
                     event("progress", dict(stats))
+            read_started = time.monotonic()
 
         _assert_source_snapshot(fence_conn, preflight)
         final_preflight = source_preflight(fence_conn)
