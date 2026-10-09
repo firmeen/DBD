@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 # v0.6 production endpoint order is static. The original seven Deep bits are a
@@ -212,6 +213,93 @@ def required_mask(submit_fin_year: object) -> int:
         if latest_fiscal_year(submit_fin_year) is not None
         else BASE_REQUIRED_MASK
     )
+
+
+def core_required_mask(status_code: object, fiscal_year: object) -> int:
+    """Only legally active entities require Core Deep work in G2+."""
+    if str(status_code or "").strip() != ACTIVE_STATUS_CODE:
+        return 0
+    return required_mask(fiscal_year)
+
+
+def core_stale_mask(
+    endpoint_meta: object,
+    resolved_mask: int,
+    *,
+    stale_hours: dict[str, float],
+    now: datetime,
+) -> int:
+    """Refresh dated Core results only; undated G1 history is not mass-reopened."""
+    if isinstance(endpoint_meta, str):
+        try:
+            endpoint_meta = json.loads(endpoint_meta)
+        except (TypeError, ValueError):
+            return 0
+    if not isinstance(endpoint_meta, dict):
+        return 0
+
+    now_utc = now.replace(tzinfo=timezone.utc) if now.tzinfo is None else now.astimezone(timezone.utc)
+    reopened = 0
+    for endpoint in CORE_ENDPOINTS:
+        bit = ENDPOINT_BITS[endpoint]
+        if not (resolved_mask & bit):
+            continue
+        meta = endpoint_meta.get(endpoint)
+        if not isinstance(meta, dict) or meta.get("status") not in ("done", "not_available"):
+            continue
+        raw = meta.get("requested_at")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            observed_at = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            continue
+        if observed_at.tzinfo is None:
+            observed_at = observed_at.replace(tzinfo=timezone.utc)
+        if now_utc >= observed_at.astimezone(timezone.utc) + timedelta(
+            hours=max(1.0, float(stale_hours.get(endpoint, 168.0)))
+        ):
+            reopened |= bit
+    return reopened & CORE_ENDPOINT_MASK
+
+
+def core_discovery_plan(
+    *,
+    previous_status: object,
+    current_status: object,
+    previous_fiscal: object,
+    current_fiscal: object,
+    done_mask: int,
+    not_available_mask: int,
+    endpoint_meta: object,
+    first_observation: bool,
+    force_refresh_mask: int,
+    stale_hours: dict[str, float],
+    now: datetime,
+) -> tuple[int, int]:
+    """Return (Core required, Core reopen) identically for both DB engines.
+
+    Every discovery observation can retire ineligible Core requirements; a
+    repeated observation within a generation cannot re-open fresh endpoints.
+    """
+    required = core_required_mask(current_status, current_fiscal)
+    if not required:
+        return 0, 0
+
+    reopen = 0
+    if str(previous_status or "").strip() != ACTIVE_STATUS_CODE:
+        reopen |= ENDPOINT_BITS["profile"]
+    if previous_fiscal != current_fiscal:
+        reopen |= FINANCIAL_MASK
+    if first_observation:
+        reopen |= int(force_refresh_mask)
+        reopen |= core_stale_mask(
+            endpoint_meta,
+            int(done_mask) | int(not_available_mask),
+            stale_hours=stale_hours,
+            now=now,
+        )
+    return required, reopen & required
 
 
 def unresolved_mask(
