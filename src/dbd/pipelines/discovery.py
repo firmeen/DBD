@@ -708,13 +708,16 @@ async def recover_discovery(
                     await asyncio.to_thread(mark_search_archive, confirm_archive, "processed")
                     if confirm.current_page != 1 or confirm.total_items != current_parent:
                         raise ContractError("Parent count drifted while recounting children")
+                    if health is not None:
+                        await asyncio.to_thread(health)
                     outcome = await asyncio.to_thread(
                         apply_recovery_recount, bucket_id, current_parent, observations
                     )
                     reopened += int(outcome["reopened"])
-                    recovered += 1
                     if not outcome["count_consistent"] or outcome["changed_nonzero"]:
                         failures.append(f"{bucket_id}: counts cannot yet be reconciled")
+                    elif outcome["parent_updated"] or outcome["reopened"]:
+                        recovered += 1
                 else:
                     row = await asyncio.to_thread(get_bucket, bucket_id)
                     if row is None or row["status"] != "failed":
@@ -724,6 +727,8 @@ async def recover_discovery(
                             raise DiscoveryLeaseLost("Overflow bucket has an active lease")
                     if provinces is None:
                         provinces = await fetch_provinces(client)
+                    if health is not None:
+                        await asyncio.to_thread(health)
                     await _process_bucket(
                         client, row, provinces, master_cache={},
                         progress_line=None, status_codes=statuses,
