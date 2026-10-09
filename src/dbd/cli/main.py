@@ -1003,11 +1003,14 @@ def main():
             from dataclasses import asdict
 
             from ..workflow import cycle_loop, cycle_run, status
-            from ..presentation.setup import local_node_id
-            identity = {
-                "operator_name": settings.dbd_operator_name,
-                "node_id": local_node_id(),
-            }
+            selected_backend = args.backend or settings.dbd_production_backend
+            identity = {}
+            if selected_backend == "sqlserver":
+                from ..presentation.setup import local_node_id
+                identity = {
+                    "operator_name": settings.dbd_operator_name,
+                    "node_id": local_node_id(),
+                }
 
             if args.cycle_command == "status":
                 v06_terminal = V06Terminal("cycle-status", app="DBD DATA").start(
