@@ -877,7 +877,7 @@ def main():
             v06_terminal = V06Terminal("fetch-company", app="DBD DATA").start(
                 phase=args.phase,
                 registration_no=parsed.jp_no,
-                juristic_type_code=parsed.jp_type_code
+                juristic_type_code=parsed.jp_type_code,
                 backend=args.backend or settings.dbd_production_backend,
             )
             result = asyncio.run(
