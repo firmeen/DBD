@@ -151,6 +151,35 @@ class ControlRepository:
             )
             if int(cur.fetchone()[0] or 0) != 8:
                 raise ControlError("DBD_CONTROL schema is missing; run dbd-data migrate as an administrator")
+            cur.execute(
+                "SELECT c.name, TYPE_NAME(c.user_type_id), c.is_nullable "
+                "FROM sys.columns AS c "
+                "WHERE c.object_id=OBJECT_ID(N'dbo.DBD_CONTROL')"
+            )
+            actual = {str(name): (str(dtype).lower(), int(nullable))
+                      for name, dtype, nullable in cur.fetchall()}
+            expected = {
+                "control_id": ("bigint", 0),
+                "record_type": ("varchar", 0),
+                "record_key": ("varchar", 0),
+                "payload": ("nvarchar", 0),
+                "created_at": ("datetime2", 0),
+                "updated_at": ("datetime2", 0),
+                "updated_by": ("nvarchar", 0),
+                "row_version": ("timestamp", 0),
+            }
+            if actual != expected:
+                raise ControlError("DBD_CONTROL column contract mismatch; manual schema review required")
+            cur.execute(
+                "SELECT name FROM sys.objects "
+                "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_CONTROL') "
+                "AND type IN ('UQ','C')"
+            )
+            constraints = {str(row[0]) for row in cur.fetchall()}
+            if not {
+                "UQ_DBD_CONTROL_RECORD", "CK_DBD_CONTROL_JSON", "CK_DBD_CONTROL_TYPE",
+            }.issubset(constraints):
+                raise ControlError("DBD_CONTROL constraints are incomplete; manual schema review required")
             cur.execute("SELECT OBJECT_ID(N'dbo.DBD_CONTROL_ADMIT',N'P')")
             if not cur.fetchone()[0]:
                 raise ControlError("DBD_CONTROL_ADMIT procedure is missing; run dbd-data migrate")
@@ -350,6 +379,20 @@ class ControlRepository:
             schedule = self._read(conn, "SCHEDULE", "core")
             if schedule is not None and schedule.get("admin_node") != node_id:
                 raise ControlError("This is not the designated Admin Coordinator machine")
+
+    def can_execute_admission(self) -> bool:
+        """Check the right to use the only Worker-writable control operation."""
+        with connection() as conn:
+            cur = conn.cursor()
+            try:
+                cur.execute(
+                    "SELECT HAS_PERMS_BY_NAME("
+                    "N'dbo.DBD_CONTROL_ADMIT',N'OBJECT',N'EXECUTE')"
+                )
+                row = cur.fetchone()
+                return bool(row and row[0])
+            finally:
+                cur.close()
 
     def node_status(self, node_id: str) -> dict[str, Any] | None:
         with connection() as conn:
