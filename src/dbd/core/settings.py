@@ -16,6 +16,7 @@ class Settings(BaseSettings):
         env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore", frozen=True
     )
     dbd_production_backend: Literal["sqlserver", "mysql"] = "sqlserver"
+    dbd_operator_name: str | None = None
     # Separate from DB_* (Legacy Dataset 1 and campaign runtime).
     prod_mysql_host: str = "127.0.0.1"
     prod_mysql_port: int = Field(3307, ge=1, le=65535)
