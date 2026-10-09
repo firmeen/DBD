@@ -27,6 +27,16 @@ def positive(value):
     return value
 
 
+def cutover_batch_size(value):
+    try:
+        size = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError("batch size must be an integer from 1 to 10000") from None
+    if not 1 <= size <= 10000:
+        raise argparse.ArgumentTypeError("batch size must be between 1 and 10000")
+    return size
+
+
 def non_negative(value):
     value = int(value)
     if value < 0:
@@ -797,7 +807,7 @@ def main():
         "cutover", help="Import legacy MySQL Generation 1 into the selected production target"
     )
     cutover.add_argument("--backend", choices=("sqlserver", "mysql"), default="sqlserver")
-    cutover.add_argument("--batch-size", type=positive, default=500)
+    cutover.add_argument("--batch-size", type=cutover_batch_size, default=500)
     args = parser.parse_args()
     presenter = TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
