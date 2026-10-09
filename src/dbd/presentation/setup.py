@@ -207,9 +207,13 @@ class SetupWizard:
                 return 2
             try:
                 check_connection()
-                status = ControlRepository().node_status(node)
+                control = ControlRepository()
+                status = control.node_status(node)
                 self.console.print(f"Node: {status or 'NOT ENROLLED'}")
-                return 0 if status and status.get("authorized") else 2
+                admission_ready = control.can_execute_admission()
+                if not admission_ready:
+                    self.console.print("[red]SQL EXECUTE permission on DBD_CONTROL_ADMIT is missing.[/red]")
+                return 0 if status and status.get("authorized") and admission_ready else 2
             except Exception as exc:
                 self.console.print(f"[red]Readiness failed: {exc}[/red]")
                 return 2
@@ -287,6 +291,12 @@ class SetupWizard:
                 ))
                 return 2
 
+            if not repo.can_execute_admission():
+                raise ControlError(
+                    "SQL Server login cannot EXECUTE dbo.DBD_CONTROL_ADMIT; "
+                    "ask the SQL Server administrator for the minimal grant "
+                    "(see docs/WORKER_SETUP.md)"
+                )
             self.console.print(
                 f"[green]Authorized[/green] {current['role']}  |  Node {node}  |  SQL login {sql_login}"
             )
