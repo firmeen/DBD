@@ -407,6 +407,10 @@ async def collect(
     allow_targeted_sql: bool = False,
 ) -> dict[str, Any]:
     repo = _repo(repository, backend)
+    # Remote SQL Server Workers are authorized only to join the monthly Core
+    # fleet; standalone Extended collection retains its Admin-only boundary.
+    if getattr(repo, "backend", None) == "sqlserver" and phase != "core":
+        _require_sql_admin(repo)
     targeted_sql = (
         bool(allow_targeted_sql) and company_id is not None
         and getattr(repo, "backend", None) == "sqlserver"
