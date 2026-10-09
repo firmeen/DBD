@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from contextlib import contextmanager
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from datetime import time as datetime_time
 from typing import Any, Iterable, Iterator
 from uuid import uuid4
@@ -13,6 +13,8 @@ from ...contracts.master_deep import (
     mssql_create_table_sql,
     ordered_values,
 )
+from ...core.settings import settings
+from ...deep.catalog import CORE_ENDPOINT_MASK, core_discovery_plan
 from ..production import ProductionLeaseLost
 from .engine import _pymssql, check_connection, connection
 from .engine import transaction as sqlserver_transaction
@@ -1253,7 +1255,9 @@ class ProductionSqlServerRepository:
                 cur.execute(
                     """
                     SELECT
-                      company_id,last_seen_generation,profile_payload,latest_fiscal_year
+                      company_id,last_seen_generation,profile_payload,latest_fiscal_year,
+                      status_code,required_mask,done_mask,not_available_mask,
+                      failed_mask,endpoint_meta
                     FROM dbo.DBD_COMPANY WITH (UPDLOCK,HOLDLOCK)
                     WHERE juristic_type_code=%s AND registration_no=%s
                     """,
@@ -1303,7 +1307,10 @@ class ProductionSqlServerRepository:
                     inserted += 1
                     continue
 
-                _company_id, old_generation, profile_payload, old_fiscal = existing
+                (
+                    _company_id, old_generation, profile_payload, old_fiscal,
+                    old_status, old_required, old_done, old_na, old_failed, old_meta,
+                ) = existing
                 old_generation = int(old_generation or 0)
                 if old_generation > generation:
                     raise SqlServerWriteError(
@@ -1311,29 +1318,42 @@ class ProductionSqlServerRepository:
                         f"row={old_generation}, incoming={generation}"
                     )
                 first_observation = old_generation < generation
-
-                fiscal_present = "latest_fiscal_year" in values
-                incoming_fiscal = values.get("latest_fiscal_year")
-                fiscal_changed = fiscal_present and incoming_fiscal != old_fiscal
+                current_status = values.get("status_code", old_status)
+                current_fiscal = values.get("latest_fiscal_year", old_fiscal)
 
                 if profile_payload is not None:
-                    # Search remains durable raw/master truth, but collected
-                    # Profile-owned typed columns remain authoritative.
-                    allowed = {"master_payload", "published_at", "latest_fiscal_year"}
+                    # Profile owns typed details, but a newer Search observation
+                    # must be allowed to update legal status and eligibility.
+                    allowed = {
+                        "master_payload", "published_at", "latest_fiscal_year",
+                        "status_code", "status_description",
+                    }
                     values = {key: value for key, value in values.items() if key in allowed}
+
+                core_required, reopen_mask = core_discovery_plan(
+                    previous_status=old_status,
+                    current_status=current_status,
+                    previous_fiscal=old_fiscal,
+                    current_fiscal=current_fiscal,
+                    done_mask=int(old_done or 0),
+                    not_available_mask=int(old_na or 0),
+                    endpoint_meta=old_meta,
+                    first_observation=first_observation,
+                    force_refresh_mask=int(refresh_mask),
+                    stale_hours=settings.dbd_refresh_stale_hours,
+                    now=datetime.now(timezone.utc),
+                )
+                new_required = (int(old_required or 0) & ~CORE_ENDPOINT_MASK) | core_required
+                reopened_outcomes = (
+                    int(old_done or 0) | int(old_na or 0) | int(old_failed or 0)
+                ) & ~reopen_mask
+                unresolved = new_required & ~reopened_outcomes
+                remaining_failures = int(old_failed or 0) & ~reopen_mask & new_required
 
                 assignments = [f"[{column}]=%s" for column in values]
                 params = list(values.values())
-
-                reopen_mask = int(refresh_mask) if first_observation else 0
-                if fiscal_changed:
-                    reopen_mask |= int(financial_mask)
-                    if incoming_fiscal is None:
-                        assignments.append("required_mask=(required_mask & ~%s)")
-                    else:
-                        assignments.append("required_mask=(required_mask | %s)")
-                    params.append(int(financial_mask))
-
+                assignments.append("required_mask=%s")
+                params.append(new_required)
                 if reopen_mask:
                     assignments.extend(
                         [
@@ -1348,15 +1368,27 @@ class ProductionSqlServerRepository:
                     if first_observation and refresh_mask:
                         refresh_reopened += 1
 
-                assignments.append("last_seen_generation=%s")
-                params.append(int(generation))
-                if reopen_mask:
+                if new_required != int(old_required or 0) or reopen_mask:
+                    # SQL Server SET expressions see old column values: derive
+                    # the outcome from the computed masks, not stale columns.
                     assignments.append(
                         "collect_status=CASE "
                         "WHEN lease_owner IS NOT NULL "
-                        " AND lease_expires_at > SYSUTCDATETIME() "
-                        "THEN N'COLLECTING' ELSE N'PENDING' END"
+                        "AND lease_expires_at>SYSUTCDATETIME() THEN N'COLLECTING' "
+                        "WHEN %s=0 THEN N'DISCOVERED' "
+                        "WHEN %s<>0 THEN N'PENDING' "
+                        "WHEN %s=0 THEN N'COMPLETE' "
+                        "WHEN %s=%s THEN N'FAILED' "
+                        "ELSE N'PARTIAL' END"
                     )
+                    params.extend([
+                        new_required, unresolved, remaining_failures,
+                        remaining_failures, new_required,
+                    ])
+                    if unresolved:
+                        assignments.append("collection_completed_at=NULL")
+                assignments.append("last_seen_generation=%s")
+                params.append(int(generation))
                 cur.execute(
                     "UPDATE dbo.DBD_COMPANY SET "
                     + ",".join(assignments)
@@ -1483,6 +1515,7 @@ class ProductionSqlServerRepository:
                           N'DISCOVERED',N'PENDING',N'COLLECTING',
                           N'RETRY_WAIT',N'PARTIAL'
                       )
+                      AND status_code=N'1'
                       AND (required_mask & %s) <> 0
                       AND ((required_mask & %s)
                            & ~(done_mask | not_available_mask | failed_mask)) <> 0
