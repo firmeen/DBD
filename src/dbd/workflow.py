@@ -88,7 +88,14 @@ def _emit(event: EventCallback | None, name: str, **payload: object) -> None:
 
 
 def _repo(repository: Any | None, backend: str | None = None) -> Any:
-    return repository if repository is not None else production_repository(backend)
+    if repository is None:
+        return production_repository(backend)
+    actual = getattr(repository, "backend", None)
+    if backend is not None and actual is not None and backend != actual:
+        raise ValueError(
+            f"Production repository backend {actual!r} does not match {backend!r}"
+        )
+    return repository
 
 
 def _manual_generation(
