@@ -1650,6 +1650,11 @@ class ProductionSqlServerRepository:
         claim_generation: int,
         lease_seconds: int,
     ) -> None:
+        node_id = claim_token.split(":", 1)[0]
+        if node_id.startswith("node-") and int(claim_generation) >= 2:
+            ControlRepository().require_collection_access(
+                conn, node_id, claim_generation, finishing=True,
+            )
         cur = conn.cursor()
         try:
             cur.execute(
