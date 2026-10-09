@@ -393,45 +393,63 @@ async def collect(
     event: EventCallback | None = None,
 ) -> dict[str, Any]:
     repo = _repo(repository, backend)
+    is_shared_core = getattr(repo, "backend", None) == "sqlserver" and phase == "core"
     node_id = None
-    selected_generation = int(
-        generation or await asyncio.to_thread(_manual_generation, repo, phase=phase)
-    )
-    if getattr(repo, "backend", None) == "sqlserver" and phase == "core":
+    control = None
+    if is_shared_core:
         from .presentation.setup import local_node_id
         from .storage.sqlserver.control_repository import ControlRepository
         node_id = local_node_id()
         if node_id is None:
             raise RuntimeError("Run dbd-data setup before SQL Server Deep Collection")
         control = ControlRepository()
-        active = await asyncio.to_thread(control.active_generation)
-        if active is None or active.get("state") != "COLLECTING":
-            raise RuntimeError("No COLLECTING monthly generation is available to join")
-        if generation is not None and int(generation) != int(active["generation"]):
-            raise RuntimeError("Collector generation does not match SQL Server coordinator")
-        selected_generation = int(active["generation"])
-        node = await asyncio.to_thread(control.node_status, node_id)
-        if node is None or not node.get("authorized"):
-            raise RuntimeError("Unapproved node or mismatched SQL Server login")
-    collector = DeepCollector(
-        repository=repo,
-        generation=selected_generation,
-        phase=phase,
-        concurrency=int(concurrency or settings.dbd_concurrency),
-        rate_per_second=float(rate or settings.dbd_rate_per_second),
-        http_retries=(
-            int(settings.dbd_http_retries)
-            if http_retries is None
-            else int(http_retries)
-        ),
-        company_limit=limit,
-        company_id=company_id,
-        node_id=node_id,
-        continuous=continuous,
-        idle_seconds=idle_seconds,
-        event=event,
-    )
-    return await collector.run()
+
+    while True:
+        selected_generation = int(
+            generation or await asyncio.to_thread(_manual_generation, repo, phase=phase)
+        )
+        if control is not None:
+            active = await asyncio.to_thread(control.active_generation)
+            node = await asyncio.to_thread(control.node_status, node_id)
+            if node is None or not node.get("authorized"):
+                raise RuntimeError("Unapproved node or mismatched SQL Server login")
+            if active is None or active.get("state") != "COLLECTING":
+                if not continuous or generation is not None:
+                    raise RuntimeError("No COLLECTING monthly generation is available to join")
+                _emit(event, "cycle_waiting", idle_seconds=idle_seconds)
+                await asyncio.sleep(idle_seconds)
+                continue
+            if generation is not None and int(generation) != int(active["generation"]):
+                raise RuntimeError("Collector generation does not match SQL Server coordinator")
+            selected_generation = int(active["generation"])
+
+        collector = DeepCollector(
+            repository=repo,
+            generation=selected_generation,
+            phase=phase,
+            concurrency=int(concurrency or settings.dbd_concurrency),
+            rate_per_second=float(rate or settings.dbd_rate_per_second),
+            http_retries=(
+                int(settings.dbd_http_retries)
+                if http_retries is None
+                else int(http_retries)
+            ),
+            company_limit=limit,
+            company_id=company_id,
+            node_id=node_id,
+            continuous=continuous,
+            idle_seconds=idle_seconds,
+            event=event,
+        )
+        with _keep_system_awake():
+            result = await collector.run()
+        if not (continuous and is_shared_core and generation is None
+                and limit is None and company_id is None):
+            return result
+        # A long-running Worker may join the *next* Generation without holding
+        # old claims or attempting to start a Generation itself.
+        _emit(event, "cycle_waiting", idle_seconds=idle_seconds)
+        await asyncio.sleep(idle_seconds)
 
 
 async def discover(
