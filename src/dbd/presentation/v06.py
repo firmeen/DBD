@@ -1444,7 +1444,10 @@ class V06Terminal:
             "FINALIZING",
         }:
             return "cyan"
-        if normalized in {"IDLE", "N/A", "PENDING", "SKIPPED", "STOPPED", "SNAPSHOT"}:
+        if normalized in {
+            "IDLE", "N/A", "PENDING", "SKIPPED", "STOPPED", "SNAPSHOT",
+            "NOT_DUE", "ALREADY_COMPLETED",
+        }:
             return "dim"
         return "white"
 
