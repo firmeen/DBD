@@ -66,6 +66,45 @@ def _insert(conn, table: str, row: dict[str, Any], *, preserve: tuple[str, ...] 
         )
 
 
+def _upsert_many(conn, table: str, rows: list[dict[str, Any]], *,
+                 natural_key: tuple[str, ...]) -> int:
+    """Bounded multi-row upserts; PyMySQL splits statements by max packet length."""
+    if not rows:
+        return 0
+    columns = _columns(table)
+    preserve = set(natural_key) | {"first_seen_generation"}
+    unknown = set().union(*(set(row) for row in rows)) - set(columns)
+    if unknown:
+        raise MySqlProductionWriteError(f"{table} unsupported columns: {sorted(unknown)}")
+    parameters = []
+    seen: dict[tuple[Any, ...], tuple[Any, ...]] = {}
+    for row in rows:
+        key = tuple(_production_value(row.get(field)) for field in natural_key)
+        if any(v is None for v in key):
+            raise MySqlProductionWriteError(f"{table} missing natural-key value")
+        values = tuple(_production_value(row.get(field)) for field in columns)
+        previous = seen.get(key)
+        if previous is not None:
+            if previous != values:
+                raise MySqlProductionWriteError(f"{table} conflicting duplicate natural key")
+            continue
+        seen[key] = values
+        parameters.append(values)
+    updates = [
+        f"`{column}`=VALUES(`{column}`)"
+        for column in columns if column not in preserve
+    ]
+    sql = (
+        f"INSERT INTO `{table}` ("
+        + ",".join(f"`{column}`" for column in columns)
+        + ") VALUES (" + ",".join(["%s"] * len(columns))
+        + ") ON DUPLICATE KEY UPDATE " + ",".join(updates)
+    )
+    with conn.cursor() as cur:
+        cur.executemany(sql, parameters)
+    return len(parameters)
+
+
 def _update(conn, table: str, values: dict[str, Any], where: str, params: tuple):
     if not values:
         return 0
@@ -223,33 +262,28 @@ class ProductionMySqlRepository:
         return result
 
     def upsert_companies(self, conn, rows):
-        for row in rows:
-            _identity(row.get("juristic_type_code"), "juristic_type_code")
-            _identity(row.get("registration_no"), "registration_no")
-            _insert(conn, "DBD_COMPANY", row, preserve=(
-                "company_id", "first_seen_generation",
-            ))
+        _upsert_many(
+            conn, "DBD_COMPANY", rows,
+            natural_key=("juristic_type_code", "registration_no"),
+        )
         return self.company_ids(
             conn, [(x["juristic_type_code"], x["registration_no"]) for x in rows]
         )
 
     def upsert_relations(self, conn, rows):
-        for row in rows:
-            _insert(conn, "DBD_COMPANY_RELATION", row,
-                    preserve=("first_seen_generation",))
-        return len(rows)
+        return _upsert_many(
+            conn, "DBD_COMPANY_RELATION", rows, natural_key=("company_id", "relation_type", "source_key"),
+        )
 
     def upsert_events(self, conn, rows):
-        for row in rows:
-            _insert(conn, "DBD_COMPANY_EVENT", row,
-                    preserve=("first_seen_generation",))
-        return len(rows)
+        return _upsert_many(
+            conn, "DBD_COMPANY_EVENT", rows, natural_key=("company_id", "event_type", "source_key"),
+        )
 
     def upsert_financials(self, conn, rows):
-        for row in rows:
-            _insert(conn, "DBD_FINANCIAL", row,
-                    preserve=("first_seen_generation",))
-        return len(rows)
+        return _upsert_many(
+            conn, "DBD_FINANCIAL", rows, natural_key=("company_id", "fiscal_year"),
+        )
 
     def upsert_industries(self, conn, rows, *, reject_conflicts=False):
         for row in rows:
