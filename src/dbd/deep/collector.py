@@ -8,7 +8,7 @@ from decimal import Decimal
 from typing import Any, Callable
 
 from ..contracts.company import normalize as normalize_profile
-from ..contracts.financial import normalize_statements, normalize_submissions
+from ..contracts.financial import normalize_statements, validate_deep_submissions
 from ..contracts.identity import identity
 from ..contracts.strict import normalize_collection, normalize_industry_benchmark
 from ..core.exceptions import (
@@ -43,7 +43,7 @@ def _normalize_resource(endpoint: str, payload: object):
     if endpoint == "profile":
         return normalize_profile(payload)
     if endpoint == "financial_submissions":
-        return normalize_submissions(payload)
+        return validate_deep_submissions(payload)
     if endpoint == "financial_statements":
         return normalize_statements(payload)
     if endpoint == "industry_benchmark":
