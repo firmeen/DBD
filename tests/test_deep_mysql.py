@@ -1027,3 +1027,128 @@ async def test_older_discovery_response_cannot_revert_newer_deep_status(
             (jp_no,),
         )
         assert cur.fetchone()["n"] == 0
+
+
+@pytest.mark.asyncio
+async def test_deep_retry_recovers_same_year_submission_without_rewriting_other_endpoints() -> None:
+    """Integration: real MySQL transaction, masks, and JSON source fidelity."""
+    from dbd.deep.catalog import EndpointSpec
+    from dbd.deep.collector import DeepCollector, _json_payload
+
+    number = "9000000001294"
+    bit = ENDPOINT_BITS["financial_submissions"]
+    preserved = {"sentinel": "previously completed profile"}
+    raw = [
+        {
+            "submitYear": "2554",
+            "statusCode": "1",
+            "updateDate": [2012, 3, 1],
+            "sourceOnly": {"revision": "one"},
+        },
+        {
+            "submitYear": "2554",
+            "statusCode": "2",
+            "updateDate": [2012, 5, 9],
+            "sourceOnly": {"revision": "two"},
+        },
+        {
+            "submitYear": "2554",
+            "statusCode": "1",
+            "updateDate": [2012, 3, 1],
+            "sourceOnly": {"revision": "one"},
+        },
+    ]
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO dbd_company_deep (
+                jp_type_code,jp_no,jp_stat_code,submit_fin_year,master_data,
+                profile_data,financial_submissions_data,
+                required_mask,done_mask,not_available_mask,failed_mask,
+                deep_status,endpoint_meta,last_endpoint,last_http_status,
+                last_error,last_error_at,deep_completed_at
+            ) VALUES (
+                '5',%s,'1','2568',JSON_OBJECT(),CAST(%s AS JSON),NULL,
+                %s,%s,0,%s,'PARTIAL',JSON_OBJECT(),
+                'industry_benchmark',200,'financial_submissions: ContractError',
+                UTC_TIMESTAMP(6),UTC_TIMESTAMP(6)
+            )
+            """,
+            (number, json.dumps(preserved), ACTIVE_ENDPOINT_MASK,
+             ACTIVE_ENDPOINT_MASK & ~bit, bit),
+        )
+        conn.commit()
+
+    spec = EndpointSpec(
+        key="financial_submissions",
+        sequence_no=20,
+        bit=bit,
+        method="GET",
+        path_template="/api/v1/fin/submit/{jp_type_code}/{jp_no}",
+        referer_template=None,
+        destination_column="financial_submissions_data",
+        request_schema={},
+        response_schema={"type": "array", "item_key": "submitYear"},
+        required_rule={"type": "when_master_field_present", "field": "submit_fin_year"},
+    )
+    company = {"jp_type_code": "5", "jp_no": number}
+    assert DeepCollector._validate_payload(spec, company, raw) == (
+        "done", None, False
+    )
+
+    repo = DeepRepository()
+    try:
+        await repo.ensure_runtime_table()
+        assert await repo.retry_failed(limit=1) == 1
+        claimed = await repo.claim()
+        assert claimed is not None
+        assert claimed["jp_no"] == number
+        assert claimed["done_mask"] == (ACTIVE_ENDPOINT_MASK & ~bit)
+        assert claimed["failed_mask"] == 0
+
+        result = await repo.commit_endpoint(
+            jp_type_code="5",
+            jp_no=number,
+            spec=spec,
+            outcome="done",
+            payload_json=_json_payload(raw),
+            meta_json=json.dumps({
+                "status": "done",
+                "http_status": 200,
+                "requested_at": "2026-10-12T01:00:00",
+            }),
+            http_status=200,
+            error=None,
+            requested_at=datetime.now(UTC).replace(tzinfo=None),
+        )
+        await repo.finish_runtime("5", number)
+        assert result["deep_status"] == "COMPLETE"
+        assert result["failed_mask"] == 0
+        assert result["done_mask"] == ACTIVE_ENDPOINT_MASK
+    finally:
+        await repo.close()
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT profile_data,financial_submissions_data,
+                   done_mask,failed_mask,deep_status,deep_completed_at
+            FROM dbd_company_deep
+            WHERE jp_type_code='5' AND jp_no=%s
+            """,
+            (number,),
+        )
+        saved = cur.fetchone()
+        assert saved["deep_status"] == "COMPLETE"
+        assert saved["deep_completed_at"] is not None
+        assert saved["done_mask"] == ACTIVE_ENDPOINT_MASK
+        assert saved["failed_mask"] == 0
+        assert json.loads(saved["profile_data"]) == preserved
+        assert json.loads(saved["financial_submissions_data"]) == raw
+        assert len(json.loads(saved["financial_submissions_data"])) == 3
+        cur.execute(
+            "SELECT COUNT(*) n FROM dbd_deep_runtime WHERE jp_type_code='5' AND jp_no=%s",
+            (number,),
+        )
+        assert cur.fetchone()["n"] == 0
