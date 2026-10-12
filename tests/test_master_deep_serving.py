@@ -249,3 +249,38 @@ def test_master_deep_terminal_error_render_includes_exception() -> None:
     output = stream.getvalue()
     assert "NoSuchColumnError: column_name" in output
     assert "Error" in output
+
+
+def test_serving_counts_distinct_same_year_records_without_rejecting_complete_deep():
+    source = _deep_row()
+    source["financial_submissions_data"] = [
+        {"submitYear": "2568", "statusCode": "1", "revisionHint": "A"},
+        {"submitYear": "2568", "statusCode": "1", "revisionHint": "B"},
+        {"submitYear": "2568", "statusCode": "1", "revisionHint": "A"},
+        {"submitYear": "2567", "statusCode": "2"},
+    ]
+    projected = flatten_complete_row(source)
+
+    assert projected["financial_submissions_status"] == "DONE"
+    # 4 unmodified raw items, but only 3 unique raw source records.
+    assert len(source["financial_submissions_data"]) == 4
+    assert projected["financial_submission_count"] == 3
+    assert projected["deep_status"] == "COMPLETE"
+
+
+def test_serving_same_year_extra_metadata_changes_distinct_count_and_hash():
+    source = _deep_row()
+    source["financial_submissions_data"] = [
+        {"submitYear": "2568", "sourceRevision": "A"},
+        {"submitYear": "2568", "sourceRevision": "B"},
+    ]
+    projected = flatten_complete_row(source)
+    assert projected["financial_submission_count"] == 2
+    assert projected["row_hash"] == serving_row_hash(projected)
+
+    source["financial_submissions_data"].append(
+        {"submitYear": "2568", "sourceRevision": "C"}
+    )
+    changed = flatten_complete_row(source)
+    assert changed["financial_submission_count"] == 3
+    assert changed["row_hash"] != projected["row_hash"]
