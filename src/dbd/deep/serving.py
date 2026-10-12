@@ -11,7 +11,7 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from ..contracts.company import normalize as normalize_profile
-from ..contracts.financial import normalize_statements, normalize_submissions
+from ..contracts.financial import normalize_statements, validate_deep_submissions
 from ..contracts.master_deep import (
     RATIO_COLUMNS,
     SERVING_COLUMNS,
@@ -156,7 +156,7 @@ def flatten_complete_row(row: dict[str, Any], *, projected_at: datetime | None =
 
     submissions = []
     if statuses["financial_submissions"] == "DONE":
-        submissions = normalize_submissions(_json_value(row.get("financial_submissions_data")))
+        submissions = validate_deep_submissions(_json_value(row.get("financial_submissions_data")))
 
     statements = []
     if statuses["financial_statements"] == "DONE":
