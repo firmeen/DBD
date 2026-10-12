@@ -264,3 +264,17 @@ def test_deep_submission_still_rejects_invalid_source_contract(payload):
 
 def test_deep_submission_empty_array_remains_valid():
     assert validate_deep_submissions([]) == []
+
+
+def test_deep_submission_identity_does_not_mix_decimal_numbers_with_strings():
+    numeric = {"submitYear": "2568", "sourceAmount": Decimal("1.0")}
+    string = {"submitYear": "2568", "sourceAmount": "1.0"}
+    deep = validate_deep_submissions([numeric, string, dict(numeric)])
+    assert len(deep) == 2
+
+
+def test_deep_submission_identity_ignores_object_key_order_only():
+    left = {"submitYear": "2568", "statusCode": "1", "extra": {"a": 1, "b": 2}}
+    same = {"extra": {"b": 2, "a": 1}, "statusCode": "1", "submitYear": "2568"}
+    different = {"submitYear": "2568", "statusCode": "1", "extra": {"a": 2, "b": 1}}
+    assert len(validate_deep_submissions([left, same, different])) == 2
