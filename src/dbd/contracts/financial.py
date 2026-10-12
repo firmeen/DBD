@@ -250,3 +250,45 @@ def normalize_submissions(data: object) -> list[dict]:
             }
         )
     return rows
+
+
+def validate_deep_submissions(data: object) -> list[dict]:
+    """Validate Deep submission history without imposing a one-row-per-year key.
+
+    DBD can return distinct source records for the same submitYear. Deep stores
+    the unmodified response JSON, so these records must not be discarded or
+    mistaken for a corrupt response. Return one normalized row per distinct
+    source record for derived counts; only identical JSON objects are collapsed
+    in this *derived view*, never in the persisted Deep payload.
+
+    The legacy normalize_submissions() contract remains intentionally strict
+    because its SQL table is unique on (jp_no, submit_year).
+    """
+    normalized: list[dict] = []
+    seen: set[str] = set()
+    for source in require_rows(data, "submitYear"):
+        # Validate dates for every source record, even identical duplicates.
+        submit_date = to_date(source.get("submitDate"))
+        update_date = to_date(source.get("updateDate"))
+        fingerprint = json.dumps(
+            source,
+            sort_keys=True,
+            ensure_ascii=False,
+            separators=(",", ":"),
+            default=str,
+        )
+        if fingerprint in seen:
+            continue
+        seen.add(fingerprint)
+        normalized.append(
+            {
+                "submit_year": str(source["submitYear"]),
+                "ac_date": source.get("acDate"),
+                "submit_date": submit_date,
+                "ac_code": source.get("acCode"),
+                "au_code": source.get("auCode"),
+                "status_code": source.get("statusCode"),
+                "update_date": update_date,
+            }
+        )
+    return normalized
