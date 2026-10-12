@@ -238,3 +238,82 @@ async def test_company_limit_stops_direct_claim_without_prefetch() -> None:
     assert repo.claim.await_count == 2
     assert collector._stop.is_set()
 
+
+def test_financial_submissions_deep_payload_allows_multiple_source_records_per_year():
+    company = {"jp_type_code": "5", "jp_no": "0905553003301"}
+    payload = [
+        {"submitYear": "2554", "statusCode": "1", "sourceOnly": "first"},
+        {"submitYear": "2554", "statusCode": "2", "sourceOnly": "second"},
+    ]
+    outcome = DeepCollector._validate_payload(
+        _spec("financial_submissions"), company, payload
+    )
+    assert outcome == ("done", None, False)
+    assert len(payload) == 2
+    assert payload[0]["sourceOnly"] == "first"
+    assert payload[1]["sourceOnly"] == "second"
+
+
+@pytest.mark.asyncio
+async def test_retry_financial_submission_commits_full_raw_json_and_skips_other_done_endpoint():
+    import json
+    from datetime import UTC, datetime
+
+    from dbd.deep.http import DeepResponse
+
+    payload = [
+        {"submitYear": "2568", "statusCode": "1", "sourceHint": "A"},
+        {"submitYear": "2568", "statusCode": "2", "sourceHint": "B"},
+        {"submitYear": "2568", "statusCode": "1", "sourceHint": "A"},
+    ]
+    spec = _spec("financial_submissions")
+    state = {
+        "submit_fin_year": "2568",
+        "required_mask": ACTIVE_ENDPOINT_MASK,
+        "done_mask": ACTIVE_ENDPOINT_MASK,
+        "not_available_mask": 0,
+        "failed_mask": 0,
+        "deep_status": "COMPLETE",
+    }
+    repository = SimpleNamespace(
+        commit_endpoint=AsyncMock(return_value=state),
+        finish_runtime=AsyncMock(),
+    )
+    collector = DeepCollector(
+        repository=repository,
+        concurrency=1,
+        rate_per_second=1,
+        http_retries=0,
+    )
+    # The profile endpoint has already been marked DONE before retry.
+    collector._specs = (_spec("profile"), spec)
+    company = {
+        "jp_type_code": "5",
+        "jp_no": "0905553003301",
+        "submit_fin_year": "2568",
+        "attempts": 1,
+        "required_mask": ACTIVE_ENDPOINT_MASK,
+        "done_mask": ACTIVE_ENDPOINT_MASK & ~ENDPOINT_BITS["financial_submissions"],
+        "not_available_mask": 0,
+        "failed_mask": 0,
+        "deep_status": "COLLECTING",
+    }
+    now = datetime(2026, 10, 12, tzinfo=UTC)
+    response = DeepResponse(
+        data=payload, status=200,
+        requested_at=now, received_at=now,
+    )
+    client = SimpleNamespace(fetch=AsyncMock(return_value=response))
+
+    await collector._process_company(company, client)
+
+    client.fetch.assert_awaited_once()
+    repository.commit_endpoint.assert_awaited_once()
+    saved = repository.commit_endpoint.await_args.kwargs
+    assert saved["spec"].key == "financial_submissions"
+    assert saved["outcome"] == "done"
+    assert saved["http_status"] == 200
+    assert json.loads(saved["payload_json"]) == payload
+    assert collector.stats.endpoints_done == 1
+    assert collector.stats.endpoints_failed == 0
+    repository.finish_runtime.assert_awaited_once_with("5", "0905553003301")
