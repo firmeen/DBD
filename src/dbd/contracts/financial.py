@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass, field
+from decimal import Decimal
 
 from ..core.exceptions import ContractError
 from .common import money, require_rows, to_date
@@ -252,6 +253,28 @@ def normalize_submissions(data: object) -> list[dict]:
     return rows
 
 
+def _deep_source_identity(value: object) -> tuple:
+    """Typed, order-independent JSON identity: number and string never collide."""
+    if isinstance(value, dict):
+        return (
+            "object",
+            tuple(sorted((str(k), _deep_source_identity(v)) for k, v in value.items())),
+        )
+    if isinstance(value, list):
+        return ("array", tuple(_deep_source_identity(item) for item in value))
+    if value is None:
+        return ("null",)
+    if isinstance(value, bool):
+        return ("boolean", value)
+    if isinstance(value, (int, float, Decimal)):
+        return ("number", str(value))
+    if isinstance(value, str):
+        return ("string", value)
+    raise ContractError(
+        f"Unsupported financial submission JSON value: {type(value).__name__}"
+    )
+
+
 def validate_deep_submissions(data: object) -> list[dict]:
     """Validate Deep submission history without imposing a one-row-per-year key.
 
@@ -265,18 +288,12 @@ def validate_deep_submissions(data: object) -> list[dict]:
     because its SQL table is unique on (jp_no, submit_year).
     """
     normalized: list[dict] = []
-    seen: set[str] = set()
+    seen: set[tuple] = set()
     for source in require_rows(data, "submitYear"):
         # Validate dates for every source record, even identical duplicates.
         submit_date = to_date(source.get("submitDate"))
         update_date = to_date(source.get("updateDate"))
-        fingerprint = json.dumps(
-            source,
-            sort_keys=True,
-            ensure_ascii=False,
-            separators=(",", ":"),
-            default=str,
-        )
+        fingerprint = _deep_source_identity(source)
         if fingerprint in seen:
             continue
         seen.add(fingerprint)
