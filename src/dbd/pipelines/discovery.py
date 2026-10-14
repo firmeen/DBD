@@ -12,6 +12,7 @@ from uuid import uuid4
 from ..client.async_client import AsyncDbdClient
 from ..client.endpoints.search import (
     MAX_ROWS_PER_QUERY,
+    ITEMS_PER_PAGE,
     SEARCH_PATH,
     SEARCH_REFERER,
     SearchFilters,
@@ -354,6 +355,18 @@ async def _drain_bucket(
                     f"expected_items={expected_items} actual_items={page.total_items} "
                     f"expected_pages={pages_total} actual_pages={page.total_pages}"
                 )
+            # A page that claims the same total but has fewer identities is
+            # not a complete page. Check the documented fixed page size.
+            if expected_items is not None:
+                expected_rows = min(
+                    ITEMS_PER_PAGE,
+                    max(0, int(expected_items) - (page_no - 1) * ITEMS_PER_PAGE),
+                )
+                if len(page.rows) != expected_rows:
+                    raise ContractError(
+                        f"PAGE_SIZE_MISMATCH bucket={bucket_id} page={page_no} "
+                        f"expected_rows={expected_rows} actual_rows={len(page.rows)}"
+                    )
             if filters.numeric_range() is not None:
                 from ..contracts.common import money
 
@@ -395,12 +408,12 @@ async def _drain_bucket(
             raise
         except Exception as exc:
             detail = f"{type(exc).__name__}: {str(exc)[:700]}"
-            # A structural contradiction affects the entire page stream. Do
-            # not blindly fetch all remaining pages after the first failure.
-            if isinstance(exc, (ContractError, TypeError, ValueError)):
-                if not stop_pages.is_set():
-                    bucket_error = detail
-                stop_pages.set()
+            # Even one exhausted request failure should pause this bucket;
+            # the shared client has already applied its bounded HTTP retries.
+            # Other buckets continue, without a storm of failed page records.
+            if not stop_pages.is_set():
+                bucket_error = detail
+            stop_pages.set()
             if lease_owner is None:
                 await asyncio.to_thread(fail_page, bucket_id, page_no, detail)
             else:
