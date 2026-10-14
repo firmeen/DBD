@@ -818,3 +818,16 @@ def test_v06_recovery_pass_is_not_reported_as_global_discovery_complete() -> Non
     assert "unresolved=3" in output
     assert "Completed with failures" in output
     assert "\x1b[" not in output and "\r" not in output
+
+
+def test_v06_branch_deferred_pass_is_not_a_clean_success() -> None:
+    output = StringIO()
+    terminal = V06Terminal("branch", app="DBD DATA", stream=output, tty=False)
+    terminal.start(backend="sqlserver")
+    terminal.finish({
+        "checked": 8, "verified": 6, "branches": 11,
+        "deferred": 2, "skipped": 0, "http_requests": 12,
+    })
+    text = output.getvalue()
+    assert "Completed with failures" in text
+    assert "deferred=2" in text
