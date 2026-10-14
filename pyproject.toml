@@ -32,6 +32,7 @@ dependencies = [
   "rich>=14,<15",
   "tzdata>=2025.2,<2028",
   "prompt_toolkit>=3.0,<4",
+  "beautifulsoup4>=4.13,<5",
 ]
 
 [project.optional-dependencies]
