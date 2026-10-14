@@ -516,6 +516,13 @@ async def _process_bucket(
         # count to prevent mixing two result snapshots during resume.
         recorded_count = row.get("total_items")
         if recorded_count is not None and total_items != int(recorded_count):
+            # A transient empty result is not enough to conclude an already
+            # observed non-empty cohort disappeared. Leave it unresolved.
+            if int(recorded_count) > 0 and total_items == 0:
+                await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
+                raise ContractError(
+                    f"Discovery refused unexpected empty live population for bucket {bucket_id}"
+                )
             has_pages = await asyncio.to_thread(bucket_has_pages, bucket_id)
             if int(row.get("pages_done") or 0) or has_pages:
                 await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
@@ -782,10 +789,11 @@ async def _validated_children(
     numeric_allowed: bool | None = None,
     parent_rows: list[dict] | None = None,
 ) -> list[SearchFilters]:
-    """Try unused categorical dimensions first, then *certified* numeric ranges.
+    """Try categories first, then bounded live-validated numeric candidates.
 
-    Unverified numeric dimensions always fail closed. Existing discovery
-    collection continues to use the established categorical planner.
+    A candidate must have disjoint structural bounds, sample membership and
+    matching stable API counts. Unresolved ranges remain failed; this does not
+    claim global NULL/fractional coverage from count parity alone.
     """
     plans = _partition_plans(filters, provinces, statuses)
     if not plans and rejection_reasons is not None:
