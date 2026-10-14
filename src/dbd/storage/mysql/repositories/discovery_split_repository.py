@@ -5,7 +5,7 @@ from collections.abc import Sequence
 
 from ....client.endpoints.search import SearchFilters
 from ..engine import connect
-from .discovery_repository import assert_bucket_lease
+from .discovery_repository import DiscoveryLeaseLost, assert_bucket_lease
 
 
 def _bucket_key(filters: SearchFilters) -> str:
@@ -31,14 +31,19 @@ def split_bucket(
         if lease_owner is not None:
             assert_bucket_lease(cur, int(parent_id), lease_owner, int(lease_version))
         cur.execute(
-            "SELECT id,status,pages_done,bucket_key,keyword,search_type,"
-            "pv_codes,jp_statuses,jp_types,business_sizes "
+            "SELECT id,status,pages_done,bucket_key,keyword,search_type,depth,"
+            "pv_codes,jp_statuses,jp_types,business_sizes,lease_owner,"
+            "(lease_expires_at IS NOT NULL AND lease_expires_at > UTC_TIMESTAMP(6)) AS lease_live "
             "FROM discovery_buckets WHERE id=%s FOR UPDATE",
             (int(parent_id),),
         )
         parent = cur.fetchone()
         if parent is None:
             raise ValueError(f"Discovery bucket {parent_id} not found")
+        if lease_owner is None and parent["lease_owner"] and parent["lease_live"]:
+            raise DiscoveryLeaseLost("Cannot split a bucket held by an active worker")
+        if int(depth) != int(parent["depth"]) + 1:
+            raise ValueError("Discovery child depth must equal parent depth + 1")
 
         # A split must refine the exact parent query, never replace the
         # keyword or remove an already-selected categorical constraint.
@@ -52,7 +57,8 @@ def split_bucket(
                 ("business_sizes", "business_sizes"),
             ):
                 selected = set(filter(None, (parent[column] or "").split(",")))
-                if selected and not set(getattr(child, attribute)) <= selected:
+                chosen = set(getattr(child, attribute))
+                if selected and (not chosen or not chosen <= selected):
                     raise ValueError(f"Split child broadened parent {attribute}")
 
         keys = [_bucket_key(filters) for filters in children]

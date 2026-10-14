@@ -35,6 +35,14 @@ class NumericObservation:
     count: int
     rows: list[dict]
 
+    @property
+    def total_items(self) -> int:
+        return self.count
+
+    @property
+    def current_page(self) -> int:
+        return 1
+
 
 @dataclass
 class NumericPlan:
