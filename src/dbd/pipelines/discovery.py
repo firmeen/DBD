@@ -1496,6 +1496,7 @@ async def _run_work(
     owner: str,
     progress_line: ProgressLine,
     numeric_split: bool = False,
+    recovery_rate: float = 1.0,
 ) -> DiscoveryResult:
     buckets_processed = pages_fetched = companies_written = 0
     provinces = await fetch_provinces(client)
@@ -1503,6 +1504,7 @@ async def _run_work(
     status_codes = await asyncio.to_thread(observed_status_codes)
     attempted_failed: set[int] = set()
     attempted_recovery_count = 0
+    stale_zero_checked = False
     baseline = await asyncio.to_thread(discovery_summary)
 
     if not seeds:
@@ -1538,6 +1540,27 @@ async def _run_work(
                 )
                 recovery_batch = bool(batch)
         if not batch:
+            # One bounded pass over existing false-zero children, using the
+            # existing transactional recovery logic. No bulk failed reset and
+            # no repeated recount loop; any reopened children go to the
+            # standard pending queue. Distributed runs leave this reconciliation
+            # to the single-manager invocation to avoid competing recounts.
+            if not distributed and max_buckets is None and not stale_zero_checked:
+                stale_zero_checked = True
+                from ..storage.mysql.repositories.discovery_repository import recovery_candidates
+
+                candidates = await asyncio.to_thread(recovery_candidates, 400)
+                if any(item["reason"] == "stale_zero" for item in candidates):
+                    report = await recover_discovery(
+                        limit=400, execute=True, rate=recovery_rate,
+                    )
+                    progress_line.event(
+                        "discovery: stale-zero reconciliation "
+                        f"reopened={report.get('reopened', 0)} "
+                        f"unresolved={report.get('unresolved', 0)}"
+                    )
+                    if int(report.get("reopened") or 0):
+                        continue
             break
         if recovery_batch:
             # Each historical failed leaf is attempted at most once per run.
@@ -1682,6 +1705,7 @@ async def run(
                     owner=owner,
                     progress_line=progress_line,
                     numeric_split=numeric_split,
+                    recovery_rate=global_rate,
                 )
             finally:
                 stop.set()
