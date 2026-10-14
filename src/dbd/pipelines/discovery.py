@@ -750,6 +750,20 @@ async def recover_discovery(
     if rate <= 0:
         raise ValueError("Recovery rate must be positive")
 
+    # No actionable candidates: reconcile existing checkpoints, but do not
+    # authenticate or issue even one Search request.
+    if not any(item["reason"] in actionable for item in candidates):
+        checked = await asyncio.to_thread(validate_splits, False)
+        report.update({
+            "reopened": 0,
+            "split": 0,
+            "recovered": 0,
+            "partitions_checked": checked,
+            "unresolved": blocked,
+            "sample_errors": "",
+        })
+        return report
+
     reopened = split = recovered = 0
     failures: list[str] = []
     async with AsyncDbdClient(
