@@ -841,6 +841,16 @@ async def cycle_run(
         )
 
         if control is not None:
+            # SQL durable Discovery is the sole authority for full-universe
+            # completion; an empty transient queue is not a coverage certificate.
+            from .storage.sqlserver import discovery_repository as discovery_work
+            with repo.transaction() as conn:
+                evidence = discovery_work.coverage(conn, generation, "full")
+            if not evidence["ok"]:
+                raise RuntimeError(
+                    "Monthly Core Discovery is incomplete; cannot PREPARE: "
+                    + str(evidence)
+                )
             control.transition(control_node, cycle_month, "PREPARING")
         _emit(event, "phase_started", phase="PREPARE", generation=generation)
         repo.assert_manager_lock(lock_conn)
