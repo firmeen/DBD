@@ -38,6 +38,7 @@ from .discovery_numeric import (
     NUMERIC_DIMENSIONS,
     PRODUCTION_CERTIFIED_DIMENSIONS,
     NumericObservation,
+    numeric_partition_structure,
     plan_numeric_split,
 )
 
@@ -579,7 +580,7 @@ def validate_splits(verbose: bool = True) -> int:
         cur.execute(
             """
             SELECT id,parent_id,depth,status,total_items,pages_total,pages_done,
-                   partition_lossless
+                   partition_lossless,bucket_key
             FROM discovery_buckets
             ORDER BY depth DESC,id
             """
@@ -616,7 +617,30 @@ def validate_splits(verbose: bool = True) -> int:
                 count > 0 and 0 < total <= 1000 and done == total
             )
 
-        lossless = bool(count_equal) and all(child_ready(c) for c in children)
+        # Numeric children may match the parent count while silently omitting
+        # NULL/fractional identities. Until the backend semantics and exact
+        # interval structure are certified, NEVER mark their ancestors lossless.
+        parent_numeric = {
+            part for part in str(parent["bucket_key"]).split("|")
+            if part.startswith(("cap=", "asset=", "income=", "profit="))
+        }
+        numeric_children = any(
+            {
+                part for part in str(child["bucket_key"]).split("|")
+                if part.startswith(("cap=", "asset=", "income=", "profit="))
+            } != parent_numeric for child in children
+        )
+        numeric_safe = (
+            not numeric_children
+            or numeric_partition_structure(
+                str(parent["bucket_key"]),
+                [str(child["bucket_key"]) for child in children],
+                certified=PRODUCTION_CERTIFIED_DIMENSIONS,
+            )
+        )
+        lossless = bool(count_equal) and numeric_safe and all(
+            child_ready(c) for c in children
+        )
         verified[parent_id] = lossless
         if parent["partition_lossless"] is None or int(parent["partition_lossless"]) != int(lossless):
             update_bucket(parent_id, partition_lossless=int(lossless))
@@ -638,8 +662,9 @@ async def _probe_partition(
     parent_count: int,
     candidates: list[SearchFilters],
     rejection_reasons: list[str] | None = None,
+    observations: list[NumericObservation] | None = None,
 ) -> bool:
-    """Validate an existing categorical plan; never accept no-progress or overlap."""
+    """Validate count/sample constraints without duplicating numeric count probes."""
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
     def reject(reason: str) -> bool:
@@ -651,11 +676,16 @@ async def _probe_partition(
     if not keys or len(set(keys)) != len(keys) or filters.key() in keys:
         return reject("duplicate_or_unchanged_child_key")
 
+    if observations is not None and len(observations) != len(candidates):
+        return reject("numeric_observation_count_mismatch")
     child_counts: list[int] = []
     sampled_identities: set[tuple[str, str]] = set()
-    for child in candidates:
-        page, archive_id, _, _ = await _count(client, bucket_id, child)
-        await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+    for index, child in enumerate(candidates):
+        if observations is None:
+            page, archive_id, _, _ = await _count(client, bucket_id, child)
+            await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+        else:
+            page = observations[index]
         if page.current_page != 1 or (page.total_items > 0 and not page.rows):
             raise ContractError("Invalid Discovery split count response")
 
@@ -757,7 +787,9 @@ async def _validated_children(
             return options
 
     if numeric_allowed is None:
-        numeric_allowed = bool(PRODUCTION_CERTIFIED_DIMENSIONS)
+        # Explicit recovery-only opt-in; never activate Numeric automatically
+        # through normal 'dbd-data discover' when certification changes.
+        numeric_allowed = False
     if not numeric_allowed:
         return []
     if not PRODUCTION_CERTIFIED_DIMENSIONS:
@@ -793,7 +825,8 @@ async def _validated_children(
         return []
     failures: list[str] = []
     if await _probe_partition(
-        client, bucket_id, filters, parent_count, plan.children, failures
+        client, bucket_id, filters, parent_count, plan.children, failures,
+        observations=plan.child_observations,
     ):
         return plan.children
     if rejection_reasons is not None:

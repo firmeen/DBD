@@ -50,6 +50,98 @@ class NumericPlan:
         return len(self.children) == 2 and len(self.child_observations) == 2
 
 
+def _numeric_parts(key: str) -> dict[str, dict[str, Decimal]]:
+    """Read stored bucket keys without requiring optional migration 0013."""
+    result: dict[str, dict[str, Decimal]] = {}
+    for part in key.split("|"):
+        if "=" not in part:
+            continue
+        label, text = part.split("=", 1)
+        if label not in ("cap", "asset", "income", "profit"):
+            continue
+        fields: dict[str, Decimal] = {}
+        for item in text.split(","):
+            if ":" not in item:
+                raise ValueError("Invalid numeric bucket key")
+            field_name, value = item.split(":", 1)
+            if value:
+                fields[field_name] = Decimal(value)
+        result[label] = fields
+    return result
+
+
+def numeric_partition_structure(
+    parent_key: str,
+    child_keys: list[str],
+    *,
+    certified: frozenset[str] = PRODUCTION_CERTIFIED_DIMENSIONS,
+    step: Decimal = CANDIDATE_STEP,
+) -> bool:
+    """Validate a two-way interval refinement, NOT backend coverage itself.
+
+    Production certification remains a separate prerequisite. Categorical
+    partitions retain their original validation and must not enter here.
+    """
+    if len(child_keys) != 2 or not certified:
+        return False
+    labels = {
+        "cap": ("cap_amt", "capAmt"),
+        "asset": ("total_asset", "totalAsset"),
+        "income": ("total_income", "totalIncome"),
+        "profit": ("net_profit", "netProfit"),
+    }
+    try:
+        parent = _numeric_parts(parent_key)
+        children = [_numeric_parts(key) for key in child_keys]
+        parent_categories = tuple(
+            p for p in parent_key.split("|") if p.split("=", 1)[0] not in labels
+        )
+        if any(
+            tuple(p for p in key.split("|") if p.split("=", 1)[0] not in labels)
+            != parent_categories for key in child_keys
+        ):
+            return False
+
+        changed: list[str] = []
+        for label, (dimension, _) in labels.items():
+            original = parent.get(label, {})
+            left = children[0].get(label, {})
+            right = children[1].get(label, {})
+            if left != original or right != original:
+                changed.append(label)
+                if dimension not in certified:
+                    return False
+            else:
+                continue
+        if len(changed) != 1:
+            return False
+
+        label = changed[0]
+        _, prefix = labels[label]
+        lo_key, hi_key = prefix + "Min", prefix + "Max"
+        p = parent.get(label, {})
+        a, b = (child.get(label, {}) for child in children)
+        # Either child order is valid. For each numeric dimension, every
+        # constraint on *other* dimensions must remain untouched.
+        for low, high in ((a, b), (b, a)):
+            if (
+                low.get(lo_key) == p.get(lo_key)
+                and high.get(hi_key) == p.get(hi_key)
+                and lo_key in high and hi_key in low
+                and high[lo_key] == low[hi_key] + step
+                and (p.get(hi_key) is None or low[hi_key] <= p[hi_key])
+                and (p.get(lo_key) is None or high[lo_key] >= p[lo_key])
+                and (lo_key not in low or hi_key not in low
+                     or low[lo_key] <= low[hi_key])
+                and (lo_key not in high or hi_key not in high
+                     or high[lo_key] <= high[hi_key])
+            ):
+                return True
+        return False
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+
+
 def _safe_pivot(
     pivot: Decimal,
     lower: Decimal | None,
