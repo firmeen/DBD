@@ -1110,9 +1110,17 @@ async def _run_durable_discovery(
             # Rendering/telemetry failures never fail persistence.
             pass
 
-    with repo.transaction() as conn:
+    async def atomic(fn, *args, **kwargs):
+        def execute():
+            with repo.transaction() as conn:
+                return fn(conn, *args, **kwargs)
+        return await asyncio.to_thread(execute)
+
+    def initialize(conn):
         work.validate_schema(conn)
         work.register_roots(conn, generation, scope, roots)
+
+    await atomic(initialize)
 
     async def pulse() -> None:
         while True:
@@ -1122,8 +1130,7 @@ async def _run_durable_discovery(
     task = asyncio.create_task(pulse())
     try:
         while True:
-            with repo.transaction() as conn:
-                bucket = work.next_work(conn, generation, scope)
+            bucket = await atomic(work.next_work, generation, scope)
             if bucket is None:
                 break
             if (max_buckets is not None and processed >= max_buckets
@@ -1141,22 +1148,19 @@ async def _run_durable_discovery(
             pages_fetched += 1
             processed += 1
             if bucket["status"] == "PENDING":
-                with repo.transaction() as conn:
-                    work.count(conn, bucket_id, parent.total_items, parent.total_pages)
+                await atomic(work.count, bucket_id, parent.total_items, parent.total_pages)
                 bucket["status"] = "COUNTED"
                 bucket["total_items"] = parent.total_items
                 bucket["total_pages"] = parent.total_pages
             elif (int(bucket["total_items"]) != parent.total_items
                   or int(bucket["total_pages"]) != parent.total_pages):
-                with repo.transaction() as conn:
-                    work.blocked(conn, bucket_id, "count_or_pagination_drift")
+                await atomic(work.blocked, bucket_id, "count_or_pagination_drift")
                 notify("discovery_progress", **active,
                        stage="RECONCILING", error="count_or_pagination_drift")
                 continue
 
             if parent.total_items == 0:
-                with repo.transaction() as conn:
-                    work.done(conn, bucket, empty=True)
+                await atomic(work.done, bucket, empty=True)
                 notify("discovery_progress", **active, stage="DONE")
                 continue
 
@@ -1221,8 +1225,7 @@ async def _run_durable_discovery(
                     # NULL, decimal and identity semantics have been certified.
                     # Do not truncate overflow work to 1000 pages.
                     reason = "no_certified_lossless_split"
-                    with repo.transaction() as conn:
-                        work.blocked(conn, bucket_id, reason)
+                    await atomic(work.blocked, bucket_id, reason)
                     notify("discovery_progress", **active,
                            stage="BLOCKED", error=reason)
                     continue
@@ -1246,22 +1249,19 @@ async def _run_durable_discovery(
 
                 parity = parity and sum(x[0] for x in counts) == parent.total_items
                 if not parity:
-                    with repo.transaction() as conn:
-                        work.blocked(conn, bucket_id, "child_count_or_identity_mismatch")
+                    await atomic(work.blocked, bucket_id, "child_count_or_identity_mismatch")
                     notify("discovery_progress", **active,
                            stage="BLOCKED", error="child_count_or_identity_mismatch")
                     continue
 
                 active["stage"] = "SPLITTING"
-                with repo.transaction() as conn:
-                    # Child counts and parent split commit atomically.
-                    work.split(conn, bucket, children, split_dimension, counts)
+                # Child counts and parent split commit atomically.
+                await atomic(work.split, bucket, children, split_dimension, counts)
                 notify("discovery_split", **active, children=len(children))
                 continue
 
             if bucket["status"] == "COUNTED":
-                with repo.transaction() as conn:
-                    work.fetching(conn, bucket)
+                await atomic(work.fetching, bucket)
             previous = int(bucket["last_committed_page"])
             total_pages = int(parent.total_pages)
             active.update(stage="FETCHING", pages_done=previous,
@@ -1305,8 +1305,8 @@ async def _run_durable_discovery(
 
                 active["stage"] = "PERSISTING"
                 notify("discovery_progress", **active)
-                staged_written = 0
-                with repo.transaction() as conn:
+                def commit_chunk(conn):
+                    staged_written = 0
                     size = max(1, int(settings.dbd_write_batch_size))
                     for offset in range(0, len(batch), size):
                         result = repo.upsert_discovered_companies(
@@ -1315,17 +1315,17 @@ async def _run_durable_discovery(
                             refresh_mask=refresh_mask)
                         staged_written += int(result["inserted"]) + int(result["updated"])
                     work.checkpoint(conn, bucket_id, previous, numbers[-1])
-                written += staged_written
+                    return staged_written
+
+                written += await atomic(commit_chunk)
                 previous = numbers[-1]
                 next_page = previous + 1
                 active.update(stage="FETCHING", pages_done=previous)
                 notify("discovery_progress", **active)
-            with repo.transaction() as conn:
-                work.done(conn, bucket)
+            await atomic(work.done, bucket)
             notify("discovery_progress", **active, stage="DONE")
 
-        with repo.transaction() as conn:
-            report = work.coverage(conn, generation, scope)
+        report = await atomic(work.coverage, generation, scope)
         notify("discovery_progress", **report, stage="RECONCILING")
         if max_buckets is not None or (recovery_limit is None and not report["ok"]):
             raise ContractError(
