@@ -768,8 +768,9 @@ class ProductionSqlServerRepository:
         with self.transaction() as conn:
             result = ensure_production_schema(conn)
             ControlRepository().ensure_schema(conn)
-            from . import discovery_repository
+            from . import discovery_repository, branch_repository
             discovery_repository.ensure_schema(conn)
+            branch_repository.ensure_schema(conn)
             return result
 
     def validate_schema(self) -> dict[str, object]:
