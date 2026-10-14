@@ -240,3 +240,48 @@ def test_failed_leaf_with_all_categorical_filters_is_partition_exhausted():
     rows = recovery_candidates(limit=10, parent_id=bucket_id)
     assert len(rows) == 1
     assert rows[0]["reason"] == "partition_exhausted"
+
+
+def test_optional_numeric_split_children_persist_and_resume_without_duplicate_keys():
+    from dbd.pipelines.discovery import _filters_from_row
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        get_bucket,
+        recovery_family,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    keyword = "numeric-resume-" + uuid4().hex
+    parent_filters = SearchFilters(keyword, jp_types=["5"], pv_codes=["10"])
+    parent_id = upsert_bucket(parent_filters)
+    original_key = parent_filters.key()
+    assert "cap=" not in original_key
+    assert get_bucket(parent_id)["bucket_key"] == original_key
+
+    children = [
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["10"], cap_amt_max="0"),
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["10"], cap_amt_min="1"),
+    ]
+    ids = split_bucket(parent_id, children, 1)
+    assert len(ids) == 2
+    assert len(set(ids)) == 2
+    parent, persisted = recovery_family(parent_id)
+    assert parent["status"] == "split"
+    assert len(persisted) == 2
+    assert all(r["status"] == "pending" for r in persisted)
+
+    restored = [_filters_from_row(r) for r in persisted]
+    assert {f.key() for f in restored} == {f.key() for f in children}
+    assert {f.payload()["capAmtMax"] for f in restored} == {None, 0}
+    assert {f.payload()["capAmtMin"] for f in restored} == {None, 1}
+
+    # Fenced split transaction must be idempotent across repeated invocation.
+    assert split_bucket(parent_id, children, 1) == ids
+    _, again = recovery_family(parent_id)
+    assert len(again) == 2
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM discovery_pages WHERE bucket_id IN (%s,%s)",
+            tuple(ids),
+        )
+        assert int(cur.fetchone()["n"]) == 0
