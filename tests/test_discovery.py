@@ -1050,9 +1050,8 @@ async def test_recursive_split_only_tries_unused_dimension_then_stops(monkeypatc
             object(), 42, parent, ["10", "20"], ["1", "2"], 20000
         )
         assert result
-        assert getattr(result[0], dimension) == [chosen] if dimension != "jp_types" else (
-            getattr(result[0], dimension) == ["0"]
-        )
+        expected = ["0"] if dimension == "jp_types" else [chosen]
+        assert getattr(result[0], dimension) == expected
         from dataclasses import replace
 
         parent = replace(parent, **{dimension: [chosen]})
@@ -1079,10 +1078,11 @@ async def test_categorical_validation_reports_failed_dimension_and_tries_next(mo
         else:
             count = 25
             fields = {"jpTypeCode": "5", "pvCode": "10"}
+        identifier = (fields.get("jpTypeCode", "") + fields.get("pvCode", "")) or "5"
         return (
             type("Page", (), {
                 "current_page": 1, "total_items": count,
-                "rows": [{"jpNo": "0100000000001", **fields}],
+                "rows": [{"jpNo": f"0100000{identifier}", **fields}],
             })(),
             len(requests), {}, None,
         )
