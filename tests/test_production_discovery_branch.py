@@ -125,6 +125,7 @@ def test_durable_work_is_one_row_per_bucket_not_one_row_per_page() -> None:
 
 
 def test_branch_writer_retains_history_and_disallows_core_mask_update() -> None:
-    assert "is_current=0" in branch_repository.save_snapshot.__code__.co_consts
+    import inspect
+    assert "is_current=0" in inspect.getsource(branch_repository.save_snapshot)
     assert "branch_count" in branch_repository.SUMMARY_COLUMNS
     assert "DBD_COMPANY_BRANCH" in branch_repository.DDL
