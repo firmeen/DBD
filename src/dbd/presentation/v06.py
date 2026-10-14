@@ -592,6 +592,12 @@ class V06Terminal:
         if self.state.command in {"cycle-run", "cycle-loop"}:
             value = payload.get("status")
             return str(value or "COMPLETE").upper()
+        if self.state.command == "branch":
+            return (
+                "COMPLETE_WITH_FAILURES"
+                if _truthy_count(payload.get("deferred"))
+                else "COMPLETE"
+            )
         if self.state.command == "fetch-company":
             value = str(payload.get("status") or "COMPLETE").upper()
             return "COMPLETE" if value == "COMPLETE" else "COMPLETE_WITH_FAILURES"
@@ -863,7 +869,7 @@ class V06Terminal:
             ("Deferred",values.get("deferred",0),"branch.deferred"),
             ("HTTP attempts",values.get("http_requests",0),"branch.requests"),
         ]
-        status = "COMPLETE" if self.state.result else "RUNNING"
+        status = self.state.status if self.state.result else "RUNNING"
         body = self._metric_grid(items,width)
         return self._panel("BRANCH ENRICHMENT",body,status,active=not bool(self.state.result))
 
