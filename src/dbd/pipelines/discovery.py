@@ -487,6 +487,7 @@ async def _process_bucket(
     pages_total = row["pages_total"]
     first_page = None
     count_archive_id = None
+    counted_parent_rows: list[dict] | None = None
 
     def owned_update(**fields) -> None:
         if lease_owner is None:
@@ -526,6 +527,7 @@ async def _process_bucket(
             if int(recorded_count) != total_items:
                 raise ContractError("Search total changed after pages were committed")
         first_page = (count_archive_id, data, requested)
+        counted_parent_rows = page.rows
         owned_update(total_items=total_items, pages_total=pages_total, status="counted")
 
     if total_items == 0:
@@ -539,6 +541,8 @@ async def _process_bucket(
             await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
         rejected_plans: list[str] = []
         validation_options = {"rejection_reasons": rejected_plans}
+        if counted_parent_rows is not None:
+            validation_options["parent_rows"] = counted_parent_rows
         if numeric_allowed is not None:
             validation_options["numeric_allowed"] = numeric_allowed
         children = await _validated_children(
@@ -771,6 +775,7 @@ async def _validated_children(
     *,
     rejection_reasons: list[str] | None = None,
     numeric_allowed: bool | None = None,
+    parent_rows: list[dict] | None = None,
 ) -> list[SearchFilters]:
     """Try unused categorical dimensions first, then *certified* numeric ranges.
 
@@ -812,8 +817,12 @@ async def _validated_children(
     from ..contracts.common import money
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
-    current, archive_id, _, _ = await _count(client, bucket_id, filters)
-    await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+    if parent_rows is None:
+        current, archive_id, _, _ = await _count(client, bucket_id, filters)
+        await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+    else:
+        # _process_bucket already retrieved the parent count and first page.
+        current = NumericObservation(parent_count, parent_rows)
     if current.current_page != 1 or current.total_items != parent_count:
         if rejection_reasons is not None:
             rejection_reasons.append("numeric_parent_count_changed_during_split")
