@@ -566,7 +566,7 @@ def main():
     recovery.add_argument("--limit", type=positive, default=10)
     recovery.add_argument("--execute", action="store_true")
     recovery.add_argument("--probe", action="store_true", help="Read-only live API filter diagnostics for --parent-id")
-    recovery.add_argument("--rate", type=positive_rate, default=1.0)
+    recovery.add_argument("--rate", type=positive_rate, default=None)
     reset = _add_output_options(
         sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
     )
@@ -831,7 +831,7 @@ def main():
                     result = asyncio.run(
                         probe_discovery_partition(
                             parent_id=args.parent_id,
-                            rate=args.rate,
+                            rate=args.rate if args.rate is not None else 0.25,
                             health=lambda: assert_manager_lock(conn),
                         )
                     )
@@ -842,7 +842,7 @@ def main():
                             parent_id=args.parent_id,
                             limit=args.limit,
                             execute=True,
-                            rate=args.rate,
+                            rate=args.rate if args.rate is not None else 1.0,
                             health=lambda: assert_manager_lock(conn),
                         )
                     )
@@ -852,7 +852,7 @@ def main():
                         parent_id=args.parent_id,
                         limit=args.limit,
                         execute=False,
-                        rate=args.rate,
+                        rate=args.rate if args.rate is not None else 1.0,
                     )
                 )
             presenter.command_result("DBD · DISCOVERY RECOVERY", result)
