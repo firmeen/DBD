@@ -59,6 +59,9 @@ class DiscoveryResult:
     split_created: int = 0
     remaining_failed: int = 0
     remaining_lossy: int = 0
+    remaining_open: int = 0
+    remaining_partial: int = 0
+    remaining_quarantine: int = 0
 
 
 @dataclass
@@ -1619,6 +1622,9 @@ async def _run_work(
         ),
         remaining_failed=int(latest.get("buckets_failed") or 0),
         remaining_lossy=int(latest.get("partitions_lossy") or 0),
+        remaining_open=int(latest.get("buckets_open") or 0),
+        remaining_partial=int(latest.get("pages_partial") or 0),
+        remaining_quarantine=int(latest.get("unresolved_rejections") or 0),
     )
 
 
@@ -1694,7 +1700,9 @@ async def run(
         message=(
             f"Discovery: companies={int(status.get('unique_companies') or 0):,} "
             f"pages_done={int(status.get('pages_done') or 0):,} "
-            f"open_buckets={int(status.get('buckets_open') or 0):,}"
+            f"open_buckets={int(status.get('buckets_open') or 0):,} "
+            f"failed={int(status.get('buckets_failed') or 0):,} "
+            f"lossy={int(status.get('partitions_lossy') or 0):,}"
         )
     )
     blockers = []
@@ -1706,6 +1714,13 @@ async def run(
         blockers.append(f"{status['unresolved_rejections']} quarantined row(s)")
     if int(status.get("partitions_lossy") or 0):
         blockers.append(f"{status['partitions_lossy']} lossy partition(s)")
-    if blockers and max_buckets is None:
-        raise ContractError("Discovery incomplete: " + ", ".join(blockers))
+    if blockers:
+        # Work on all other buckets has already completed. Report residual
+        # limitations without turning already committed pages into a failure
+        # or falsely claiming full upstream coverage.
+        from ..presentation import TerminalPresenter
+
+        TerminalPresenter().message(
+            "Discovery INCOMPLETE: " + ", ".join(blockers), kind="warning"
+        )
     return result

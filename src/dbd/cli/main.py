@@ -959,6 +959,16 @@ def main():
                     "new_splits": result.split_created,
                     "failed_remaining": result.remaining_failed,
                     "lossy_remaining": result.remaining_lossy,
+                    "open_remaining": result.remaining_open,
+                    "partial_pages_remaining": result.remaining_partial,
+                    "quarantined_remaining": result.remaining_quarantine,
+                    "status": (
+                        "COMPLETE" if not any((
+                            result.remaining_failed, result.remaining_lossy,
+                            result.remaining_open, result.remaining_partial,
+                            result.remaining_quarantine,
+                        )) else "INCOMPLETE"
+                    ),
                 },
             )
     except KeyboardInterrupt:
