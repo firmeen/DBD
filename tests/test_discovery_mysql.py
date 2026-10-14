@@ -81,7 +81,9 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
 
 def test_false_zero_recount_reopens_only_proven_positive_child_and_preserves_pages():
     from dbd.storage.mysql.repositories.discovery_repository import (
-        apply_recovery_recount, recovery_family, update_bucket,
+        apply_recovery_recount,
+        recovery_family,
+        update_bucket,
     )
     from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
 
@@ -120,7 +122,9 @@ def test_false_zero_recount_reopens_only_proven_positive_child_and_preserves_pag
 
 def test_recount_does_not_reset_completed_nonzero_child_when_count_drifts():
     from dbd.storage.mysql.repositories.discovery_repository import (
-        apply_recovery_recount, recovery_family, update_bucket,
+        apply_recovery_recount,
+        recovery_family,
+        update_bucket,
     )
     from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
 
@@ -143,7 +147,9 @@ def test_recount_does_not_reset_completed_nonzero_child_when_count_drifts():
 
 def test_recount_cannot_mark_parent_lossless_on_shrinking_search_count():
     from dbd.storage.mysql.repositories.discovery_repository import (
-        apply_recovery_recount, recovery_family, update_bucket,
+        apply_recovery_recount,
+        recovery_family,
+        update_bucket,
     )
     from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
 
