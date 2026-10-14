@@ -423,3 +423,59 @@ only the five production tables; it does not change Run 9/Redis/Legacy schemas.
 ## Monthly and automatic SQL Server Core
 
 Initial setup: `dbd-data migrate --backend sqlserver` (authorized SQL principal), then `dbd-data setup` on the Admin computer. **Manual:** `dbd-data cycle run --phase core --backend sqlserver`. **Automatic:** `dbd-data cycle run --phase core --backend sqlserver --auto` invoked by the single Windows Task Scheduler task. No additional steps are needed for Admin-only operation. A Worker joins only during `COLLECTING` with `dbd-deep collect --phase core --backend sqlserver --continuous`. The existing status/resume commands are unchanged. The SQL Control schema must exist; no Gmail notifier or background Python watcher is installed. For complete setup instructions see [Admin](ADMIN_SETUP.md) and [Worker](WORKER_SETUP.md).
+
+
+## Dataset 2 — Durable Discovery and Branch Enrichment (PR #100 draft)
+
+These commands target the selected **Production** backend. The new durable
+Discovery checkpoint and Branch Enrichment extensions currently run on SQL Server.
+They do **not** read Dataset 1 MySQL page checkpoints or change the legacy collector.
+
+For a normal full monthly run, use the existing `dbd-data cycle run --phase core`
+on the authorized Admin. Its DISCOVER stage counts, splits, fetches, commits
+company rows and page checkpoints atomically, verifies durable coverage, and
+**refuses PREPARE/FINALIZE if coverage is incomplete**. A `SPLIT` parent is
+complete only when its descendants have been fully collected and reconciled.
+Do not reset buckets or force a terminal state to make the progress reach 100%.
+
+For an unfinished authorized monthly Generation:
+
+```powershell
+dbd-data status -d sqlserver
+dbd-data recover -d sqlserver -c
+dbd-data recover -d sqlserver
+```
+
+`recover -c` reads durable SQL Server work state without HTTP or writes.
+`recover` resumes eligible counted/fetching/pending work. An explicit recovery
+pass can end with `coverage=INCOMPLETE` and unresolved blocked leaves; it is
+**not** a national enumeration completeness certificate. An overflow requiring
+uncertified numeric filters remains BLOCKED until the upstream API range,
+NULL, precision and boundary semantics are independently established.
+
+The external branch collector is separate from Core-7 and runs only on the
+SQL Server Admin, under its own branch application lock:
+
+```powershell
+dbd-data branch -d sqlserver -c
+dbd-data branch -d sqlserver
+dbd-data branch import -d sqlserver -c
+dbd-data branch import -d sqlserver
+```
+
+Import reads the Dataset 1 `dbd_company_branch` table through the existing
+legacy MySQL connection, and resolves SQL Server `company_id` by juristic type
+and registration number. No-branch companies without a validated headquarters
+card are not assigned a fabricated zero. Conflicted historical snapshots are
+skipped, and older/equal-timestamp records never replace newer certified data.
+Imported data is not part of Core-7 masks or monthly finalization.
+
+The external HTTP profile defaults are `15` concurrent requests, `15` req/s,
+`30` seconds timeout, `3` attempts, and statuses `1,A,B`. On HTTP 401/403/429
+the branch source stops rather than attempting to bypass restrictions.
+The external rate limiter does not use or consume DBD search rate tokens.
+
+A Source or Database failure must not trigger deletion of previously committed
+company, branch, or page checkpoint data. SQL Server page-level Resume and
+the Dataset 1 MySQL checkpoint Resume are different storage contracts; do not
+interchange their identities.
