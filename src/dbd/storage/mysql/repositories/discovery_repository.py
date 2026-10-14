@@ -729,51 +729,91 @@ def reset_discovery(refresh=False, bucket_id=None):
     return result
 
 
-def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[dict]:
-    """Read-only shortlist of failed count partitions and capped leaves.
+def _classify_recovery_partition(row: dict) -> str:
+    """Conservative classification from persisted child checkpoints only.
 
-    Each call selects the least recently checked candidates of BOTH kinds.
-    This prevents persistent true-zero children from starving overflow work.
+    A zero-sized leaf is not evidence of a false zero when another child is
+    unfinished. In that case, rerunning an API recount only creates churn.
+    """
+    if int(row["blocked_children"] or 0):
+        return "descendant_incomplete"
+    if int(row["known_children"] or 0) != int(row["children"] or 0):
+        return "count_unavailable"
+    if row["total_items"] is None:
+        return "count_unavailable"
+    if int(row["child_total"] or 0) == int(row["total_items"]):
+        return "ready_to_validate"
+    if int(row["zero_children"] or 0):
+        return "stale_zero"
+    return "count_mismatch"
+
+
+def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[dict]:
+    """Read-only recovery diagnosis, including blocked partitions.
+
+    Prioritize actionable work within the operator's limit but report blocked
+    work when room remains. Never silently treat an unresolved partition as
+    complete. This function performs no HTTP request or database update.
     """
     limit = max(1, int(limit))
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT p.id AS bucket_id,p.keyword,'stale_zero' AS reason,
+            SELECT p.id AS bucket_id,p.keyword,p.total_items,p.updated_at AS last_checked,
                    COUNT(c.id) AS children,
-                   SUM(c.status='done' AND c.total_items=0
-                       AND c.pages_total=0 AND c.pages_done=0) AS zero_children,
-                   p.updated_at AS last_checked
+                   COUNT(c.total_items) AS known_children,
+                   COALESCE(SUM(c.total_items),0) AS child_total,
+                   COALESCE(SUM(c.status='done' AND c.total_items=0
+                       AND c.pages_total=0 AND c.pages_done=0),0) AS zero_children,
+                   COALESCE(SUM(
+                       c.status IN ('pending','counted','draining','failed')
+                       OR (c.status='split' AND COALESCE(c.partition_lossless,0)<>1)
+                   ),0) AS blocked_children
             FROM discovery_buckets p
             JOIN discovery_buckets c ON c.parent_id=p.id
             WHERE p.status='split' AND p.partition_lossless=0
               AND (%s IS NULL OR p.id=%s)
-            GROUP BY p.id,p.keyword,p.updated_at
-            HAVING zero_children>0
-            ORDER BY p.updated_at,p.id LIMIT %s
+            GROUP BY p.id,p.keyword,p.total_items,p.updated_at
             """,
-            (parent_id, parent_id, limit),
+            (parent_id, parent_id),
         )
-        candidates = [dict(row) for row in cur.fetchall()]
+        candidates = []
+        for row in cur.fetchall():
+            item = dict(row)
+            item["reason"] = _classify_recovery_partition(item)
+            candidates.append(item)
         cur.execute(
             """
-            SELECT p.id AS bucket_id,p.keyword,'overflow' AS reason,
-                   0 AS children,0 AS zero_children,
-                   p.updated_at AS last_checked
+            SELECT p.id AS bucket_id,p.keyword,p.total_items,p.updated_at AS last_checked,
+                   p.jp_types,p.pv_codes,p.jp_statuses,p.business_sizes
             FROM discovery_buckets p
             WHERE p.status='failed' AND p.total_items>10000
               AND NOT EXISTS (
                   SELECT 1 FROM discovery_buckets c WHERE c.parent_id=p.id
               )
               AND (%s IS NULL OR p.id=%s)
-            ORDER BY p.updated_at,p.id LIMIT %s
             """,
-            (parent_id, parent_id, limit),
+            (parent_id, parent_id),
         )
-        candidates.extend(dict(row) for row in cur.fetchall())
-        candidates.sort(key=lambda row: (row["last_checked"], int(row["bucket_id"])))
-        return candidates[:limit]
+        for row in cur.fetchall():
+            item = dict(row)
+            item["reason"] = (
+                "partition_exhausted"
+                if all(item.get(field) for field in
+                       ("jp_types","pv_codes","jp_statuses","business_sizes"))
+                else "overflow"
+            )
+            candidates.append(item)
 
+    actionable = {"stale_zero", "overflow"}
+    candidates.sort(
+        key=lambda row: (
+            0 if row["reason"] in actionable else 1,
+            row["last_checked"],
+            int(row["bucket_id"]),
+        )
+    )
+    return candidates[:limit]
 
 def recovery_family(parent_id: int) -> tuple[dict, list[dict]]:
     """Read the exact persisted filters/children for one partition."""
