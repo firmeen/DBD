@@ -20,6 +20,15 @@ from ..storage.sqlserver.repository import ProductionSqlServerRepository
 
 SITE = "https://www.dataforthai.com"
 
+# Missing/invalid external pages are not evidence of zero branches. Retry
+# them at a bounded cadence; verified snapshots refresh every 30 days in SQL.
+_RECHECK_HOURS = {
+    "RETRY": 1,
+    "UNAVAILABLE": 24,
+    "NOT_LISTED": 168,
+    "INVALID": 168,
+}
+
 
 class BranchError(RuntimeError):
     pass
@@ -281,11 +290,15 @@ def collect(*, event=None, limit: int | None = None) -> dict:
                                 stats["verified"] += 1
                                 stats["branches"] += len(output["branches"])
                             else:
-                                until = (datetime.now(timezone.utc)+timedelta(hours=1)
-                                         if output["status"] == "RETRY" else None)
+                                status = str(output["status"])
+                                if status not in _RECHECK_HOURS:
+                                    raise BranchError(f"Unknown external branch status: {status}")
+                                until = datetime.now(timezone.utc) + timedelta(
+                                    hours=_RECHECK_HOURS[status]
+                                )
                                 store.defer(conn,company_id=row["company_id"],
-                                            reason=output.get("reason",output["status"]),
-                                            retry_at=until, status=output["status"])
+                                            reason=output.get("reason",status),
+                                            retry_at=until, status=status)
                                 stats["deferred"] += 1
                         stats["checked"] += 1
                         stats["http_requests"] = client.requests
