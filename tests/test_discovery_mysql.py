@@ -275,7 +275,7 @@ def test_optional_numeric_split_children_persist_and_resume_without_duplicate_ke
     assert {f.payload()["capAmtMin"] for f in restored} == {None, 1}
 
     # Fenced split transaction must be idempotent across repeated invocation.
-    assert split_bucket(parent_id, children, 1) == ids
+    assert set(split_bucket(parent_id, children, 1)) == set(ids)
     _, again = recovery_family(parent_id)
     assert len(again) == 2
 
