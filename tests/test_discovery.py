@@ -754,8 +754,12 @@ async def test_keyword_probe_checks_every_identity_and_never_writes(
     assert report["parent_count"] == len(rows)
     assert report["count_stable"] is True
     assert report["cohort_check"] == expected_check
+    assert report["zero_boundary"] == "ZERO_PRESENT_IN_ALL_TESTED_ZERO_FILTERS"
     assert report["child_missing"] == expected_missing
     assert report["null_parent_rows"] == expected_null
+    assert report["null_coverage"] == (
+        "NOT_TESTED_NO_NULL_IN_PARENT" if expected_null == 0 else "OBSERVED_MISSING"
+    )
     assert report["child_overlap"] == 0
     assert report["decision"] == "OBSERVATION_ONLY"
     assert report["min_zero_matches_parent"] is True
@@ -763,7 +767,7 @@ async def test_keyword_probe_checks_every_identity_and_never_writes(
 
 
 @pytest.mark.asyncio
-async def test_keyword_probe_reads_all_pages_and_rejects_duplicate_id(monkeypatch):
+async def test_keyword_probe_reads_all_pages_and_counts_requests(monkeypatch):
     rows = [
         {"jpTypeCode": "5", "jpNo": f"0100000000{i:03d}", "capAmt": str(i)}
         for i in range(12)
