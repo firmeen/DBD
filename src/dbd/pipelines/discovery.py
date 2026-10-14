@@ -813,6 +813,7 @@ async def run(
     concurrency: int | None = None,
     rate: float | None = None,
     max_buckets: int | None = None,
+    recovery_limit: int | None = None,
     verbose: bool = True,
     health=None,
     distributed: bool = False,
@@ -915,6 +916,7 @@ async def run(
                 concurrency=int(concurrency or settings.dbd_concurrency),
                 max_buckets=max_buckets, event=event, health=health,
                 explicitly_scoped=explicitly_scoped,
+                recovery_limit=recovery_limit,
             )
 
         queue = deque(
@@ -1063,6 +1065,7 @@ async def _run_durable_discovery(
     search_type: str, provinces: list[str], generation: int,
     refresh_mask: int, concurrency: int, max_buckets: int | None,
     event=None, health=None, explicitly_scoped: bool = False,
+    recovery_limit: int | None = None,
 ) -> DiscoveryResult:
     """SQL Server G2+ Discovery: one durable tree and atomic page checkpoints.
 
@@ -1123,7 +1126,8 @@ async def _run_durable_discovery(
                 bucket = work.next_work(conn, generation, scope)
             if bucket is None:
                 break
-            if max_buckets is not None and processed >= max_buckets:
+            if (max_buckets is not None and processed >= max_buckets
+                or recovery_limit is not None and processed >= recovery_limit):
                 break
             if health is not None:
                 await asyncio.to_thread(health)
@@ -1269,7 +1273,7 @@ async def _run_durable_discovery(
         with repo.transaction() as conn:
             report = work.coverage(conn, generation, scope)
         notify("discovery_progress", **report, stage="RECONCILING")
-        if max_buckets is not None or not report["ok"]:
+        if max_buckets is not None or (recovery_limit is None and not report["ok"]):
             raise ContractError(
                 "Discovery coverage incomplete: " + ", ".join(
                     f"{key}={value}" for key, value in sorted(report.items())
