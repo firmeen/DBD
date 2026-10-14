@@ -342,6 +342,11 @@ async def _drain_bucket(
                     f"PAGE_NUMBER_MISMATCH bucket={bucket_id} page={page_no} "
                     f"actual_page={page.current_page}"
                 )
+            if page.items_per_page != ITEMS_PER_PAGE:
+                raise ContractError(
+                    f"PAGE_SIZE_CONTRACT_MISMATCH bucket={bucket_id} page={page_no} "
+                    f"expected_page_size={ITEMS_PER_PAGE} actual_page_size={page.items_per_page}"
+                )
             if not page.rows and page.total_items > 0:
                 raise ContractError(
                     f"UNEXPECTED_EMPTY_PAGE bucket={bucket_id} page={page_no} "
@@ -464,6 +469,12 @@ async def _drain_bucket(
                     batch.append(result_queue.get_nowait())
                 except asyncio.QueueEmpty:
                     break
+            if stop_pages.is_set():
+                # Do not commit buffered results once this bucket's current
+                # pagination snapshot has been rejected; committed work stays.
+                for _ in batch:
+                    result_queue.task_done()
+                continue
             staged_cache = _stage_projection_cache(batch, cache)
             started = time.monotonic()
             try:

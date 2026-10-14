@@ -780,15 +780,9 @@ def fail_page(
                     (bucket_id, page_no, detail),
                 )
                 changed = bool(cur.rowcount)
-                cur.execute(
-                    """
-                    UPDATE response_archive a JOIN discovery_pages p ON p.archive_id=a.id
-                    SET a.processing_status='failed',a.error_code=%s
-                    WHERE p.bucket_id=%s AND p.page_no=%s AND p.status='failed'
-                    """,
-                    (type(error).__name__ if isinstance(error, Exception) else detail[:100],
-                     bucket_id, page_no),
-                )
+                # Do not rewrite the processing status of an older archived
+                # response: this failure may be a later HTTP request that
+                # produced no archive at all. Preserve original evidence.
             conn.commit()
         except BaseException:
             conn.rollback()
