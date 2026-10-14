@@ -27,6 +27,7 @@ _COLLECTION_COUNTERS = (
 _MUTATING_COMMANDS = {
     "migrate",
     "discover",
+    "recover",
     "fetch-company",
     "cycle-run",
     "cycle-loop",
@@ -35,12 +36,13 @@ _MUTATING_COMMANDS = {
     "retry",
     "branch",
 }
-_LONG_RUNNING_COMMANDS = {"discover", "fetch-company", "cycle-run", "cycle-loop", "collect", "branch"}
+_LONG_RUNNING_COMMANDS = {"discover", "recover", "fetch-company", "cycle-run", "cycle-loop", "collect", "branch"}
 _COMMAND_LABELS = {
     "check-db": "CHECK DB",
     "migrate": "MIGRATE",
     "cutover": "CUTOVER",
     "discover": "DISCOVER",
+    "recover": "RECOVER",
     "branch": "BRANCH",
     "fetch-company": "FETCH COMPANY",
     "cycle-run": "CYCLE RUN",
@@ -684,7 +686,7 @@ class V06Terminal:
             return [self._render_migrate(width)]
         if command == "cutover":
             return [self._render_cutover(width)]
-        if command == "discover":
+        if command in {"discover", "recover"}:
             return [self._render_discovery(width)]
         if command == "branch":
             return [self._render_branch(width)]
@@ -837,8 +839,15 @@ class V06Terminal:
                 content.append(self._centered("──────●──────  ↳ Splitting partition", width, "cyan"))
             else:
                 content.append(self._centered(self._motion("sweep", width), width, "cyan"))
-        status = "COMPLETE" if self.state.result else "RUNNING"
-        return self._panel("DISCOVERY", Group(*content), status, active=not self.state.result)
+        if self.state.command == "recover" and self.state.result:
+            content.extend([Text(), self._metric_grid([
+                ("Recovery pass",self.state.result.get("recovery_pass"),"recovery.pass"),
+                ("Coverage",self.state.result.get("coverage"),"recovery.coverage"),
+                ("Unresolved",self.state.result.get("unresolved"),"recovery.unresolved"),
+            ],width)])
+        status = self.state.status if self.state.result else "RUNNING"
+        heading = "DISCOVERY RECOVERY" if self.state.command == "recover" else "DISCOVERY"
+        return self._panel(heading, Group(*content), status, active=not self.state.result)
 
     def _render_branch(self, width: int):
         values = self.state.result or self.state.branch
@@ -1753,6 +1762,12 @@ class V06Terminal:
             return (
                 f"Result: checked={payload.get('checked')} verified={payload.get('verified')} "
                 f"branches={payload.get('branches')} deferred={payload.get('deferred')}"
+            )
+        if command == "recover":
+            return (
+                f"Result: generation={payload.get('generation')} "
+                f"pass={payload.get('recovery_pass')} coverage={payload.get('coverage')} "
+                f"unresolved={payload.get('unresolved')}"
             )
         if command == "discover":
             return (
