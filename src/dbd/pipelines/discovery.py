@@ -119,6 +119,8 @@ def _partition_plans(
                 "jp_statuses": list(filters.jp_statuses),
                 "jp_types": list(filters.jp_types),
                 "business_sizes": list(filters.business_sizes),
+                "cap_amt_min": filters.cap_amt_min,
+                "cap_amt_max": filters.cap_amt_max,
             }
             kwargs[field] = [value]
             options.append(SearchFilters(**kwargs))
@@ -619,6 +621,17 @@ async def _probe_partition(
             ):
                 selected = getattr(child, field)
                 if selected and key in raw and str(raw[key]) not in selected:
+                    return False
+        if child.numeric_range() is not None:
+            from ..contracts.common import money
+
+            for raw in page.rows:
+                amount = money(raw.get("capAmt"))
+                if amount is None:
+                    return False
+                if child.cap_amt_min is not None and amount < child.cap_amt_min:
+                    return False
+                if child.cap_amt_max is not None and amount > child.cap_amt_max:
                     return False
         child_counts.append(page.total_items)
 
