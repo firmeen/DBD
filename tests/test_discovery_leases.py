@@ -209,3 +209,21 @@ def test_split_child_cannot_drop_a_parent_numeric_constraint():
     with pytest.raises(ValueError, match="removed parent numeric"):
         split_bucket(parent_id, [child], 1)
     assert get_bucket(parent_id)["status"] == "pending"
+
+def test_split_rejects_child_that_removes_fixed_categorical_filter():
+    parent_filter = SearchFilters("fixed-cat-empty-" + uuid4().hex, jp_types=["5"])
+    parent_id = upsert_bucket(parent_filter)
+    child = SearchFilters(parent_filter.keyword, pv_codes=["10"])
+    with pytest.raises(ValueError, match="broadened parent"):
+        split_bucket(parent_id, [child], 1)
+    assert get_bucket(parent_id)["status"] == "pending"
+
+
+def test_split_without_lease_cannot_steal_active_bucket():
+    parent_filter = SearchFilters("active-lease-" + uuid4().hex)
+    parent_id = upsert_bucket(parent_filter)
+    _set_lease(parent_id, "another-discovery-worker", 3)
+    child = SearchFilters(parent_filter.keyword, jp_types=["5"])
+    with pytest.raises(DiscoveryLeaseLost):
+        split_bucket(parent_id, [child], 1)
+    assert get_bucket(parent_id)["status"] == "draining"

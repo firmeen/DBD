@@ -264,6 +264,7 @@ async def plan_numeric_split(
 
         best: tuple[int, list[SearchFilters], list[NumericObservation]] | None = None
         tried: set[Decimal] = set()
+        previous_no_progress: tuple[int, int] | None = None
         for _ in range(max_dimension_trials):
             if len(plan.attempts) >= max_total_trials:
                 plan.reason = "numeric_probe_budget_exhausted"
@@ -317,6 +318,18 @@ async def plan_numeric_split(
             elif reason in ("count_mismatch_or_numeric_gap", "sample_filter_mismatch", "invalid_child_count"):
                 # Coverage contradictions must not be 'fixed' by repeated guesses.
                 break
+
+            if reason == "no_progress":
+                signature = (counts[0], counts[1])
+                if signature == previous_no_progress:
+                    # Two shifted pivots with identical 0/parent counts are a
+                    # bounded signal to try another dimension, not proof that
+                    # the entire parent has one numeric value.
+                    plan.reason = f"{dimension}:repeated_no_progress"
+                    break
+                previous_no_progress = signature
+            else:
+                previous_no_progress = None
 
             candidate_pivot = _next_pivot(
                 pivot, counts[0], counts[1], lower, upper, quantum

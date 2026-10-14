@@ -1435,3 +1435,18 @@ async def test_certified_numeric_fallback_can_reuse_existing_split_validation(mo
     assert children[1].cap_amt_min is not None
     assert all(child.jp_types == ["5"] for child in children)
     assert len(requests) <= 7
+
+@pytest.mark.asyncio
+async def test_normal_discovery_path_never_auto_enables_numeric(monkeypatch):
+    from dbd.client.endpoints.search import SearchFilters
+
+    # Certification in a future release is not sufficient to authorize
+    # Numeric execution in an ordinary 'dbd-data discover' invocation.
+    monkeypatch.setattr(discovery, "PRODUCTION_CERTIFIED_DIMENSIONS", frozenset({"cap_amt"}))
+    filters = SearchFilters(
+        "010", jp_types=["5"], pv_codes=["10"],
+        jp_statuses=["1"], business_sizes=["S"],
+    )
+    assert await discovery._validated_children(
+        object(), 42, filters, ["10"], ["1"], 30000
+    ) == []

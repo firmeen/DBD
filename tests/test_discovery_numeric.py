@@ -152,3 +152,80 @@ async def test_numeric_planner_reaches_profit_when_prior_dimensions_cannot_progr
     assert len(plan.attempts) <= 8
     assert attempted[:2] == ["cap_amt", "cap_amt"]
     assert all(child.jp_types == ["5"] and child.pv_codes == ["10"] for child in plan.children)
+
+@pytest.mark.parametrize("initial", ["0", "0.005", "0.01"])
+@pytest.mark.asyncio
+async def test_numeric_planner_never_builds_child_outside_a_tiny_parent_range(initial):
+    filters = SearchFilters("010", cap_amt_min="0", cap_amt_max="0.01")
+
+    async def read_count(_filters):
+        raise AssertionError("too narrow to make an exhaustive two-child interval")
+
+    plan = await plan_numeric_split(
+        filters, 20000, read_count, [{"capAmt": initial}],
+        dimensions=("cap_amt",), step=Decimal("0.02"),
+    )
+    assert not plan.candidate
+    assert plan.attempts == []
+
+
+@pytest.mark.asyncio
+async def test_numeric_planner_preserves_all_dimensions_and_budget_when_concentrated():
+    filters = SearchFilters("010", cap_amt_min="100", cap_amt_max="100",
+                            total_asset_min="500", total_asset_max="500")
+
+    async def read_count(child):
+        if child.total_income_max is not None:
+            return NumericObservation(0, [])
+        if child.total_income_min is not None:
+            return NumericObservation(30000, [{"totalIncome": "99999999"}])
+        if child.net_profit_max is not None:
+            return NumericObservation(9000, [{"netProfit": "-5"}])
+        return NumericObservation(21000, [{"netProfit": "99999"}])
+
+    plan = await plan_numeric_split(
+        filters, 30000, read_count,
+        [{"capAmt": "100", "totalAsset": "500",
+          "totalIncome": "500", "netProfit": "500"}],
+    )
+    assert plan.candidate and plan.dimension == "net_profit"
+    assert all(c.cap_amt_min == c.cap_amt_max == Decimal("100") for c in plan.children)
+    assert all(c.total_asset_min == c.total_asset_max == Decimal("500") for c in plan.children)
+    assert len(plan.attempts) <= 12
+
+
+def test_numeric_structure_never_certifies_unproven_or_gapped_intervals():
+    from dbd.pipelines.discovery_numeric import numeric_partition_structure
+
+    parent = SearchFilters("010", cap_amt_min="0", cap_amt_max="100")
+    valid = [
+        SearchFilters("010", cap_amt_min="0", cap_amt_max="50"),
+        SearchFilters("010", cap_amt_min="50.01", cap_amt_max="100"),
+    ]
+    keys = [x.key() for x in valid]
+    assert not numeric_partition_structure(parent.key(), keys)
+    assert numeric_partition_structure(
+        parent.key(), keys, certified=frozenset({"cap_amt"}),
+    )
+    gapped = [
+        valid[0], SearchFilters("010", cap_amt_min="50.02", cap_amt_max="100")
+    ]
+    assert not numeric_partition_structure(
+        parent.key(), [c.key() for c in gapped],
+        certified=frozenset({"cap_amt"}),
+    )
+    widened = [
+        valid[0], SearchFilters("010", cap_amt_min="50.01", cap_amt_max="101")
+    ]
+    assert not numeric_partition_structure(
+        parent.key(), [c.key() for c in widened],
+        certified=frozenset({"cap_amt"}),
+    )
+    no_cat = [
+        SearchFilters("010", jp_types=["5"], cap_amt_min="0", cap_amt_max="50"),
+        valid[1],
+    ]
+    assert not numeric_partition_structure(
+        parent.key(), [c.key() for c in no_cat],
+        certified=frozenset({"cap_amt"}),
+    )
