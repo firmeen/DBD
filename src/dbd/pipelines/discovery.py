@@ -1753,8 +1753,17 @@ async def run(
     distributed: bool = False,
     numeric_split: bool = True,
 ) -> DiscoveryResult:
-    # Ordinary Discovery attempts safe count-validated numeric candidates when
-    # categorical partitioning is exhausted; unprovable candidates stay failed.
+    # Fail before any HTTP or bucket writes if the existing migration 0013
+    # has not been applied. No hidden DDL, guessed schema or retry storm.
+    if numeric_split:
+        from ..storage.mysql.repositories.discovery_repository import numeric_schema_ready
+
+        if not await asyncio.to_thread(numeric_schema_ready):
+            raise ContractError(
+                "DISCOVERY_NUMERIC_SCHEMA_MISSING: discovery_buckets.numeric_filters "
+                "JSON is required. Check alembic_version and apply existing "
+                "dbd-data migrate with the collector stopped."
+            )
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed discovery requires DBD_REDIS_URL")
     stop = asyncio.Event()
