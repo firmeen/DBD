@@ -237,7 +237,11 @@ def split(conn, parent: dict, children: list[SearchFilters],
     if parent.get("total_items") is None or sum(total for total, _ in counts) != int(parent["total_items"]):
         raise ContractError("Discovery split child totals do not reconcile with the parent")
     if any(
-        total < 0 or pages != (total + 9) // 10
+        total < 0 or pages < 0 or
+        (total > 0 and pages == 0) or
+        # Oversized API partitions may report a capped page count. Their
+        # rows are never fetched until split below the 10k ceiling.
+        (total <= 10_000 and pages != (total + 9) // 10)
         for total, pages in counts
     ):
         raise ContractError("Invalid Discovery child pagination snapshot")
