@@ -219,3 +219,48 @@ terminal endpoint failures สามารถมีอยู่ได้แล�
 ## Monthly control acceptance gates
 
 The v0.6 SQL Server control feature requires unit and integration validation for one Generation per month, manual early confirmation, Resume across month boundaries, admin-only collection with zero remote Workers, distinct SQL logins for Admin/Worker, NODE approval/revocation, SQL permission denials, global HTTP admission across processes (including retry and Search), graceful `DRAINING` before VERIFY, Task Scheduler non-overlap, and unchanged G1/Legacy/MySQL/Extended semantics. Fake SQL tests cannot prove SQL Server grant and concurrency correctness; run disposable SQL Server integration and Windows Task tests before Production. CI jobs with no executed steps do not count as passing tests.
+
+
+## Dataset 2 Discovery / Branch extension safety gates (PR #100)
+
+Before enabling on a real production Generation, execute tests locally or in
+an isolated SQL Server 2017 database; CI runner allocation is not a substitute
+for actual executed tests.
+
+- Confirm SQL Server v0.6 migrations are additive and the five Core
+  `MANAGED_TABLES` remain unchanged. The Discovery Work table must have a
+  trusted parent self-reference FK and JSON/status/page checks; the Branch
+  table must have its trusted company FK, primary key and branch-code check.
+- Count an oversized Search partition; enforce exact child count parity **in
+  the SQL repository transaction** before committing the SPLIT state.
+  Reprocess the counted children through the existing page fetch/persist loop.
+- Interrupt a page chunk before SQL commit and after SQL commit; verify page
+  cursor and company writes roll back/advance together. An interrupted run
+  must prioritize resumable fetching and newly split children.
+- Reject falsely complete trees (no roots, invalid SPLIT parent/descendant,
+  incomplete pages, blocked or failed leaves). Never transition a monthly
+  Generation to PREPARING with such evidence.
+- Keep numeric dimensions uncertified until NULL/zero/negative/decimal
+  boundaries and sample identities are independently verified from the API.
+  A BLOCKED oversized bucket must not be marked DONE or repeatedly retried by
+  an unattended auto-cycle.
+- Parse an external branch printview with headquarters and zero branches,
+  as well as a page with zero cards and no headquarters. Only the former can
+  certify `branch_count=0`.
+- On import, reject mismatched company URLs, incoherent source timestamps,
+  inconsistent branch totals, duplicate codes, missing source counts, and
+  equal/newer target snapshot timestamps. Never infer zero from missing MySQL
+  source rows.
+- Verify non-200 HTTP responses and source restrictions do not erase verified
+  branch counts. Verified records become eligible for periodic refresh;
+  invalid/unavailable/not-listed records are retried on bounded schedules.
+- Test interactive and redirected Terminal views. A recovery pass that handled
+  its candidates but has blocked leaves must report `INCOMPLETE`, not
+  Discovery Complete.
+- Do not claim `recover -d mysql` or `branch -d mysql` support until
+  Production MySQL extension repositories exist and pass equivalent tests.
+  The default SQL Server routes are independently gated.
+
+The sole newly added extension test module for these features is
+`tests/test_production_discovery_branch.py`; extend existing test modules
+instead of adding separate ones for each new domain.
