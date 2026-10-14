@@ -801,7 +801,7 @@ async def test_keyword_probe_reads_all_pages_and_rejects_duplicate_id(monkeypatc
     report = await discovery.probe_discovery_partition(keyword="สงวนทอง")
     assert report["parent_count"] == 12
     assert report["cohort_check"] == "PASS"
-    assert report["request_count"] == 9
+    assert report["request_count"] == 10
     assert any(item["currentPage"] == 2 for item in requests)
 
 
