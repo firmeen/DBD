@@ -927,7 +927,7 @@ def main():
                 )
                 recovered_generation, result = asyncio.run(discover(
                     backend=selected, event=v06_terminal.event,
-                    max_buckets=args.limit,
+                    recovery_limit=args.limit,
                 ))
                 v06_terminal.finish({
                     "generation":recovered_generation,
