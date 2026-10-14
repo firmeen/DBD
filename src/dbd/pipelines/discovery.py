@@ -313,11 +313,16 @@ async def _drain_bucket(
         page_queue.put_nowait(page_no)
     result_queue: asyncio.Queue[dict] = asyncio.Queue(maxsize=max(8, client.concurrency * 2))
     workers_done = asyncio.Event()
+    stop_pages = asyncio.Event()
+    bucket_error: str | None = None
     controller = _BatchController.build(client.concurrency)
     fetched = 0
     written = 0
 
     async def fetch_one(page_no: int) -> dict | None:
+        nonlocal bucket_error
+        if stop_pages.is_set():
+            return None
         try:
             archive_id = None
             if page_no == 1 and first_page is not None:
@@ -331,12 +336,24 @@ async def _drain_bucket(
                     rate_key="search",
                 )
             page = parse_search_response(data)
-            if page.current_page != page_no or (not page.rows and page.total_items > 0):
-                raise ContractError("Search page number or empty-page contract mismatch")
+            if page.current_page != page_no:
+                raise ContractError(
+                    f"PAGE_NUMBER_MISMATCH bucket={bucket_id} page={page_no} "
+                    f"actual_page={page.current_page}"
+                )
+            if not page.rows and page.total_items > 0:
+                raise ContractError(
+                    f"UNEXPECTED_EMPTY_PAGE bucket={bucket_id} page={page_no} "
+                    f"total_items={page.total_items}"
+                )
             if page.total_pages != pages_total or (
                 expected_items is not None and page.total_items != expected_items
             ):
-                raise ContractError("Search count/pagination changed during checkpointed collection")
+                raise ContractError(
+                    f"PAGINATION_MISMATCH bucket={bucket_id} page={page_no} "
+                    f"expected_items={expected_items} actual_items={page.total_items} "
+                    f"expected_pages={pages_total} actual_pages={page.total_pages}"
+                )
             if filters.numeric_range() is not None:
                 from ..contracts.common import money
 
@@ -351,7 +368,8 @@ async def _drain_bucket(
                             maximum is not None and amount > maximum
                         ):
                             raise ContractError(
-                                f"Discovery numeric page violates {dimension} bounds"
+                                f"NUMERIC_BOUNDARY_MISMATCH bucket={bucket_id} "
+                                f"page={page_no} dimension={dimension}"
                             )
             profiles, rejections = _normalize_rows(page.rows)
             canonical_payload = json.dumps(data, ensure_ascii=False, default=str)
@@ -376,26 +394,35 @@ async def _drain_bucket(
         except DiscoveryLeaseLost:
             raise
         except Exception as exc:
+            detail = f"{type(exc).__name__}: {str(exc)[:700]}"
+            # A structural contradiction affects the entire page stream. Do
+            # not blindly fetch all remaining pages after the first failure.
+            if isinstance(exc, (ContractError, TypeError, ValueError)):
+                if not stop_pages.is_set():
+                    bucket_error = detail
+                stop_pages.set()
             if lease_owner is None:
-                await asyncio.to_thread(fail_page, bucket_id, page_no, type(exc).__name__)
+                await asyncio.to_thread(fail_page, bucket_id, page_no, detail)
             else:
                 await asyncio.to_thread(
                     fail_page,
                     bucket_id,
                     page_no,
-                    type(exc).__name__,
+                    detail,
                     lease_owner=lease_owner,
                     lease_version=lease_version,
                 )
             return None
 
     async def page_worker():
-        while True:
+        while not stop_pages.is_set():
             try:
                 page_no = page_queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
             try:
+                if stop_pages.is_set():
+                    return
                 result = await fetch_one(page_no)
                 if result is not None:
                     await result_queue.put(result)
@@ -404,10 +431,12 @@ async def _drain_bucket(
 
     async def fetch_all():
         worker_count = min(client.concurrency, max(1, len(pages)))
-        async with asyncio.TaskGroup() as group:
-            for _ in range(worker_count):
-                group.create_task(page_worker())
-        workers_done.set()
+        try:
+            async with asyncio.TaskGroup() as group:
+                for _ in range(worker_count):
+                    group.create_task(page_worker())
+        finally:
+            workers_done.set()
 
     async def writer():
         nonlocal fetched, written
@@ -457,10 +486,12 @@ async def _drain_bucket(
     complete = state["done"] == pages_total and state["failed"] == 0 and state["partial"] == 0
     if complete:
         error = None
+    elif bucket_error is not None:
+        error = bucket_error[:700]
     elif state["partial"]:
-        error = "One or more pages contain quarantined rows; fix the contract and run discover-retry"
+        error = "One or more pages contain quarantined rows; investigation required"
     else:
-        error = "One or more pages failed; run discover-retry"
+        error = "One or more pages failed; safe checkpoint resume required"
     owned_update(
         status="done" if complete else "failed",
         pages_done=state["done"],
@@ -484,7 +515,11 @@ async def _process_bucket(
     status_codes: list[str] | None = None,
     numeric_allowed: bool | None = None,
 ) -> tuple[int, int]:
-    from ..storage.mysql.repositories.discovery_repository import mark_search_archive
+    from ..storage.mysql.repositories.discovery_repository import (
+        completed_first_page_evidence,
+        completed_pages,
+        mark_search_archive,
+    )
 
     bucket_id = int(row["id"])
     filters = _filters_from_row(row)
@@ -541,6 +576,53 @@ async def _process_bucket(
         first_page = (count_archive_id, data, requested)
         counted_parent_rows = page.rows
         owned_update(total_items=total_items, pages_total=pages_total, status="counted")
+
+    if (
+        row.get("status") == "failed"
+        and total_items is not None
+        and 0 < int(total_items) <= MAX_ROWS_PER_QUERY
+        and pages_total is not None
+        and 0 < int(pages_total) <= 1000
+    ):
+        # Resume existing failed/missing pages only after checking the current
+        # API population AND the identity order of the archived first page.
+        # Never mix committed pages from an incompatible live snapshot.
+        live, resume_archive, resume_data, resume_requested = await _count(
+            client, bucket_id, filters
+        )
+        await asyncio.to_thread(mark_search_archive, resume_archive, "processed")
+        if (
+            live.current_page != 1 or live.total_items != int(total_items)
+            or live.total_pages != int(pages_total)
+        ):
+            raise ContractError(
+                f"RESUME_SNAPSHOT_MISMATCH bucket={bucket_id} "
+                f"expected_items={total_items} actual_items={live.total_items} "
+                f"expected_pages={pages_total} actual_pages={live.total_pages}"
+            )
+        saved_done = await asyncio.to_thread(completed_pages, bucket_id)
+        if 1 in saved_done:
+            evidence = await asyncio.to_thread(completed_first_page_evidence, bucket_id)
+            if evidence is None:
+                raise ContractError(
+                    f"RESUME_MISSING_FIRST_PAGE_ARCHIVE bucket={bucket_id}"
+                )
+            identities = [
+                (str(item.get("jpTypeCode")), str(item.get("jpNo")))
+                for item in live.rows
+            ]
+            if (
+                identities != evidence["identities"]
+                or evidence["total_items"] != live.total_items
+                or evidence["total_pages"] != live.total_pages
+            ):
+                raise ContractError(
+                    f"RESUME_FIRST_PAGE_CHANGED bucket={bucket_id} "
+                    "archived identities or pagination no longer match"
+                )
+        else:
+            # Reuse this validated count page if page one needs collection.
+            first_page = (resume_archive, resume_data, resume_requested)
 
     if total_items == 0:
         if count_archive_id is not None:
