@@ -303,3 +303,25 @@ def test_durable_split_allows_uncapped_child_count_with_bounded_page_metadata(
         [(10_000,1_000),(20_000,1_000)],
     )
     assert len(added) == 2
+
+
+def test_discovery_claim_prioritizes_committed_resume_and_fresh_children() -> None:
+    class Cursor:
+        def execute(self, sql, params):
+            assert "WHEN 'FETCHING' THEN 0" in sql
+            assert "WHEN 'COUNTED' THEN 1" in sql
+            assert "parent_work_id IS NULL THEN 1" in sql
+            assert "work_id DESC" in sql
+            assert params == (2, "full")
+
+        def fetchone(self):
+            return None
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    assert discovery_repository.next_work(Connection(), 2, "full") is None
