@@ -91,6 +91,29 @@ def validate_schema(conn) -> None:
         }
         if not required.issubset(columns.get("DBD_COMPANY_BRANCH", set())):
             raise ContractError("DBD_COMPANY_BRANCH missing required columns")
+        cur.execute(
+            "SELECT name FROM sys.key_constraints "
+            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH') "
+            "AND type='PK'"
+        )
+        if "PK_DBD_COMPANY_BRANCH" not in {str(row[0]) for row in cur.fetchall()}:
+            raise ContractError("DBD_COMPANY_BRANCH primary key is missing")
+        cur.execute(
+            "SELECT name,is_disabled,is_not_trusted FROM sys.foreign_keys "
+            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH')"
+        )
+        keys = {str(name):(bool(disabled),bool(untrusted))
+                for name,disabled,untrusted in cur.fetchall()}
+        if keys.get("FK_DBD_COMPANY_BRANCH_COMPANY") != (False,False):
+            raise ContractError("DBD_COMPANY_BRANCH company FK is missing or untrusted")
+        cur.execute(
+            "SELECT name,is_disabled,is_not_trusted FROM sys.check_constraints "
+            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH')"
+        )
+        checks = {str(name):(bool(disabled),bool(untrusted))
+                  for name,disabled,untrusted in cur.fetchall()}
+        if checks.get("CK_DBD_COMPANY_BRANCH_NUMBER") != (False,False):
+            raise ContractError("DBD_COMPANY_BRANCH branch number CHECK is missing or untrusted")
     finally:
         cur.close()
 
