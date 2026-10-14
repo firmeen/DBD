@@ -521,10 +521,12 @@ async def _process_bucket(
         if count_archive_id is not None:
             await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
         rejected_plans: list[str] = []
+        validation_options = {"rejection_reasons": rejected_plans}
+        if numeric_allowed is not None:
+            validation_options["numeric_allowed"] = numeric_allowed
         children = await _validated_children(
             client, bucket_id, filters, provinces, status_codes or [], int(total_items),
-            rejection_reasons=rejected_plans,
-            numeric_allowed=numeric_allowed,
+            **validation_options,
         )
         if not children:
             reason = "; ".join(rejected_plans) if rejected_plans else "no_usable_partition"

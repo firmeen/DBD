@@ -199,3 +199,13 @@ def test_split_refuses_child_that_drops_fixed_categorical_filter():
     with pytest.raises(ValueError, match="broadened parent"):
         split_bucket(parent_id, [child], 1)
     assert get_bucket(parent_id)["status"] == "pending"
+
+def test_split_child_cannot_drop_a_parent_numeric_constraint():
+    parent_filter = SearchFilters(
+        "numeric-parent-" + uuid4().hex, cap_amt_min="100", cap_amt_max="100",
+    )
+    parent_id = upsert_bucket(parent_filter)
+    child = SearchFilters(parent_filter.keyword, total_asset_min="1")
+    with pytest.raises(ValueError, match="removed parent numeric"):
+        split_bucket(parent_id, [child], 1)
+    assert get_bucket(parent_id)["status"] == "pending"

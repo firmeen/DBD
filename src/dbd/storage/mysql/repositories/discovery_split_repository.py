@@ -31,7 +31,7 @@ def split_bucket(
         if lease_owner is not None:
             assert_bucket_lease(cur, int(parent_id), lease_owner, int(lease_version))
         cur.execute(
-            "SELECT id,status,pages_done,keyword,search_type,"
+            "SELECT id,status,pages_done,bucket_key,keyword,search_type,"
             "pv_codes,jp_statuses,jp_types,business_sizes "
             "FROM discovery_buckets WHERE id=%s FOR UPDATE",
             (int(parent_id),),
@@ -78,7 +78,11 @@ def split_bucket(
         # Numeric parent bounds are checked only when the optional migrated
         # column is actually needed. Legacy categorical splitting works before
         # migration 0013 and must not gain an implicit schema dependency.
-        if any(child.numeric_range() is not None for child in children):
+        parent_has_numeric_key = any(
+            "|" + prefix + "=" in parent["bucket_key"]
+            for prefix in ("cap", "asset", "income", "profit")
+        )
+        if parent_has_numeric_key or any(child.numeric_range() is not None for child in children):
             from decimal import Decimal
 
             cur.execute(

@@ -1348,3 +1348,19 @@ async def test_numeric_execution_is_blocked_without_certified_api_coverage():
         await discovery.recover_discovery(
             parent_id=9001, execute=True, numeric_split=True
         )
+
+@pytest.mark.asyncio
+async def test_numeric_fallback_refuses_uncertified_dimensions_without_http(monkeypatch):
+    from dbd.client.endpoints.search import SearchFilters
+
+    filters = SearchFilters(
+        "010", jp_types=["5"], pv_codes=["10"],
+        jp_statuses=["1"], business_sizes=["S"],
+    )
+    reasons = []
+    result = await discovery._validated_children(
+        object(), 12, filters, ["10"], ["1"], 30000,
+        rejection_reasons=reasons, numeric_allowed=True,
+    )
+    assert result == []
+    assert "numeric_unverified:NULL_and_boundary_coverage" in reasons
