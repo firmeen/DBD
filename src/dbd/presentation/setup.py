@@ -57,7 +57,9 @@ def _task_script() -> Path:
     return PROJECT_ROOT / "scripts" / "dbd-auto.bat"
 
 
-def register_windows_task(*, check_hour: int = 9, check_minute: int = 0, wake: bool = False) -> None:
+def register_windows_task(*, check_hour: int = 9, check_minute: int = 0,
+                          pending_time: tuple[int, int] | None = None,
+                          wake: bool = False) -> None:
     """Create a single per-user Task with Daily + Logon triggers.
 
     Registration failures do not alter database state. This is run only after
@@ -66,6 +68,8 @@ def register_windows_task(*, check_hour: int = 9, check_minute: int = 0, wake: b
     if sys.platform != "win32":
         raise ControlError("Windows Task Scheduler is available only on Windows")
     validate_schedule(1, check_hour, check_minute)
+    if pending_time is not None:
+        validate_schedule(1,pending_time[0],pending_time[1])
     script = _task_script()
     if not script.exists():
         raise ControlError(f"Auto-run script not found: {script}")
@@ -79,6 +83,12 @@ def register_windows_task(*, check_hour: int = 9, check_minute: int = 0, wake: b
     root_path = str(PROJECT_ROOT).replace("'", "''")
     name = TASK_NAME.replace("'", "''")
     wake_flag = '-WakeToRun' if wake else ''
+    next_trigger = ""
+    if pending_time is not None and pending_time != (check_hour,check_minute):
+        next_trigger = (
+            "(New-ScheduledTaskTrigger -Daily -At "
+            f"'{pending_time[0]:02d}:{pending_time[1]:02d}'),"
+        )
     # The principal is the current interactive Windows user, not an elevated
     # service account. No plain-text Windows password is needed.
     ps = f"""
@@ -87,6 +97,7 @@ $cmd = Join-Path $env:SystemRoot 'System32\\cmd.exe'
 $action = New-ScheduledTaskAction -Execute $cmd -Argument '/d /c ""{task_path}""' -WorkingDirectory '{root_path}'
 $triggers = @(
     (New-ScheduledTaskTrigger -Daily -At '{check_hour:02d}:{check_minute:02d}'),
+    {next_trigger}
     (New-ScheduledTaskTrigger -AtLogOn -User "$env:USERDOMAIN\\$env:USERNAME")
 )
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit ([TimeSpan]::Zero) {wake_flag}
@@ -369,12 +380,24 @@ class SetupWizard:
             ])
             try:
                 if task_action == "enable":
-                    time_value = self.ask("Daily check time (HH:MM)", "09:00")
-                    hour, minute = [int(x) for x in time_value.split(":")]
-                    validate_schedule(15, hour, minute)
-                    if self.confirm("Register/update the one per-user non-elevated Windows Task?"):
+                    current_schedule = repo.schedule()
+                    if current_schedule is None:
+                        raise ControlError("Save the monthly SQL schedule before enabling Auto Run")
+                    hour, minute = int(current_schedule["hour"]), int(current_schedule["minute"])
+                    pending = current_schedule.get("pending")
+                    next_time = (
+                        (int(pending["hour"]),int(pending["minute"]))
+                        if isinstance(pending,dict) else None
+                    )
+                    if self.confirm(
+                        f"Register daily SQL due checks at {hour:02d}:{minute:02d}"
+                        + (f" and pending {next_time[0]:02d}:{next_time[1]:02d}"
+                           if next_time and next_time!=(hour,minute) else "")
+                        + " Asia/Bangkok using the current Windows local timezone?"
+                    ):
                         wake = self.confirm("Wake the computer from Sleep when Windows and hardware support it?")
-                        register_windows_task(check_hour=hour, check_minute=minute, wake=wake)
+                        register_windows_task(check_hour=hour, check_minute=minute,
+                                              pending_time=next_time,wake=wake)
                         self.console.print("[green]Windows Task registered.[/green]")
                 elif task_action == "disable" and self.confirm("Disable the DBD Monthly Core Task?"):
                     result = subprocess.run(
