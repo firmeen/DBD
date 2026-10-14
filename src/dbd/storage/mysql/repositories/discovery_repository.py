@@ -144,10 +144,56 @@ def bucket_has_pages(bucket_id: int) -> bool:
         return cur.fetchone() is not None
 
 
+def numeric_schema_ready() -> bool:
+    """Validate the existing 0013 JSON column without changing any schema."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='discovery_buckets'
+              AND column_name='numeric_filters' AND data_type='json'
+            LIMIT 1
+            """
+        )
+        return cur.fetchone() is not None
+
+
+def completed_first_page_evidence(bucket_id: int) -> dict | None:
+    """Return archived page-one identity order only when it was committed."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT a.payload FROM discovery_pages p
+            JOIN response_archive a ON a.id=p.archive_id
+            WHERE p.bucket_id=%s AND p.page_no=1 AND p.status='done'
+            """,
+            (int(bucket_id),),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+        contents = payload["contents"]
+        metadata = payload["meta"]
+        if not isinstance(contents, list) or not isinstance(metadata, dict):
+            raise ValueError("invalid archived page structure")
+        identities = [(str(item["jpTypeCode"]), str(item["jpNo"])) for item in contents]
+        return {
+            "identities": identities,
+            "total_items": metadata["totalItems"],
+            "total_pages": metadata["totalPages"],
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Discovery bucket {bucket_id} has an unreadable archived first page"
+        ) from exc
+
+
 def recoverable_failed_buckets(
     limit: int = 50, *, exclude_ids: set[int] | None = None,
 ) -> list[dict]:
-    """Select only untouched oversized failed leaves, never historical split parents."""
+    """Select unfinished failed leaves and untouched oversized leaves without resetting pages."""
     excluded = sorted(int(item) for item in (exclude_ids or set()))
     not_seen = (
         f" AND b.id NOT IN ({','.join(['%s'] * len(excluded))})"
@@ -157,17 +203,22 @@ def recoverable_failed_buckets(
         cur.execute(
             """
             SELECT b.* FROM discovery_buckets b
-            WHERE b.status='failed' AND b.total_items>10000
-              AND COALESCE(b.pages_done,0)=0
+            WHERE b.status='failed'
               AND (b.lease_owner IS NULL OR b.lease_expires_at<UTC_TIMESTAMP(6))
               AND NOT EXISTS (
                 SELECT 1 FROM discovery_buckets child WHERE child.parent_id=b.id
               )
-              AND NOT EXISTS (
-                SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+              AND (
+                (b.total_items>10000 AND COALESCE(b.pages_done,0)=0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+                 ))
+                OR (b.total_items BETWEEN 1 AND 10000
+                    AND b.pages_total BETWEEN 1 AND 1000
+                    AND COALESCE(b.pages_done,0)<b.pages_total)
               )
             """ + not_seen + """
-            ORDER BY b.total_items ASC,b.depth DESC,b.id
+            ORDER BY (b.total_items<=10000) DESC,b.total_items ASC,b.depth DESC,b.id
             LIMIT %s
             """,
             (*excluded, int(limit)),
@@ -208,18 +259,23 @@ def claim_buckets(
                     cur.execute(
                         """
                         SELECT b.* FROM discovery_buckets b
-                        WHERE b.status='failed' AND b.total_items>10000
-                          AND COALESCE(b.pages_done,0)=0
+                        WHERE b.status='failed'
                           AND (b.lease_owner IS NULL
                                OR b.lease_expires_at<UTC_TIMESTAMP(6))
                           AND NOT EXISTS (
                             SELECT 1 FROM discovery_buckets child WHERE child.parent_id=b.id
                           )
-                          AND NOT EXISTS (
-                            SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+                          AND (
+                            (b.total_items>10000 AND COALESCE(b.pages_done,0)=0
+                             AND NOT EXISTS (
+                               SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+                             ))
+                            OR (b.total_items BETWEEN 1 AND 10000
+                                AND b.pages_total BETWEEN 1 AND 1000
+                                AND COALESCE(b.pages_done,0)<b.pages_total)
                           )
                         """ + exclude_sql + """
-                        ORDER BY b.total_items ASC,b.depth DESC,b.id
+                        ORDER BY (b.total_items<=10000) DESC,b.total_items ASC,b.depth DESC,b.id
                         LIMIT %s FOR UPDATE SKIP LOCKED
                         """,
                         (*excluded, int(limit)),
@@ -703,6 +759,9 @@ def fail_page(
     lease_owner: str | None = None,
     lease_version: int | None = None,
 ):
+    # A late or duplicate failure cannot downgrade an already committed page.
+    detail = str(error)[:900]
+    changed = False
     with connect() as conn:
         try:
             with conn.cursor() as cur:
@@ -712,23 +771,28 @@ def fail_page(
                     INSERT INTO discovery_pages(bucket_id,page_no,status,last_error)
                     VALUES (%s,%s,'failed',%s)
                     ON DUPLICATE KEY UPDATE
-                      status='failed',last_error=VALUES(last_error),updated_at=UTC_TIMESTAMP(6)
+                      last_error=IF(status='done',last_error,VALUES(last_error)),
+                      updated_at=IF(status='done',updated_at,UTC_TIMESTAMP(6)),
+                      status=IF(status='done','done','failed')
                     """,
-                    (bucket_id, page_no, error),
+                    (bucket_id, page_no, detail),
                 )
+                changed = bool(cur.rowcount)
                 cur.execute(
                     """
                     UPDATE response_archive a JOIN discovery_pages p ON p.archive_id=a.id
                     SET a.processing_status='failed',a.error_code=%s
-                    WHERE p.bucket_id=%s AND p.page_no=%s
+                    WHERE p.bucket_id=%s AND p.page_no=%s AND p.status='failed'
                     """,
-                    (error, bucket_id, page_no),
+                    (type(error).__name__ if isinstance(error, Exception) else detail[:100],
+                     bucket_id, page_no),
                 )
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
-    DISCOVERY_PAGE_RESULTS.labels("failed").inc()
+    if changed:
+        DISCOVERY_PAGE_RESULTS.labels("failed").inc()
 
 
 def page_progress(bucket_id):
