@@ -1450,3 +1450,43 @@ async def test_normal_discovery_path_never_auto_enables_numeric(monkeypatch):
     assert await discovery._validated_children(
         object(), 42, filters, ["10"], ["1"], 30000
     ) == []
+
+@pytest.mark.asyncio
+async def test_numeric_discover_run_requires_explicit_certification_before_http():
+    with pytest.raises(ValueError, match="certified"):
+        await discovery.run(["010"], numeric_split=True)
+
+
+@pytest.mark.asyncio
+async def test_oversized_bucket_refuses_automatic_count_growth(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    row = {
+        "id": 17, "keyword": "010", "search_type": "",
+        "pv_codes": "", "jp_statuses": "", "jp_types": "",
+        "business_sizes": "", "total_items": 20000,
+        "pages_total": 2000, "pages_done": 0, "depth": 0,
+    }
+    recorded = []
+
+    async def count(_client, _id, _filters):
+        return (
+            type("Page", (), {
+                "current_page": 1, "total_items": 20001, "total_pages": 2001,
+            })(), 5, {}, None,
+        )
+
+    monkeypatch.setattr(discovery, "_count", count)
+    monkeypatch.setattr(repository, "mark_search_archive", lambda *a: recorded.append(a))
+    monkeypatch.setattr(
+        discovery, "update_bucket",
+        lambda *_a, **_kw: (_ for _ in ()).throw(
+            AssertionError("Count drift must not overwrite the historical bucket")
+        ),
+    )
+    with pytest.raises(ContractError, match="refusing automatic growth"):
+        await discovery._process_bucket(
+            object(), row, [], master_cache={}, progress_line=None,
+        )
+    assert recorded == [(5, "processed")]
+    assert row["total_items"] == 20000

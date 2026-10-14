@@ -734,6 +734,10 @@ def main():
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
     disc.add_argument(
+        "--numeric-split", action="store_true",
+        help="Explicit numeric opt-in; rejected until verified API coverage is certified",
+    )
+    disc.add_argument(
         "--distributed",
         action="store_true",
         help="Claim buckets across processes with Redis-shared Search pacing",
@@ -921,6 +925,7 @@ def main():
                         max_buckets=args.max_buckets,
                         verbose=not bool(getattr(args, "json", False)),
                         distributed=True,
+                        numeric_split=args.numeric_split,
                     )
                 )
             else:
@@ -934,6 +939,7 @@ def main():
                             max_buckets=args.max_buckets,
                             verbose=not bool(getattr(args, "json", False)),
                             health=lambda: assert_manager_lock(conn),
+                            numeric_split=args.numeric_split,
                         )
                     )
             presenter.command_result(

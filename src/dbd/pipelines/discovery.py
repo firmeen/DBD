@@ -501,14 +501,16 @@ async def _process_bucket(
         if page.current_page != 1:
             raise ContractError("Invalid Discovery count page")
         total_items, pages_total = page.total_items, page.total_pages
-        # Never silently replace a previously observed population with a
-        # smaller live search count, even when no pages were committed yet.
+        # Refuse BOTH shrink and growth: a different live snapshot cannot
+        # silently replace historical counts/parent-child reconciliation.
         recorded_count = row.get("total_items")
-        if recorded_count is not None and total_items < int(recorded_count):
+        if recorded_count is not None and total_items != int(recorded_count):
             await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
+            change = "shrink" if total_items < int(recorded_count) else "growth"
             raise ContractError(
                 f"Discovery count drift for bucket {bucket_id}: "
-                f"stored={recorded_count}, live={total_items}; refusing automatic shrink"
+                f"stored={recorded_count}, live={total_items}; "
+                f"refusing automatic {change}"
             )
         if int(row.get("pages_done") or 0) and row["total_items"] != total_items:
             raise ContractError("Search total changed after pages were committed")
@@ -1435,6 +1437,7 @@ async def _run_work(
     distributed: bool,
     owner: str,
     progress_line: ProgressLine,
+    numeric_split: bool = False,
 ) -> DiscoveryResult:
     buckets_processed = pages_fetched = companies_written = 0
     provinces = await fetch_provinces(client)
@@ -1476,6 +1479,7 @@ async def _run_work(
                     lease_owner=owner if distributed else None,
                     lease_version=lease_version,
                     status_codes=status_codes,
+                    numeric_allowed=numeric_split,
                 )
             except DiscoveryLeaseLost:
                 progress_line.event(
@@ -1535,7 +1539,13 @@ async def run(
     verbose: bool = True,
     health=None,
     distributed: bool = False,
+    numeric_split: bool = False,
 ) -> DiscoveryResult:
+    if numeric_split and not PRODUCTION_CERTIFIED_DIMENSIONS:
+        raise ValueError(
+            "Numeric collection requires independently certified DBD "
+            "NULL/fractional/boundary coverage; no dimensions are approved"
+        )
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed discovery requires DBD_REDIS_URL")
     stop = asyncio.Event()
@@ -1575,6 +1585,7 @@ async def run(
                     distributed=distributed,
                     owner=owner,
                     progress_line=progress_line,
+                    numeric_split=numeric_split,
                 )
             finally:
                 stop.set()
