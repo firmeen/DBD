@@ -420,3 +420,35 @@ a separate upstream quota.
 The five business tables remain unchanged. The **SQL Server-only** `dbo.DBD_CONTROL` table has `SCHEDULE`, `GENERATION`, `NODE`, `AUDIT`, and `RATE` record types in the existing eight-column key/payload contract. Admin is the single Coordinator, and can perform local Deep Collection without external Workers. An approved Worker may join only the currently `COLLECTING` Generation using existing `DBD_COMPANY` company leases; `DRAINING` stops new claims before verification/finalization. `DBD_CONTROL_ADMIT` reserves one SQL-backed global request slot per HTTP attempt without allowing Worker SQL logins to update the calendar. `DBD_OPERATOR_NAME` is not an authorization credential. Generation dates are Asia/Bangkok, UTC timestamps are stored. `--auto` is a one-shot Task Scheduler entry, not a polling daemon.
 
 See [Admin setup](ADMIN_SETUP.md) / [Worker setup](WORKER_SETUP.md).
+
+
+## Dataset 2 extensions: durable search and company locations (draft)
+
+PR #100 retains the five Core business tables as the only entries in
+`MANAGED_TABLES` and does not extend the seven Deep endpoint bits. Three
+independent SQL Server tables serve separate contracts:
+
+- `dbo.DBD_CONTROL`: monthly schedule, Admin/Worker node admission and global
+  DBD HTTP rate (existing PR #100 control plane).
+- `dbo.DBD_DISCOVERY_WORK`: a Generation-scoped parent/child bucket tree with
+  canonical Search filter identities and contiguous last committed page.
+  Parent/child counts must reconcile before an atomic split. Company upsert
+  and page advance use **one** SQL transaction. A complete tree requires valid
+  roots, trustworthy split parents, and fully committed leaf pages.
+- `dbo.DBD_COMPANY_BRANCH`: externally sourced branch records keyed by
+  `(company_id, branch_no)`. Additional nullable summary fields in
+  `dbo.DBD_COMPANY` are written **only** by Branch Enrichment, not Core Upsert
+  or Generation 1 Cutover. No extra Deep endpoint or Business Relation is implied.
+
+The SQL Server extension modules have separate schema validation and are
+excluded from the five-table shared SQL Server/MySQL core serving contract.
+The existing Production MySQL backend must not be mistaken for the legacy
+Dataset 1 MySQL schema; SQL Server-only extension commands fail explicitly
+for unsupported backends rather than silently using legacy tables.
+
+The numeric planner is read-only hypothesis generation. No numeric range
+dimension is auto-certified merely by count parity. Its production certification
+set remains empty pending real upstream coverage evidence; a nonpartitionable
+overflow remains durable BLOCKED, never DONE. A future explicitly authorized
+recovery may recheck safely blocked zero-page oversize work after numeric
+certification, without resetting committed pages or core Business data.
