@@ -47,6 +47,8 @@ class SearchFilters:
                 raise ValueError(f"{name} must be a finite decimal") from None
             if not value.is_finite() or (value and not -12 <= value.adjusted() <= 25):
                 raise ValueError(f"{name} is outside supported capital precision")
+            if value == 0:
+                value = Decimal(0)
             normalized = format(value.normalize(), "f")
             if len(normalized) > 60:
                 raise ValueError(f"{name} is too long to persist safely")
