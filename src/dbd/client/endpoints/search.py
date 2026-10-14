@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 
 from ...contracts.common import as_list
 from ...core.exceptions import ContractError
@@ -29,6 +30,39 @@ class SearchFilters:
     jp_statuses: list[str] = field(default_factory=list)
     jp_types: list[str] = field(default_factory=list)
     business_sizes: list[str] = field(default_factory=list)
+    cap_amt_min: Decimal | None = None
+    cap_amt_max: Decimal | None = None
+
+    def __post_init__(self) -> None:
+        """Canonicalize decimal ranges without changing legacy bucket identity."""
+        for name in ("cap_amt_min", "cap_amt_max"):
+            raw = getattr(self, name)
+            if raw is None:
+                continue
+            if isinstance(raw, bool):
+                raise ValueError(f"{name} must be a finite decimal")
+            try:
+                value = Decimal(str(raw))
+            except (InvalidOperation, ValueError):
+                raise ValueError(f"{name} must be a finite decimal") from None
+            if not value.is_finite():
+                raise ValueError(f"{name} must be a finite decimal")
+            normalized = format(value.normalize(), "f")
+            if len(normalized) > 60:
+                raise ValueError(f"{name} is too long to persist safely")
+            setattr(self, name, Decimal(normalized))
+        if self.cap_amt_min is not None and self.cap_amt_max is not None:
+            if self.cap_amt_min > self.cap_amt_max:
+                raise ValueError("cap_amt_min exceeds cap_amt_max")
+
+    def numeric_range(self) -> dict[str, str] | None:
+        if self.cap_amt_min is None and self.cap_amt_max is None:
+            return None
+        return {
+            k: format(value, "f")
+            for k, value in (("capAmtMin", self.cap_amt_min), ("capAmtMax", self.cap_amt_max))
+            if value is not None
+        }
 
     def payload(self, page: int = 1, sort_by: str = "jpName") -> dict:
         if len(self.keyword) < MIN_KEYWORD_LENGTH:
@@ -43,8 +77,8 @@ class SearchFilters:
             "jpStatusList": self.jp_statuses,
             "jpTypeList": self.jp_types,
             "businessSizeList": self.business_sizes,
-            "capAmtMin": None,
-            "capAmtMax": None,
+            "capAmtMin": self._api_amount(self.cap_amt_min),
+            "capAmtMax": self._api_amount(self.cap_amt_max),
             "totalIncomeMin": None,
             "totalIncomeMax": None,
             "netProfitMin": None,
@@ -52,6 +86,17 @@ class SearchFilters:
             "totalAssetMin": None,
             "totalAssetMax": None,
         }
+
+    @staticmethod
+    def _api_amount(value: Decimal | None) -> int | str | None:
+        if value is None:
+            return None
+        # Avoid binary float rounding. Integral bounds remain JSON numbers;
+        # fractional bounds stay exact strings until their API semantics pass
+        # the read-only probe gate.
+        if value == value.to_integral_value():
+            return int(value)
+        return format(value, "f")
 
     def key(self) -> str:
         """Stable identity for a bucket, used to resume without duplicating."""
@@ -63,6 +108,11 @@ class SearchFilters:
             f"jt={','.join(sorted(self.jp_types))}",
             f"sz={','.join(sorted(self.business_sizes))}",
         ]
+        numeric = self.numeric_range()
+        if numeric is not None:
+            parts.append(
+                "cap=" + ",".join(f"{k}:{numeric.get(k, '')}" for k in ("capAmtMin", "capAmtMax"))
+            )
         return "|".join(parts)
 
 
