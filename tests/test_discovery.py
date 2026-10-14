@@ -1190,3 +1190,53 @@ async def test_failed_overflow_receipt_retains_rejected_partition_details(monkey
     )
     assert updates[-1]["status"] == "failed"
     assert "jp_types:count_mismatch:" in updates[-1]["last_error"]
+
+
+@pytest.mark.asyncio
+async def test_targeted_failed_overflow_uses_existing_recovery_and_split_path(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repo
+
+    row = {
+        "id": 482, "status": "failed", "total_items": 20000,
+        "keyword": "010", "search_type": "", "jp_types": ["5"],
+        "pv_codes": "", "jp_statuses": "", "business_sizes": "",
+        "lease_owner": None, "lease_expires_at": None,
+    }
+    calls = []
+
+    monkeypatch.setattr(
+        repo, "recovery_candidates",
+        lambda limit, parent: [{"bucket_id": 482, "reason": "overflow"}],
+    )
+    monkeypatch.setattr(repo, "get_bucket", lambda _id: dict(row))
+    monkeypatch.setattr(discovery, "observed_status_codes", lambda: ["1", "2"])
+
+    async def provinces(_client):
+        return ["10", "20"]
+
+    async def split_existing(_client, _row, _pv, **_kw):
+        calls.append("split")
+        row["status"] = "split"
+        return 0, 0
+
+    monkeypatch.setattr(discovery, "fetch_provinces", provinces)
+    monkeypatch.setattr(discovery, "_process_bucket", split_existing)
+    monkeypatch.setattr(discovery, "validate_splits", lambda verbose: 1)
+
+    class Client:
+        def __init__(self, **options):
+            assert options["concurrency"] == 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    receipt = await discovery.recover_discovery(parent_id=482, execute=True, rate=0.25)
+    assert calls == ["split"]
+    assert receipt["split"] == 1
+    assert receipt["recovered"] == 0
+    assert receipt["partitions_checked"] == 1
+    assert receipt["unresolved"] == 0
