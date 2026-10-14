@@ -162,3 +162,71 @@ def test_recount_cannot_mark_parent_lossless_on_shrinking_search_count():
     assert result["parent_updated"] is False
     assert old_parent["total_items"] == 100  # never certify a lower live count
     assert family[0]["status"] == "pending"
+
+
+def test_recovery_candidates_distinguish_unfinished_descendant_from_false_zero():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        recovery_candidates,
+        update_bucket,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    filters = SearchFilters("diagnostic-" + uuid4().hex)
+    parent_id = upsert_bucket(filters)
+    first, second = split_bucket(
+        parent_id,
+        [
+            SearchFilters(filters.keyword, jp_types=["2"]),
+            SearchFilters(filters.keyword, jp_types=["5"]),
+        ],
+        1,
+    )
+    update_bucket(parent_id, total_items=100, partition_lossless=0)
+    update_bucket(first, status="done", total_items=0, pages_total=0, pages_done=0)
+    update_bucket(
+        second,
+        status="split",
+        total_items=100,
+        pages_total=10,
+        pages_done=0,
+        partition_lossless=0,
+    )
+
+    def reason():
+        rows = recovery_candidates(limit=10, parent_id=parent_id)
+        assert len(rows) == 1
+        return rows[0]["reason"]
+
+    assert reason() == "descendant_incomplete"
+
+    update_bucket(
+        second, status="done", total_items=99, pages_total=10, pages_done=10
+    )
+    assert reason() == "stale_zero"
+
+    update_bucket(
+        second, status="done", total_items=100, pages_total=10, pages_done=10
+    )
+    assert reason() == "ready_to_validate"
+
+
+def test_failed_leaf_with_all_categorical_filters_is_partition_exhausted():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        recovery_candidates,
+        update_bucket,
+    )
+
+    filters = SearchFilters(
+        "diagnostic-" + uuid4().hex,
+        jp_types=["5"],
+        pv_codes=["10"],
+        jp_statuses=["1"],
+        business_sizes=["S"],
+    )
+    bucket_id = upsert_bucket(filters)
+    update_bucket(
+        bucket_id, status="failed", total_items=271406, pages_total=27141
+    )
+    rows = recovery_candidates(limit=10, parent_id=bucket_id)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "partition_exhausted"
