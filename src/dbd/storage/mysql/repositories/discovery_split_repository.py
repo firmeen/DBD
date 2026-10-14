@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
 import json
+from collections.abc import Sequence
 
 from ....client.endpoints.search import SearchFilters
 from ..engine import connect
