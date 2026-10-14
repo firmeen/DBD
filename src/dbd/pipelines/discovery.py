@@ -840,6 +840,7 @@ async def run(
     rate: float | None = None,
     max_buckets: int | None = None,
     recovery_limit: int | None = None,
+    recovery_pass: bool = False,
     verbose: bool = True,
     health=None,
     distributed: bool = False,
@@ -943,6 +944,7 @@ async def run(
                 max_buckets=max_buckets, event=event, health=health,
                 explicitly_scoped=explicitly_scoped,
                 recovery_limit=recovery_limit,
+                recovery_pass=recovery_pass,
             )
 
         queue = deque(
@@ -1092,6 +1094,7 @@ async def _run_durable_discovery(
     refresh_mask: int, concurrency: int, max_buckets: int | None,
     event=None, health=None, explicitly_scoped: bool = False,
     recovery_limit: int | None = None,
+    recovery_pass: bool = False,
 ) -> DiscoveryResult:
     """SQL Server G2+ Discovery: one durable tree and atomic page checkpoints.
 
@@ -1412,7 +1415,7 @@ async def _run_durable_discovery(
 
         report = await atomic(work.coverage, generation, scope)
         notify("discovery_progress", **report, stage="RECONCILING")
-        if max_buckets is not None or (recovery_limit is None and not report["ok"]):
+        if max_buckets is not None or (not recovery_pass and not report["ok"]):
             raise ContractError(
                 "Discovery coverage incomplete: " + ", ".join(
                     f"{key}={value}" for key, value in sorted(report.items())
