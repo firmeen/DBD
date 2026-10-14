@@ -24,12 +24,12 @@ from ..core.settings import settings
 from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
     DiscoveryLeaseLost,
+    bucket_has_pages,
     claim_buckets,
     discovery_summary,
-    bucket_has_pages,
-    recoverable_failed_buckets,
     heartbeat_bucket_claims,
     pending_buckets,
+    recoverable_failed_buckets,
     release_bucket_claim,
     release_bucket_claims,
     update_bucket,
