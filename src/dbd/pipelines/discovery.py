@@ -76,6 +76,14 @@ def _filters_from_row(row: dict) -> SearchFilters:
     def split(raw: str) -> list[str]:
         return [item for item in (raw or "").split(",") if item]
 
+    persisted = row.get("numeric_filters")
+    if isinstance(persisted, str):
+        persisted = json.loads(persisted)
+    if persisted is None:
+        persisted = {}
+    if not isinstance(persisted, dict) or set(persisted) - {"capAmtMin", "capAmtMax"}:
+        raise ContractError("Unexpected persisted discovery numeric filters")
+
     return SearchFilters(
         keyword=row["keyword"],
         search_type=row["search_type"],
@@ -83,6 +91,8 @@ def _filters_from_row(row: dict) -> SearchFilters:
         jp_statuses=split(row["jp_statuses"]),
         jp_types=split(row["jp_types"]),
         business_sizes=split(row["business_sizes"]),
+        cap_amt_min=persisted.get("capAmtMin"),
+        cap_amt_max=persisted.get("capAmtMax"),
     )
 
 
