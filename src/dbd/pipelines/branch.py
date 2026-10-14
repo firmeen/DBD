@@ -157,7 +157,9 @@ class BranchHttp:
             self.local.session = Session(impersonate="chrome")
         return self.local.session
 
-    def get(self, url: str) -> tuple[str | None, str]:
+    def get(self, url: str, follow_depth: int = 0) -> tuple[str | None, str]:
+        if follow_depth > 2:
+            return None, "UNAVAILABLE"
         if self.stop.is_set():
             raise SourceAccessDenied("External branch source is access restricted")
         for attempt in range(settings.dataforthai_http_attempts):
@@ -188,13 +190,14 @@ class BranchHttp:
                 target_path = urlparse(target).path
                 if (urlparse(target).scheme != "https"
                     or urlparse(target).hostname != "www.dataforthai.com"
+                    or target == url
                     or not src or not (
                         target_path.startswith(f"/company/{src.group(1)}/")
                         or target_path.startswith(f"/company-branch/{src.group(1)}/")
                     )):
                     return None, "UNAVAILABLE"
                 # Never follow an arbitrary login, homepage, or foreign redirect.
-                return self.get(target)
+                return self.get(target, follow_depth + 1)
             if status == 404:
                 return None, "NOT_FOUND"
             if status in (500,502,503,504):
