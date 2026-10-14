@@ -836,7 +836,9 @@ def main():
                 command_bulk(None, args.run_id, [], args.limit, presenter=presenter)
         elif args.command == "discover-recover":
             from ..pipelines.discovery import (
-                preview_numeric_discovery_plan, probe_discovery_partition, recover_discovery,
+                preview_numeric_discovery_plan,
+                probe_discovery_partition,
+                recover_discovery,
             )
 
             if args.probe and args.execute:

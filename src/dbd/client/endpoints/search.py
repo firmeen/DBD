@@ -56,7 +56,9 @@ class SearchFilters:
                 value = Decimal(str(raw))
             except (InvalidOperation, ValueError):
                 raise ValueError(f"{name} must be a finite decimal") from None
-            if not value.is_finite() or (value and not -12 <= value.adjusted() <= 25):
+            if not value.is_finite():
+                raise ValueError(f"{name} must be a finite decimal")
+            if value and not -12 <= value.adjusted() <= 25:
                 raise ValueError(f"{name} is outside supported numeric precision")
             if value == 0:
                 value = Decimal(0)
@@ -64,11 +66,11 @@ class SearchFilters:
             if len(normalized) > 60:
                 raise ValueError(f"{name} is too long to persist safely")
             setattr(self, name, Decimal(normalized))
-        for field in ("cap_amt", "total_asset", "total_income", "net_profit"):
-            minimum = getattr(self, field + "_min")
-            maximum = getattr(self, field + "_max")
+        for dimension in ("cap_amt", "total_asset", "total_income", "net_profit"):
+            minimum = getattr(self, dimension + "_min")
+            maximum = getattr(self, dimension + "_max")
             if minimum is not None and maximum is not None and minimum > maximum:
-                raise ValueError(f"{field}_min exceeds {field}_max")
+                raise ValueError(f"{dimension}_min exceeds {dimension}_max")
 
     def numeric_range(self) -> dict[str, str] | None:
         """Persist only specified bounds, preserving legacy capital-only keys."""
