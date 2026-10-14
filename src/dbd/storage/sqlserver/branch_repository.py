@@ -173,7 +173,9 @@ def save_snapshot(conn, *, company_id: int, branches: list[dict],
         record = cur.fetchone()
         if record is None:
             raise ContractError("Branch references an unknown company_id")
-        if record[0] is not None and record[0] > now:
+        if record[0] is not None and record[0] >= now:
+            # Equal timestamps are not evidence that an imported snapshot
+            # supersedes the stored one. Avoid silently overwriting history.
             return False
         cur.execute(
             f"UPDATE {TABLE} SET is_current=0 WHERE company_id=%s",
