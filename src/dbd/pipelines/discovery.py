@@ -1164,32 +1164,86 @@ async def _run_durable_discovery(
                 active["stage"] = "VALIDATING_SPLIT"
                 notify("discovery_progress", **active)
                 children = _children_for(filters, provinces)
+                counts = []
+                identities = set()
+                parity = True
+                split_dimension = "categorical"
+
                 if not children:
-                    # Numeric plans are hypotheses until their API boundary,
-                    # NULL and identity coverage have been certified. Never
-                    # fetch the first 1000 pages and call an overflow DONE.
+                    from .discovery_numeric import (
+                        PRODUCTION_CERTIFIED_DIMENSIONS,
+                        NumericObservation,
+                        numeric_partition_structure,
+                        plan_numeric_split,
+                    )
+                    if PRODUCTION_CERTIFIED_DIMENSIONS:
+                        async def numeric_count(candidate: SearchFilters):
+                            nonlocal pages_fetched
+                            child_data, _ = await _direct_page(client, candidate, 1)
+                            child_page = parse_search_response(child_data)
+                            pages_fetched += 1
+                            return NumericObservation(
+                                child_page.total_items, child_page.rows,
+                            )
+
+                        candidate = await plan_numeric_split(
+                            filters, parent.total_items, numeric_count, parent.rows,
+                            dimensions=tuple(PRODUCTION_CERTIFIED_DIMENSIONS),
+                        )
+                        if (
+                            candidate.candidate
+                            and candidate.dimension in PRODUCTION_CERTIFIED_DIMENSIONS
+                            and numeric_partition_structure(
+                                filters.key(),
+                                [child.key() for child in candidate.children],
+                                certified=PRODUCTION_CERTIFIED_DIMENSIONS,
+                            )
+                        ):
+                            # A matching count candidate is necessary, never
+                            # sufficient, for source-side numeric coverage.
+                            fresh, _ = await _direct_page(client, filters, 1)
+                            pages_fetched += 1
+                            fresh_parent = parse_search_response(fresh)
+                            if (fresh_parent.total_items == parent.total_items
+                                and fresh_parent.total_pages == parent.total_pages):
+                                children = candidate.children
+                                counts = [
+                                    (child.count, (child.count + 9) // 10)
+                                    for child in candidate.child_observations
+                                ]
+                                split_dimension = str(candidate.dimension)
+                            else:
+                                notify("discovery_progress", **active,
+                                       error="numeric_parent_count_drift")
+
+                if not children:
+                    # Numeric plans are hypotheses until the source boundary,
+                    # NULL, decimal and identity semantics have been certified.
+                    # Do not truncate overflow work to 1000 pages.
                     reason = "no_certified_lossless_split"
                     with repo.transaction() as conn:
                         work.blocked(conn, bucket_id, reason)
                     notify("discovery_progress", **active,
                            stage="BLOCKED", error=reason)
                     continue
-                counts = []
-                identities = set()
-                parity = True
-                for child in children:
-                    child_data, _ = await _direct_page(client, child, 1)
-                    observed = parse_search_response(child_data)
-                    pages_fetched += 1
-                    counts.append((observed.total_items, observed.total_pages))
-                    # First-page identity overlap is an early contradiction,
-                    # not proof that every page is disjoint.
-                    for row in observed.rows:
-                        identifier = (row.get("jpType"), row.get("jpNo"))
-                        if all(identifier):
-                            if identifier in identities:
-                                parity = False
-                            identities.add(identifier)
+
+                if not counts:
+                    for child in children:
+                        child_data, _ = await _direct_page(client, child, 1)
+                        observed = parse_search_response(child_data)
+                        pages_fetched += 1
+                        counts.append((observed.total_items, observed.total_pages))
+                        # First-page overlap is a contradiction, not a proof
+                        # of complete disjointness on all pages.
+                        for row in observed.rows:
+                            identifier = (
+                                row.get("jpTypeCode"), row.get("jpNo")
+                            )
+                            if all(identifier):
+                                if identifier in identities:
+                                    parity = False
+                                identities.add(identifier)
+
                 parity = parity and sum(x[0] for x in counts) == parent.total_items
                 if not parity:
                     with repo.transaction() as conn:
@@ -1197,11 +1251,11 @@ async def _run_durable_discovery(
                     notify("discovery_progress", **active,
                            stage="BLOCKED", error="child_count_or_identity_mismatch")
                     continue
+
                 active["stage"] = "SPLITTING"
                 with repo.transaction() as conn:
-                    # Child counts and parent split are committed together.
-                    work.split(conn, bucket, children,
-                               "categorical", counts)
+                    # Child counts and parent split commit atomically.
+                    work.split(conn, bucket, children, split_dimension, counts)
                 notify("discovery_split", **active, children=len(children))
                 continue
 
