@@ -1240,3 +1240,56 @@ async def test_targeted_failed_overflow_uses_existing_recovery_and_split_path(mo
     assert receipt["recovered"] == 0
     assert receipt["partitions_checked"] == 1
     assert receipt["unresolved"] == 0
+
+def test_all_numeric_filters_preserve_legacy_bucket_keys_and_exact_payload():
+    from decimal import Decimal
+
+    from dbd.client.endpoints.search import SearchFilters
+
+    legacy = SearchFilters("010", jp_types=["5"], cap_amt_min="0.5", cap_amt_max="100")
+    assert legacy.key().endswith("cap=capAmtMin:0.5,capAmtMax:100")
+    assert SearchFilters("010").key() == "k=010|t=|pv=|st=|jt=|sz="
+
+    filters = SearchFilters(
+        "010", jp_types=["5"], cap_amt_min="0.5", cap_amt_max="100",
+        total_asset_min="0", total_asset_max="12345678.25",
+        total_income_min="-25", total_income_max="500",
+        net_profit_min="-999.50", net_profit_max="0",
+    )
+    payload = filters.payload()
+    assert payload["totalAssetMin"] == 0
+    assert payload["totalAssetMax"] == "12345678.25"
+    assert payload["totalIncomeMin"] == -25
+    assert payload["netProfitMin"] == "-999.5"
+    assert payload["netProfitMax"] == 0
+    assert filters.numeric_range()["netProfitMin"] == "-999.5"
+    assert filters.key().startswith(legacy.key() + "|asset=")
+    assert "|income=" in filters.key() and "|profit=" in filters.key()
+    assert Decimal(filters.numeric_range()["totalAssetMax"]) == Decimal("12345678.25")
+
+
+def test_numeric_filter_ranges_reject_invalid_or_reversed_values():
+    import pytest
+
+    from dbd.client.endpoints.search import SearchFilters
+
+    with pytest.raises(ValueError, match="total_asset_min exceeds"):
+        SearchFilters("010", total_asset_min="2", total_asset_max="1")
+    with pytest.raises(ValueError, match="net_profit_min exceeds"):
+        SearchFilters("010", net_profit_min="1", net_profit_max="-1")
+    with pytest.raises(ValueError, match="finite decimal"):
+        SearchFilters("010", total_income_min="NaN")
+
+
+def test_categorical_refinement_carries_all_numeric_constraints():
+    from dbd.client.endpoints.search import SearchFilters
+    from dbd.pipelines.discovery import _partition_plans
+
+    parent = SearchFilters(
+        "010", jp_types=["5"], cap_amt_min="1", cap_amt_max="5",
+        total_asset_min="100", net_profit_max="-5",
+    )
+    plans = _partition_plans(parent, ["10", "20"], ["1"])
+    province = plans[0]
+    assert [child.pv_codes for child in province] == [["10"], ["20"]]
+    assert all(child.numeric_range() == parent.numeric_range() for child in province)

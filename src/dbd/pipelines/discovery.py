@@ -81,7 +81,10 @@ def _filters_from_row(row: dict) -> SearchFilters:
         persisted = json.loads(persisted)
     if persisted is None:
         persisted = {}
-    if not isinstance(persisted, dict) or set(persisted) - {"capAmtMin", "capAmtMax"}:
+    if not isinstance(persisted, dict) or set(persisted) - {
+        "capAmtMin", "capAmtMax", "totalAssetMin", "totalAssetMax",
+        "totalIncomeMin", "totalIncomeMax", "netProfitMin", "netProfitMax",
+    }:
         raise ContractError("Unexpected persisted discovery numeric filters")
 
     return SearchFilters(
@@ -93,6 +96,12 @@ def _filters_from_row(row: dict) -> SearchFilters:
         business_sizes=split(row["business_sizes"]),
         cap_amt_min=persisted.get("capAmtMin"),
         cap_amt_max=persisted.get("capAmtMax"),
+        total_asset_min=persisted.get("totalAssetMin"),
+        total_asset_max=persisted.get("totalAssetMax"),
+        total_income_min=persisted.get("totalIncomeMin"),
+        total_income_max=persisted.get("totalIncomeMax"),
+        net_profit_min=persisted.get("netProfitMin"),
+        net_profit_max=persisted.get("netProfitMax"),
     )
 
 
@@ -115,20 +124,7 @@ def _partition_plans(
         distinct_values = tuple(dict.fromkeys(str(value) for value in values if value))
         if not distinct_values:
             continue
-        options = []
-        for value in distinct_values:
-            kwargs = {
-                "keyword": filters.keyword,
-                "search_type": filters.search_type,
-                "pv_codes": list(filters.pv_codes),
-                "jp_statuses": list(filters.jp_statuses),
-                "jp_types": list(filters.jp_types),
-                "business_sizes": list(filters.business_sizes),
-                "cap_amt_min": filters.cap_amt_min,
-                "cap_amt_max": filters.cap_amt_max,
-            }
-            kwargs[field] = [value]
-            options.append(SearchFilters(**kwargs))
+        options = [replace(filters, **{field: [value]}) for value in distinct_values]
         plans.append(options)
     return plans
 
@@ -653,14 +649,24 @@ async def _probe_partition(
         if child.numeric_range() is not None:
             from ..contracts.common import money
 
-            for raw in page.rows:
-                amount = money(raw.get("capAmt"))
-                if amount is None:
-                    return reject("sample_capital_unavailable")
-                if child.cap_amt_min is not None and amount < child.cap_amt_min:
-                    return reject("sample_capital_below_min")
-                if child.cap_amt_max is not None and amount > child.cap_amt_max:
-                    return reject("sample_capital_above_max")
+            for dimension, raw_key in (
+                ("cap_amt", "capAmt"),
+                ("total_asset", "totalAsset"),
+                ("total_income", "totalIncome"),
+                ("net_profit", "netProfit"),
+            ):
+                minimum = getattr(child, dimension + "_min")
+                maximum = getattr(child, dimension + "_max")
+                if minimum is None and maximum is None:
+                    continue
+                for raw in page.rows:
+                    amount = money(raw.get(raw_key))
+                    if amount is None:
+                        return reject(f"sample_{dimension}_unavailable")
+                    if minimum is not None and amount < minimum:
+                        return reject(f"sample_{dimension}_below_min")
+                    if maximum is not None and amount > maximum:
+                        return reject(f"sample_{dimension}_above_max")
         child_counts.append(page.total_items)
 
     child_total = sum(child_counts)

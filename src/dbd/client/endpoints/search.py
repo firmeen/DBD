@@ -32,10 +32,21 @@ class SearchFilters:
     business_sizes: list[str] = field(default_factory=list)
     cap_amt_min: Decimal | None = None
     cap_amt_max: Decimal | None = None
+    total_asset_min: Decimal | None = None
+    total_asset_max: Decimal | None = None
+    total_income_min: Decimal | None = None
+    total_income_max: Decimal | None = None
+    net_profit_min: Decimal | None = None
+    net_profit_max: Decimal | None = None
 
     def __post_init__(self) -> None:
         """Canonicalize decimal ranges without changing legacy bucket identity."""
-        for name in ("cap_amt_min", "cap_amt_max"):
+        for name in (
+            "cap_amt_min", "cap_amt_max",
+            "total_asset_min", "total_asset_max",
+            "total_income_min", "total_income_max",
+            "net_profit_min", "net_profit_max",
+        ):
             raw = getattr(self, name)
             if raw is None:
                 continue
@@ -46,25 +57,29 @@ class SearchFilters:
             except (InvalidOperation, ValueError):
                 raise ValueError(f"{name} must be a finite decimal") from None
             if not value.is_finite() or (value and not -12 <= value.adjusted() <= 25):
-                raise ValueError(f"{name} is outside supported capital precision")
+                raise ValueError(f"{name} is outside supported numeric precision")
             if value == 0:
                 value = Decimal(0)
             normalized = format(value.normalize(), "f")
             if len(normalized) > 60:
                 raise ValueError(f"{name} is too long to persist safely")
             setattr(self, name, Decimal(normalized))
-        if self.cap_amt_min is not None and self.cap_amt_max is not None:
-            if self.cap_amt_min > self.cap_amt_max:
-                raise ValueError("cap_amt_min exceeds cap_amt_max")
+        for field in ("cap_amt", "total_asset", "total_income", "net_profit"):
+            minimum = getattr(self, field + "_min")
+            maximum = getattr(self, field + "_max")
+            if minimum is not None and maximum is not None and minimum > maximum:
+                raise ValueError(f"{field}_min exceeds {field}_max")
 
     def numeric_range(self) -> dict[str, str] | None:
-        if self.cap_amt_min is None and self.cap_amt_max is None:
-            return None
-        return {
-            k: format(value, "f")
-            for k, value in (("capAmtMin", self.cap_amt_min), ("capAmtMax", self.cap_amt_max))
-            if value is not None
-        }
+        """Persist only specified bounds, preserving legacy capital-only keys."""
+        bounds = (
+            ("capAmtMin", self.cap_amt_min), ("capAmtMax", self.cap_amt_max),
+            ("totalAssetMin", self.total_asset_min), ("totalAssetMax", self.total_asset_max),
+            ("totalIncomeMin", self.total_income_min), ("totalIncomeMax", self.total_income_max),
+            ("netProfitMin", self.net_profit_min), ("netProfitMax", self.net_profit_max),
+        )
+        result = {key: format(value, "f") for key, value in bounds if value is not None}
+        return result or None
 
     def payload(self, page: int = 1, sort_by: str = "jpName") -> dict:
         if len(self.keyword) < MIN_KEYWORD_LENGTH:
@@ -81,12 +96,12 @@ class SearchFilters:
             "businessSizeList": self.business_sizes,
             "capAmtMin": self._api_amount(self.cap_amt_min),
             "capAmtMax": self._api_amount(self.cap_amt_max),
-            "totalIncomeMin": None,
-            "totalIncomeMax": None,
-            "netProfitMin": None,
-            "netProfitMax": None,
-            "totalAssetMin": None,
-            "totalAssetMax": None,
+            "totalIncomeMin": self._api_amount(self.total_income_min),
+            "totalIncomeMax": self._api_amount(self.total_income_max),
+            "netProfitMin": self._api_amount(self.net_profit_min),
+            "netProfitMax": self._api_amount(self.net_profit_max),
+            "totalAssetMin": self._api_amount(self.total_asset_min),
+            "totalAssetMax": self._api_amount(self.total_asset_max),
         }
 
     @staticmethod
@@ -112,10 +127,25 @@ class SearchFilters:
         ]
         numeric = self.numeric_range()
         if numeric is not None:
-            parts.append(
-                "cap=" + ",".join(f"{k}:{numeric.get(k, '')}" for k in ("capAmtMin", "capAmtMax"))
-            )
-        return "|".join(parts)
+            # Preserve the key of every existing capital-only child unchanged.
+            if "capAmtMin" in numeric or "capAmtMax" in numeric:
+                parts.append(
+                    "cap=" + ",".join(f"{key}:{numeric.get(key, '')}"
+                                     for key in ("capAmtMin", "capAmtMax"))
+                )
+            for label, fields in (
+                ("asset", ("totalAssetMin", "totalAssetMax")),
+                ("income", ("totalIncomeMin", "totalIncomeMax")),
+                ("profit", ("netProfitMin", "netProfitMax")),
+            ):
+                if any(key in numeric for key in fields):
+                    parts.append(label + "=" + ",".join(
+                        f"{key}:{numeric.get(key, '')}" for key in fields
+                    ))
+        key = "|".join(parts)
+        if len(key) > 500:
+            raise ValueError("Discovery bucket key exceeds VARCHAR(500)")
+        return key
 
 
 @dataclass
