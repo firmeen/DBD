@@ -129,3 +129,55 @@ def test_branch_writer_retains_history_and_disallows_core_mask_update() -> None:
     assert "is_current=0" in inspect.getsource(branch_repository.save_snapshot)
     assert "branch_count" in branch_repository.SUMMARY_COLUMNS
     assert "DBD_COMPANY_BRANCH" in branch_repository.DDL
+
+
+@pytest.mark.parametrize(
+    ("roots", "invalid_tree", "blocked", "expected"),
+    [
+        (1, 0, 0, True),
+        (0, 0, 0, False),
+        (1, 1, 0, False),
+        (1, 0, 2, False),
+    ],
+)
+def test_discovery_coverage_requires_durable_roots_and_valid_split_tree(
+    monkeypatch, roots, invalid_tree, blocked, expected,
+) -> None:
+    """An empty work queue cannot certify an orphan or unvalidated split."""
+    from dbd.storage.sqlserver import discovery_repository as work
+
+    monkeypatch.setattr(work, "report", lambda *_: {
+        "total_buckets": 3, "done": 2, "split": 1,
+        "pending": 0, "counted": 0, "fetching": 0,
+        "failed": 0, "blocked": blocked,
+    })
+
+    class Cursor:
+        calls = 0
+
+        def execute(self, query, params):
+            assert params == (2, "full")
+            if self.calls == 0:
+                assert "parent_work_id IS NULL" in query
+            else:
+                assert "partition_lossless" in query
+                assert "parent.status='SPLIT'" in query
+                assert "last_committed_page" in query
+            self.calls += 1
+
+        def fetchone(self):
+            return (roots if self.calls == 1 else invalid_tree,)
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return cursor
+
+    cursor = Cursor()
+    result = work.coverage(Connection(), 2, "full")
+    assert result["ok"] is expected
+    assert result["roots"] == roots
+    assert result["invalid_tree"] == invalid_tree
+    assert cursor.calls == 2
