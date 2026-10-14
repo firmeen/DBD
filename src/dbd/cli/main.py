@@ -565,6 +565,7 @@ def main():
     recovery.add_argument("--parent-id", type=positive)
     recovery.add_argument("--limit", type=positive, default=10)
     recovery.add_argument("--execute", action="store_true")
+    recovery.add_argument("--probe", action="store_true", help="Read-only live API filter diagnostics for --parent-id")
     recovery.add_argument("--rate", type=positive_rate, default=1.0)
     reset = _add_output_options(
         sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
@@ -819,9 +820,22 @@ def main():
             with manager_lock():
                 command_bulk(None, args.run_id, [], args.limit, presenter=presenter)
         elif args.command == "discover-recover":
-            from ..pipelines.discovery import recover_discovery
+            from ..pipelines.discovery import probe_discovery_partition, recover_discovery
 
-            if args.execute:
+            if args.probe and args.execute:
+                raise ValueError("--probe and --execute are mutually exclusive")
+            if args.probe and args.parent_id is None:
+                raise ValueError("--probe requires --parent-id")
+            if args.probe:
+                with manager_lock() as conn:
+                    result = asyncio.run(
+                        probe_discovery_partition(
+                            parent_id=args.parent_id,
+                            rate=args.rate,
+                            health=lambda: assert_manager_lock(conn),
+                        )
+                    )
+            elif args.execute:
                 with manager_lock() as conn:
                     result = asyncio.run(
                         recover_discovery(
