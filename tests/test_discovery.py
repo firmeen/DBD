@@ -869,3 +869,129 @@ async def test_oversized_discovery_bucket_refuses_silent_count_shrink(monkeypatc
         )
     assert row["total_items"] == 271406
     assert archived == [(42, "processed")]
+
+
+def test_capital_filters_keep_legacy_bucket_key_and_exact_decimal_payload():
+    from decimal import Decimal
+
+    base = SearchFilters("010", jp_types=["5"], pv_codes=["10"])
+    assert base.key() == "k=010|t=|pv=10|st=|jt=5|sz="
+    with_bound = SearchFilters(
+        "010", jp_types=["5"], pv_codes=["10"],
+        cap_amt_min=Decimal("0.50"), cap_amt_max=Decimal("1000000.00"),
+    )
+    assert with_bound.key() != base.key()
+    assert "cap=capAmtMin:0.5,capAmtMax:1000000" in with_bound.key()
+    assert with_bound.payload()["capAmtMin"] == "0.5"
+    assert with_bound.payload()["capAmtMax"] == 1000000
+    assert SearchFilters("010", cap_amt_max=Decimal("1.00")).key() == (
+        SearchFilters("010", cap_amt_max=Decimal("1")).key()
+    )
+    for amount in ("NaN", "Infinity", "1E+1000000"):
+        with pytest.raises(ValueError):
+            SearchFilters("010", cap_amt_min=amount)
+    with pytest.raises(ValueError, match="exceeds"):
+        SearchFilters("010", cap_amt_min="2", cap_amt_max="1")
+
+
+def test_discovery_filter_round_trip_and_categorical_split_preserve_capital_range():
+    from decimal import Decimal
+
+    row = {
+        "keyword": "010", "search_type": "", "pv_codes": "", "jp_statuses": "",
+        "jp_types": "5", "business_sizes": "S",
+        "numeric_filters": '{"capAmtMin":"0.5","capAmtMax":"1000000"}',
+    }
+    original = discovery._filters_from_row(row)
+    assert original.cap_amt_min == Decimal("0.5")
+    assert original.cap_amt_max == Decimal("1000000")
+    plans = discovery._partition_plans(original, ["10", "20"], ["1", "8"])
+    assert plans
+    assert all(
+        child.cap_amt_min == original.cap_amt_min
+        and child.cap_amt_max == original.cap_amt_max
+        for plan in plans for child in plan
+    )
+
+
+@pytest.mark.asyncio
+async def test_numeric_parent_boundary_preview_does_not_write_or_certify(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repo
+
+    row = {
+        "id": 13316, "status": "failed", "total_items": 120,
+        "keyword": "010", "search_type": "", "pv_codes": "10",
+        "jp_types": "5", "jp_statuses": "1", "business_sizes": "S",
+        "numeric_filters": None,
+    }
+    calls = []
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Numeric boundary preview must not write any discovery state")
+
+    monkeypatch.setattr(repo, "get_bucket", lambda _id: row)
+    monkeypatch.setattr(repo, "archive_search", forbidden)
+    monkeypatch.setattr(discovery, "_count", forbidden)
+    monkeypatch.setattr(discovery, "split_bucket", forbidden)
+    monkeypatch.setattr(discovery, "update_bucket", forbidden)
+
+    class Client:
+        def __init__(self, **options):
+            assert options["concurrency"] == 1
+            assert options["rate_per_second"] == 0.25
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, path, payload, **_kwargs):
+            assert path == discovery.SEARCH_PATH
+            calls.append(dict(payload))
+            if payload["capAmtMax"] == 0:
+                amount, count = "0", 20
+            elif payload["capAmtMin"] == 1:
+                amount, count = "1", 100
+            else:
+                amount, count = "2", 120
+            return {
+                "meta": {"currentPage": 1, "totalItems": count, "totalPages": (count + 9) // 10},
+                "contents": [{"jpTypeCode": "5", "jpNo": "0100000000001", "capAmt": amount}],
+            }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    report = await discovery.probe_discovery_partition(
+        parent_id=13316, cap_max="0", cap_next_min="1", rate=0.25
+    )
+    assert report["mode"] == "numeric_plan_preview"
+    assert report["request_count"] == 4
+    assert report["count_parity"] is True
+    assert report["count_stable"] is True
+    assert report["stored_count_drift"] is False
+    assert report["decision"] == "OBSERVATION_ONLY"
+    assert calls[0] == calls[3]
+    assert calls[1]["capAmtMax"] == 0
+    assert calls[2]["capAmtMin"] == 1
+
+
+@pytest.mark.asyncio
+async def test_numeric_parent_probe_rejects_invalid_gap_before_http(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repo
+
+    row = {
+        "id": 13316, "status": "failed", "total_items": 120,
+        "keyword": "010", "search_type": "", "pv_codes": "10",
+        "jp_types": "5", "jp_statuses": "1", "business_sizes": "S",
+    }
+    monkeypatch.setattr(repo, "get_bucket", lambda _id: row)
+
+    class ForbiddenClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("Invalid numeric boundaries must not open HTTP")
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", ForbiddenClient)
+    with pytest.raises(ValueError, match="cap_max < cap_next_min"):
+        await discovery.probe_discovery_partition(
+            parent_id=13316, cap_max="1", cap_next_min="1",
+        )
