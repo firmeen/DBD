@@ -761,3 +761,23 @@ async def test_sqlserver_worker_cannot_bypass_core_node_gate_with_extended_colle
             phase="extended", backend="sqlserver",
             repository=repo, continuous=False,
         )
+
+
+@pytest.mark.asyncio
+async def test_recovery_mode_is_forwarded_to_discovery_without_changing_core_workflow(
+    monkeypatch,
+) -> None:
+    repo = _WorkflowRepo(finalized=1, unresolved=0)
+    captured = {}
+
+    async def fake_discovery_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return DiscoveryResult(1, 1, 0, 1, 0)
+
+    monkeypatch.setattr(workflow.discovery, "run", fake_discovery_run)
+    _, result = await workflow.discover(
+        repository=repo, recovery_pass=True, recovery_limit=3, verbose=False,
+    )
+    assert captured["recovery_pass"] is True
+    assert captured["recovery_limit"] == 3
+    assert result.buckets_processed == 1
