@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+import json
 
 from ....client.endpoints.search import SearchFilters
 from ..engine import connect
@@ -65,25 +66,29 @@ def split_bucket(
 
         for filters in children:
             key = _bucket_key(filters)
+            columns = [
+                "bucket_key", "parent_id", "depth", "keyword", "search_type",
+                "pv_codes", "jp_statuses", "jp_types", "business_sizes",
+                "status", "created_at", "updated_at",
+            ]
+            values = [
+                key, int(parent_id), int(depth), filters.keyword, filters.search_type,
+                ",".join(filters.pv_codes), ",".join(filters.jp_statuses),
+                ",".join(filters.jp_types), ",".join(filters.business_sizes),
+            ]
+            placeholders = ["%s"] * len(values) + [
+                "'pending'", "UTC_TIMESTAMP(6)", "UTC_TIMESTAMP(6)",
+            ]
+            numeric = filters.numeric_range()
+            if numeric is not None:
+                columns.append("numeric_filters")
+                placeholders.append("%s")
+                values.append(json.dumps(numeric, sort_keys=True))
             cur.execute(
-                """
-                INSERT INTO discovery_buckets(
-                  bucket_key,parent_id,depth,keyword,search_type,pv_codes,jp_statuses,jp_types,
-                  business_sizes,status,created_at,updated_at
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'pending',UTC_TIMESTAMP(6),UTC_TIMESTAMP(6))
-                ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),updated_at=VALUES(updated_at)
-                """,
-                (
-                    key,
-                    int(parent_id),
-                    int(depth),
-                    filters.keyword,
-                    filters.search_type,
-                    ",".join(filters.pv_codes),
-                    ",".join(filters.jp_statuses),
-                    ",".join(filters.jp_types),
-                    ",".join(filters.business_sizes),
-                ),
+                f"INSERT INTO discovery_buckets ({','.join(columns)}) "
+                f"VALUES ({','.join(placeholders)}) "
+                "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),updated_at=VALUES(updated_at)",
+                tuple(values),
             )
             child_ids.append(int(cur.lastrowid))
 
