@@ -325,3 +325,35 @@ def test_discovery_claim_prioritizes_committed_resume_and_fresh_children() -> No
             return Cursor()
 
     assert discovery_repository.next_work(Connection(), 2, "full") is None
+
+
+def test_numeric_recovery_reopens_only_safe_blocked_zero_page_buckets() -> None:
+    class Cursor:
+        rowcount = 1
+
+        def __init__(self):
+            self.sql = []
+
+        def execute(self, sql, params):
+            self.sql.append((sql, params))
+
+        def fetchall(self):
+            return [(101,), (102,)]
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return cursor
+
+    cursor = Cursor()
+    count = discovery_repository.reopen_blocked_numeric(
+        Connection(), 2, "full", limit=2,
+    )
+    assert count == 2
+    assert "last_committed_page=0" in cursor.sql[0][0]
+    assert "no_certified_lossless_split" in cursor.sql[0][0]
+    assert "ORDER BY updated_at,work_id" in cursor.sql[0][0]
+    assert all("SET status='COUNTED'" in sql for sql, _ in cursor.sql[1:])
+    assert [params[0] for _, params in cursor.sql[1:]] == [101,102]
