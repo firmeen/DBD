@@ -197,9 +197,13 @@ def save_snapshot(conn, *, company_id: int, branches: list[dict],
 
 
 def defer(conn, *, company_id: int, reason: str,
-          retry_at: datetime | None = None) -> None:
+          retry_at: datetime | None = None,
+          status: str = "UNAVAILABLE") -> None:
     """Failures never erase the previously certified branch count/snapshot."""
-    status = "RETRY" if retry_at is not None else "UNAVAILABLE"
+    if status not in {"RETRY", "UNAVAILABLE", "NOT_LISTED", "INVALID"}:
+        raise ContractError("Unknown branch failure status")
+    if status == "RETRY" and retry_at is None:
+        raise ContractError("Retry status requires a due time")
     cur = conn.cursor()
     try:
         cur.execute(
