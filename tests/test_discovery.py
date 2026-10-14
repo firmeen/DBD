@@ -679,3 +679,189 @@ async def test_numeric_probe_never_approves_drifting_parent(monkeypatch):
     assert result["count_stable"] is False
     assert result["decision"] == "OBSERVATION_ONLY"
     assert "drifted" in result["reason"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("capitals", "expected_check", "expected_missing", "expected_null"),
+    [
+        (["0", "0", "100", "500", "1000", "2000", "3000", "4000", "5000"], "PASS", 0, 0),
+        (["0", "0.5", "1"], "FAIL", 1, 0),
+        ([None, "0", "1"], "FAIL", 1, 1),
+    ],
+)
+async def test_keyword_probe_checks_every_identity_and_never_writes(
+    monkeypatch, capitals, expected_check, expected_missing, expected_null,
+):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    rows = [
+        {"jpTypeCode": "5", "jpNo": f"0100000000{i:03d}", "capAmt": amount}
+        for i, amount in enumerate(capitals)
+    ]
+    requests = []
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("Keyword probe must not access persistent discovery state")
+
+    monkeypatch.setattr(repository, "get_bucket", forbidden)
+    monkeypatch.setattr(repository, "archive_search", forbidden)
+    monkeypatch.setattr(discovery, "update_bucket", forbidden)
+    monkeypatch.setattr(discovery, "_count", forbidden)
+    monkeypatch.setattr(discovery, "split_bucket", forbidden)
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs["concurrency"] == 1
+            assert kwargs["rate_per_second"] == 0.25
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, path, payload, **_kwargs):
+            assert path == discovery.SEARCH_PATH
+            assert payload["keyword"] == "สงวนทอง"
+            requests.append(dict(payload))
+            selected = rows
+            if payload["capAmtMax"] == 0:
+                selected = [
+                    row for row in selected
+                    if row["capAmt"] is not None and float(row["capAmt"]) <= 0
+                ]
+            elif payload["capAmtMin"] == 1:
+                selected = [
+                    row for row in selected
+                    if row["capAmt"] is not None and float(row["capAmt"]) >= 1
+                ]
+            # This mimics the observed backend behavior: Min=0 returns Parent.
+            return {
+                "meta": {
+                    "currentPage": payload["currentPage"],
+                    "totalItems": len(selected),
+                    "totalPages": 1 if selected else 0,
+                },
+                "contents": selected,
+            }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    report = await discovery.probe_discovery_partition(keyword="สงวนทอง", rate=0.25)
+
+    assert len(requests) == 6
+    assert report["request_count"] == 6
+    assert report["parent_count"] == len(rows)
+    assert report["count_stable"] is True
+    assert report["cohort_check"] == expected_check
+    assert report["child_missing"] == expected_missing
+    assert report["null_parent_rows"] == expected_null
+    assert report["child_overlap"] == 0
+    assert report["decision"] == "OBSERVATION_ONLY"
+    assert report["min_zero_matches_parent"] is True
+    assert requests[0] == requests[-1]
+
+
+@pytest.mark.asyncio
+async def test_keyword_probe_reads_all_pages_and_rejects_duplicate_id(monkeypatch):
+    rows = [
+        {"jpTypeCode": "5", "jpNo": f"0100000000{i:03d}", "capAmt": str(i)}
+        for i in range(12)
+    ]
+    requests = []
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _path, payload, **_kwargs):
+            requests.append(dict(payload))
+            selected = rows
+            if payload["capAmtMax"] == 0:
+                selected = rows[:1]
+            elif payload["capAmtMin"] == 1:
+                selected = rows[1:]
+            start = (payload["currentPage"] - 1) * 10
+            return {
+                "meta": {
+                    "currentPage": payload["currentPage"],
+                    "totalItems": len(selected),
+                    "totalPages": (len(selected) + 9) // 10,
+                },
+                "contents": selected[start:start + 10],
+            }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    report = await discovery.probe_discovery_partition(keyword="สงวนทอง")
+    assert report["parent_count"] == 12
+    assert report["cohort_check"] == "PASS"
+    assert report["request_count"] == 9
+    assert any(item["currentPage"] == 2 for item in requests)
+
+
+@pytest.mark.asyncio
+async def test_keyword_probe_refuses_large_cohort_before_reading_more_pages(monkeypatch):
+    requests = []
+
+    class Client:
+        def __init__(self, **_kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _path, payload, **_kwargs):
+            requests.append(dict(payload))
+            return {
+                "meta": {"currentPage": 1, "totalItems": 101, "totalPages": 11},
+                "contents": [{"jpTypeCode": "5", "jpNo": "0100000000001"}],
+            }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    with pytest.raises(ContractError, match="safety limit"):
+        await discovery.probe_discovery_partition(keyword="สงวนทอง")
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_oversized_discovery_bucket_refuses_silent_count_shrink(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    row = {
+        "id": 13316, "keyword": "010", "search_type": "",
+        "jp_types": "5", "pv_codes": "10", "jp_statuses": "1",
+        "business_sizes": "S", "total_items": 271406,
+        "pages_total": 27141, "pages_done": 0, "depth": 4,
+    }
+    archived = []
+
+    async def fake_count(_client, _bucket_id, _filters):
+        return (
+            type("Page", (), {"current_page": 1, "total_items": 271341, "total_pages": 27135})(),
+            42, {}, None,
+        )
+
+    def forbid_update(*_args, **_kwargs):
+        raise AssertionError("Previously recorded count must not be overwritten")
+
+    monkeypatch.setattr(discovery, "_count", fake_count)
+    monkeypatch.setattr(discovery, "update_bucket", forbid_update)
+    monkeypatch.setattr(
+        repository, "mark_search_archive",
+        lambda archive_id, status: archived.append((archive_id, status)),
+    )
+    with pytest.raises(ContractError, match="refusing automatic shrink"):
+        await discovery._process_bucket(
+            None, row, [], master_cache={}, progress_line=None,
+        )
+    assert row["total_items"] == 271406
+    assert archived == [(42, "processed")]
