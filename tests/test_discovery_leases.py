@@ -138,7 +138,8 @@ def test_release_is_fenced_by_lease_version_even_for_same_owner() -> None:
 
 def test_recovery_cannot_change_a_child_held_by_live_worker() -> None:
     from dbd.storage.mysql.repositories.discovery_repository import (
-        apply_recovery_recount, update_bucket,
+        apply_recovery_recount,
+        update_bucket,
     )
 
     parent_filters = SearchFilters("recovery-lease-" + uuid4().hex)
