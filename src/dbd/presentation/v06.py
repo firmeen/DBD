@@ -551,7 +551,8 @@ class V06Terminal:
             "total_buckets", "committed_pages", "pending", "counted",
             "fetching", "done", "blocked", "failed", "split",
             "rate_limit_hits", "configured_rate", "cooldown_seconds",
-            "elapsed_seconds", "scope", "error",
+            "actual_http_rate_1m", "saved_page_rate_1m", "saved_pages_run",
+            "work_stage", "elapsed_seconds", "scope", "error",
         ):
             source = target
             if source not in payload:
@@ -821,6 +822,8 @@ class V06Terminal:
         if values.get("configured_rate") is not None:
             content.extend([Text(), self._metric_grid([
                 ("Target req/s",values.get("configured_rate"),"discovery.rate"),
+                ("Actual HTTP/s 1m",values.get("actual_http_rate_1m"),"discovery.actualrate"),
+                ("Saved pages/s 1m",values.get("saved_page_rate_1m"),"discovery.pagesrate"),
                 ("HTTP 429",values.get("rate_limit_hits",0),"discovery.429"),
                 ("Cooldown s",round(float(values.get("cooldown_seconds") or 0),1),"discovery.cooldown"),
             ],width)])
