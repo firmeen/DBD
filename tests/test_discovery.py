@@ -1392,3 +1392,46 @@ async def test_checkpointed_numeric_page_rejects_changed_total_items(monkeypatch
     )
     assert changes[-1]["status"] == "failed"
     assert changes[-1]["pages_done"] == 0
+
+@pytest.mark.asyncio
+async def test_certified_numeric_fallback_can_reuse_existing_split_validation(monkeypatch):
+    """Only an explicitly certified dimension may enter the split path."""
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    monkeypatch.setattr(
+        discovery, "PRODUCTION_CERTIFIED_DIMENSIONS", frozenset({"cap_amt"})
+    )
+    requests = []
+
+    async def count(_client, _bucket, filters):
+        requests.append(filters)
+        if filters.cap_amt_max is not None:
+            total, amount, identity = 8000, "100", "0100000000001"
+        elif filters.cap_amt_min is not None:
+            total, amount, identity = 12000, "9999999", "0100000000002"
+        else:
+            total, amount, identity = 20000, "1000000", "0100000000003"
+        page = type("Page", (), {
+            "current_page": 1, "total_items": total,
+            "rows": [{
+                "jpTypeCode": "5", "jpNo": identity,
+                "pvCode": "10", "jpStatCode": "1",
+                "businessSizeCode": "S", "capAmt": amount,
+            }],
+        })()
+        return page, 3, {}, None
+
+    monkeypatch.setattr(discovery, "_count", count)
+    monkeypatch.setattr(repository, "mark_search_archive", lambda *_a: None)
+    source = SearchFilters(
+        "010", jp_types=["5"], pv_codes=["10"],
+        jp_statuses=["1"], business_sizes=["S"],
+    )
+    children = await discovery._validated_children(
+        object(), 42, source, ["10"], ["1"], 20000, numeric_allowed=True
+    )
+    assert len(children) == 2
+    assert children[0].cap_amt_max is not None
+    assert children[1].cap_amt_min is not None
+    assert all(child.jp_types == ["5"] for child in children)
+    assert len(requests) <= 7
