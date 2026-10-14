@@ -1,20 +1,17 @@
-"""Count-aware numeric partition planning for Discovery.
+"""Count-aware range candidates for existing durable Discovery buckets.
 
-A plan is only an observation. Search numeric bounds are NOT approved for
-production splitting until their NULL, fractional and boundary coverage is
-independently certified. No MySQL writes or HTTP requests originate here.
+Planning is bounded and deliberately is not a production coverage certificate.
+Only the existing Discovery runner owns HTTP requests, leases and MySQL writes.
 """
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field, replace
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from ..client.endpoints.search import SearchFilters
 from ..contracts.common import money
 
-# Priority is stable; a later dimension is tried only if the former cannot
-# produce a useful subdivision. Existing numeric constraints are never dropped.
 NUMERIC_DIMENSIONS = (
     ("cap_amt", "capAmt"),
     ("total_asset", "totalAsset"),
@@ -22,15 +19,15 @@ NUMERIC_DIMENSIONS = (
     ("net_profit", "netProfit"),
 )
 
-# Intentionally empty. No DBD numeric dimension has passed the production-wide
-# NULL/fractional/boundary coverage gate. A successful count probe is insufficient.
+# No dimension has been proven to preserve DBD NULL, negative/fractional and
+# boundary coverage. Never enable these on the basis of count parity alone.
 PRODUCTION_CERTIFIED_DIMENSIONS: frozenset[str] = frozenset()
 
-# Candidate probe precision only. It is NOT evidence that the DBD API supports
-# an exhaustive one-satang partition; this must be established separately.
+# Preview hypothesis, NOT a certified DBD numeric quantum. Before any live
+# Numeric execution, both this quantum and API filtering semantics need proof.
 CANDIDATE_STEP = Decimal("0.01")
-MAX_TOTAL_TRIALS = 8
-MAX_DIMENSION_TRIALS = 2
+MAX_TOTAL_TRIALS = 12
+MAX_DIMENSION_TRIALS = 4
 
 
 @dataclass(frozen=True)
@@ -43,70 +40,83 @@ class NumericObservation:
 class NumericPlan:
     children: list[SearchFilters] = field(default_factory=list)
     child_counts: list[int] = field(default_factory=list)
+    child_observations: list[NumericObservation] = field(default_factory=list)
     dimension: str | None = None
     attempts: list[dict] = field(default_factory=list)
     reason: str = "no_valid_numeric_candidate"
 
     @property
     def candidate(self) -> bool:
-        return len(self.children) == 2
+        return len(self.children) == 2 and len(self.child_observations) == 2
+
+
+def _safe_pivot(
+    pivot: Decimal,
+    lower: Decimal | None,
+    upper: Decimal | None,
+    step: Decimal,
+) -> Decimal | None:
+    """Reject invalid or non-progressing two-child intervals *before* construction."""
+    if not pivot.is_finite() or step <= 0 or not step.is_finite():
+        return None
+    if lower is not None and pivot < lower:
+        return None
+    if upper is not None and pivot + step > upper:
+        return None
+    return pivot
 
 
 def _seed_pivot(
-    filters: SearchFilters, dimension: str, raw_key: str, samples: list[dict],
+    filters: SearchFilters,
+    dimension: str,
+    raw_key: str,
+    samples: list[dict],
+    step: Decimal,
 ) -> Decimal | None:
     lower = getattr(filters, dimension + "_min")
     upper = getattr(filters, dimension + "_max")
     if lower is not None and upper is not None:
-        if upper - lower < CANDIDATE_STEP:
+        if upper - lower < step:
             return None
-        return (lower + upper) / 2
+        return _safe_pivot(lower + (upper - lower - step) / 2, lower, upper, step)
 
-    # Reuse already fetched parent-page values: no extra sampling request.
+    # Parent page is already available from Count; do not fetch sample pages.
     observed = sorted(
         value for row in samples
         if (value := money(row.get(raw_key))) is not None
     )
-    if observed:
-        pivot = observed[len(observed) // 2]
-    elif lower is not None:
-        pivot = lower + Decimal(1_000_000)
-    elif upper is not None:
-        pivot = upper - Decimal(1_000_000)
-    else:
-        # A missing sampled field is not evidence of numeric completeness.
+    if not observed:
         return None
+    pivot = observed[len(observed) // 2]
+    if lower is not None:
+        pivot = max(pivot, lower)
+    if upper is not None:
+        pivot = min(pivot, upper - step)
+    return _safe_pivot(pivot, lower, upper, step)
 
-    if lower is not None and pivot < lower:
-        pivot = lower
-    if upper is not None and pivot + CANDIDATE_STEP > upper:
-        pivot = upper - CANDIDATE_STEP
-    return pivot
 
-
-def _step_pivot(
-    pivot: Decimal, left: int, right: int,
-    lower: Decimal | None, upper: Decimal | None,
+def _next_pivot(
+    pivot: Decimal,
+    left: int,
+    right: int,
+    lower: Decimal | None,
+    upper: Decimal | None,
+    step: Decimal,
 ) -> Decimal | None:
-    # Move toward the denser child. Bounded ranges permit binary refinement;
-    # unbounded ranges expand or contract by magnitude, never an endless loop.
+    """Count-directed refinement, not a fixed 50/50 split of monetary values."""
+    if left == right:
+        return None
     if left > right:
-        candidate = (lower + pivot) / 2 if lower is not None else (
+        next_value = ((lower + pivot) / 2) if lower is not None else (
             pivot / 2 if pivot > 0 else pivot - max(Decimal(1), abs(pivot) * 9)
         )
     else:
-        candidate = (pivot + upper) / 2 if upper is not None else (
-            pivot * 10 if pivot > 0 else (
-                Decimal(1) if pivot == 0 else pivot / 2
-            )
+        next_value = ((pivot + upper - step) / 2) if upper is not None else (
+            pivot * 10 if pivot > 0 else Decimal(1) if pivot == 0 else pivot / 2
         )
-    if candidate == pivot:
+    if next_value == pivot:
         return None
-    if lower is not None and candidate < lower:
-        return None
-    if upper is not None and candidate + CANDIDATE_STEP > upper:
-        return None
-    return candidate
+    return _safe_pivot(next_value, lower, upper, step)
 
 
 async def plan_numeric_split(
@@ -118,60 +128,74 @@ async def plan_numeric_split(
     dimensions: tuple[str, ...] | None = None,
     max_total_trials: int = MAX_TOTAL_TRIALS,
     max_dimension_trials: int = MAX_DIMENSION_TRIALS,
+    step: Decimal = CANDIDATE_STEP,
 ) -> NumericPlan:
-    """Return a bounded, count-aware *candidate*, never a certified split.
+    """Find a useful two-way candidate within the total request budget.
 
-    A candidate must still pass a separate backend capability and identity
-    coverage gate plus a stable parent recount before children may be saved.
+    One trial is TWO count requests. A numeric candidate cannot prove that
+    unavailable/NULL values were covered, even when child counts add up.
     """
     if parent_count <= 10_000:
         return NumericPlan(reason="within_page_limit")
     if max_total_trials < 1 or max_dimension_trials < 1:
         raise ValueError("numeric probe budget must be positive")
-
+    try:
+        quantum = Decimal(step)
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("invalid numeric candidate quantum") from None
+    if not quantum.is_finite() or quantum <= 0:
+        raise ValueError("numeric candidate quantum must be positive")
     allowed = set(dimensions) if dimensions is not None else {
-        name for name, _ in NUMERIC_DIMENSIONS
+        dimension for dimension, _ in NUMERIC_DIMENSIONS
     }
+    if allowed - {dimension for dimension, _ in NUMERIC_DIMENSIONS}:
+        raise ValueError("unknown numeric dimension")
     plan = NumericPlan()
+
     for dimension, raw_key in NUMERIC_DIMENSIONS:
         if dimension not in allowed:
             continue
         lower = getattr(filters, dimension + "_min")
         upper = getattr(filters, dimension + "_max")
-        pivot = _seed_pivot(filters, dimension, raw_key, parent_rows)
+        pivot = _seed_pivot(filters, dimension, raw_key, parent_rows, quantum)
         if pivot is None:
-            plan.reason = f"{dimension}:no_sample_or_unsplittable_bounds"
+            plan.reason = f"{dimension}:no_valid_boundary_or_sample"
             continue
 
-        best: tuple[int, list[SearchFilters], list[int], str] | None = None
+        best: tuple[int, list[SearchFilters], list[NumericObservation]] | None = None
+        tried: set[Decimal] = set()
         for _ in range(max_dimension_trials):
             if len(plan.attempts) >= max_total_trials:
+                plan.reason = "numeric_probe_budget_exhausted"
                 break
-            # Decimal next-min is only a *hypothesis*. Executing this as a
-            # lossless split requires a separately established precision gate.
-            child_left = replace(filters, **{dimension + "_max": pivot})
-            child_right = replace(filters, **{
-                dimension + "_min": pivot + CANDIDATE_STEP
+            if pivot in tried or _safe_pivot(pivot, lower, upper, quantum) is None:
+                break
+            tried.add(pivot)
+            left_filter = replace(filters, **{dimension + "_max": pivot})
+            right_filter = replace(filters, **{
+                dimension + "_min": pivot + quantum,
             })
-            if child_left.key() == filters.key() or child_right.key() == filters.key():
+            if left_filter.key() == filters.key() or right_filter.key() == filters.key():
                 break
-
-            left = await read_count(child_left)
-            right = await read_count(child_right)
+            left = await read_count(left_filter)
+            right = await read_count(right_filter)
+            observations = [left, right]
             counts = [left.count, right.count]
             reason = "candidate"
-            if any(value < 0 for value in counts):
+
+            if any(count < 0 for count in counts):
                 reason = "invalid_child_count"
             elif sum(counts) != parent_count:
                 reason = "count_mismatch_or_numeric_gap"
             elif max(counts) >= parent_count or min(counts) == 0:
                 reason = "no_progress"
             elif any(
-                money(row.get(raw_key)) is None
-                or (index == 0 and money(row.get(raw_key)) > pivot)
-                or (index == 1 and money(row.get(raw_key)) < pivot + CANDIDATE_STEP)
-                for index, obs in enumerate((left, right))
+                amount is None
+                or (i == 0 and amount > pivot)
+                or (i == 1 and amount < pivot + quantum)
+                for i, obs in enumerate(observations)
                 for row in obs.rows
+                for amount in [money(row.get(raw_key))]
             ):
                 reason = "sample_filter_mismatch"
 
@@ -181,29 +205,34 @@ async def plan_numeric_split(
                 "reason": reason,
             })
             if reason == "candidate":
-                # Prefer a completed child or a balanced split; don't spend
-                # further HTTP requests polishing an already useful split.
-                imbalance = max(counts)
-                if best is None or imbalance < best[0]:
-                    best = (imbalance, [child_left, child_right], counts, dimension)
-                if min(counts) <= 10_000 or imbalance * 4 <= parent_count * 3:
-                    plan.children, plan.child_counts = best[1], best[2]
-                    plan.dimension, plan.reason = best[3], "count_candidate_only"
+                score = max(counts)
+                if best is None or score < best[0]:
+                    best = (score, [left_filter, right_filter], observations)
+                # One completed leaf is useful even if the other remains large.
+                if min(counts) <= 10_000 or score * 4 <= parent_count * 3:
+                    plan.children, plan.child_observations = best[1], best[2]
+                    plan.child_counts = [o.count for o in best[2]]
+                    plan.dimension, plan.reason = dimension, "count_candidate_only"
                     return plan
-            elif reason in ("count_mismatch_or_numeric_gap", "sample_filter_mismatch"):
-                # Do not re-probe a dimension with evidence of a coverage gap.
+            elif reason in ("count_mismatch_or_numeric_gap", "sample_filter_mismatch", "invalid_child_count"):
+                # Coverage contradictions must not be 'fixed' by repeated guesses.
                 break
 
-            next_pivot = _step_pivot(pivot, counts[0], counts[1], lower, upper)
-            if next_pivot is None:
+            candidate_pivot = _next_pivot(
+                pivot, counts[0], counts[1], lower, upper, quantum
+            )
+            if candidate_pivot is None:
                 break
-            pivot = next_pivot
+            pivot = candidate_pivot
 
         if best is not None:
-            plan.children, plan.child_counts = best[1], best[2]
-            plan.dimension, plan.reason = best[3], "count_candidate_only"
+            plan.children, plan.child_observations = best[1], best[2]
+            plan.child_counts = [o.count for o in best[2]]
+            plan.dimension, plan.reason = dimension, "count_candidate_only"
             return plan
         if len(plan.attempts) >= max_total_trials:
             plan.reason = "numeric_probe_budget_exhausted"
             break
+        # Exhausting a finite probe budget is not proof that a dimension holds
+        # only one numeric value. Switching dimension is a bounded heuristic.
     return plan
