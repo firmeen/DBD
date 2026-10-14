@@ -16,6 +16,11 @@ class Settings(BaseSettings):
         env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore", frozen=True
     )
     dbd_production_backend: Literal["sqlserver", "mysql"] = "sqlserver"
+    dataforthai_concurrency: int = Field(15, ge=1, le=32)
+    dataforthai_rate_per_second: float = Field(15, gt=0, le=100)
+    dataforthai_request_timeout: int = Field(30, ge=1, le=300)
+    dataforthai_http_attempts: int = Field(3, ge=1, le=10)
+    dataforthai_status_codes: str = Field("1,A,B", pattern=r"^[0-9A-Za-z]+(?:,[0-9A-Za-z]+)*$")
     dbd_operator_name: str | None = None
     # Separate from DB_* (Legacy Dataset 1 and campaign runtime).
     prod_mysql_host: str = "127.0.0.1"
