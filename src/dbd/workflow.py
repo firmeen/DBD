@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from contextlib import contextmanager
+from time import monotonic
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable
@@ -20,6 +23,38 @@ from .pipelines.discovery import DiscoveryResult
 from .storage.production import production_repository
 
 EventCallback = Callable[[str, dict[str, Any]], None]
+
+@contextmanager
+def _keep_system_awake():
+    """Prevent idle sleep only while a foreground production operation runs."""
+    if sys.platform != "win32":
+        yield
+        return
+    import ctypes
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001
+    succeeded = ctypes.windll.kernel32.SetThreadExecutionState(
+        ES_CONTINUOUS | ES_SYSTEM_REQUIRED
+    )
+    try:
+        yield
+    finally:
+        if succeeded:
+            ctypes.windll.kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+
+
+async def _wait_for_remote_claims(repo, *, generation: int) -> None:
+    """Drain active SQL leases before VERIFY without waiting for idle nodes."""
+    deadline = monotonic() + max(90, int(settings.dbd_lease_seconds) * 2)
+    while True:
+        summary = await asyncio.to_thread(
+            repo.status_summary, phase_mask=CORE_ENDPOINT_MASK, generation=generation
+        )
+        if int(summary.get("active_leases") or 0) == 0:
+            return
+        if monotonic() >= deadline:
+            raise RuntimeError("Remote claims did not drain; resume the same generation")
+        await asyncio.sleep(2.0)
 
 
 @dataclass(frozen=True)
@@ -96,6 +131,17 @@ def _repo(repository: Any | None, backend: str | None = None) -> Any:
             f"Production repository backend {actual!r} does not match {backend!r}"
         )
     return repository
+
+
+def _require_sql_admin(repo: Any) -> None:
+    if getattr(repo, "backend", None) != "sqlserver":
+        return
+    from .presentation.setup import local_node_id
+    from .storage.sqlserver.control_repository import ControlRepository
+    node = local_node_id()
+    if node is None:
+        raise RuntimeError("Admin setup is required for this SQL Server mutation")
+    ControlRepository().require_admin(node)
 
 
 def _manual_generation(
@@ -218,6 +264,7 @@ async def prepare(
     event: EventCallback | None = None,
 ) -> PrepareResult:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
         selected = int(generation or _manual_generation(repo, phase=phase))
         _emit(event, "phase_started", phase="PREPARE", generation=selected)
@@ -285,6 +332,7 @@ async def retry(
     event: EventCallback | None = None,
 ) -> RetryResult:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
         generation = _manual_generation(repo, phase=phase)
         _emit(event, "phase_started", phase="RETRY", generation=generation)
@@ -356,29 +404,82 @@ async def collect(
     repository: Any | None = None,
     backend: str | None = None,
     event: EventCallback | None = None,
+    allow_targeted_sql: bool = False,
 ) -> dict[str, Any]:
     repo = _repo(repository, backend)
-    selected_generation = int(
-        generation or await asyncio.to_thread(_manual_generation, repo, phase=phase)
+    # Remote SQL Server Workers are authorized only to join the monthly Core
+    # fleet; standalone Extended collection retains its Admin-only boundary.
+    if getattr(repo, "backend", None) == "sqlserver" and phase != "core":
+        _require_sql_admin(repo)
+    targeted_sql = (
+        bool(allow_targeted_sql) and company_id is not None
+        and getattr(repo, "backend", None) == "sqlserver"
     )
-    collector = DeepCollector(
-        repository=repo,
-        generation=selected_generation,
-        phase=phase,
-        concurrency=int(concurrency or settings.dbd_concurrency),
-        rate_per_second=float(rate or settings.dbd_rate_per_second),
-        http_retries=(
-            int(settings.dbd_http_retries)
-            if http_retries is None
-            else int(http_retries)
-        ),
-        company_limit=limit,
-        company_id=company_id,
-        continuous=continuous,
-        idle_seconds=idle_seconds,
-        event=event,
+    if targeted_sql:
+        _require_sql_admin(repo)
+        from .storage.sqlserver.control_repository import ControlRepository
+        if await asyncio.to_thread(ControlRepository().active_generation) is not None:
+            raise RuntimeError("Targeted SQL Server Deep cannot bypass an active monthly generation")
+    is_shared_core = (
+        getattr(repo, "backend", None) == "sqlserver"
+        and phase == "core" and not targeted_sql
     )
-    return await collector.run()
+    node_id = None
+    control = None
+    if is_shared_core:
+        from .presentation.setup import local_node_id
+        from .storage.sqlserver.control_repository import ControlRepository
+        node_id = local_node_id()
+        if node_id is None:
+            raise RuntimeError("Run dbd-data setup before SQL Server Deep Collection")
+        control = ControlRepository()
+
+    while True:
+        selected_generation = int(
+            generation or await asyncio.to_thread(_manual_generation, repo, phase=phase)
+        )
+        if control is not None:
+            active = await asyncio.to_thread(control.active_generation)
+            node = await asyncio.to_thread(control.node_status, node_id)
+            if node is None or not node.get("authorized"):
+                raise RuntimeError("Unapproved node or mismatched SQL Server login")
+            if active is None or active.get("state") != "COLLECTING":
+                if not continuous or generation is not None:
+                    raise RuntimeError("No COLLECTING monthly generation is available to join")
+                _emit(event, "cycle_waiting", idle_seconds=idle_seconds)
+                await asyncio.sleep(idle_seconds)
+                continue
+            if generation is not None and int(generation) != int(active["generation"]):
+                raise RuntimeError("Collector generation does not match SQL Server coordinator")
+            selected_generation = int(active["generation"])
+
+        collector = DeepCollector(
+            repository=repo,
+            generation=selected_generation,
+            phase=phase,
+            concurrency=int(concurrency or settings.dbd_concurrency),
+            rate_per_second=float(rate or settings.dbd_rate_per_second),
+            http_retries=(
+                int(settings.dbd_http_retries)
+                if http_retries is None
+                else int(http_retries)
+            ),
+            company_limit=limit,
+            company_id=company_id,
+            node_id=node_id,
+            continuous=continuous,
+            idle_seconds=idle_seconds,
+            event=event,
+        )
+        with _keep_system_awake():
+            result = await collector.run()
+        if not (continuous and is_shared_core and generation is None
+                and limit is None and company_id is None):
+            return result
+        # A long-running Worker may join the *next* Generation without holding
+        # old claims or attempting to start a Generation itself.
+        _emit(event, "cycle_waiting", idle_seconds=idle_seconds)
+        await asyncio.sleep(idle_seconds)
 
 
 async def discover(
@@ -390,14 +491,60 @@ async def discover(
     concurrency: int | None = None,
     rate: float | None = None,
     max_buckets: int | None = None,
+    recovery_limit: int | None = None,
+    recovery_pass: bool = False,
+    manual_confirmed: bool = False,
     verbose: bool = True,
     repository: Any | None = None,
     backend: str | None = None,
     event: EventCallback | None = None,
 ) -> tuple[int, DiscoveryResult]:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
         generation, resumed = _cycle_generation(repo, phase=phase)
+        if getattr(repo, "backend", None) == "sqlserver":
+            from .control import EarlyStartConfirmationRequired
+            from .presentation.setup import local_node_id
+            from .storage.sqlserver.control_repository import ControlRepository
+
+            node_id = local_node_id()
+            if node_id is None:
+                raise RuntimeError("Run dbd-data setup before SQL Server discovery")
+            control = ControlRepository()
+            scoped = bool(seeds or search_type or max_buckets is not None)
+            active = control.active_generation()
+            if scoped:
+                if (active is None or active.get("state") != "DISCOVERING"
+                    or int(active.get("generation") or 0) != generation):
+                    raise RuntimeError(
+                        "Scoped diagnostics require an existing DISCOVERING "
+                        "monthly generation and cannot open a new one"
+                    )
+            else:
+                action, record = control.select_cycle(
+                    node_id, repo.generation_state(), auto=False,
+                    manual_confirmed=manual_confirmed,
+                    now=datetime.now(timezone.utc),
+                )
+                if action == "NOT_DUE":
+                    raise EarlyStartConfirmationRequired(
+                        "Monthly generation not due; operator confirmation required"
+                    )
+                if action == "ALREADY_COMPLETED":
+                    raise RuntimeError(
+                        "This monthly Generation is already complete"
+                    )
+                if record is None or action not in ("START", "RESUME"):
+                    raise RuntimeError("Monthly Discovery cannot start")
+                if record.get("state") not in ("SCHEDULED", "DISCOVERING"):
+                    raise RuntimeError(
+                        "Standalone Discovery cannot rewind a generation "
+                        "that already entered Core Collection"
+                    )
+                generation = int(record["generation"])
+                resumed = action == "RESUME"
+                control.transition(node_id,str(record["cycle_month"]),"DISCOVERING")
         repo.assert_manager_lock(lock_conn)
         _emit(
             event,
@@ -412,6 +559,8 @@ async def discover(
             concurrency=concurrency,
             rate=rate,
             max_buckets=max_buckets,
+            recovery_limit=recovery_limit,
+            recovery_pass=recovery_pass,
             verbose=verbose,
             distributed=False,
             generation=generation,
@@ -547,6 +696,7 @@ async def fetch_company(
     event: EventCallback | None = None,
 ) -> FetchCompanyResult:
     repo = _repo(repository, backend)
+    _require_sql_admin(repo)
 
     with repo.manager_lock() as lock_conn:
         state = repo.generation_state()
@@ -585,6 +735,7 @@ async def fetch_company(
                 company_id=company_id,
                 repository=repo,
                 event=event,
+                allow_targeted_sql=True,
             ),
         )
         repo.assert_manager_lock(lock_conn)
@@ -639,7 +790,11 @@ async def cycle_run(
     backend: str | None = None,
     event: EventCallback | None = None,
     verbose: bool = True,
+    auto: bool = False,
+    manual_confirmed: bool = False,
 ) -> CycleResult:
+    if auto and phase != "core":
+        raise ValueError("--auto is supported only for the SQL Server Core monthly cycle")
     if seeds or search_type or max_buckets is not None:
         raise ValueError(
             "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
@@ -651,6 +806,47 @@ async def cycle_run(
         repo.assert_manager_lock(lock_conn)
 
         generation, resumed = _cycle_generation(repo, phase=phase)
+        control = None
+        control_node = None
+        cycle_month = None
+        if phase == "core" and getattr(repo, "backend", None) == "sqlserver":
+            from .control import EarlyStartConfirmationRequired
+            from .presentation.setup import local_node_id
+            from .storage.sqlserver.control_repository import ControlRepository
+            control_node = local_node_id()
+            if control_node is None:
+                raise RuntimeError("Run dbd-data setup before the monthly cycle")
+            control = ControlRepository()
+            action, record = control.select_cycle(
+                control_node,
+                repo.generation_state(),
+                auto=auto,
+                manual_confirmed=manual_confirmed,
+                now=datetime.now(timezone.utc),
+            )
+            if action == "NOT_DUE" and not auto:
+                raise EarlyStartConfirmationRequired(
+                    "Monthly generation is not due yet; confirmation required to start early"
+                )
+            if action in ("NOT_DUE", "ALREADY_COMPLETED"):
+                result = CycleResult(
+                    status=action,
+                    generation=int(record["generation"]) if record else generation,
+                    phase=phase, resumed=False,
+                    discovery={}, prepare={}, collection={}, verification={},
+                    finalized_rows=0,
+                )
+                _emit(event, "cycle_completed", **asdict(result))
+                return result
+            assert record is not None
+            generation = int(record["generation"])
+            cycle_month = str(record["cycle_month"])
+            resumed = action == "RESUME"
+            if record.get("start_warning"):
+                _emit(event, "warning", message=str(record["start_warning"]))
+            control.transition(control_node, cycle_month, "DISCOVERING")
+        elif auto:
+            raise ValueError("--auto requires the SQL Server production backend")
         _emit(
             event,
             "phase_completed",
@@ -673,11 +869,12 @@ async def cycle_run(
             event=event,
         )
         _emit(event, "phase_started", phase="DISCOVER", generation=generation)
-        discovery_result = await _guard_application_lock(
-            repo,
-            lock_conn,
-            discover_work,
-        )
+        with _keep_system_awake():
+            discovery_result = await _guard_application_lock(
+                repo,
+                lock_conn,
+                discover_work,
+            )
         _emit(
             event,
             "phase_completed",
@@ -690,6 +887,18 @@ async def cycle_run(
             invalid_rows=discovery_result.invalid_rows,
         )
 
+        if control is not None:
+            # SQL durable Discovery is the sole authority for full-universe
+            # completion; an empty transient queue is not a coverage certificate.
+            from .storage.sqlserver import discovery_repository as discovery_work
+            with repo.transaction() as conn:
+                evidence = discovery_work.coverage(conn, generation, "full")
+            if not evidence["ok"]:
+                raise RuntimeError(
+                    "Monthly Core Discovery is incomplete; cannot PREPARE: "
+                    + str(evidence)
+                )
+            control.transition(control_node, cycle_month, "PREPARING")
         _emit(event, "phase_started", phase="PREPARE", generation=generation)
         repo.assert_manager_lock(lock_conn)
         prepare_result = await asyncio.to_thread(
@@ -707,6 +916,8 @@ async def cycle_run(
             rows_prepared=prepare_result.rows_prepared,
         )
 
+        if control is not None:
+            control.transition(control_node, cycle_month, "COLLECTING")
         _emit(event, "phase_started", phase="COLLECT", generation=generation)
         collection_work = collect(
             generation=generation,
@@ -718,16 +929,22 @@ async def cycle_run(
             repository=repo,
             event=event,
         )
-        collection_result = await _guard_application_lock(
-            repo,
-            lock_conn,
-            collection_work,
-        )
+        with _keep_system_awake():
+            collection_result = await _guard_application_lock(
+                repo,
+                lock_conn,
+                collection_work,
+            )
         _emit(event, "phase_completed", phase="COLLECT", generation=generation)
 
+        if control is not None:
+            control.transition(control_node, cycle_month, "DRAINING")
+            await _wait_for_remote_claims(repo, generation=generation)
         repo.assert_manager_lock(lock_conn)
         await asyncio.to_thread(_recover_expired, repo)
         repo.assert_manager_lock(lock_conn)
+        if control is not None:
+            control.transition(control_node, cycle_month, "VERIFYING")
 
         _emit(event, "phase_started", phase="VERIFY", generation=generation)
         verification = await verify(
@@ -758,6 +975,8 @@ async def cycle_run(
             _emit(event, "cycle_completed", **asdict(result))
             return result
 
+        if control is not None:
+            control.transition(control_node, cycle_month, "FINALIZING")
         _emit(event, "phase_started", phase="FINALIZE", generation=generation)
         finalized_rows = await _finalize_all(
             repo,
@@ -791,6 +1010,11 @@ async def cycle_run(
             verification=final_verification.details,
             finalized_rows=finalized_rows,
         )
+        if control is not None and final_ok:
+            control.transition(
+                control_node, cycle_month,
+                "COMPLETE_WITH_FAILURES" if status_value == "COMPLETE_WITH_FAILURES" else "COMPLETED",
+            )
         _emit(event, "phase_completed", phase="FINALIZE", generation=generation)
         _emit(event, "cycle_completed", **asdict(result))
         return result
@@ -832,6 +1056,7 @@ async def cycle_loop(
             backend=backend,
             event=event,
             verbose=verbose,
+            auto=(phase == "core" and (backend or settings.dbd_production_backend) == "sqlserver"),
         )
         if last.status == "FAILED":
             return last

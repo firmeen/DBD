@@ -696,3 +696,88 @@ def test_core_cycle_resumes_same_generation_without_skipping_ineligible_rows() -
     repo.finalized = 2
     repo.unfinished = 0
     assert workflow._cycle_generation(repo, phase="core") == (3, False)
+
+
+@pytest.mark.asyncio
+async def test_sqlserver_auto_cycle_not_due_skips_all_http_and_finalize(monkeypatch) -> None:
+    from dbd.presentation import setup as setup_module
+    from dbd.storage.sqlserver import control_repository
+
+    class FakeControl:
+        def select_cycle(self, _node, _state, **kwargs):
+            assert kwargs["auto"] is True
+            return "NOT_DUE", None
+
+    repo = _WorkflowRepo(finalized=1)
+    repo.backend = "sqlserver"
+    monkeypatch.setattr(setup_module, "local_node_id", lambda: "node-test")
+    monkeypatch.setattr(control_repository, "ControlRepository", FakeControl)
+
+    async def never_discover(*_args, **_kwargs):
+        raise AssertionError("NOT_DUE must never issue upstream Search")
+
+    monkeypatch.setattr(workflow.discovery, "run", never_discover)
+    result = await workflow.cycle_run(
+        phase="core", auto=True, repository=repo, verbose=False,
+    )
+    assert result.status == "NOT_DUE"
+    assert result.finalized_rows == 0
+    assert repo.finalize_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sqlserver_manual_before_due_requires_confirmation(monkeypatch) -> None:
+    from dbd.control import EarlyStartConfirmationRequired
+    from dbd.presentation import setup as setup_module
+    from dbd.storage.sqlserver import control_repository
+
+    class FakeControl:
+        def select_cycle(self, _node, _state, **kwargs):
+            assert not kwargs["auto"]
+            assert not kwargs["manual_confirmed"]
+            return "NOT_DUE", None
+
+    repo = _WorkflowRepo(finalized=1)
+    repo.backend = "sqlserver"
+    monkeypatch.setattr(setup_module, "local_node_id", lambda: "node-test")
+    monkeypatch.setattr(control_repository, "ControlRepository", FakeControl)
+
+    with pytest.raises(EarlyStartConfirmationRequired):
+        await workflow.cycle_run(phase="core", repository=repo, verbose=False)
+    assert repo.finalize_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_sqlserver_worker_cannot_bypass_core_node_gate_with_extended_collect(monkeypatch) -> None:
+    repo = _WorkflowRepo(finalized=1, active=None, unresolved=0)
+    repo.backend = "sqlserver"
+
+    def deny(_repository):
+        raise RuntimeError("Admin authorization required")
+
+    monkeypatch.setattr(workflow, "_require_sql_admin", deny)
+    with pytest.raises(RuntimeError, match="Admin authorization required"):
+        await workflow.collect(
+            phase="extended", backend="sqlserver",
+            repository=repo, continuous=False,
+        )
+
+
+@pytest.mark.asyncio
+async def test_recovery_mode_is_forwarded_to_discovery_without_changing_core_workflow(
+    monkeypatch,
+) -> None:
+    repo = _WorkflowRepo(finalized=1, unresolved=0)
+    captured = {}
+
+    async def fake_discovery_run(*_args, **kwargs):
+        captured.update(kwargs)
+        return DiscoveryResult(1, 1, 0, 1, 0)
+
+    monkeypatch.setattr(workflow.discovery, "run", fake_discovery_run)
+    _, result = await workflow.discover(
+        repository=repo, recovery_pass=True, recovery_limit=3, verbose=False,
+    )
+    assert captured["recovery_pass"] is True
+    assert captured["recovery_limit"] == 3
+    assert result.buckets_processed == 1

@@ -181,10 +181,17 @@ def parse_args(argv: list[str] | None = None):
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
     terminal = V06Terminal(args.command, app="DBD DEEP")
+    selected_backend = args.backend or settings.dbd_production_backend
     context = {
         "phase": args.phase,
-        "backend": args.backend or settings.dbd_production_backend,
+        "backend": selected_backend,
     }
+    if selected_backend == "sqlserver":
+        from ..presentation.setup import local_node_id
+        context.update(
+            operator_name=settings.dbd_operator_name,
+            node_id=local_node_id(),
+        )
     if args.command == "collect":
         context.update(
             {

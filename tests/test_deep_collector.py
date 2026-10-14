@@ -768,3 +768,65 @@ async def test_inactive_profile_stops_rest_of_core_without_erasing_history() -> 
     assert repo.state["done_mask"] & ENDPOINT_BITS["transformations"]
     assert repo.state["collect_status"] == "DISCOVERED"
     assert repo.released == 1
+
+
+def test_worker_machine_identity_is_in_durable_claim_prefix() -> None:
+    collector = _collector(node_id="node-test123")
+    assert collector._worker_prefix.startswith("node-test123:")
+    assert collector.node_id == "node-test123"
+
+
+@pytest.mark.asyncio
+async def test_fleet_rate_admission_is_checked_per_http_attempt() -> None:
+    from dbd.deep.http import FixedRateDbdClient
+    admitted = []
+    client = FixedRateDbdClient(
+        concurrency=1, rate_per_second=1000, max_retries=1,
+        admission=lambda: admitted.append("slot") or 0.0,
+    )
+    await client._admit()
+    await client._admit()
+    assert admitted == ["slot", "slot"]
+
+
+@pytest.mark.asyncio
+async def test_fleet_rate_database_failure_must_not_fallback_to_local_rate() -> None:
+    from dbd.deep.http import FixedRateDbdClient
+
+    def unavailable():
+        raise RuntimeError("SQL Server global admission unavailable")
+
+    client = FixedRateDbdClient(
+        concurrency=1, rate_per_second=1000, max_retries=0,
+        admission=unavailable,
+    )
+    with pytest.raises(RuntimeError, match="global admission"):
+        await client._admit()
+
+
+def test_global_admission_covers_sync_auth_warmup_and_refresh(monkeypatch) -> None:
+    """Sync auth HTTP must not silently bypass the SQL Server fleet limiter."""
+    import dbd.deep.http as http
+    events = []
+
+    class AuthSession:
+        def request(self, method, _url, **_kwargs):
+            events.append(("http", method))
+            return object()
+        def get(self, url, **kwargs):
+            return self.request("GET", url, **kwargs)
+        def post(self, url, **kwargs):
+            return self.request("POST", url, **kwargs)
+
+    monkeypatch.setattr(http, "create_session", AuthSession)
+    client = http.FixedRateDbdClient(
+        concurrency=1, rate_per_second=10.0, max_retries=0,
+        admission=lambda: events.append(("slot", None)) or 0.0,
+    )
+    session = client._new_auth_session()
+    session.get("https://example.invalid/warmup")
+    session.post("https://example.invalid/api/refresh")
+    assert events == [
+        ("slot", None), ("http", "GET"),
+        ("slot", None), ("http", "POST"),
+    ]

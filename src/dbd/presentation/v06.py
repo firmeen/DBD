@@ -27,19 +27,23 @@ _COLLECTION_COUNTERS = (
 _MUTATING_COMMANDS = {
     "migrate",
     "discover",
+    "recover",
     "fetch-company",
     "cycle-run",
     "cycle-loop",
     "prepare",
     "collect",
     "retry",
+    "branch",
 }
-_LONG_RUNNING_COMMANDS = {"discover", "fetch-company", "cycle-run", "cycle-loop", "collect"}
+_LONG_RUNNING_COMMANDS = {"discover", "recover", "fetch-company", "cycle-run", "cycle-loop", "collect", "branch"}
 _COMMAND_LABELS = {
     "check-db": "CHECK DB",
     "migrate": "MIGRATE",
     "cutover": "CUTOVER",
     "discover": "DISCOVER",
+    "recover": "RECOVER",
+    "branch": "BRANCH",
     "fetch-company": "FETCH COMPANY",
     "cycle-run": "CYCLE RUN",
     "cycle-loop": "CYCLE LOOP",
@@ -103,6 +107,9 @@ class V06TerminalState:
     app: str
     command: str
     backend: str = "sqlserver"
+    operator_name: str | None = None
+    node_id: str | None = None
+    automatic: bool = False
     started_at: datetime | None = None
     started_monotonic: float = 0.0
     finished_at: datetime | None = None
@@ -114,6 +121,8 @@ class V06TerminalState:
     resumed: bool | None = None
     phase_states: dict[str, str] = field(default_factory=dict)
     discovery: dict[str, Any] = field(default_factory=dict)
+    branch: dict[str, Any] = field(default_factory=dict)
+    last_plain_progress_at: float = 0.0
     collection: dict[str, Any] = field(default_factory=dict)
     config: dict[str, Any] = field(default_factory=dict)
     active_endpoints: tuple[str, ...] = ()
@@ -204,6 +213,13 @@ class V06Terminal:
         with self._lock:
             if context.get("backend"):
                 self.state.backend = str(context["backend"])
+            self.state.operator_name = (
+                str(context["operator_name"]) if context.get("operator_name") else None
+            )
+            self.state.node_id = (
+                str(context["node_id"]) if context.get("node_id") else None
+            )
+            self.state.automatic = bool(context.get("auto", False))
             self.state.started_at = self._wall_clock()
             self.state.started_monotonic = now
             self.state.status = "RUNNING"
@@ -389,6 +405,10 @@ class V06Terminal:
                 self.state.phase = phase
                 return
 
+            if name == "branch_progress":
+                self.state.branch.update(payload)
+                return
+
             if name == "discovery_progress":
                 self._update_discovery(payload, now)
                 return
@@ -527,11 +547,14 @@ class V06Terminal:
             "requests": "requests_made",
         }
         for target in (
-            "buckets_processed",
-            "pages_fetched",
-            "companies_written",
-            "requests_made",
-            "invalid_rows",
+            "buckets_processed", "pages_fetched", "companies_written",
+            "requests_made", "invalid_rows",
+            "work_id", "bucket", "stage", "pages_done", "pages_total",
+            "total_buckets", "committed_pages", "pending", "counted",
+            "fetching", "done", "blocked", "failed", "split",
+            "rate_limit_hits", "configured_rate", "cooldown_seconds",
+            "actual_http_rate_1m", "saved_page_rate_1m", "saved_pages_run",
+            "reopened_buckets", "work_stage", "elapsed_seconds", "scope", "error",
         ):
             source = target
             if source not in payload:
@@ -569,6 +592,12 @@ class V06Terminal:
         if self.state.command in {"cycle-run", "cycle-loop"}:
             value = payload.get("status")
             return str(value or "COMPLETE").upper()
+        if self.state.command == "branch":
+            return (
+                "COMPLETE_WITH_FAILURES"
+                if _truthy_count(payload.get("deferred"))
+                else "COMPLETE"
+            )
         if self.state.command == "fetch-company":
             value = str(payload.get("status") or "COMPLETE").upper()
             return "COMPLETE" if value == "COMPLETE" else "COMPLETE_WITH_FAILURES"
@@ -618,7 +647,23 @@ class V06Terminal:
             elapsed = self.state.finished_monotonic - self.state.started_monotonic
             timing.append("Duration  ", style="dim")
         timing.append(_duration(elapsed), style="white")
-        return Group(title, timing)
+        identity = Text()
+        if self.state.operator_name:
+            identity.append("Operator  ", style="dim")
+            identity.append(self.state.operator_name, style="white")
+        if self.state.node_id:
+            if identity.plain:
+                identity.append("   ·   ", style="dim")
+            identity.append("Node  ", style="dim")
+            identity.append(self.state.node_id, style="cyan")
+        if self.state.command == "cycle-run":
+            if identity.plain:
+                identity.append("   ·   ", style="dim")
+            identity.append(
+                "AUTO" if self.state.automatic else "MANUAL",
+                style="bold cyan" if self.state.automatic else "dim",
+            )
+        return Group(title, timing, identity) if identity.plain else Group(title, timing)
 
     def _render_command(self, width: int) -> list[Any]:
         command = self.state.command
@@ -647,8 +692,10 @@ class V06Terminal:
             return [self._render_migrate(width)]
         if command == "cutover":
             return [self._render_cutover(width)]
-        if command == "discover":
+        if command in {"discover", "recover"}:
             return [self._render_discovery(width)]
+        if command == "branch":
+            return [self._render_branch(width)]
         if command == "fetch-company":
             return self._render_fetch_company(width)
         if command in {"cycle-run", "cycle-loop"}:
@@ -755,14 +802,76 @@ class V06Terminal:
             ]
         )
         content: list[Any] = [self._metric_grid(items, width)]
+        if values.get("stage") or values.get("bucket"):
+            detail = Text()
+            detail.append("Stage  ", style="dim")
+            detail.append(str(values.get("stage") or "INITIALIZING"), style="bold cyan")
+            if values.get("bucket"):
+                detail.append("   Bucket  ", style="dim")
+                detail.append(str(values["bucket"])[:70])
+            content.extend([Text(), detail])
+        page_done = values.get("pages_done")
+        page_total = values.get("pages_total")
+        if page_done is not None and page_total:
+            done = max(0, min(int(page_done),int(page_total)))
+            total = max(1,int(page_total))
+            progress = Text(
+                f"Current leaf  {done:,}/{total:,}  ({done/total:.1%})",
+                style="cyan",
+            )
+            content.append(progress)
+        if values.get("total_buckets") is not None:
+            content.extend([Text(), self._metric_grid([
+                ("Durable buckets",values.get("total_buckets"),"discovery.total"),
+                ("Done leaves",values.get("done",0),"discovery.done"),
+                ("Blocked",values.get("blocked",0),"discovery.blocked"),
+                ("Committed pages",values.get("committed_pages",0),"discovery.committed"),
+            ],width)])
+        if values.get("reopened_buckets") is not None:
+            content.append(Text(
+                f"Safe recovery reopened {int(values['reopened_buckets']):,} buckets",
+                style="cyan",
+            ))
+        if values.get("configured_rate") is not None:
+            content.extend([Text(), self._metric_grid([
+                ("Target req/s",values.get("configured_rate"),"discovery.rate"),
+                ("Actual HTTP/s 1m",values.get("actual_http_rate_1m"),"discovery.actualrate"),
+                ("Saved pages/s 1m",values.get("saved_page_rate_1m"),"discovery.pagesrate"),
+                ("HTTP 429",values.get("rate_limit_hits",0),"discovery.429"),
+                ("Cooldown s",round(float(values.get("cooldown_seconds") or 0),1),"discovery.cooldown"),
+            ],width)])
+        if values.get("blocked") or values.get("failed"):
+            content.append(Text("Global coverage: INCOMPLETE",style="yellow"))
+        elif not self.state.result:
+            content.append(Text("Global coverage: VERIFYING / UNKNOWN",style="dim"))
         if not self.state.result:
             content.append(Text())
             if self._transient("split"):
                 content.append(self._centered("──────●──────  ↳ Splitting partition", width, "cyan"))
             else:
                 content.append(self._centered(self._motion("sweep", width), width, "cyan"))
-        status = "COMPLETE" if self.state.result else "RUNNING"
-        return self._panel("DISCOVERY", Group(*content), status, active=not self.state.result)
+        if self.state.command == "recover" and self.state.result:
+            content.extend([Text(), self._metric_grid([
+                ("Recovery pass",self.state.result.get("recovery_pass"),"recovery.pass"),
+                ("Coverage",self.state.result.get("coverage"),"recovery.coverage"),
+                ("Unresolved",self.state.result.get("unresolved"),"recovery.unresolved"),
+            ],width)])
+        status = self.state.status if self.state.result else "RUNNING"
+        heading = "DISCOVERY RECOVERY" if self.state.command == "recover" else "DISCOVERY"
+        return self._panel(heading, Group(*content), status, active=not self.state.result)
+
+    def _render_branch(self, width: int):
+        values = self.state.result or self.state.branch
+        items = [
+            ("Checked",values.get("checked",0),"branch.checked"),
+            ("Verified",values.get("verified",0),"branch.verified"),
+            ("Branches",values.get("branches",0),"branch.branches"),
+            ("Deferred",values.get("deferred",0),"branch.deferred"),
+            ("HTTP attempts",values.get("http_requests",0),"branch.requests"),
+        ]
+        status = self.state.status if self.state.result else "RUNNING"
+        body = self._metric_grid(items,width)
+        return self._panel("BRANCH ENRICHMENT",body,status,active=not bool(self.state.result))
 
     def _render_prepare(self, width: int):
         if self.state.result:
@@ -1444,7 +1553,10 @@ class V06Terminal:
             "FINALIZING",
         }:
             return "cyan"
-        if normalized in {"IDLE", "N/A", "PENDING", "SKIPPED", "STOPPED", "SNAPSHOT"}:
+        if normalized in {
+            "IDLE", "N/A", "PENDING", "SKIPPED", "STOPPED", "SNAPSHOT",
+            "NOT_DUE", "ALREADY_COMPLETED",
+        }:
             return "dim"
         return "white"
 
@@ -1592,6 +1704,25 @@ class V06Terminal:
             suffix = f" {' '.join(details)}" if details else ""
             self._plain_write(f"{stamp} {phase} complete{suffix}")
             return
+        if name in {"discovery_progress","branch_progress"}:
+            now = self._clock()
+            if now - self.state.last_plain_progress_at >= 15.0:
+                self.state.last_plain_progress_at = now
+                if name == "discovery_progress":
+                    self._plain_write(
+                        f"{stamp} DISCOVER stage={payload.get('stage','RUNNING')} "
+                        f"bucket={payload.get('work_id','--')} "
+                        f"pages={payload.get('pages_done','--')}/{payload.get('pages_total','--')} "
+                        f"429={payload.get('rate_limit_hits','--')} "
+                        f"cooldown={payload.get('cooldown_seconds','--')}"
+                    )
+                else:
+                    self._plain_write(
+                        f"{stamp} BRANCH checked={payload.get('checked',0)} "
+                        f"verified={payload.get('verified',0)} "
+                        f"deferred={payload.get('deferred',0)}"
+                    )
+            return
         if name == "cycle_waiting":
             seconds = float(
                 payload.get("interval_seconds") or payload.get("idle_seconds") or 0
@@ -1637,6 +1768,17 @@ class V06Terminal:
                 f"Result: status={status} managed_tables={payload.get('managed_tables')} "
                 f"created={len(created) if isinstance(created, list) else created} "
                 f"altered={len(altered) if isinstance(altered, list) else altered}"
+            )
+        if command == "branch":
+            return (
+                f"Result: checked={payload.get('checked')} verified={payload.get('verified')} "
+                f"branches={payload.get('branches')} deferred={payload.get('deferred')}"
+            )
+        if command == "recover":
+            return (
+                f"Result: generation={payload.get('generation')} "
+                f"pass={payload.get('recovery_pass')} coverage={payload.get('coverage')} "
+                f"unresolved={payload.get('unresolved')}"
             )
         if command == "discover":
             return (

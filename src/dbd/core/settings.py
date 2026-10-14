@@ -16,6 +16,12 @@ class Settings(BaseSettings):
         env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore", frozen=True
     )
     dbd_production_backend: Literal["sqlserver", "mysql"] = "sqlserver"
+    dataforthai_concurrency: int = Field(15, ge=1, le=32)
+    dataforthai_rate_per_second: float = Field(15, gt=0, le=100)
+    dataforthai_request_timeout: int = Field(30, ge=1, le=300)
+    dataforthai_http_attempts: int = Field(3, ge=1, le=10)
+    dataforthai_status_codes: str = Field("1,A,B", pattern=r"^[0-9A-Za-z]+(?:,[0-9A-Za-z]+)*$")
+    dbd_operator_name: str | None = None
     # Separate from DB_* (Legacy Dataset 1 and campaign runtime).
     prod_mysql_host: str = "127.0.0.1"
     prod_mysql_port: int = Field(3307, ge=1, le=65535)
@@ -78,6 +84,20 @@ class Settings(BaseSettings):
     dbd_max_task_attempts: int = Field(3, ge=1, le=20)
     dbd_http_retries: int = Field(3, ge=0, le=10)
     dbd_upstream_defer_seconds: int = Field(30, ge=1, le=3600)
+    # SQL Server monthly Core defaults; MySQL/Extended retain legacy policies.
+    # Financial endpoints are refreshed by changed fiscal year or --refresh,
+    # not by the age of an otherwise successfully resolved result.
+    dbd_monthly_core_stale_hours: dict[str, float] = Field(
+        default_factory=lambda: {
+            "profile": 720.0,
+            "committees": 2160.0,
+            "committee_signs": 2160.0,
+            "transformations": 4320.0,
+            "financial_submissions": 876000.0,
+            "financial_statements": 876000.0,
+            "industry_benchmark": 876000.0,
+        }
+    )
     dbd_refresh_stale_hours: dict[str, float] = Field(
         default_factory=lambda: {
             "profile": 24.0,

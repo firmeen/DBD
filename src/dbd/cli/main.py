@@ -586,6 +586,7 @@ def main():
     _add_output_options(
         sub.add_parser("about", help="Inspect package, Python and installation integrity")
     )
+    sub.add_parser("setup", help="Interactive SQL Server admin/worker readiness and schedule setup")
     _add_output_options(
         sub.add_parser("check-db", help="Check database connectivity"),
         json_enabled=False,
@@ -759,15 +760,41 @@ def main():
     disc.add_argument("--type", default="")
     disc.add_argument("--phase", choices=("core", "extended"), default="core")
     disc.add_argument("--refresh", action="store_true")
-    disc.add_argument("--concurrency", type=positive)
-    disc.add_argument("--rate", type=positive_rate)
-    disc.add_argument("--max-buckets", type=positive)
+    disc.add_argument("--concurrency", "--jobs", "-j", type=positive)
+    disc.add_argument("--rate", "-r", type=positive_rate)
+    disc.add_argument("--max-buckets", "--limit", "-l", type=positive)
     disc.add_argument(
         "--distributed",
         action="store_true",
         help="Legacy flag; v0.6 direct SQL Server discovery rejects distributed bucket mode",
     )
     disc.add_argument("--metrics-port", type=int, default=settings.dbd_metrics_port)
+
+    recover_parser = sub.add_parser(
+        "recover", help="Resume eligible durable Production Discovery work")
+    recover_parser.add_argument("--check", "-c", action="store_true",
+                                help="Read-only coverage and recovery preview")
+    recover_parser.add_argument("--limit", "-l", type=positive)
+    recover_parser.add_argument("--db", "-d", "--backend",
+                                choices=("sqlserver", "mysql"))
+    collect_parser = sub.add_parser(
+        "collect", help="Join the active Core-7 Production collection")
+    collect_parser.add_argument("--db", "-d", "--backend",
+                                choices=("sqlserver", "mysql"))
+    collect_parser.add_argument("--jobs", "-j", "--concurrency", type=positive)
+    collect_parser.add_argument("--rate", "-r", type=positive_rate)
+    status_parser = sub.add_parser(
+        "status", help="Read durable Production state (not Legacy Dataset 1)")
+    status_parser.add_argument("--db", "-d", "--backend",
+                               choices=("sqlserver", "mysql"))
+    branch_parser = sub.add_parser(
+        "branch", help="Enrich company branch addresses and branch counts")
+    branch_parser.add_argument("action", nargs="?", choices=("import",))
+    branch_parser.add_argument("--check", "-c", action="store_true",
+                               help="Read-only preview")
+    branch_parser.add_argument("--limit", "-l", type=positive)
+    branch_parser.add_argument("--db", "-d", "--backend",
+                               choices=("sqlserver", "mysql"))
 
     cycle = sub.add_parser("cycle", help="Run the v0.6 SQL Server production workflow")
     cycle_sub = cycle.add_subparsers(dest="cycle_command", required=True)
@@ -776,6 +803,10 @@ def main():
     )
     cycle_run_parser.add_argument("--phase", choices=("core", "extended"), default="core")
     cycle_run_parser.add_argument("--refresh", action="store_true")
+    cycle_run_parser.add_argument(
+        "--auto", action="store_true",
+        help="Task Scheduler mode: start only when the monthly generation is due",
+    )
     cycle_run_parser.add_argument("--concurrency", type=positive)
     cycle_run_parser.add_argument("--rate", type=positive_rate)
     cycle_run_parser.add_argument("--http-retries", type=non_negative)
@@ -799,7 +830,7 @@ def main():
     for command_parser in (
         fetch, disc, cycle_run_parser, cycle_loop_parser, cycle_status_parser,
     ):
-        command_parser.add_argument("--backend", choices=("sqlserver", "mysql"))
+        command_parser.add_argument("--backend", "--db", "-d", choices=("sqlserver", "mysql"))
     # Existing command parser objects were returned anonymously above.
     for command in ("check-db", "migrate"):
         sub.choices[command].add_argument("--backend", choices=("sqlserver", "mysql"))
@@ -815,7 +846,11 @@ def main():
     )
     v06_terminal = None
     try:
-        if args.command == "about":
+        if args.command == "setup":
+            from ..presentation.setup import SetupWizard
+            code = SetupWizard().run()
+            raise SystemExit(code)
+        elif args.command == "about":
             from ..core.package_info import package_environment_snapshot
 
             presenter.package_about(package_environment_snapshot())
@@ -841,6 +876,103 @@ def main():
             result = run_generation1_cutover(
                 backend=backend, batch_size=args.batch_size, event=v06_terminal.event,
             )
+            v06_terminal.finish(result)
+        elif args.command == "branch":
+            from ..pipelines.branch import collect as collect_branches, import_mysql
+            selected = args.backend or settings.dbd_production_backend
+            if selected != "sqlserver":
+                raise ValueError("Branch enrichment currently requires SQL Server production")
+            if args.action == "import":
+                result = import_mysql(check=args.check, limit=args.limit)
+                presenter.command_result("DBD · BRANCH IMPORT", result)
+            elif args.check:
+                from ..storage.sqlserver import branch_repository
+                from ..storage.sqlserver.engine import connection
+                with connection() as conn:
+                    branch_repository.validate_schema(conn)
+                    pending = branch_repository.candidates(conn, limit=min(args.limit or 50, 1000))
+                presenter.command_result(
+                    "DBD · BRANCH PREVIEW",
+                    {"read_only": True, "candidate_sample": len(pending),
+                     "first_company_id": pending[0]["company_id"] if pending else None},
+                )
+            else:
+                v06_terminal = V06Terminal("branch", app="DBD DATA").start(
+                    backend=selected,
+                )
+                result = collect_branches(event=v06_terminal.event, limit=args.limit)
+                v06_terminal.finish(result)
+        elif args.command == "recover":
+            from ..storage.sqlserver import discovery_repository as discovery_work
+            from ..storage.sqlserver.engine import connection
+            from ..storage.production import production_repository
+            selected = args.backend or settings.dbd_production_backend
+            if selected != "sqlserver":
+                raise ValueError("Durable Production Discovery recovery requires SQL Server")
+            repo = production_repository(selected)
+            current = repo.generation_state()
+            generation = current.get("active_generation")
+            if generation is None:
+                raise ValueError("No active Production Generation to resume")
+            with connection() as conn:
+                discovery_work.validate_schema(conn)
+                preview = discovery_work.coverage(conn,int(generation),"full")
+            if args.check:
+                presenter.command_result("DBD · RECOVERY PREVIEW", {
+                    "read_only":True,"generation":int(generation),**preview})
+            else:
+                from ..workflow import discover
+                v06_terminal = V06Terminal("recover", app="DBD DATA").start(
+                    backend=selected,
+                )
+                recovered_generation, result = asyncio.run(discover(
+                    backend=selected, event=v06_terminal.event,
+                    recovery_limit=args.limit,
+                    recovery_pass=True,
+                ))
+                with connection() as conn:
+                    remaining = discovery_work.coverage(
+                        conn, int(recovered_generation), "full"
+                    )
+                v06_terminal.finish({
+                    "generation":recovered_generation,
+                    "partitions":result.buckets_processed,
+                    "pages":result.pages_fetched,
+                    "companies":result.companies_written,
+                    "recovery_pass":"FINISHED",
+                    "coverage":"VERIFIED" if remaining["ok"] else "INCOMPLETE",
+                    "unresolved":sum(remaining.get(k,0) for k in
+                                     ("pending","counted","fetching","failed","blocked")),
+                },status="COMPLETE" if remaining["ok"] else "COMPLETE_WITH_FAILURES")
+        elif args.command == "status":
+            from dataclasses import asdict
+            from ..workflow import status as production_status
+            selected = args.backend or settings.dbd_production_backend
+            data = asyncio.run(production_status(
+                phase="core",backend=selected,coverage=False))
+            result = asdict(data)
+            if selected == "sqlserver":
+                from ..storage.sqlserver import discovery_repository as discovery_work
+                from ..storage.sqlserver.engine import connection
+                from ..storage.production import production_repository
+                state = production_repository(selected).generation_state()
+                gen = state.get("active_generation")
+                if gen is not None:
+                    with connection() as conn:
+                        result["discovery"] = discovery_work.coverage(
+                            conn,int(gen),"full"
+                        )
+            presenter.command_result("DBD · PRODUCTION STATUS", result)
+        elif args.command == "collect":
+            from ..workflow import collect as production_collect
+            selected = args.backend or settings.dbd_production_backend
+            v06_terminal = V06Terminal("collect", app="DBD DATA").start(
+                backend=selected,phase="core",
+            )
+            result = asyncio.run(production_collect(
+                backend=selected,phase="core",concurrency=args.jobs,
+                rate=args.rate,event=v06_terminal.event,
+            ))
             v06_terminal.finish(result)
         elif args.command == "master-status":
             from ..storage.mysql.engine import connect
@@ -965,20 +1097,30 @@ def main():
                 phase=args.phase,
                 backend=args.backend or settings.dbd_production_backend,
             )
-            generation, result = asyncio.run(
-                discover(
-                    seeds,
+            from ..control import EarlyStartConfirmationRequired
+            from ..presentation.setup import confirm_early_cycle
+
+            options = {
+                "phase": args.phase, "backend": args.backend,
+                "refresh": args.refresh, "search_type": args.type,
+                "concurrency": args.concurrency, "rate": args.rate,
+                "max_buckets": args.max_buckets, "verbose": False,
+                "event": v06_terminal.event,
+            }
+            try:
+                generation, result = asyncio.run(discover(seeds, **options))
+            except EarlyStartConfirmationRequired:
+                v06_terminal.close()
+                v06_terminal = None
+                if not confirm_early_cycle():
+                    raise SystemExit(2)
+                v06_terminal = V06Terminal("discover", app="DBD DATA").start(
                     phase=args.phase,
-                    backend=args.backend,
-                    refresh=args.refresh,
-                    search_type=args.type,
-                    concurrency=args.concurrency,
-                    rate=args.rate,
-                    max_buckets=args.max_buckets,
-                    verbose=False,
-                    event=v06_terminal.event,
+                    backend=args.backend or settings.dbd_production_backend,
                 )
-            )
+                options["event"] = v06_terminal.event
+                options["manual_confirmed"] = True
+                generation, result = asyncio.run(discover(seeds, **options))
             v06_terminal.finish(
                 {
                     "generation": generation,
@@ -994,11 +1136,20 @@ def main():
             from dataclasses import asdict
 
             from ..workflow import cycle_loop, cycle_run, status
+            selected_backend = args.backend or settings.dbd_production_backend
+            identity = {}
+            if selected_backend == "sqlserver":
+                from ..presentation.setup import local_node_id
+                identity = {
+                    "operator_name": settings.dbd_operator_name,
+                    "node_id": local_node_id(),
+                }
 
             if args.cycle_command == "status":
                 v06_terminal = V06Terminal("cycle-status", app="DBD DATA").start(
                     phase=args.phase,
                     backend=args.backend or settings.dbd_production_backend,
+                    **identity,
                 )
                 current = asyncio.run(status(phase=args.phase, coverage=False, backend=args.backend))
                 v06_terminal.finish(asdict(current))
@@ -1007,6 +1158,8 @@ def main():
                 v06_terminal = V06Terminal(command, app="DBD DATA").start(
                     phase=args.phase,
                     backend=args.backend or settings.dbd_production_backend,
+                    auto=bool(getattr(args, "auto", False)),
+                    **identity,
                 )
                 common = {
                     "phase": args.phase,
@@ -1019,7 +1172,21 @@ def main():
                     "event": v06_terminal.event,
                 }
                 if args.cycle_command == "run":
-                    result = asyncio.run(cycle_run(**common))
+                    from ..control import EarlyStartConfirmationRequired
+                    from ..presentation.setup import confirm_early_cycle
+                    try:
+                        result = asyncio.run(cycle_run(**common, auto=args.auto))
+                    except EarlyStartConfirmationRequired:
+                        v06_terminal.close()
+                        v06_terminal = None
+                        if not confirm_early_cycle():
+                            raise SystemExit(2)
+                        v06_terminal = V06Terminal(command, app="DBD DATA").start(
+                            phase=args.phase, backend=args.backend or settings.dbd_production_backend,
+                            **identity,
+                        )
+                        common["event"] = v06_terminal.event
+                        result = asyncio.run(cycle_run(**common, manual_confirmed=True))
                 else:
                     result = asyncio.run(
                         cycle_loop(

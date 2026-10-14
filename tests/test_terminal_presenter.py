@@ -770,3 +770,64 @@ def test_v06_plain_continuous_wait_uses_next_check_not_next_cycle() -> None:
     output = stream.getvalue()
     assert "WAITING next_check=00:00:05" in output
     assert "next_cycle" not in output
+
+
+def test_v06_monthly_no_work_statuses_are_neutral_not_failures() -> None:
+    terminal = V06Terminal("cycle-run", stream=StringIO(), tty=False)
+    assert terminal._status_style("NOT_DUE") == "dim"
+    assert terminal._status_style("ALREADY_COMPLETED") == "dim"
+    assert terminal._final_status({"status": "NOT_DUE"}) == "NOT_DUE"
+
+
+def test_v06_terminal_shows_operator_node_and_auto_mode_without_leaking_secret() -> None:
+    from io import StringIO
+    output = StringIO()
+    terminal = V06Terminal("cycle-run", stream=output, tty=False)
+    terminal.start(
+        phase="core", backend="sqlserver",
+        operator_name="operator-test", node_id="node-test-123", auto=True,
+    )
+    terminal.console.print(terminal._render(104))
+    terminal.close()
+    text = output.getvalue()
+    assert "operator-test" in text
+    assert "node-test-123" in text
+    assert "AUTO" in text
+    assert "MSSQL_PASSWORD" not in text
+
+
+def test_v06_recovery_pass_is_not_reported_as_global_discovery_complete() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "recover", app="DBD DATA", stream=stream, tty=False,
+        clock=lambda: 100.0, wall_clock=_v06_wall_clock,
+    ).start(backend="sqlserver")
+    terminal.event("discovery_progress", {
+        "stage": "RECONCILING", "work_id": 42, "blocked": 3,
+        "pending": 0, "done": 7, "rate_limit_hits": 1,
+    })
+    terminal.finish({
+        "generation": 2, "recovery_pass": "FINISHED",
+        "coverage": "INCOMPLETE", "unresolved": 3,
+        "partitions": 10, "pages": 25,
+    }, status="COMPLETE_WITH_FAILURES")
+    output = stream.getvalue()
+    assert "DBD DATA / RECOVER" in output
+    assert "pass=FINISHED" in output
+    assert "coverage=INCOMPLETE" in output
+    assert "unresolved=3" in output
+    assert "Completed with failures" in output
+    assert "\x1b[" not in output and "\r" not in output
+
+
+def test_v06_branch_deferred_pass_is_not_a_clean_success() -> None:
+    output = StringIO()
+    terminal = V06Terminal("branch", app="DBD DATA", stream=output, tty=False)
+    terminal.start(backend="sqlserver")
+    terminal.finish({
+        "checked": 8, "verified": 6, "branches": 11,
+        "deferred": 2, "skipped": 0, "http_requests": 12,
+    })
+    text = output.getvalue()
+    assert "Completed with failures" in text
+    assert "deferred=2" in text

@@ -21,6 +21,7 @@ from .engine import transaction as sqlserver_transaction
 from .schema import MANAGED_TABLES, TABLE_COLUMNS
 from .schema import ensure_schema as ensure_production_schema
 from .schema import validate_schema as validate_production_schema
+from .control_repository import ControlRepository
 
 TARGET_TABLE = "dbo.DBD_MASTER_DEEP"
 
@@ -765,7 +766,12 @@ class ProductionSqlServerRepository:
 
     def ensure_schema(self) -> dict[str, object]:
         with self.transaction() as conn:
-            return ensure_production_schema(conn)
+            result = ensure_production_schema(conn)
+            ControlRepository().ensure_schema(conn)
+            from . import discovery_repository, branch_repository
+            discovery_repository.ensure_schema(conn)
+            branch_repository.ensure_schema(conn)
+            return result
 
     def validate_schema(self) -> dict[str, object]:
         with connection() as conn:
@@ -1340,7 +1346,7 @@ class ProductionSqlServerRepository:
                     endpoint_meta=old_meta,
                     first_observation=first_observation,
                     force_refresh_mask=int(refresh_mask),
-                    stale_hours=settings.dbd_refresh_stale_hours,
+                    stale_hours=settings.dbd_monthly_core_stale_hours,
                     now=datetime.now(timezone.utc),
                 )
                 if first_observation:
@@ -1495,7 +1501,39 @@ class ProductionSqlServerRepository:
         lease_seconds: int,
         worker_prefix: str,
         company_id: int | None = None,
+        node_id: str | None = None,
     ) -> dict[str, Any] | None:
+        # Core G2+ is always a coordinated node claim.  A missing node_id
+        # must not bypass SQL control merely because a caller invokes the
+        # repository directly.  Explicit targeted Admin-only claims are
+        # handled separately through company_id.
+        if (
+            int(generation) >= 2
+            and int(phase_mask) & CORE_ENDPOINT_MASK
+            and node_id is None
+        ):
+            if company_id is None:
+                raise SqlServerWriteError(
+                    "SQL Server Core claim requires an authorized node; run dbd-data setup"
+                )
+            # Targeted single-company collection is an Admin-only legacy
+            # escape hatch. It is never a way for a Worker to omit node_id.
+            # It must not race a scheduled monthly Generation.
+            from ...presentation.setup import local_node_id
+            admin_node = local_node_id()
+            control = ControlRepository()
+            if (
+                admin_node is None
+                or not control._has_admin_permission(conn)
+            ):
+                raise SqlServerWriteError(
+                    "Targeted SQL Server Core claim requires Admin authorization"
+                )
+            control.require_node(conn, admin_node, role="ADMIN", lock=True)
+            if control.active_generation(conn) is not None:
+                raise SqlServerWriteError(
+                    "Targeted Core claim cannot bypass an active monthly Generation"
+                )
         token = f"{worker_prefix}:{uuid4().hex}"
         active_filter = (
             "AND status_code=N'1'"
@@ -1512,6 +1550,8 @@ class ProductionSqlServerRepository:
             company_filter = " AND company_id=%s"
             params.append(int(company_id))
         params.extend([token, int(lease_seconds)])
+        if node_id is not None:
+            ControlRepository().require_collection_access(conn, node_id, generation)
         cur = conn.cursor()
         try:
             cur.execute(
@@ -1532,6 +1572,12 @@ class ProductionSqlServerRepository:
                       AND (lease_owner IS NULL OR lease_expires_at <= SYSUTCDATETIME())
                       {company_filter}
                     ORDER BY
+                      CASE
+                        WHEN first_seen_generation=1
+                          AND collection_completed_at IS NULL THEN 0
+                        WHEN (done_mask | not_available_mask | failed_mask)=0 THEN 1
+                        ELSE 2
+                      END,
                       CASE WHEN retry_at IS NULL THEN 0 ELSE 1 END,
                       retry_at,
                       company_id
@@ -1591,6 +1637,11 @@ class ProductionSqlServerRepository:
         claim_token: str,
         claim_generation: int,
     ) -> dict[str, Any]:
+        node_id = claim_token.split(":", 1)[0]
+        if node_id.startswith("node-") and int(claim_generation) >= 2:
+            ControlRepository().require_collection_access(
+                conn, node_id, claim_generation, finishing=True,
+            )
         cur = conn.cursor()
         try:
             cur.execute(
@@ -1633,6 +1684,11 @@ class ProductionSqlServerRepository:
         claim_generation: int,
         lease_seconds: int,
     ) -> None:
+        node_id = claim_token.split(":", 1)[0]
+        if node_id.startswith("node-") and int(claim_generation) >= 2:
+            ControlRepository().require_collection_access(
+                conn, node_id, claim_generation, finishing=True,
+            )
         cur = conn.cursor()
         try:
             cur.execute(

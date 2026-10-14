@@ -476,7 +476,9 @@ def test_prepare_preserves_existing_outcome_masks() -> None:
     assert "COLLECTING" in sql
 
 
-def test_atomic_claim_uses_sqlserver_skip_locked_semantics_and_unique_token() -> None:
+def test_atomic_claim_uses_sqlserver_skip_locked_semantics_and_unique_token(monkeypatch) -> None:
+    from dbd.storage.sqlserver.control_repository import ControlRepository
+    monkeypatch.setattr(ControlRepository, "require_collection_access", lambda *_a, **_kw: None)
     row = (
         42,
         "7",
@@ -502,6 +504,7 @@ def test_atomic_claim_uses_sqlserver_skip_locked_semantics_and_unique_token() ->
         phase_mask=127,
         lease_seconds=300,
         worker_prefix="host:1",
+        node_id="node-test",
     )
     repo.claim_company(
         _CaptureConnection(second),
@@ -509,6 +512,7 @@ def test_atomic_claim_uses_sqlserver_skip_locked_semantics_and_unique_token() ->
         phase_mask=127,
         lease_seconds=300,
         worker_prefix="host:1",
+        node_id="node-test",
     )
 
     first_sql, first_params = first.executions[-1]
@@ -1040,7 +1044,9 @@ def test_core_reactivation_reopens_profile_only_when_other_results_fresh() -> No
     assert params.count(1) >= 3  # only Profile bit reopened
 
 
-def test_sqlserver_core_prepare_and_claim_gate_active_status() -> None:
+def test_sqlserver_core_prepare_and_claim_gate_active_status(monkeypatch) -> None:
+    from dbd.storage.sqlserver.control_repository import ControlRepository
+    monkeypatch.setattr(ControlRepository, "require_collection_access", lambda *_a, **_kw: None)
     repo = ProductionSqlServerRepository()
     prepare = _SequenceCursor([(0, None)])
     repo.prepare_companies(
@@ -1052,6 +1058,30 @@ def test_sqlserver_core_prepare_and_claim_gate_active_status() -> None:
     claim = _SequenceCursor([None])
     repo.claim_company(
         _CaptureConnection(claim), generation=2, phase_mask=127,
-        lease_seconds=300, worker_prefix="test",
+        lease_seconds=300, worker_prefix="test", node_id="node-test",
     )
     assert "AND status_code=N'1'" in claim.executions[-1][0]
+
+
+def test_sqlserver_g2_bulk_core_claim_rejects_missing_node_authorization() -> None:
+    import pytest
+    from dbd.storage.sqlserver.repository import SqlServerWriteError
+    with pytest.raises(SqlServerWriteError, match="authorized node"):
+        ProductionSqlServerRepository().claim_company(
+            object(), generation=2, phase_mask=127,
+            lease_seconds=300, worker_prefix="unsafe",
+        )
+
+
+def test_targeted_sqlserver_core_claim_needs_admin_identity(monkeypatch) -> None:
+    import pytest
+    from dbd.presentation import setup as setup_ui
+    from dbd.storage.sqlserver.repository import SqlServerWriteError
+
+    monkeypatch.setattr(setup_ui, "local_node_id", lambda: None)
+    with pytest.raises(SqlServerWriteError, match="Admin authorization"):
+        ProductionSqlServerRepository().claim_company(
+            object(), generation=2, phase_mask=127,
+            lease_seconds=300, worker_prefix="worker-attempt",
+            company_id=42,
+        )

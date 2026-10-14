@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from email.utils import parsedate_to_datetime
+from typing import Callable
 
 from aiolimiter import AsyncLimiter
 from curl_cffi.requests import AsyncSession
@@ -84,6 +85,7 @@ class FixedRateDbdClient:
         rate_per_second: float,
         max_retries: int,
         timeout: float | None = None,
+        admission: Callable[[], float] | None = None,
     ) -> None:
         if concurrency < 1:
             raise ValueError("concurrency must be positive")
@@ -96,6 +98,7 @@ class FixedRateDbdClient:
         self.rate_per_second = float(rate_per_second)
         self.max_retries = int(max_retries)
         self.timeout = float(timeout or settings.request_timeout)
+        self._shared_admission = admission
 
         self._limiter = AsyncLimiter(1, 1 / self.rate_per_second)
         self._semaphore = asyncio.Semaphore(self.concurrency)
@@ -111,8 +114,28 @@ class FixedRateDbdClient:
         self.retries_made = 0
         self.rate_limit_hits = 0
 
+    def _new_auth_session(self):
+        """Account for upstream warm-up and token refresh HTTP in fleet budget.
+
+        The API client's asynchronous requests already reserve slots in
+        _admit(); the synchronous auth session needs the same admission gate.
+        Every retry performed inside warm_up/get_token goes through request().
+        """
+        session = create_session()
+        if self._shared_admission is not None:
+            original_request = session.request
+
+            def admitted_request(*args, **kwargs):
+                delay = float(self._shared_admission())
+                if delay > 0:
+                    time.sleep(delay)
+                return original_request(*args, **kwargs)
+
+            session.request = admitted_request
+        return session
+
     async def __aenter__(self) -> "FixedRateDbdClient":
-        self._auth_session = create_session()
+        self._auth_session = self._new_auth_session()
         self._session = AsyncSession(
             impersonate="chrome",
             max_clients=self.concurrency,
@@ -155,7 +178,7 @@ class FixedRateDbdClient:
 
             if reset_session:
                 self._auth_session.close()
-                self._auth_session = create_session()
+                self._auth_session = self._new_auth_session()
                 self._auth = DbdAuth()
                 self._token = None
             elif force or (
@@ -232,6 +255,12 @@ class FixedRateDbdClient:
                 continue
 
             await self._limiter.acquire()
+            if self._shared_admission is not None:
+                # Every HTTP attempt, including retries, needs a fleet slot.
+                # A SQL failure is fatal: never silently use a local-only rate.
+                delay = await asyncio.to_thread(self._shared_admission)
+                if delay > 0:
+                    await asyncio.sleep(delay)
 
             # A different request can receive 429/503 while this coroutine is
             # queued inside the limiter. Re-check after admission so already

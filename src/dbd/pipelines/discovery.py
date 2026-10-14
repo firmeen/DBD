@@ -126,6 +126,32 @@ def _children_for(filters: SearchFilters, provinces: list[str]) -> list[SearchFi
     return []
 
 
+def _direct_categorical_plans(
+    filters: SearchFilters, provinces: list[str],
+    statuses: tuple[str, ...] = (),
+) -> list[tuple[str, list[SearchFilters]]]:
+    """Bounded candidate plans; only counted, validated plans are committed.
+
+    Kept separate from legacy _children_for so Dataset 1 semantics do not
+    change. Observed status codes are hypotheses, not an exhaustive catalog.
+    """
+    from dataclasses import replace
+
+    candidates = []
+    for dimension, field, values in (
+        ("juristic_type", "jp_types", JP_TYPES if not filters.jp_types else ()),
+        ("province", "pv_codes", tuple(provinces) if not filters.pv_codes else ()),
+        ("status", "jp_statuses", statuses if not filters.jp_statuses else ()),
+        ("business_size", "business_sizes",
+         ("S","M","L","X") if not filters.business_sizes else ()),
+    ):
+        if len(values) >= 2:
+            children = [replace(filters, **{field:[value]}) for value in values]
+            if len({child.key() for child in children}) == len(children):
+                candidates.append((dimension,children))
+    return candidates
+
+
 async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
     data = await client.get("/api/v1/commons/provinces")
     if not isinstance(data, list):
@@ -813,6 +839,8 @@ async def run(
     concurrency: int | None = None,
     rate: float | None = None,
     max_buckets: int | None = None,
+    recovery_limit: int | None = None,
+    recovery_pass: bool = False,
     verbose: bool = True,
     health=None,
     distributed: bool = False,
@@ -821,10 +849,12 @@ async def run(
     repository=None,
     event=None,
 ) -> DiscoveryResult:
-    """Direct v0.6 Search traversal into selected production DBD_COMPANY.
+    """Direct v0.6 Search traversal into the selected production DBD_COMPANY.
 
-    Split/page state is intentionally transient. A crash restarts Search
-    traversal; natural-key production upserts make repeated pages safe.
+    SQL Server resumes a durable Generation-scoped bucket tree and commits
+    company writes with contiguous page checkpoints. The separate Production
+    MySQL path currently retains in-memory traversal with idempotent upserts;
+    do not advertise MySQL page-level resume until its extension is built.
     """
     if distributed:
         raise ValueError(
@@ -837,7 +867,26 @@ async def run(
     from ..storage.production import production_repository
 
     repo = repository if repository is not None else production_repository()
+    explicitly_scoped = bool(seeds or search_type or max_buckets is not None)
     global_rate = settings.dbd_rate_per_second if rate is None else rate
+    admission = None
+    if getattr(repo, "backend", None) == "sqlserver":
+        from ..presentation.setup import local_node_id
+        from ..storage.sqlserver.control_repository import ControlRepository
+        control = ControlRepository()
+        active = await asyncio.to_thread(control.active_generation)
+        if active is None or active.get("state") != "DISCOVERING" or (
+            int(active.get("generation") or 0) != int(generation)
+        ):
+            raise RuntimeError(
+                "SQL Server Discovery requires the matching authorized "
+                "DISCOVERING monthly Generation; start with dbd-data cycle run"
+            )
+        node_id = local_node_id()
+        if node_id is None:
+            raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
+        await asyncio.to_thread(control.require_admin, node_id)
+        admission = lambda: control.admit(node_id, int(generation))
 
     buckets_processed = 0
     pages_fetched = 0
@@ -862,6 +911,7 @@ async def run(
         concurrency=int(concurrency or settings.dbd_concurrency),
         rate_per_second=float(global_rate),
         max_retries=int(settings.dbd_http_retries),
+        admission=admission,
     ) as client:
         province_response = await client.fetch(
             "GET",
@@ -885,6 +935,18 @@ async def run(
                     if str(province).strip()
                 }
                 | set(EXTRA_PREFIX_SEEDS)
+            )
+
+        if getattr(repo, "backend", None) == "sqlserver":
+            return await _run_durable_discovery(
+                repo, client, seeds, search_type=search_type,
+                provinces=provinces, generation=int(generation),
+                refresh_mask=int(refresh_mask),
+                concurrency=int(concurrency or settings.dbd_concurrency),
+                max_buckets=max_buckets, event=event, health=health,
+                explicitly_scoped=explicitly_scoped,
+                recovery_limit=recovery_limit,
+                recovery_pass=recovery_pass,
             )
 
         queue = deque(
@@ -1026,3 +1088,358 @@ async def run(
         requests_made=client.requests_made,
         invalid_rows=invalid_rows,
     )
+
+
+async def _run_durable_discovery(
+    repo, client: FixedRateDbdClient, seeds: list[str], *,
+    search_type: str, provinces: list[str], generation: int,
+    refresh_mask: int, concurrency: int, max_buckets: int | None,
+    event=None, health=None, explicitly_scoped: bool = False,
+    recovery_limit: int | None = None,
+    recovery_pass: bool = False,
+) -> DiscoveryResult:
+    """SQL Server G2+ Discovery: one durable tree and atomic page checkpoints.
+
+    No second HTTP client, queue service, or company writer. The Core-7
+    repository owns business writes and shares the checkpoint transaction.
+    Uncertified partition dimensions remain BLOCKED, never marked complete.
+    """
+    from ..storage.sqlserver import discovery_repository as work
+
+    # A manually supplied keyword, search type or bound is diagnostic only.
+    # These may never share the monthly full-universe durable root set.
+    full = not explicitly_scoped
+    scope = "full" if full else (
+        "diag:" + sha256(
+            json.dumps(
+                {"seeds": sorted(set(seeds)), "type": search_type},
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:40]
+    )
+    roots = [SearchFilters(keyword=seed, search_type=search_type)
+             for seed in sorted(set(seeds))]
+    processed = pages_fetched = written = invalid = 0
+    saved_pages = 0
+    started = time.monotonic()
+    active = None
+    samples = deque(maxlen=120)
+    durable_snapshot = {}
+    last_summary_at = 0.0
+
+    def notify(name: str, **values) -> None:
+        if event is None:
+            return
+        try:
+            now = time.monotonic()
+            if not samples or now - samples[-1][0] >= 0.9:
+                samples.append((now,client.requests_made,saved_pages))
+            while len(samples)>1 and now - samples[0][0]>60.0:
+                samples.popleft()
+            rate = None
+            page_rate = None
+            if len(samples)>=2:
+                elapsed = samples[-1][0]-samples[0][0]
+                if elapsed >= 5.0:
+                    rate = round((samples[-1][1]-samples[0][1])/elapsed,3)
+                    page_rate = round((samples[-1][2]-samples[0][2])/elapsed,3)
+            cooldown = client.cooldown_remaining()
+            state = dict(values)
+            if cooldown > 0 and state.get("stage") not in ("BLOCKED","DONE"):
+                state["work_stage"] = state.get("stage")
+                state["stage"] = "RATE_LIMITED"
+            event(name, {
+                **state, "buckets_processed": processed,
+                "pages_fetched": pages_fetched, "companies_written": written,
+                "invalid_rows": invalid, "requests_made": client.requests_made,
+                "rate_limit_hits": client.rate_limit_hits,
+                "configured_rate": client.rate_per_second,
+                "actual_http_rate_1m":rate, "saved_page_rate_1m":page_rate,
+                "saved_pages_run":saved_pages,
+                "cooldown_seconds": cooldown,
+                "elapsed_seconds": max(0, now - started),
+                "generation": generation, "scope": scope,
+            })
+        except Exception:
+            # Rendering/telemetry failures never fail persistence.
+            pass
+
+    async def atomic(fn, *args, **kwargs):
+        def execute():
+            with repo.transaction() as conn:
+                return fn(conn, *args, **kwargs)
+        return await asyncio.to_thread(execute)
+
+    def initialize(conn):
+        work.validate_schema(conn)
+        work.register_roots(conn, generation, scope, roots)
+
+    await atomic(initialize)
+
+    def observed_statuses(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT DISTINCT TOP (16) status_code FROM dbo.DBD_COMPANY "
+                "WHERE status_code IS NOT NULL AND status_code<>N'' "
+                "ORDER BY status_code"
+            )
+            return tuple(str(row[0]) for row in cur.fetchall())
+        finally:
+            cur.close()
+
+    status_candidates = await atomic(observed_statuses)
+
+    if recovery_pass:
+        from .discovery_numeric import PRODUCTION_CERTIFIED_DIMENSIONS
+        if PRODUCTION_CERTIFIED_DIMENSIONS:
+            reopened = await atomic(
+                work.reopen_blocked_numeric, generation, scope,
+                limit=min(int(recovery_limit or 100), 1000),
+            )
+            notify(
+                "discovery_progress", stage="RECONCILING",
+                reopened_buckets=reopened,
+            )
+
+    async def pulse() -> None:
+        nonlocal durable_snapshot, last_summary_at
+        while True:
+            now = time.monotonic()
+            if now - last_summary_at >= 20.0:
+                last_summary_at = now
+                try:
+                    durable_snapshot = await atomic(work.report,generation,scope)
+                except Exception:
+                    # Rendering observations may fail, but the durable writer
+                    # and its independent SQL errors must never be hidden.
+                    pass
+            notify("discovery_progress", **{**durable_snapshot, **(active or {})})
+            await asyncio.sleep(1.0)
+
+    task = asyncio.create_task(pulse())
+    try:
+        while True:
+            bucket = await atomic(work.next_work, generation, scope)
+            if bucket is None:
+                break
+            if (max_buckets is not None and processed >= max_buckets
+                or recovery_limit is not None and processed >= recovery_limit):
+                break
+            if health is not None:
+                await asyncio.to_thread(health)
+            filters = work.filters_for(bucket)
+            bucket_id = int(bucket["work_id"])
+            active = {"work_id": bucket_id, "bucket": filters.key(),
+                      "stage": "COUNTING"}
+            notify("discovery_progress", **active)
+            response, _ = await _direct_page(client, filters, 1)
+            parent = parse_search_response(response)
+            pages_fetched += 1
+            processed += 1
+            if bucket["status"] == "PENDING":
+                await atomic(work.count, bucket_id, parent.total_items, parent.total_pages)
+                bucket["status"] = "COUNTED"
+                bucket["total_items"] = parent.total_items
+                bucket["total_pages"] = parent.total_pages
+            elif (int(bucket["total_items"]) != parent.total_items
+                  or int(bucket["total_pages"]) != parent.total_pages):
+                await atomic(work.blocked, bucket_id, "count_or_pagination_drift")
+                notify("discovery_progress", **active,
+                       stage="RECONCILING", error="count_or_pagination_drift")
+                continue
+
+            if parent.total_items == 0:
+                await atomic(work.done, bucket, empty=True)
+                notify("discovery_progress", **active, stage="DONE")
+                continue
+
+            if parent.total_items > MAX_ROWS_PER_QUERY:
+                active["stage"] = "VALIDATING_SPLIT"
+                notify("discovery_progress", **active)
+                children = None
+                counts = []
+                split_dimension = None
+                reasons = []
+
+                from ..deep.http import DeepPermanentHttpError
+                for dimension, planned in _direct_categorical_plans(
+                    filters, provinces, status_candidates,
+                ):
+                    seen = set()
+                    candidate_counts = []
+                    candidate_ok = True
+                    for child in planned:
+                        try:
+                            child_data, _ = await _direct_page(client,child,1)
+                        except DeepPermanentHttpError as exc:
+                            if exc.status == 400 and dimension == "status":
+                                candidate_ok = False
+                                reasons.append("status_filter_not_supported")
+                                break
+                            raise
+                        observed = parse_search_response(child_data)
+                        pages_fetched += 1
+                        candidate_counts.append(
+                            (observed.total_items, observed.total_pages)
+                        )
+                        for row in observed.rows:
+                            identity = (row.get("jpTypeCode"),row.get("jpNo"))
+                            if all(identity):
+                                if identity in seen:
+                                    candidate_ok = False
+                                seen.add(identity)
+                    if not candidate_ok or len(candidate_counts) != len(planned):
+                        reasons.append(dimension + ":sample_overlap_or_invalid_filter")
+                        continue
+                    if sum(item[0] for item in candidate_counts) != parent.total_items:
+                        reasons.append(dimension + ":count_parity_failed")
+                        continue
+                    children = planned
+                    counts = candidate_counts
+                    split_dimension = dimension
+                    break
+
+                if children is None:
+                    from .discovery_numeric import (
+                        PRODUCTION_CERTIFIED_DIMENSIONS,
+                        NumericObservation,
+                        numeric_partition_structure,
+                        plan_numeric_split,
+                    )
+                    if PRODUCTION_CERTIFIED_DIMENSIONS:
+                        async def numeric_count(candidate: SearchFilters):
+                            nonlocal pages_fetched
+                            child_data, _ = await _direct_page(client,candidate,1)
+                            child_page = parse_search_response(child_data)
+                            pages_fetched += 1
+                            return NumericObservation(
+                                child_page.total_items,child_page.rows,
+                            )
+
+                        plan = await plan_numeric_split(
+                            filters, parent.total_items, numeric_count,
+                            parent.rows,
+                            dimensions=tuple(PRODUCTION_CERTIFIED_DIMENSIONS),
+                        )
+                        if (
+                            plan.candidate
+                            and plan.dimension in PRODUCTION_CERTIFIED_DIMENSIONS
+                            and numeric_partition_structure(
+                                filters.key(),
+                                [child.key() for child in plan.children],
+                                certified=PRODUCTION_CERTIFIED_DIMENSIONS,
+                            )
+                        ):
+                            fresh, _ = await _direct_page(client,filters,1)
+                            pages_fetched += 1
+                            checked = parse_search_response(fresh)
+                            if (checked.total_items == parent.total_items
+                                and checked.total_pages == parent.total_pages):
+                                children = plan.children
+                                counts = [
+                                    (obs.count,(obs.count+9)//10)
+                                    for obs in plan.child_observations
+                                ]
+                                split_dimension = str(plan.dimension)
+                            else:
+                                reasons.append("numeric_parent_count_drift")
+                        else:
+                            reasons.append(plan.reason)
+
+                if children is None:
+                    reason = "no_certified_lossless_split:" + ",".join(reasons)[:900]
+                    await atomic(work.blocked,bucket_id,reason)
+                    notify("discovery_progress", **active,
+                           stage="BLOCKED",error=reason)
+                    continue
+
+                active["stage"] = "SPLITTING"
+                # Parent transition, child keys and validated counts share one
+                # durable transaction. The next loop Fetches the children.
+                await atomic(work.split,bucket,children,split_dimension,counts)
+                notify("discovery_split", **active,children=len(children))
+                continue
+
+            if bucket["status"] == "COUNTED":
+                await atomic(work.fetching, bucket)
+            previous = int(bucket["last_committed_page"])
+            total_pages = int(parent.total_pages)
+            active.update(stage="FETCHING", pages_done=previous,
+                          pages_total=total_pages)
+            chunk_size = max(1, min(32, concurrency * 2))
+            next_page = previous + 1
+            while next_page <= total_pages:
+                numbers = list(range(next_page, min(total_pages + 1,
+                                                    next_page + chunk_size)))
+                tasks = {
+                    p: asyncio.create_task(_direct_page(client, filters, p))
+                    for p in numbers if p != 1
+                }
+                batch = []
+                try:
+                    for p in numbers:
+                        if p == 1:
+                            obj = parent
+                        else:
+                            page_data, _ = await tasks[p]
+                            obj = parse_search_response(page_data)
+                            pages_fetched += 1
+                        if (obj.total_items != parent.total_items or
+                            obj.total_pages != parent.total_pages or
+                            len(obj.rows) == 0):
+                            raise ContractError("Discovery pagination drift or empty page")
+                        rows, rejected = _normalize_direct_rows(
+                            obj.rows, published_at=_now())
+                        invalid += rejected
+                        if rejected:
+                            raise ContractError(
+                                "Invalid company row; refusing to checkpoint incomplete page")
+                        batch.extend(rows)
+                except BaseException:
+                    for pending in tasks.values():
+                        if not pending.done():
+                            pending.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks.values(), return_exceptions=True)
+                    raise
+
+                active["stage"] = "PERSISTING"
+                notify("discovery_progress", **active)
+                def commit_chunk(conn):
+                    staged_written = 0
+                    size = max(1, int(settings.dbd_write_batch_size))
+                    for offset in range(0, len(batch), size):
+                        result = repo.upsert_discovered_companies(
+                            conn, batch[offset:offset + size],
+                            generation=generation, financial_mask=FINANCIAL_MASK,
+                            refresh_mask=refresh_mask)
+                        staged_written += int(result["inserted"]) + int(result["updated"])
+                    work.checkpoint(conn, bucket_id, previous, numbers[-1])
+                    return staged_written
+
+                written += await atomic(commit_chunk)
+                saved_pages += len(numbers)
+                previous = numbers[-1]
+                next_page = previous + 1
+                active.update(stage="FETCHING", pages_done=previous)
+                notify("discovery_progress", **active)
+            await atomic(work.done, bucket)
+            notify("discovery_progress", **active, stage="DONE")
+
+        report = await atomic(work.coverage, generation, scope)
+        notify("discovery_progress", **report, stage="RECONCILING")
+        if max_buckets is not None or (not recovery_pass and not report["ok"]):
+            raise ContractError(
+                "Discovery coverage incomplete: " + ", ".join(
+                    f"{key}={value}" for key, value in sorted(report.items())
+                )
+            )
+        return DiscoveryResult(
+            buckets_processed=processed, pages_fetched=pages_fetched,
+            companies_written=written, requests_made=client.requests_made,
+            invalid_rows=invalid,
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
