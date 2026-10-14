@@ -192,8 +192,10 @@ dbd-data discover-recover --probe --numeric-plan --parent-id 13966 --rate 0.25
 ```
 
 `--numeric-split --execute --parent-id ID` เป็นทางเข้าที่ปิดไว้แบบ fail-closed
-ขณะยังไม่มีมิติใดผ่านการรับรอง ห้ามใช้ `discover-refresh` เพื่อแก้
-Oversized Bucket; ใช้ MySQL Checkpoint เดิมต่อไป
+ขณะยังไม่มีมิติใดผ่านการรับรอง เช่นเดียวกับ `dbd-data discover --numeric-split`
+ซึ่งเป็น Explicit Opt-in และถูกปฏิเสธก่อนเรียก HTTP หากยังไม่มีหลักฐานรับรอง
+การแบ่ง Numeric ไม่ใช่สิ่งที่จะเปิดอัตโนมัติด้วย `dbd-data discover`
+ห้ามใช้ `discover-refresh` เพื่อแก้ Oversized Bucket; ใช้ MySQL Checkpoint เดิมต่อไป
 
 ระบบเก็บ valid rows ที่ผ่าน validation และ quarantine row ที่ผิด contract แยกไว้ ไม่ทิ้งทั้ง page เพียงเพราะมีบาง row ผิด
 

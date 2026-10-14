@@ -622,21 +622,22 @@ def validate_splits(verbose: bool = True) -> int:
         # Numeric children may match the parent count while silently omitting
         # NULL/fractional identities. Until the backend semantics and exact
         # interval structure are certified, NEVER mark their ancestors lossless.
+        parent_key = str(parent.get("bucket_key") or "")
         parent_numeric = {
-            part for part in str(parent["bucket_key"]).split("|")
+            part for part in parent_key.split("|")
             if part.startswith(("cap=", "asset=", "income=", "profit="))
         }
         numeric_children = any(
             {
-                part for part in str(child["bucket_key"]).split("|")
+                part for part in str(child.get("bucket_key") or "").split("|")
                 if part.startswith(("cap=", "asset=", "income=", "profit="))
             } != parent_numeric for child in children
         )
         numeric_safe = (
             not numeric_children
             or numeric_partition_structure(
-                str(parent["bucket_key"]),
-                [str(child["bucket_key"]) for child in children],
+                parent_key,
+                [str(child.get("bucket_key") or "") for child in children],
                 certified=PRODUCTION_CERTIFIED_DIMENSIONS,
             )
         )

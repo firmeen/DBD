@@ -1490,3 +1490,59 @@ async def test_oversized_bucket_refuses_automatic_count_growth(monkeypatch):
         )
     assert recorded == [(5, "processed")]
     assert row["total_items"] == 20000
+
+def test_validate_splits_never_marks_uncertified_numeric_parent_lossless(monkeypatch):
+    from dbd.storage.mysql import engine
+
+    parent = SearchFilters("010")
+    left = SearchFilters("010", cap_amt_max="50")
+    right = SearchFilters("010", cap_amt_min="50.01")
+    rows = [
+        {
+            "id": 2, "parent_id": 1, "depth": 1, "status": "done",
+            "total_items": 5000, "pages_total": 500, "pages_done": 500,
+            "partition_lossless": None, "bucket_key": left.key(),
+        },
+        {
+            "id": 3, "parent_id": 1, "depth": 1, "status": "done",
+            "total_items": 5000, "pages_total": 500, "pages_done": 500,
+            "partition_lossless": None, "bucket_key": right.key(),
+        },
+        {
+            "id": 1, "parent_id": None, "depth": 0, "status": "split",
+            "total_items": 10000, "pages_total": 1000, "pages_done": 0,
+            "partition_lossless": None, "bucket_key": parent.key(),
+        },
+    ]
+
+    class Cursor:
+        def execute(self, _sql):
+            pass
+
+        def fetchall(self):
+            return rows
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+    changes = {}
+    monkeypatch.setattr(engine, "connect", lambda: Connection())
+    monkeypatch.setattr(
+        discovery, "update_bucket",
+        lambda bucket_id, **kw: changes.update({bucket_id: kw["partition_lossless"]}),
+    )
+    assert discovery.validate_splits(verbose=False) == 1
+    assert changes == {1: 0}

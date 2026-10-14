@@ -17,7 +17,9 @@ It reports count-only *candidates*, not certified complete partitions.
 
 `--numeric-split --execute --parent-id ID` intentionally fails closed until
 backend NULL handling, fractional boundary precision, count stability, and
-identity coverage are independently certified. Historical count drift must be
+identity coverage are independently certified. The regular `discover` command
+never enables numeric splitting implicitly; `discover --numeric-split` requires
+the same certification and currently fails closed. Historical count drift must be
 reconciled; never overwrite a previously observed larger count just to split.
 Do not run bulk retry/refresh on the 35 failed leaves or reset the 286
 unverified split parents.
