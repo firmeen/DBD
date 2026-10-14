@@ -565,7 +565,8 @@ def main():
     recovery.add_argument("--parent-id", type=positive)
     recovery.add_argument("--limit", type=positive, default=10)
     recovery.add_argument("--execute", action="store_true")
-    recovery.add_argument("--probe", action="store_true", help="Read-only live API filter diagnostics for --parent-id")
+    recovery.add_argument("--probe", action="store_true", help="Read-only live API filter diagnostics")
+    recovery.add_argument("--probe-keyword", help="Read-only complete identity check for a small search cohort")
     recovery.add_argument("--rate", type=positive_rate, default=None)
     reset = _add_output_options(
         sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
@@ -824,13 +825,16 @@ def main():
 
             if args.probe and args.execute:
                 raise ValueError("--probe and --execute are mutually exclusive")
-            if args.probe and args.parent_id is None:
-                raise ValueError("--probe requires --parent-id")
+            if args.probe_keyword is not None and not args.probe:
+                raise ValueError("--probe-keyword requires --probe")
+            if args.probe and (args.parent_id is None) == (args.probe_keyword is None):
+                raise ValueError("--probe requires exactly one of --parent-id or --probe-keyword")
             if args.probe:
                 with manager_lock() as conn:
                     result = asyncio.run(
                         probe_discovery_partition(
                             parent_id=args.parent_id,
+                            keyword=args.probe_keyword,
                             rate=args.rate if args.rate is not None else 0.25,
                             health=lambda: assert_manager_lock(conn),
                         )
