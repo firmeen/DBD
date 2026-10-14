@@ -817,4 +817,4 @@ def test_v06_recovery_pass_is_not_reported_as_global_discovery_complete() -> Non
     assert "coverage=INCOMPLETE" in output
     assert "unresolved=3" in output
     assert "Completed with failures" in output
-    assert "\\x1b[" not in output and "\\r" not in output
+    assert "\x1b[" not in output and "\r" not in output
