@@ -552,6 +552,7 @@ async def test_recovery_blocked_candidates_do_not_open_http_client(monkeypatch):
         lambda _limit, _parent: [
             {"bucket_id": 13316, "reason": "partition_exhausted"},
             {"bucket_id": 62, "reason": "descendant_incomplete"},
+            {"bucket_id": 482, "reason": "overflow"},
         ],
     )
 
@@ -564,14 +565,14 @@ async def test_recovery_blocked_candidates_do_not_open_http_client(monkeypatch):
 
     preview = await discovery.recover_discovery(limit=10)
     assert preview["mode"] == "preview"
-    assert preview["blocked"] == 2
+    assert preview["blocked"] == 3
     assert preview["reason_counts"]["partition_exhausted"] == 1
     assert preview["reason_counts"]["descendant_incomplete"] == 1
 
     executed = await discovery.recover_discovery(limit=10, execute=True)
     assert executed["partitions_checked"] == 3
-    assert executed["unresolved"] == 2
-    assert executed["blocked"] == 2
+    assert executed["unresolved"] == 3
+    assert executed["blocked"] == 3
 
 
 @pytest.mark.asyncio
