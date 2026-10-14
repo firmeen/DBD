@@ -929,20 +929,39 @@ def main():
                     backend=selected, event=v06_terminal.event,
                     recovery_limit=args.limit,
                 ))
+                with connection() as conn:
+                    remaining = discovery_work.coverage(
+                        conn, int(recovered_generation), "full"
+                    )
                 v06_terminal.finish({
                     "generation":recovered_generation,
                     "partitions":result.buckets_processed,
                     "pages":result.pages_fetched,
                     "companies":result.companies_written,
-                    "coverage":"PASS_COMPLETED_NOT_DATASET_CERTIFIED",
-                })
+                    "recovery_pass":"FINISHED",
+                    "coverage":"VERIFIED" if remaining["ok"] else "INCOMPLETE",
+                    "unresolved":sum(remaining.get(k,0) for k in
+                                     ("pending","counted","fetching","failed","blocked")),
+                },status="COMPLETE" if remaining["ok"] else "COMPLETE_WITH_FAILURES")
         elif args.command == "status":
             from dataclasses import asdict
             from ..workflow import status as production_status
             selected = args.backend or settings.dbd_production_backend
             data = asyncio.run(production_status(
                 phase="core",backend=selected,coverage=False))
-            presenter.command_result("DBD · PRODUCTION STATUS", asdict(data))
+            result = asdict(data)
+            if selected == "sqlserver":
+                from ..storage.sqlserver import discovery_repository as discovery_work
+                from ..storage.sqlserver.engine import connection
+                from ..storage.production import production_repository
+                state = production_repository(selected).generation_state()
+                gen = state.get("active_generation")
+                if gen is not None:
+                    with connection() as conn:
+                        result["discovery"] = discovery_work.coverage(
+                            conn,int(gen),"full"
+                        )
+            presenter.command_result("DBD · PRODUCTION STATUS", result)
         elif args.command == "collect":
             from ..workflow import collect as production_collect
             selected = args.backend or settings.dbd_production_backend
