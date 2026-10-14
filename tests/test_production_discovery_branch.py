@@ -408,3 +408,38 @@ def test_branch_run_does_not_count_stale_snapshot_as_persisted(monkeypatch) -> N
     assert stats["verified"] == 0
     assert stats["branches"] == 0
     assert stats["skipped"] == 1
+
+
+def test_branch_import_at_equal_verified_timestamp_preserves_target_snapshot() -> None:
+    from datetime import datetime, timezone
+    from dbd.storage.sqlserver import branch_repository as store
+
+    timestamp = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    statements = []
+
+    class Cursor:
+        def execute(self, sql, params):
+            statements.append(sql)
+
+        def fetchone(self):
+            return (timestamp.replace(tzinfo=None),)
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    assert not store.save_snapshot(
+        Connection(), company_id=42,
+        branches=[{
+            "branch_no": "00001", "address_th": "New data",
+        }],
+        establishment_count=None,
+        verified_at=timestamp,
+        source="DATAFORTHAI_IMPORT",
+        url="https://www.dataforthai.com/company-branch/0107538000533/show/printview",
+    )
+    assert len(statements) == 1
+    assert statements[0].startswith("SELECT branch_verified_at")
