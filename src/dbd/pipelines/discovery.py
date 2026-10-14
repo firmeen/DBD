@@ -11,8 +11,8 @@ from uuid import uuid4
 
 from ..client.async_client import AsyncDbdClient
 from ..client.endpoints.search import (
-    MAX_ROWS_PER_QUERY,
     ITEMS_PER_PAGE,
+    MAX_ROWS_PER_QUERY,
     SEARCH_PATH,
     SEARCH_REFERER,
     SearchFilters,
