@@ -94,6 +94,16 @@ def test_verified_printview_zero_branches_is_distinct_from_missing_page() -> Non
     assert total == 1
 
 
+def test_printview_with_zero_cards_does_not_certify_zero_branches() -> None:
+    html = (
+        '<div id="divbranchsummary"><table><tr><td>รวม</td>'
+        '<td>0</td></tr></table></div>'
+        '<div id="divbranch"></div>'
+    )
+    with pytest.raises(BranchError, match="headquarters evidence"):
+        parse_printview(html, "0107538000533")
+
+
 def test_unverified_printview_never_becomes_zero_branches() -> None:
     with pytest.raises(BranchError,match="incomplete"):
         parse_printview(_html(branch=False,total=2),"0107538000533")
