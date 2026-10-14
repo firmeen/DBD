@@ -459,6 +459,15 @@ async def _process_bucket(
         if page.current_page != 1:
             raise ContractError("Invalid Discovery count page")
         total_items, pages_total = page.total_items, page.total_pages
+        # Never silently replace a previously observed population with a
+        # smaller live search count, even when no pages were committed yet.
+        recorded_count = row.get("total_items")
+        if recorded_count is not None and total_items < int(recorded_count):
+            await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
+            raise ContractError(
+                f"Discovery count drift for bucket {bucket_id}: "
+                f"stored={recorded_count}, live={total_items}; refusing automatic shrink"
+            )
         if int(row.get("pages_done") or 0) and row["total_items"] != total_items:
             raise ContractError("Search total changed after pages were committed")
         first_page = (count_archive_id, data, requested)
@@ -625,9 +634,159 @@ async def _validated_children(
     return []
 
 
+async def _probe_keyword_cohort(
+    keyword: str, *, rate: float, health=None,
+) -> dict:
+    """Read every identity in a small Search cohort without persistent writes.
+
+    These observations can reject an unsafe range plan, but never certify
+    numeric partitions for production or the whole DBD population.
+    """
+    from decimal import Decimal
+
+    from ..contracts.common import money
+
+    max_rows = 100
+    max_pages = 10  # Backend returns 10 rows/page.
+    variants = (
+        ("parent_before", {}),
+        ("max_zero", {"capAmtMax": 0}),
+        ("min_zero", {"capAmtMin": 0}),
+        ("min_one", {"capAmtMin": 1}),
+        ("both_zero", {"capAmtMin": 0, "capAmtMax": 0}),
+        ("parent_after", {}),
+    )
+    base = SearchFilters(keyword=keyword).payload(page=1)
+    observations: dict[str, dict[tuple[str, str], dict]] = {}
+    counts: dict[str, int] = {}
+    request_count = 0
+
+    async with AsyncDbdClient(
+        concurrency=1,
+        rate_per_second=rate,
+        endpoint_rates={"search": rate},
+    ) as client:
+        for label, numeric in variants:
+            rows: dict[tuple[str, str], dict] = {}
+            expected_count = expected_pages = None
+            for page_no in range(1, max_pages + 1):
+                if health is not None:
+                    await asyncio.to_thread(health)
+                data = await client.post(
+                    SEARCH_PATH,
+                    {**base, **numeric, "currentPage": page_no},
+                    referer=SEARCH_REFERER,
+                    timeout=settings.dbd_count_timeout_seconds,
+                    rate_key="search",
+                )
+                request_count += 1
+                page = parse_search_response(data)
+                if page.current_page != page_no:
+                    raise ContractError(f"Numeric probe {label}: wrong currentPage")
+                if page.total_items > max_rows or page.total_pages > max_pages:
+                    raise ContractError(
+                        f"Numeric probe {label} exceeds the {max_rows}-row safety limit"
+                    )
+                if expected_count is None:
+                    expected_count, expected_pages = page.total_items, page.total_pages
+                elif (page.total_items, page.total_pages) != (expected_count, expected_pages):
+                    raise ContractError(f"Numeric probe {label}: page count drift")
+                for raw in page.rows:
+                    jp_type, jp_no = raw.get("jpTypeCode"), raw.get("jpNo")
+                    if not isinstance(jp_type, str) or not isinstance(jp_no, str) or not jp_type or not jp_no:
+                        raise ContractError(f"Numeric probe {label}: missing company identity")
+                    identity = (jp_type, jp_no)
+                    if identity in rows:
+                        raise ContractError(f"Numeric probe {label}: duplicate company identity")
+                    rows[identity] = raw
+                if page_no >= expected_pages:
+                    break
+            if len(rows) != expected_count:
+                raise ContractError(
+                    f"Numeric probe {label}: expected {expected_count} identities, got {len(rows)}"
+                )
+            observations[label] = rows
+            counts[label] = expected_count
+
+    parent = set(observations["parent_before"])
+    after = set(observations["parent_after"])
+    max_zero = set(observations["max_zero"])
+    min_zero = set(observations["min_zero"])
+    min_one = set(observations["min_one"])
+    both_zero = set(observations["both_zero"])
+    combined = max_zero | min_one
+    missing = parent - combined
+    extra = combined - parent
+    overlap = max_zero & min_one
+    stable = counts["parent_before"] == counts["parent_after"] and parent == after
+
+    capital = {identity: money(raw.get("capAmt")) for identity, raw in observations["parent_before"].items()}
+    null_ids = {identity for identity, amount in capital.items() if amount is None}
+    fractional_ids = {
+        identity for identity, amount in capital.items()
+        if amount is not None and Decimal(0) < amount < Decimal(1)
+    }
+    zero_ids = {identity for identity, amount in capital.items() if amount == 0}
+    invalid_amounts = 0
+    for label, predicate in (
+        ("max_zero", lambda amount: amount <= 0),
+        ("min_one", lambda amount: amount >= 1),
+    ):
+        for raw in observations[label].values():
+            amount = money(raw.get("capAmt"))
+            if amount is None or not predicate(amount):
+                invalid_amounts += 1
+
+    cohort_pass = (
+        stable and not missing and not extra and not overlap
+        and invalid_amounts == 0 and bool(parent)
+    )
+    if not null_ids:
+        null_coverage = "NOT_TESTED_NO_NULL_IN_PARENT"
+    elif null_ids <= combined:
+        null_coverage = "OBSERVED_COVERED_ONLY"
+    else:
+        null_coverage = "OBSERVED_MISSING"
+    if not zero_ids:
+        zero_boundary = "NOT_TESTED_NO_ZERO_IN_PARENT"
+    elif zero_ids <= (max_zero & min_zero & both_zero):
+        zero_boundary = "ZERO_PRESENT_IN_ALL_TESTED_ZERO_FILTERS"
+    else:
+        zero_boundary = "ZERO_FILTERS_DIFFER"
+
+    return {
+        "mode": "probe",
+        "keyword": keyword,
+        "filter": "capAmt",
+        "request_count": request_count,
+        "parent_count": counts["parent_before"],
+        "parent_after": counts["parent_after"],
+        "counts": counts,
+        "count_stable": stable,
+        "null_parent_rows": len(null_ids),
+        "fractional_0_to_1_rows": len(fractional_ids),
+        "null_coverage": null_coverage,
+        "zero_boundary": zero_boundary,
+        "min_zero_matches_parent": min_zero == parent,
+        "zero_filter_overlap": len(max_zero & min_zero),
+        "child_overlap": len(overlap),
+        "child_missing": len(missing),
+        "child_extra": len(extra),
+        "invalid_child_capital": invalid_amounts,
+        "cohort_check": "PASS" if cohort_pass else "FAIL",
+        "decision": "OBSERVATION_ONLY",
+        "reason": (
+            "Small-cohort identity checks passed; numeric splitting is NOT approved globally"
+            if cohort_pass else
+            "Small-cohort identity or capital checks failed; numeric splitting is NOT approved"
+        ),
+    }
+
+
 async def probe_discovery_partition(
     *,
-    parent_id: int,
+    parent_id: int | None = None,
+    keyword: str | None = None,
     rate: float = 0.25,
     health=None,
 ) -> dict:
@@ -641,6 +800,13 @@ async def probe_discovery_partition(
 
     if rate <= 0:
         raise ValueError("Probe rate must be positive")
+    if (parent_id is None) == (keyword is None):
+        raise ValueError("Probe requires exactly one of parent_id or keyword")
+    if keyword is not None:
+        keyword = keyword.strip()
+        if len(keyword) < 3:
+            raise ValueError("Probe keyword must have at least 3 characters")
+        return await _probe_keyword_cohort(keyword, rate=rate, health=health)
     row = await asyncio.to_thread(get_bucket, parent_id)
     if row is None:
         raise ValueError(f"Unknown discovery bucket {parent_id}")
