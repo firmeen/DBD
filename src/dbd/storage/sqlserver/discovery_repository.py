@@ -212,6 +212,40 @@ def next_work(conn, generation: int, scope: str):
         "AND status IN ('PENDING','COUNTED','FETCHING')", (generation, scope))
 
 
+def reopen_blocked_numeric(conn, generation: int, scope: str, *, limit: int = 100) -> int:
+    """Operator-invoked retry after a numeric dimension is newly certified.
+
+    Never reset page checkpoints or auto-loop on uncategorized failures.
+    Round-robin oldest blocked timestamps prevents the same failures from
+    starving other buckets across bounded recovery passes.
+    """
+    if not 1 <= limit <= 1000:
+        raise ValueError("Recovery candidate limit must be 1..1000")
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT TOP ({int(limit)}) work_id FROM {TABLE} WITH (UPDLOCK,HOLDLOCK) "
+            "WHERE generation=%s AND scope_key=%s AND status='BLOCKED' "
+            "AND last_committed_page=0 AND total_items>10000 "
+            "AND last_error LIKE N'no_certified_lossless_split:%' "
+            "ORDER BY updated_at,work_id",
+            (generation,scope),
+        )
+        ids = [int(row[0]) for row in cur.fetchall()]
+        for work_id in ids:
+            cur.execute(
+                f"UPDATE {TABLE} SET status='COUNTED',"
+                "updated_at=SYSUTCDATETIME() "
+                "WHERE work_id=%s AND status='BLOCKED' AND last_committed_page=0",
+                (work_id,),
+            )
+            if cur.rowcount != 1:
+                raise ContractError("Discovery numeric recovery state changed before commit")
+        return len(ids)
+    finally:
+        cur.close()
+
+
 def report(conn, generation: int, scope: str) -> dict[str, int]:
     cur = conn.cursor()
     try:
@@ -282,7 +316,7 @@ def split(conn, parent: dict, children: list[SearchFilters],
     try:
         cur.execute(
             f"UPDATE {TABLE} SET status='SPLIT',partition_lossless=1,"
-            "split_dimension=%s,updated_at=SYSUTCDATETIME() "
+            "split_dimension=%s,last_error=NULL,updated_at=SYSUTCDATETIME() "
             "WHERE work_id=%s AND status='COUNTED'",
             (dimension,parent["work_id"]),
         )
