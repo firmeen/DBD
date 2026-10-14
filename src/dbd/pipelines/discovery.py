@@ -849,10 +849,12 @@ async def run(
     repository=None,
     event=None,
 ) -> DiscoveryResult:
-    """Direct v0.6 Search traversal into selected production DBD_COMPANY.
+    """Direct v0.6 Search traversal into the selected production DBD_COMPANY.
 
-    Split/page state is intentionally transient. A crash restarts Search
-    traversal; natural-key production upserts make repeated pages safe.
+    SQL Server resumes a durable Generation-scoped bucket tree and commits
+    company writes with contiguous page checkpoints. The separate Production
+    MySQL path currently retains in-memory traversal with idempotent upserts;
+    do not advertise MySQL page-level resume until its extension is built.
     """
     if distributed:
         raise ValueError(
