@@ -209,6 +209,10 @@ def test_recovery_candidates_distinguish_unfinished_descendant_from_false_zero()
     )
     assert reason() == "ready_to_validate"
 
+    # A corrupt/incomplete DONE checkpoint must never be certified.
+    update_bucket(second, status="done", pages_total=10, pages_done=9)
+    assert reason() == "descendant_incomplete"
+
 
 def test_failed_leaf_with_all_categorical_filters_is_partition_exhausted():
     from dbd.storage.mysql.repositories.discovery_repository import (
