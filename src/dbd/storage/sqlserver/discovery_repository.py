@@ -110,6 +110,29 @@ def validate_schema(conn) -> None:
         indexes = {str(row[0]) for row in cur.fetchall() if row[0]}
         if not {"UQ_DBD_DISCOVERY_WORK","IX_DBD_DISCOVERY_WORK_QUEUE"}.issubset(indexes):
             raise ContractError("DBD_DISCOVERY_WORK missing required unique/queue index")
+        cur.execute(
+            "SELECT name,is_disabled,is_not_trusted FROM sys.check_constraints "
+            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_DISCOVERY_WORK')"
+        )
+        checks = {str(name): (bool(disabled),bool(untrusted))
+                  for name,disabled,untrusted in cur.fetchall()}
+        required_checks = {
+            "CK_DBD_DISCOVERY_WORK_JSON",
+            "CK_DBD_DISCOVERY_WORK_STATUS",
+            "CK_DBD_DISCOVERY_WORK_PAGES",
+        }
+        if not required_checks.issubset(checks) or any(
+            checks[name] != (False,False) for name in required_checks if name in checks
+        ):
+            raise ContractError("DBD_DISCOVERY_WORK missing or untrusted CHECK constraint")
+        cur.execute(
+            "SELECT name,is_disabled,is_not_trusted FROM sys.foreign_keys "
+            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_DISCOVERY_WORK')"
+        )
+        keys = {str(name): (bool(disabled),bool(untrusted))
+                for name,disabled,untrusted in cur.fetchall()}
+        if keys.get("FK_DBD_DISCOVERY_WORK_PARENT") != (False,False):
+            raise ContractError("DBD_DISCOVERY_WORK self-reference FK is missing or untrusted")
     finally:
         cur.close()
 
