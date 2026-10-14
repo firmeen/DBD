@@ -134,6 +134,47 @@ def get_bucket(bucket_id: int) -> dict | None:
         return cur.fetchone()
 
 
+def bucket_has_pages(bucket_id: int) -> bool:
+    """Protect any existing page checkpoint, including failed/partial pages."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM discovery_pages WHERE bucket_id=%s LIMIT 1",
+            (int(bucket_id),),
+        )
+        return cur.fetchone() is not None
+
+
+def recoverable_failed_buckets(
+    limit: int = 50, *, exclude_ids: set[int] | None = None,
+) -> list[dict]:
+    """Select only untouched oversized failed leaves, never historical split parents."""
+    excluded = sorted(int(item) for item in (exclude_ids or set()))
+    not_seen = (
+        f" AND b.id NOT IN ({','.join(['%s'] * len(excluded))})"
+        if excluded else ""
+    )
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT b.* FROM discovery_buckets b
+            WHERE b.status='failed' AND b.total_items>10000
+              AND COALESCE(b.pages_done,0)=0
+              AND (b.lease_owner IS NULL OR b.lease_expires_at<UTC_TIMESTAMP(6))
+              AND NOT EXISTS (
+                SELECT 1 FROM discovery_buckets child WHERE child.parent_id=b.id
+              )
+              AND NOT EXISTS (
+                SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+              )
+            """ + not_seen + """
+            ORDER BY b.total_items ASC,b.depth DESC,b.id
+            LIMIT %s
+            """,
+            (*excluded, int(limit)),
+        )
+        return cur.fetchall()
+
+
 def pending_buckets(limit: int = 50) -> list[dict]:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -148,23 +189,52 @@ def pending_buckets(limit: int = 50) -> list[dict]:
         return cur.fetchall()
 
 
-def claim_buckets(owner: str, limit: int, lease_seconds: int) -> list[dict]:
-    """Atomically claim buckets across Discovery processes without overlap."""
+def claim_buckets(
+    owner: str, limit: int, lease_seconds: int,
+    *, failed_only: bool = False, exclude_ids: set[int] | None = None,
+) -> list[dict]:
+    """Atomically claim open or recoverable failed leaves under the original lease."""
     if limit < 1:
         return []
     with connect() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT * FROM discovery_buckets
-                    WHERE status IN ('pending','counted','draining')
-                      AND (lease_owner IS NULL OR lease_expires_at<UTC_TIMESTAMP(6))
-                    ORDER BY depth,id
-                    LIMIT %s FOR UPDATE SKIP LOCKED
-                    """,
-                    (limit,),
-                )
+                if failed_only:
+                    excluded = sorted(int(item) for item in (exclude_ids or set()))
+                    exclude_sql = (
+                        " AND b.id NOT IN (" + ",".join(["%s"] * len(excluded)) + ")"
+                        if excluded else ""
+                    )
+                    cur.execute(
+                        """
+                        SELECT b.* FROM discovery_buckets b
+                        WHERE b.status='failed' AND b.total_items>10000
+                          AND COALESCE(b.pages_done,0)=0
+                          AND (b.lease_owner IS NULL
+                               OR b.lease_expires_at<UTC_TIMESTAMP(6))
+                          AND NOT EXISTS (
+                            SELECT 1 FROM discovery_buckets child WHERE child.parent_id=b.id
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+                          )
+                        """ + exclude_sql + """
+                        ORDER BY b.total_items ASC,b.depth DESC,b.id
+                        LIMIT %s FOR UPDATE SKIP LOCKED
+                        """,
+                        (*excluded, int(limit)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT * FROM discovery_buckets
+                        WHERE status IN ('pending','counted','draining')
+                          AND (lease_owner IS NULL OR lease_expires_at<UTC_TIMESTAMP(6))
+                        ORDER BY depth,id
+                        LIMIT %s FOR UPDATE SKIP LOCKED
+                        """,
+                        (int(limit),),
+                    )
                 rows = cur.fetchall()
                 if not rows:
                     conn.commit()
