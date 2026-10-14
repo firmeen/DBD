@@ -268,7 +268,6 @@ async def test_recovery_preview_is_read_only_and_does_not_initialize_http(monkey
 
 
 def test_validate_splits_requires_terminal_children_and_descendants(monkeypatch):
-    from contextlib import contextmanager
     from dbd.storage.mysql import engine
 
     def bucket(i, parent, depth, status, items, pages=0, done=0, lossless=None):
