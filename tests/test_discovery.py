@@ -919,7 +919,7 @@ async def test_numeric_parent_boundary_preview_does_not_write_or_certify(monkeyp
     from dbd.storage.mysql.repositories import discovery_repository as repo
 
     row = {
-        "id": 13316, "status": "failed", "total_items": 120,
+        "id": 13316, "status": "failed", "total_items": 20000,
         "keyword": "010", "search_type": "", "pv_codes": "10",
         "jp_types": "5", "jp_statuses": "1", "business_sizes": "S",
         "numeric_filters": None,
@@ -968,7 +968,7 @@ async def test_numeric_parent_boundary_preview_does_not_write_or_certify(monkeyp
     assert report["request_count"] == 4
     assert report["count_parity"] is True
     assert report["count_stable"] is True
-    assert report["stored_count_drift"] is False
+    assert report["stored_count_drift"] is True
     assert report["decision"] == "OBSERVATION_ONLY"
     assert calls[0] == calls[3]
     assert calls[1]["capAmtMax"] == 0
@@ -980,7 +980,7 @@ async def test_numeric_parent_probe_rejects_invalid_gap_before_http(monkeypatch)
     from dbd.storage.mysql.repositories import discovery_repository as repo
 
     row = {
-        "id": 13316, "status": "failed", "total_items": 120,
+        "id": 13316, "status": "failed", "total_items": 20000,
         "keyword": "010", "search_type": "", "pv_codes": "10",
         "jp_types": "5", "jp_statuses": "1", "business_sizes": "S",
     }
