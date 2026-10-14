@@ -492,6 +492,7 @@ async def discover(
     rate: float | None = None,
     max_buckets: int | None = None,
     recovery_limit: int | None = None,
+    manual_confirmed: bool = False,
     verbose: bool = True,
     repository: Any | None = None,
     backend: str | None = None,
@@ -501,6 +502,48 @@ async def discover(
     _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
         generation, resumed = _cycle_generation(repo, phase=phase)
+        if getattr(repo, "backend", None) == "sqlserver":
+            from .control import EarlyStartConfirmationRequired
+            from .presentation.setup import local_node_id
+            from .storage.sqlserver.control_repository import ControlRepository
+
+            node_id = local_node_id()
+            if node_id is None:
+                raise RuntimeError("Run dbd-data setup before SQL Server discovery")
+            control = ControlRepository()
+            scoped = bool(seeds or search_type or max_buckets is not None)
+            active = control.active_generation()
+            if scoped:
+                if (active is None or active.get("state") != "DISCOVERING"
+                    or int(active.get("generation") or 0) != generation):
+                    raise RuntimeError(
+                        "Scoped diagnostics require an existing DISCOVERING "
+                        "monthly generation and cannot open a new one"
+                    )
+            else:
+                action, record = control.select_cycle(
+                    node_id, repo.generation_state(), auto=False,
+                    manual_confirmed=manual_confirmed,
+                    now=datetime.now(timezone.utc),
+                )
+                if action == "NOT_DUE":
+                    raise EarlyStartConfirmationRequired(
+                        "Monthly generation not due; operator confirmation required"
+                    )
+                if action == "ALREADY_COMPLETED":
+                    raise RuntimeError(
+                        "This monthly Generation is already complete"
+                    )
+                if record is None or action not in ("START", "RESUME"):
+                    raise RuntimeError("Monthly Discovery cannot start")
+                if record.get("state") not in ("SCHEDULED", "DISCOVERING"):
+                    raise RuntimeError(
+                        "Standalone Discovery cannot rewind a generation "
+                        "that already entered Core Collection"
+                    )
+                generation = int(record["generation"])
+                resumed = action == "RESUME"
+                control.transition(node_id,str(record["cycle_month"]),"DISCOVERING")
         repo.assert_manager_lock(lock_conn)
         _emit(
             event,
