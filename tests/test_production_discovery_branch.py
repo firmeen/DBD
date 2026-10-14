@@ -181,3 +181,47 @@ def test_discovery_coverage_requires_durable_roots_and_valid_split_tree(
     assert result["roots"] == roots
     assert result["invalid_tree"] == invalid_tree
     assert cursor.calls == 2
+
+
+def test_verified_branch_snapshot_is_due_again_after_monthly_refresh() -> None:
+    from datetime import datetime, timezone
+    from dbd.storage.sqlserver import branch_repository as store
+
+    class Cursor:
+        statements = []
+        rowcount = 1
+
+        def execute(self, sql, params):
+            self.statements.append((sql, params))
+
+        def fetchone(self):
+            return (None,)  # company exists, no previous verified snapshot
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return cursor
+
+    cursor = Cursor()
+    when = datetime(2026, 10, 14, tzinfo=timezone.utc)
+    assert store.save_snapshot(
+        Connection(), company_id=17, branches=[],
+        establishment_count=1, verified_at=when,
+        url="https://www.dataforthai.com/company-branch/0107538000533/show/printview",
+    )
+    sql, params = cursor.statements[-1]
+    assert "branch_retry_at=DATEADD(day,30,%s)" in sql
+    assert params[0] == 0
+    assert params[2] == "NO_BRANCH"
+    assert params[-1] == 17
+
+
+def test_external_branch_missing_and_invalid_pages_are_retryable() -> None:
+    from dbd.pipelines.branch import _RECHECK_HOURS
+
+    assert _RECHECK_HOURS["RETRY"] == 1
+    assert _RECHECK_HOURS["UNAVAILABLE"] > _RECHECK_HOURS["RETRY"]
+    assert _RECHECK_HOURS["NOT_LISTED"] > _RECHECK_HOURS["RETRY"]
+    assert _RECHECK_HOURS["INVALID"] > _RECHECK_HOURS["RETRY"]
