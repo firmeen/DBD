@@ -295,3 +295,123 @@ def collect(*, event=None, limit: int | None = None) -> dict:
                         future.cancel()
                     raise
     return stats
+
+
+def import_mysql(*, check: bool = False, limit: int | None = None,
+                 event=None) -> dict:
+    """Copy already fetched Dataset 1 branch rows without calling DataForThai.
+
+    Missing rows do NOT mean no branch. Inconsistent/partial generations are
+    skipped instead of marking them complete. Source remains read-only.
+    """
+    from ..presentation.setup import local_node_id
+    from ..storage.sqlserver.control_repository import ControlRepository
+
+    node = local_node_id()
+    if node is None:
+        raise BranchError("Admin setup required")
+    ControlRepository().require_admin(node)
+    repo = ProductionSqlServerRepository()
+    state = repo.generation_state()
+    if int(state.get("finalized_generation") or 0) < 1:
+        raise BranchError("Generation 1 cutover must be finalized before branch import")
+    stats = {"selected":0,"imported":0,"skipped":0,"conflicted":0,
+             "branches":0,"check":bool(check)}
+    from ..storage.mysql.engine import connect as legacy_connection
+    with legacy_connection() as legacy:
+        with legacy.cursor() as cur:
+            cur.execute(
+                "SELECT TABLE_NAME FROM information_schema.TABLES "
+                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='dbd_company_branch'"
+            )
+            if cur.fetchone() is None:
+                raise BranchError("Missing Dataset 1 dbd_company_branch source table")
+        last_type, last_no = "", ""
+        with repo.manager_lock(resource="TIPDI:DBD:v0.6:branch") as lock:
+            with repo.transaction() as conn:
+                store.validate_schema(conn)
+            while limit is None or stats["selected"] < limit:
+                repo.assert_manager_lock(lock,resource="TIPDI:DBD:v0.6:branch")
+                size = min(100,limit-stats["selected"]) if limit else 100
+                with legacy.cursor() as cur:
+                    cur.execute(
+                        "SELECT jp_type_code,jp_no FROM dbd_company_branch "
+                        "WHERE (jp_type_code>%s OR "
+                        "(jp_type_code=%s AND jp_no>%s)) "
+                        "GROUP BY jp_type_code,jp_no "
+                        "ORDER BY jp_type_code,jp_no LIMIT %s",
+                        (last_type,last_type,last_no,size),
+                    )
+                    keys = list(cur.fetchall())
+                if not keys:
+                    break
+                for key in keys:
+                    jp_type = key["jp_type_code"]
+                    jp_no = key["jp_no"]
+                    last_type,last_no = jp_type,jp_no
+                    stats["selected"] += 1
+                    with legacy.cursor() as cur:
+                        cur.execute(
+                            "SELECT branch_no,branch_name,branch_address,"
+                            "province_name,district_name,subdistrict_name,"
+                            "postal_code,branch_count,source_url,fetched_at "
+                            "FROM dbd_company_branch "
+                            "WHERE jp_type_code=%s AND jp_no=%s ORDER BY branch_no",
+                            (jp_type,jp_no),
+                        )
+                        source = list(cur.fetchall())
+                    if not source:
+                        stats["skipped"] += 1
+                        continue
+                    # Only an internally coherent source snapshot can be copied.
+                    # Earlier refreshes may leave stale rows in Dataset 1.
+                    date_set = {row["fetched_at"] for row in source}
+                    counts = {int(row["branch_count"]) for row in source
+                              if row["branch_count"] is not None}
+                    if (len(date_set)!=1 or len(counts)!=1
+                        or next(iter(counts)) != len(source)):
+                        stats["conflicted"] += 1
+                        continue
+                    stamp = next(iter(date_set))
+                    if not isinstance(stamp, datetime):
+                        stats["conflicted"] += 1
+                        continue
+                    branches = [
+                        {"branch_no":row["branch_no"],"branch_name":row["branch_name"],
+                         "address_th":row["branch_address"],
+                         "province_name":row["province_name"],
+                         "district_name":row["district_name"],
+                         "subdistrict_name":row["subdistrict_name"],
+                         "postal_code":row["postal_code"]}
+                        for row in source
+                    ]
+                    with repo.transaction() as conn:
+                        cur = conn.cursor()
+                        try:
+                            cur.execute(
+                                "SELECT company_id FROM dbo.DBD_COMPANY "
+                                "WHERE juristic_type_code=%s AND registration_no=%s",
+                                (jp_type,jp_no),
+                            )
+                            target = cur.fetchone()
+                        finally:
+                            cur.close()
+                        if target is None:
+                            stats["skipped"] += 1
+                            continue
+                        if not check:
+                            changed = store.save_snapshot(
+                                conn,company_id=int(target[0]),branches=branches,
+                                establishment_count=None,verified_at=stamp,
+                                url=str(source[0]["source_url"]),
+                                source="DATAFORTHAI_IMPORT",
+                            )
+                            if not changed:
+                                stats["skipped"] += 1
+                                continue
+                        stats["imported"] += 1
+                        stats["branches"] += len(branches)
+                    if event:
+                        try: event("branch_progress",dict(stats))
+                        except Exception: pass
+    return stats
