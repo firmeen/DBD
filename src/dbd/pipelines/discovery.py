@@ -34,6 +34,12 @@ from ..storage.mysql.repositories.discovery_repository import (
     upsert_bucket,
 )
 from ..storage.mysql.repositories.discovery_split_repository import split_bucket
+from .discovery_numeric import (
+    NUMERIC_DIMENSIONS,
+    PRODUCTION_CERTIFIED_DIMENSIONS,
+    NumericObservation,
+    plan_numeric_split,
+)
 
 JP_TYPES = ("0", "2", "3", "5", "7", "8", "9", "A")
 BUSINESS_SIZES = ("S", "M", "L", "X")
@@ -316,6 +322,24 @@ async def _drain_bucket(
             page = parse_search_response(data)
             if page.current_page != page_no or (not page.rows and page.total_items > 0):
                 raise ContractError("Search page number or empty-page contract mismatch")
+            if page.total_pages != pages_total:
+                raise ContractError("Search pagination changed during checkpointed collection")
+            if filters.numeric_range() is not None:
+                from ..contracts.common import money
+
+                for dimension, raw_key in NUMERIC_DIMENSIONS:
+                    minimum = getattr(filters, dimension + "_min")
+                    maximum = getattr(filters, dimension + "_max")
+                    if minimum is None and maximum is None:
+                        continue
+                    for raw in page.rows:
+                        amount = money(raw.get(raw_key))
+                        if amount is None or (minimum is not None and amount < minimum) or (
+                            maximum is not None and amount > maximum
+                        ):
+                            raise ContractError(
+                                f"Discovery numeric page violates {dimension} bounds"
+                            )
             profiles, rejections = _normalize_rows(page.rows)
             canonical_payload = json.dumps(data, ensure_ascii=False, default=str)
             result = {
@@ -445,6 +469,7 @@ async def _process_bucket(
     lease_owner: str | None = None,
     lease_version: int | None = None,
     status_codes: list[str] | None = None,
+    numeric_allowed: bool | None = None,
 ) -> tuple[int, int]:
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
@@ -499,6 +524,7 @@ async def _process_bucket(
         children = await _validated_children(
             client, bucket_id, filters, provinces, status_codes or [], int(total_items),
             rejection_reasons=rejected_plans,
+            numeric_allowed=numeric_allowed,
         )
         if not children:
             reason = "; ".join(rejected_plans) if rejected_plans else "no_usable_partition"
@@ -694,11 +720,12 @@ async def _validated_children(
     parent_count: int,
     *,
     rejection_reasons: list[str] | None = None,
+    numeric_allowed: bool | None = None,
 ) -> list[SearchFilters]:
-    """Try only unused categorical dimensions in the established priority order.
+    """Try unused categorical dimensions first, then *certified* numeric ranges.
 
-    Numeric fallback is deliberately not enabled: NULL/fractional coverage
-    and production count reconciliation are not yet proven.
+    Unverified numeric dimensions always fail closed. Existing discovery
+    collection continues to use the established categorical planner.
     """
     plans = _partition_plans(filters, provinces, statuses)
     if not plans and rejection_reasons is not None:
@@ -722,6 +749,49 @@ async def _validated_children(
                 rejection_reasons.append(f"{dimension}:{reason}")
         if accepted:
             return options
+
+    if numeric_allowed is None:
+        numeric_allowed = bool(PRODUCTION_CERTIFIED_DIMENSIONS)
+    if not numeric_allowed:
+        return []
+    if not PRODUCTION_CERTIFIED_DIMENSIONS:
+        if rejection_reasons is not None:
+            rejection_reasons.append("numeric_unverified:NULL_and_boundary_coverage")
+        return []
+
+    # This branch is deliberately dormant until backend coverage certification.
+    # Recheck the parent; plan only from samples already returned by its count.
+    current, archive_id, _, _ = await _count(client, bucket_id, filters)
+    from ..storage.mysql.repositories.discovery_repository import mark_search_archive
+
+    await asyncio.to_thread(mark_search_archive, archive_id, "processed")
+    if current.current_page != 1 or current.total_items != parent_count:
+        if rejection_reasons is not None:
+            rejection_reasons.append("numeric_parent_count_drift")
+        return []
+
+    async def read_numeric_count(candidate: SearchFilters) -> NumericObservation:
+        page, item_archive, _, _ = await _count(client, bucket_id, candidate)
+        await asyncio.to_thread(mark_search_archive, item_archive, "processed")
+        if page.current_page != 1:
+            raise ContractError("Numeric count returned invalid currentPage")
+        return NumericObservation(page.total_items, page.rows)
+
+    plan = await plan_numeric_split(
+        filters, parent_count, read_numeric_count, current.rows,
+        dimensions=tuple(PRODUCTION_CERTIFIED_DIMENSIONS),
+    )
+    if not plan.candidate:
+        if rejection_reasons is not None:
+            rejection_reasons.append("numeric:" + plan.reason)
+        return []
+    failures: list[str] = []
+    if await _probe_partition(
+        client, bucket_id, filters, parent_count, plan.children, failures
+    ):
+        return plan.children
+    if rejection_reasons is not None:
+        rejection_reasons.extend("numeric:" + failure for failure in failures)
     return []
 
 
@@ -1073,6 +1143,75 @@ async def probe_discovery_partition(
     }
 
 
+async def preview_numeric_discovery_plan(
+    parent_id: int, *, rate: float = 0.25, health=None,
+) -> dict:
+    """Read-only bounded numeric count preview. No archives or checkpoint writes."""
+    from ..storage.mysql.repositories.discovery_repository import get_bucket
+
+    if rate <= 0:
+        raise ValueError("Numeric preview rate must be positive")
+    row = await asyncio.to_thread(get_bucket, parent_id)
+    if row is None or row["status"] != "failed" or int(row.get("total_items") or 0) <= MAX_ROWS_PER_QUERY:
+        raise ValueError("Numeric preview requires an oversized failed leaf")
+    filters = _filters_from_row(row)
+    requests = 0
+    async with AsyncDbdClient(
+        concurrency=1, rate_per_second=rate, endpoint_rates={"search": rate},
+    ) as client:
+
+        async def count_one(query: SearchFilters) -> NumericObservation:
+            nonlocal requests
+            if health is not None:
+                await asyncio.to_thread(health)
+            data = await client.post(
+                SEARCH_PATH, query.payload(page=1), referer=SEARCH_REFERER,
+                timeout=settings.dbd_count_timeout_seconds, rate_key="search",
+            )
+            requests += 1
+            page = parse_search_response(data)
+            if page.current_page != 1 or (page.total_items and not page.rows):
+                raise ContractError("Numeric preview received invalid search page")
+            return NumericObservation(page.total_items, page.rows)
+
+        before = await count_one(filters)
+        stored_count = int(row["total_items"])
+        if before.count != stored_count:
+            return {
+                "mode": "numeric_plan_preview", "bucket_id": parent_id,
+                "stored_count": stored_count, "live_count": before.count,
+                "request_count": requests, "decision": "BLOCKED",
+                "reason": "historical_count_drift_no_rewrite",
+            }
+
+        plan = await plan_numeric_split(
+            filters, before.count, count_one, before.rows,
+        )
+        after = await count_one(filters)
+
+    stable = before.count == after.count
+    return {
+        "mode": "numeric_plan_preview",
+        "bucket_id": parent_id,
+        "stored_count": stored_count,
+        "parent_before": before.count, "parent_after": after.count,
+        "candidate_dimension": plan.dimension,
+        "candidate_child_counts": plan.child_counts,
+        "candidate_ranges": [
+            child.numeric_range() for child in plan.children
+        ],
+        "attempts": plan.attempts,
+        "request_count": requests,
+        "count_stable": stable,
+        "decision": "OBSERVATION_ONLY" if stable else "BLOCKED",
+        "reason": (
+            "Count-only plans do not certify NULL, decimal boundary or full identity coverage"
+            if stable else "Parent count drifted during numeric preview"
+        ),
+        "planner_reason": plan.reason,
+    }
+
+
 async def recover_discovery(
     *,
     parent_id: int | None = None,
@@ -1080,6 +1219,7 @@ async def recover_discovery(
     execute: bool = False,
     rate: float = 1.0,
     health=None,
+    numeric_split: bool = False,
 ) -> dict:
     """Preview or selectively recover historical count failures.
 
@@ -1105,6 +1245,8 @@ async def recover_discovery(
     actionable = {"stale_zero"}
     if parent_id is not None:
         actionable.add("overflow")
+        if numeric_split and PRODUCTION_CERTIFIED_DIMENSIONS:
+            actionable.add("partition_exhausted")
     blocked = sum(item["reason"] not in actionable | {"ready_to_validate"} for item in candidates)
     report: dict = {
         "mode": "execute" if execute else "preview",
@@ -1120,6 +1262,11 @@ async def recover_discovery(
         return report
     if rate <= 0:
         raise ValueError("Recovery rate must be positive")
+    if numeric_split and (parent_id is None or not PRODUCTION_CERTIFIED_DIMENSIONS):
+        raise ValueError(
+            "Numeric execution requires a targeted parent and independently certified "
+            "backend NULL/fractional/boundary coverage; no dimensions are approved"
+        )
 
     # No actionable candidates: reconcile existing checkpoints, but do not
     # authenticate or issue even one Search request.
@@ -1212,6 +1359,7 @@ async def recover_discovery(
                     await _process_bucket(
                         client, row, provinces, master_cache={},
                         progress_line=None, status_codes=statuses,
+                        numeric_allowed=numeric_split,
                     )
                     state = await asyncio.to_thread(get_bucket, bucket_id)
                     if state["status"] == "split":

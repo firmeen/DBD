@@ -1293,3 +1293,58 @@ def test_categorical_refinement_carries_all_numeric_constraints():
     province = plans[0]
     assert [child.pv_codes for child in province] == [["10"], ["20"]]
     assert all(child.numeric_range() == parent.numeric_range() for child in province)
+
+@pytest.mark.asyncio
+async def test_numeric_plan_preview_is_read_only_and_reports_bounded_counts(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    monkeypatch.setattr(repository, "get_bucket", lambda _id: {
+        "id": 9001, "status": "failed", "keyword": "010", "search_type": "",
+        "jp_types": "5", "pv_codes": "10", "jp_statuses": "1",
+        "business_sizes": "S", "total_items": 20000,
+        "numeric_filters": None,
+    })
+    for name in ("archive_search", "upsert_bucket", "update_bucket"):
+        monkeypatch.setattr(
+            repository, name,
+            lambda *_a, **_kw: (_ for _ in ()).throw(
+                AssertionError("Preview must not persist any changes")
+            ),
+        )
+
+    class Client:
+        def __init__(self, **kwargs):
+            assert kwargs["concurrency"] == 1
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _path, payload, **_kwargs):
+            if payload["capAmtMax"] is not None:
+                total, amount = 8000, "100"
+            elif payload["capAmtMin"] is not None:
+                total, amount = 12000, "99999999"
+            else:
+                total, amount = 20000, "1000000"
+            return {
+                "meta": {"currentPage": 1, "totalItems": total, "totalPages": (total + 9) // 10},
+                "contents": [{"jpTypeCode": "5", "jpNo": "0100000000001", "capAmt": amount}],
+            }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    preview = await discovery.preview_numeric_discovery_plan(9001)
+    assert preview["decision"] == "OBSERVATION_ONLY"
+    assert preview["candidate_dimension"] == "cap_amt"
+    assert preview["candidate_child_counts"] == [8000, 12000]
+    assert preview["request_count"] <= 18
+
+
+@pytest.mark.asyncio
+async def test_numeric_execution_is_blocked_without_certified_api_coverage():
+    with pytest.raises(ValueError, match="certified"):
+        await discovery.recover_discovery(
+            parent_id=9001, execute=True, numeric_split=True
+        )
