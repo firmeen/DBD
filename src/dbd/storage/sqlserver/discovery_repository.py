@@ -225,14 +225,19 @@ def count(conn, work_id: int, total: int, pages: int) -> None:
 
 
 def split(conn, parent: dict, children: list[SearchFilters],
-          dimension: str) -> None:
+          dimension: str, counts: list[tuple[int, int]] | None = None) -> None:
     if parent["status"] != "COUNTED" or len(children) < 2:
         raise ContractError("Only counted parents may be split into distinct children")
     if len({f.key() for f in children}) != len(children):
         raise ContractError("Duplicate Discovery child key")
-    for child in children:
-        _add(conn, int(parent["generation"]), parent["scope_key"],
-             child, int(parent["work_id"]))
+    if counts is not None and len(counts) != len(children):
+        raise ContractError("Every Discovery child must have a count and page total")
+    for index, child in enumerate(children):
+        child_id = _add(conn, int(parent["generation"]), parent["scope_key"],
+                        child, int(parent["work_id"]))
+        if counts is not None:
+            total, pages = counts[index]
+            count(conn, child_id, total, pages)
     cur = conn.cursor()
     try:
         cur.execute(
