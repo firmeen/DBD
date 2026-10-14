@@ -1188,6 +1188,18 @@ async def _run_durable_discovery(
 
     status_candidates = await atomic(observed_statuses)
 
+    if recovery_pass:
+        from .discovery_numeric import PRODUCTION_CERTIFIED_DIMENSIONS
+        if PRODUCTION_CERTIFIED_DIMENSIONS:
+            reopened = await atomic(
+                work.reopen_blocked_numeric, generation, scope,
+                limit=min(int(recovery_limit or 100), 1000),
+            )
+            notify(
+                "discovery_progress", stage="RECONCILING",
+                reopened_buckets=reopened,
+            )
+
     async def pulse() -> None:
         nonlocal durable_snapshot, last_summary_at
         while True:
