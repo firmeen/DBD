@@ -922,7 +922,7 @@ def main():
                     "read_only":True,"generation":int(generation),**preview})
             else:
                 from ..workflow import discover
-                v06_terminal = V06Terminal("discover", app="DBD DATA").start(
+                v06_terminal = V06Terminal("recover", app="DBD DATA").start(
                     backend=selected,
                 )
                 recovered_generation, result = asyncio.run(discover(
