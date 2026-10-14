@@ -733,7 +733,12 @@ async def recover_discovery(
         reason: sum(item["reason"] == reason for item in candidates)
         for reason in sorted({item["reason"] for item in candidates})
     }
-    actionable = {"stale_zero", "overflow"}
+    # Previously failed oversized leaves have already exhausted the existing
+    # partition planner. Retry them only on explicit --parent-id, not on bulk
+    # recovery where they would repeat costly failed Search probes.
+    actionable = {"stale_zero"}
+    if parent_id is not None:
+        actionable.add("overflow")
     blocked = sum(item["reason"] not in actionable | {"ready_to_validate"} for item in candidates)
     report: dict = {
         "mode": "execute" if execute else "preview",
