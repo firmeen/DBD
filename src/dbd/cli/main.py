@@ -567,6 +567,8 @@ def main():
     recovery.add_argument("--execute", action="store_true")
     recovery.add_argument("--probe", action="store_true", help="Read-only live API filter diagnostics")
     recovery.add_argument("--probe-keyword", help="Read-only complete identity check for a small search cohort")
+    recovery.add_argument("--cap-max", help="Numeric plan preview: inclusive lower child maximum")
+    recovery.add_argument("--cap-next-min", help="Numeric plan preview: upper child minimum")
     recovery.add_argument("--rate", type=positive_rate, default=None)
     reset = _add_output_options(
         sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
@@ -827,6 +829,8 @@ def main():
                 raise ValueError("--probe and --execute are mutually exclusive")
             if args.probe_keyword is not None and not args.probe:
                 raise ValueError("--probe-keyword requires --probe")
+            if (args.cap_max is not None or args.cap_next_min is not None) and not args.probe:
+                raise ValueError("Numeric plan bounds require --probe")
             if args.probe and (args.parent_id is None) == (args.probe_keyword is None):
                 raise ValueError("--probe requires exactly one of --parent-id or --probe-keyword")
             if args.probe:
@@ -835,6 +839,8 @@ def main():
                         probe_discovery_partition(
                             parent_id=args.parent_id,
                             keyword=args.probe_keyword,
+                            cap_max=args.cap_max,
+                            cap_next_min=args.cap_next_min,
                             rate=args.rate if args.rate is not None else 0.25,
                             health=lambda: assert_manager_lock(conn),
                         )
