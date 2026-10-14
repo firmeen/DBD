@@ -357,3 +357,54 @@ def test_numeric_recovery_reopens_only_safe_blocked_zero_page_buckets() -> None:
     assert "ORDER BY updated_at,work_id" in cursor.sql[0][0]
     assert all("SET status='COUNTED'" in sql for sql, _ in cursor.sql[1:])
     assert [params[0] for _, params in cursor.sql[1:]] == [101,102]
+
+
+def test_branch_run_does_not_count_stale_snapshot_as_persisted(monkeypatch) -> None:
+    from contextlib import contextmanager
+    from threading import Event
+    from dbd.pipelines import branch as pipeline
+    from dbd.presentation import setup as setup_ui
+    from dbd.storage.sqlserver.control_repository import ControlRepository
+
+    class Repository:
+        @contextmanager
+        def manager_lock(self, **kwargs):
+            yield object()
+
+        @contextmanager
+        def transaction(self):
+            yield object()
+
+        def assert_manager_lock(self, *args, **kwargs):
+            return None
+
+    class FakeHttp:
+        def __init__(self):
+            self.requests = 1
+            self.stop = Event()
+
+        def collect(self, jp_no):
+            return {
+                "status": "COMPLETE", "branches": [{
+                    "branch_no": "00001",
+                    "address_th": "Test Road Bangkok",
+                }],
+                "total": 2,
+                "url": "https://www.dataforthai.com/company-branch/"
+                       + jp_no + "/show/printview",
+            }
+
+    monkeypatch.setattr(setup_ui, "local_node_id", lambda: "node-admin")
+    monkeypatch.setattr(ControlRepository, "require_admin", lambda *_: None)
+    monkeypatch.setattr(pipeline, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(pipeline, "BranchHttp", FakeHttp)
+    monkeypatch.setattr(pipeline.store, "validate_schema", lambda *_: None)
+    monkeypatch.setattr(pipeline.store, "candidates", lambda *_args, **_kwargs: [{
+        "company_id": 17, "registration_no": "0107538000533",
+    }])
+    monkeypatch.setattr(pipeline.store, "save_snapshot", lambda *_args, **_kwargs: False)
+    stats = pipeline.collect(limit=1)
+    assert stats["checked"] == 1
+    assert stats["verified"] == 0
+    assert stats["branches"] == 0
+    assert stats["skipped"] == 1
