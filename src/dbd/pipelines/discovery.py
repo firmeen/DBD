@@ -625,11 +625,28 @@ async def _process_bucket(
                 live_evidence = live
             else:
                 # Only one extra read when the earliest DONE page is not page 1.
+                requested_evidence = _now()
                 response = await client.post(
                     SEARCH_PATH, filters.payload(page=evidence_page),
                     referer=SEARCH_REFERER, rate_key="search",
                 )
-                live_evidence = parse_search_response(response)
+                from ..storage.mysql.repositories.discovery_repository import archive_search
+
+                evidence_archive_id = await asyncio.to_thread(
+                    archive_search, bucket_id, evidence_page, filters,
+                    response, requested_evidence, link_page=False,
+                )
+                try:
+                    live_evidence = parse_search_response(response)
+                except Exception:
+                    await asyncio.to_thread(
+                        mark_search_archive, evidence_archive_id, "invalid",
+                        "checkpoint_resume_evidence_invalid",
+                    )
+                    raise
+                await asyncio.to_thread(
+                    mark_search_archive, evidence_archive_id, "processed"
+                )
             identities = [
                 (str(item.get("jpTypeCode")), str(item.get("jpNo")))
                 for item in live_evidence.rows
@@ -930,6 +947,13 @@ async def _validated_children(
         # through normal 'dbd-data discover' when certification changes.
         numeric_allowed = False
     if not numeric_allowed:
+        return []
+
+    from ..storage.mysql.repositories.discovery_repository import numeric_schema_ready
+
+    if not await asyncio.to_thread(numeric_schema_ready):
+        if rejection_reasons is not None:
+            rejection_reasons.append("numeric_schema_missing_migration_0013")
         return []
 
     # Numeric is a continuation of normal Discovery work, never a separate
@@ -1780,21 +1804,27 @@ async def run(
 ) -> DiscoveryResult:
     # Fail before any HTTP or bucket writes if the existing migration 0013
     # has not been applied. No hidden DDL, guessed schema or retry storm.
+    numeric_schema_missing = False
     if numeric_split:
         from ..storage.mysql.repositories.discovery_repository import numeric_schema_ready
 
         if not await asyncio.to_thread(numeric_schema_ready):
-            raise ContractError(
-                "DISCOVERY_NUMERIC_SCHEMA_MISSING: discovery_buckets.numeric_filters "
-                "JSON is required. Check alembic_version and apply existing "
-                "dbd-data migrate with the collector stopped."
-            )
+            # Numeric-only work is deferred, not permitted to block all
+            # categorical children or checkpointed page collection.
+            numeric_split = False
+            numeric_schema_missing = True
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed discovery requires DBD_REDIS_URL")
     stop = asyncio.Event()
     owner_label = os.environ.get("DBD_WORKER_ID") or "discovery"
     owner = f"{owner_label}-{uuid4().hex}"
     progress_line = ProgressLine("DISCOVERY", interval=0.75, enabled=verbose)
+    if numeric_schema_missing:
+        progress_line.event(
+            "DISCOVERY_NUMERIC_SCHEMA_MISSING: discovery_buckets.numeric_filters "
+            "JSON is absent; categorical splits and page resume continue, "
+            "numeric fallback is deferred until the existing migration 0013 is applied"
+        )
     global_rate = settings.dbd_rate_per_second if rate is None else rate
 
     async with AsyncDbdClient(
