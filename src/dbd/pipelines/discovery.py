@@ -126,6 +126,32 @@ def _children_for(filters: SearchFilters, provinces: list[str]) -> list[SearchFi
     return []
 
 
+def _direct_categorical_plans(
+    filters: SearchFilters, provinces: list[str],
+    statuses: tuple[str, ...] = (),
+) -> list[tuple[str, list[SearchFilters]]]:
+    """Bounded candidate plans; only counted, validated plans are committed.
+
+    Kept separate from legacy _children_for so Dataset 1 semantics do not
+    change. Observed status codes are hypotheses, not an exhaustive catalog.
+    """
+    from dataclasses import replace
+
+    candidates = []
+    for dimension, field, values in (
+        ("juristic_type", "jp_types", JP_TYPES if not filters.jp_types else ()),
+        ("province", "pv_codes", tuple(provinces) if not filters.pv_codes else ()),
+        ("status", "jp_statuses", statuses if not filters.jp_statuses else ()),
+        ("business_size", "business_sizes",
+         ("S","M","L","X") if not filters.business_sizes else ()),
+    ):
+        if len(values) >= 2:
+            children = [replace(filters, **{field:[value]}) for value in values]
+            if len({child.key() for child in children}) == len(children):
+                candidates.append((dimension,children))
+    return candidates
+
+
 async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
     data = await client.get("/api/v1/commons/provinces")
     if not isinstance(data, list):
