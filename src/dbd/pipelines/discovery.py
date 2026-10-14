@@ -259,6 +259,7 @@ async def _drain_bucket(
     progress_line: ProgressLine | None = None,
     lease_owner: str | None = None,
     lease_version: int | None = None,
+    expected_items: int | None = None,
 ):
     """Drain incomplete page checkpoints; start_page is retained for API compatibility."""
     from ..storage.mysql.repositories.discovery_batch_repository import persist_page_batch
@@ -322,8 +323,10 @@ async def _drain_bucket(
             page = parse_search_response(data)
             if page.current_page != page_no or (not page.rows and page.total_items > 0):
                 raise ContractError("Search page number or empty-page contract mismatch")
-            if page.total_pages != pages_total:
-                raise ContractError("Search pagination changed during checkpointed collection")
+            if page.total_pages != pages_total or (
+                expected_items is not None and page.total_items != expected_items
+            ):
+                raise ContractError("Search count/pagination changed during checkpointed collection")
             if filters.numeric_range() is not None:
                 from ..contracts.common import money
 
@@ -564,6 +567,7 @@ async def _process_bucket(
         progress_line=progress_line,
         lease_owner=lease_owner,
         lease_version=lease_version,
+        expected_items=int(total_items),
     )
 
 

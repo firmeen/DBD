@@ -116,3 +116,39 @@ def test_production_numeric_gate_is_fail_closed():
     from dbd.pipelines.discovery_numeric import PRODUCTION_CERTIFIED_DIMENSIONS
 
     assert not PRODUCTION_CERTIFIED_DIMENSIONS
+
+@pytest.mark.asyncio
+async def test_numeric_planner_reaches_profit_when_prior_dimensions_cannot_progress():
+    filters = SearchFilters("010", jp_types=["5"], pv_codes=["10"])
+    attempted = []
+
+    async def count(child):
+        for dimension, raw_key in (
+            ("cap_amt", "capAmt"),
+            ("total_asset", "totalAsset"),
+            ("total_income", "totalIncome"),
+            ("net_profit", "netProfit"),
+        ):
+            if getattr(child, dimension + "_max") is not None:
+                attempted.append(dimension)
+                if dimension == "net_profit":
+                    return NumericObservation(9000, [{raw_key: "1"}])
+                return NumericObservation(0, [])
+            if getattr(child, dimension + "_min") is not None:
+                if dimension == "net_profit":
+                    return NumericObservation(21000, [{raw_key: "9999999"}])
+                return NumericObservation(30000, [{raw_key: "9999999"}])
+        raise AssertionError("Unexpected unfiltered child")
+
+    plan = await plan_numeric_split(
+        filters, 30000, count,
+        [{
+            "capAmt": "100", "totalAsset": "100",
+            "totalIncome": "100", "netProfit": "100",
+        }],
+    )
+    assert plan.candidate
+    assert plan.dimension == "net_profit"
+    assert len(plan.attempts) <= 8
+    assert attempted[:2] == ["cap_amt", "cap_amt"]
+    assert all(child.jp_types == ["5"] and child.pv_codes == ["10"] for child in plan.children)

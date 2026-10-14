@@ -30,7 +30,7 @@ PRODUCTION_CERTIFIED_DIMENSIONS: frozenset[str] = frozenset()
 # an exhaustive one-satang partition; this must be established separately.
 CANDIDATE_STEP = Decimal("0.01")
 MAX_TOTAL_TRIALS = 8
-MAX_DIMENSION_TRIALS = 4
+MAX_DIMENSION_TRIALS = 2
 
 
 @dataclass(frozen=True)

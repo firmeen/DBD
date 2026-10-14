@@ -1364,3 +1364,31 @@ async def test_numeric_fallback_refuses_uncertified_dimensions_without_http(monk
     )
     assert result == []
     assert "numeric_unverified:NULL_and_boundary_coverage" in reasons
+
+@pytest.mark.asyncio
+async def test_checkpointed_numeric_page_rejects_changed_total_items(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    changes = []
+    monkeypatch.setattr(discovery, "update_bucket", lambda _id, **kw: changes.append(kw))
+    monkeypatch.setattr(repository, "completed_pages", lambda _id: set())
+    monkeypatch.setattr(repository, "fail_page", lambda *_a, **_kw: None)
+    monkeypatch.setattr(repository, "page_progress", lambda _id: {
+        "done": 0, "failed": 1, "partial": 0, "rows": 0, "rejected": 0,
+    })
+
+    class Client:
+        concurrency = 1
+
+        async def post(self, _path, _payload, **_kw):
+            return {
+                "meta": {"currentPage": 1, "totalItems": 8, "totalPages": 1},
+                "contents": [{"jpTypeCode": "5", "jpNo": "0100000000001", "capAmt": 100}],
+            }
+
+    await discovery._drain_bucket(
+        Client(), 42, SearchFilters("010", cap_amt_min="1"), 1,
+        expected_items=9,
+    )
+    assert changes[-1]["status"] == "failed"
+    assert changes[-1]["pages_done"] == 0
