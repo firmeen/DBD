@@ -158,14 +158,15 @@ def numeric_schema_ready() -> bool:
         return cur.fetchone() is not None
 
 
-def completed_first_page_evidence(bucket_id: int) -> dict | None:
-    """Return archived page-one identity order only when it was committed."""
+def completed_page_evidence(bucket_id: int) -> dict | None:
+    """Return the earliest committed page and its archived identity order."""
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT a.payload FROM discovery_pages p
+            SELECT p.page_no,a.payload FROM discovery_pages p
             JOIN response_archive a ON a.id=p.archive_id
-            WHERE p.bucket_id=%s AND p.page_no=1 AND p.status='done'
+            WHERE p.bucket_id=%s AND p.status='done'
+            ORDER BY p.page_no LIMIT 1
             """,
             (int(bucket_id),),
         )
@@ -180,13 +181,14 @@ def completed_first_page_evidence(bucket_id: int) -> dict | None:
             raise ValueError("invalid archived page structure")
         identities = [(str(item["jpTypeCode"]), str(item["jpNo"])) for item in contents]
         return {
+            "page_no": int(row["page_no"]),
             "identities": identities,
             "total_items": metadata["totalItems"],
             "total_pages": metadata["totalPages"],
         }
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError(
-            f"Discovery bucket {bucket_id} has an unreadable archived first page"
+            f"Discovery bucket {bucket_id} has an unreadable archived done page"
         ) from exc
 
 

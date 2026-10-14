@@ -529,7 +529,7 @@ async def _process_bucket(
     numeric_allowed: bool | None = None,
 ) -> tuple[int, int]:
     from ..storage.mysql.repositories.discovery_repository import (
-        completed_first_page_evidence,
+        completed_page_evidence,
         completed_pages,
         mark_search_archive,
     )
@@ -614,24 +614,36 @@ async def _process_bucket(
                 f"expected_pages={pages_total} actual_pages={live.total_pages}"
             )
         saved_done = await asyncio.to_thread(completed_pages, bucket_id)
-        if 1 in saved_done:
-            evidence = await asyncio.to_thread(completed_first_page_evidence, bucket_id)
-            if evidence is None:
+        if saved_done:
+            evidence = await asyncio.to_thread(completed_page_evidence, bucket_id)
+            if evidence is None or int(evidence["page_no"]) not in saved_done:
                 raise ContractError(
-                    f"RESUME_MISSING_FIRST_PAGE_ARCHIVE bucket={bucket_id}"
+                    f"RESUME_MISSING_DONE_PAGE_ARCHIVE bucket={bucket_id}"
                 )
+            evidence_page = int(evidence["page_no"])
+            if evidence_page == 1:
+                live_evidence = live
+            else:
+                # Only one extra read when the earliest DONE page is not page 1.
+                response = await client.post(
+                    SEARCH_PATH, filters.payload(page=evidence_page),
+                    referer=SEARCH_REFERER, rate_key="search",
+                )
+                live_evidence = parse_search_response(response)
             identities = [
                 (str(item.get("jpTypeCode")), str(item.get("jpNo")))
-                for item in live.rows
+                for item in live_evidence.rows
             ]
             if (
-                identities != evidence["identities"]
-                or evidence["total_items"] != live.total_items
-                or evidence["total_pages"] != live.total_pages
+                live_evidence.current_page != evidence_page
+                or identities != evidence["identities"]
+                or live_evidence.total_items != evidence["total_items"]
+                or live_evidence.total_pages != evidence["total_pages"]
             ):
                 raise ContractError(
-                    f"RESUME_FIRST_PAGE_CHANGED bucket={bucket_id} "
-                    "archived identities or pagination no longer match"
+                    f"RESUME_CHECKPOINT_CHANGED bucket={bucket_id} "
+                    f"page={evidence_page}: archived identities or "
+                    "pagination no longer match"
                 )
         else:
             # Reuse this validated count page if page one needs collection.
