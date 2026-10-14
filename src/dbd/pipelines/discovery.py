@@ -1089,21 +1089,44 @@ async def _run_durable_discovery(
     roots = [SearchFilters(keyword=seed, search_type=search_type)
              for seed in sorted(set(seeds))]
     processed = pages_fetched = written = invalid = 0
+    saved_pages = 0
     started = time.monotonic()
     active = None
+    samples = deque(maxlen=120)
+    durable_snapshot = {}
+    last_summary_at = 0.0
 
     def notify(name: str, **values) -> None:
         if event is None:
             return
         try:
+            now = time.monotonic()
+            if not samples or now - samples[-1][0] >= 0.9:
+                samples.append((now,client.requests_made,saved_pages))
+            while len(samples)>1 and now - samples[0][0]>60.0:
+                samples.popleft()
+            rate = None
+            page_rate = None
+            if len(samples)>=2:
+                elapsed = samples[-1][0]-samples[0][0]
+                if elapsed >= 5.0:
+                    rate = round((samples[-1][1]-samples[0][1])/elapsed,3)
+                    page_rate = round((samples[-1][2]-samples[0][2])/elapsed,3)
+            cooldown = client.cooldown_remaining()
+            state = dict(values)
+            if cooldown > 0 and state.get("stage") not in ("BLOCKED","DONE"):
+                state["work_stage"] = state.get("stage")
+                state["stage"] = "RATE_LIMITED"
             event(name, {
-                **values, "buckets_processed": processed,
+                **state, "buckets_processed": processed,
                 "pages_fetched": pages_fetched, "companies_written": written,
                 "invalid_rows": invalid, "requests_made": client.requests_made,
                 "rate_limit_hits": client.rate_limit_hits,
                 "configured_rate": client.rate_per_second,
-                "cooldown_seconds": client.cooldown_remaining(),
-                "elapsed_seconds": max(0, time.monotonic() - started),
+                "actual_http_rate_1m":rate, "saved_page_rate_1m":page_rate,
+                "saved_pages_run":saved_pages,
+                "cooldown_seconds": cooldown,
+                "elapsed_seconds": max(0, now - started),
                 "generation": generation, "scope": scope,
             })
         except Exception:
@@ -1123,8 +1146,18 @@ async def _run_durable_discovery(
     await atomic(initialize)
 
     async def pulse() -> None:
+        nonlocal durable_snapshot, last_summary_at
         while True:
-            notify("discovery_progress", **(active or {}))
+            now = time.monotonic()
+            if now - last_summary_at >= 20.0:
+                last_summary_at = now
+                try:
+                    durable_snapshot = await atomic(work.report,generation,scope)
+                except Exception:
+                    # Rendering observations may fail, but the durable writer
+                    # and its independent SQL errors must never be hidden.
+                    pass
+            notify("discovery_progress", **{**durable_snapshot, **(active or {})})
             await asyncio.sleep(1.0)
 
     task = asyncio.create_task(pulse())
@@ -1318,6 +1351,7 @@ async def _run_durable_discovery(
                     return staged_written
 
                 written += await atomic(commit_chunk)
+                saved_pages += len(numbers)
                 previous = numbers[-1]
                 next_page = previous + 1
                 active.update(stage="FETCHING", pages_done=previous)
