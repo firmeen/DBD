@@ -285,7 +285,7 @@ def collect(*, event=None, limit: int | None = None) -> dict:
                                          if output["status"] == "RETRY" else None)
                                 store.defer(conn,company_id=row["company_id"],
                                             reason=output.get("reason",output["status"]),
-                                            retry_at=until)
+                                            retry_at=until, status=output["status"])
                                 stats["deferred"] += 1
                         stats["checked"] += 1
                         stats["http_requests"] = client.requests
