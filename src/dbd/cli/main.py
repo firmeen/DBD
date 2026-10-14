@@ -1077,20 +1077,30 @@ def main():
                 phase=args.phase,
                 backend=args.backend or settings.dbd_production_backend,
             )
-            generation, result = asyncio.run(
-                discover(
-                    seeds,
+            from ..control import EarlyStartConfirmationRequired
+            from ..presentation.setup import confirm_early_cycle
+
+            options = {
+                "phase": args.phase, "backend": args.backend,
+                "refresh": args.refresh, "search_type": args.type,
+                "concurrency": args.concurrency, "rate": args.rate,
+                "max_buckets": args.max_buckets, "verbose": False,
+                "event": v06_terminal.event,
+            }
+            try:
+                generation, result = asyncio.run(discover(seeds, **options))
+            except EarlyStartConfirmationRequired:
+                v06_terminal.close()
+                v06_terminal = None
+                if not confirm_early_cycle():
+                    raise SystemExit(2)
+                v06_terminal = V06Terminal("discover", app="DBD DATA").start(
                     phase=args.phase,
-                    backend=args.backend,
-                    refresh=args.refresh,
-                    search_type=args.type,
-                    concurrency=args.concurrency,
-                    rate=args.rate,
-                    max_buckets=args.max_buckets,
-                    verbose=False,
-                    event=v06_terminal.event,
+                    backend=args.backend or settings.dbd_production_backend,
                 )
-            )
+                options["event"] = v06_terminal.event
+                options["manual_confirmed"] = True
+                generation, result = asyncio.run(discover(seeds, **options))
             v06_terminal.finish(
                 {
                     "generation": generation,
