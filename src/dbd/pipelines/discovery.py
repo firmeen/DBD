@@ -1171,6 +1171,20 @@ async def _run_durable_discovery(
 
     await atomic(initialize)
 
+    def observed_statuses(conn):
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                "SELECT DISTINCT TOP (16) status_code FROM dbo.DBD_COMPANY "
+                "WHERE status_code IS NOT NULL AND status_code<>N'' "
+                "ORDER BY status_code"
+            )
+            return tuple(str(row[0]) for row in cur.fetchall())
+        finally:
+            cur.close()
+
+    status_candidates = await atomic(observed_statuses)
+
     async def pulse() -> None:
         nonlocal durable_snapshot, last_summary_at
         while True:
@@ -1226,13 +1240,50 @@ async def _run_durable_discovery(
             if parent.total_items > MAX_ROWS_PER_QUERY:
                 active["stage"] = "VALIDATING_SPLIT"
                 notify("discovery_progress", **active)
-                children = _children_for(filters, provinces)
+                children = None
                 counts = []
-                identities = set()
-                parity = True
-                split_dimension = "categorical"
+                split_dimension = None
+                reasons = []
 
-                if not children:
+                from ..deep.http import DeepPermanentHttpError
+                for dimension, planned in _direct_categorical_plans(
+                    filters, provinces, status_candidates,
+                ):
+                    seen = set()
+                    candidate_counts = []
+                    candidate_ok = True
+                    for child in planned:
+                        try:
+                            child_data, _ = await _direct_page(client,child,1)
+                        except DeepPermanentHttpError as exc:
+                            if exc.status == 400 and dimension == "status":
+                                candidate_ok = False
+                                reasons.append("status_filter_not_supported")
+                                break
+                            raise
+                        observed = parse_search_response(child_data)
+                        pages_fetched += 1
+                        candidate_counts.append(
+                            (observed.total_items, observed.total_pages)
+                        )
+                        for row in observed.rows:
+                            identity = (row.get("jpTypeCode"),row.get("jpNo"))
+                            if all(identity):
+                                if identity in seen:
+                                    candidate_ok = False
+                                seen.add(identity)
+                    if not candidate_ok or len(candidate_counts) != len(planned):
+                        reasons.append(dimension + ":sample_overlap_or_invalid_filter")
+                        continue
+                    if sum(item[0] for item in candidate_counts) != parent.total_items:
+                        reasons.append(dimension + ":count_parity_failed")
+                        continue
+                    children = planned
+                    counts = candidate_counts
+                    split_dimension = dimension
+                    break
+
+                if children is None:
                     from .discovery_numeric import (
                         PRODUCTION_CERTIFIED_DIMENSIONS,
                         NumericObservation,
@@ -1242,81 +1293,55 @@ async def _run_durable_discovery(
                     if PRODUCTION_CERTIFIED_DIMENSIONS:
                         async def numeric_count(candidate: SearchFilters):
                             nonlocal pages_fetched
-                            child_data, _ = await _direct_page(client, candidate, 1)
+                            child_data, _ = await _direct_page(client,candidate,1)
                             child_page = parse_search_response(child_data)
                             pages_fetched += 1
                             return NumericObservation(
-                                child_page.total_items, child_page.rows,
+                                child_page.total_items,child_page.rows,
                             )
 
-                        candidate = await plan_numeric_split(
-                            filters, parent.total_items, numeric_count, parent.rows,
+                        plan = await plan_numeric_split(
+                            filters, parent.total_items, numeric_count,
+                            parent.rows,
                             dimensions=tuple(PRODUCTION_CERTIFIED_DIMENSIONS),
                         )
                         if (
-                            candidate.candidate
-                            and candidate.dimension in PRODUCTION_CERTIFIED_DIMENSIONS
+                            plan.candidate
+                            and plan.dimension in PRODUCTION_CERTIFIED_DIMENSIONS
                             and numeric_partition_structure(
                                 filters.key(),
-                                [child.key() for child in candidate.children],
+                                [child.key() for child in plan.children],
                                 certified=PRODUCTION_CERTIFIED_DIMENSIONS,
                             )
                         ):
-                            # A matching count candidate is necessary, never
-                            # sufficient, for source-side numeric coverage.
-                            fresh, _ = await _direct_page(client, filters, 1)
+                            fresh, _ = await _direct_page(client,filters,1)
                             pages_fetched += 1
-                            fresh_parent = parse_search_response(fresh)
-                            if (fresh_parent.total_items == parent.total_items
-                                and fresh_parent.total_pages == parent.total_pages):
-                                children = candidate.children
+                            checked = parse_search_response(fresh)
+                            if (checked.total_items == parent.total_items
+                                and checked.total_pages == parent.total_pages):
+                                children = plan.children
                                 counts = [
-                                    (child.count, (child.count + 9) // 10)
-                                    for child in candidate.child_observations
+                                    (obs.count,(obs.count+9)//10)
+                                    for obs in plan.child_observations
                                 ]
-                                split_dimension = str(candidate.dimension)
+                                split_dimension = str(plan.dimension)
                             else:
-                                notify("discovery_progress", **active,
-                                       error="numeric_parent_count_drift")
+                                reasons.append("numeric_parent_count_drift")
+                        else:
+                            reasons.append(plan.reason)
 
-                if not children:
-                    # Numeric plans are hypotheses until the source boundary,
-                    # NULL, decimal and identity semantics have been certified.
-                    # Do not truncate overflow work to 1000 pages.
-                    reason = "no_certified_lossless_split"
-                    await atomic(work.blocked, bucket_id, reason)
+                if children is None:
+                    reason = "no_certified_lossless_split:" + ",".join(reasons)[:900]
+                    await atomic(work.blocked,bucket_id,reason)
                     notify("discovery_progress", **active,
-                           stage="BLOCKED", error=reason)
-                    continue
-
-                if not counts:
-                    for child in children:
-                        child_data, _ = await _direct_page(client, child, 1)
-                        observed = parse_search_response(child_data)
-                        pages_fetched += 1
-                        counts.append((observed.total_items, observed.total_pages))
-                        # First-page overlap is a contradiction, not a proof
-                        # of complete disjointness on all pages.
-                        for row in observed.rows:
-                            identifier = (
-                                row.get("jpTypeCode"), row.get("jpNo")
-                            )
-                            if all(identifier):
-                                if identifier in identities:
-                                    parity = False
-                                identities.add(identifier)
-
-                parity = parity and sum(x[0] for x in counts) == parent.total_items
-                if not parity:
-                    await atomic(work.blocked, bucket_id, "child_count_or_identity_mismatch")
-                    notify("discovery_progress", **active,
-                           stage="BLOCKED", error="child_count_or_identity_mismatch")
+                           stage="BLOCKED",error=reason)
                     continue
 
                 active["stage"] = "SPLITTING"
-                # Child counts and parent split commit atomically.
-                await atomic(work.split, bucket, children, split_dimension, counts)
-                notify("discovery_split", **active, children=len(children))
+                # Parent transition, child keys and validated counts share one
+                # durable transaction. The next loop Fetches the children.
+                await atomic(work.split,bucket,children,split_dimension,counts)
+                notify("discovery_split", **active,children=len(children))
                 continue
 
             if bucket["status"] == "COUNTED":
