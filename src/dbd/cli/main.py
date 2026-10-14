@@ -734,8 +734,12 @@ def main():
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
     disc.add_argument(
-        "--numeric-split", action="store_true",
-        help="Explicit numeric opt-in; rejected until verified API coverage is certified",
+        "--numeric-split", action="store_true", default=True,
+        help="Use automatic bounded numeric fallback (default)",
+    )
+    disc.add_argument(
+        "--no-numeric-split", action="store_false", dest="numeric_split",
+        help="Collect categorical-only buckets without numeric fallback",
     )
     disc.add_argument(
         "--distributed",

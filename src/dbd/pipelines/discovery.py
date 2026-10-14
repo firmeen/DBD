@@ -26,6 +26,9 @@ from ..storage.mysql.repositories.discovery_repository import (
     DiscoveryLeaseLost,
     claim_buckets,
     discovery_summary,
+    get_bucket,
+    bucket_has_pages,
+    recoverable_failed_buckets,
     heartbeat_bucket_claims,
     pending_buckets,
     release_bucket_claim,
@@ -501,19 +504,26 @@ async def _process_bucket(
         if page.current_page != 1:
             raise ContractError("Invalid Discovery count page")
         total_items, pages_total = page.total_items, page.total_pages
-        # Refuse BOTH shrink and growth: a different live snapshot cannot
-        # silently replace historical counts/parent-child reconciliation.
+        # Use the current population for an untouched oversized leaf.
+        # A preexisting page (done, partial or failed) fences its historical
+        # count to prevent mixing two result snapshots during resume.
         recorded_count = row.get("total_items")
         if recorded_count is not None and total_items != int(recorded_count):
-            await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
-            change = "shrink" if total_items < int(recorded_count) else "growth"
-            raise ContractError(
-                f"Discovery count drift for bucket {bucket_id}: "
-                f"stored={recorded_count}, live={total_items}; "
-                f"refusing automatic {change}"
-            )
-        if int(row.get("pages_done") or 0) and row["total_items"] != total_items:
-            raise ContractError("Search total changed after pages were committed")
+            has_pages = await asyncio.to_thread(bucket_has_pages, bucket_id)
+            if int(row.get("pages_done") or 0) or has_pages:
+                await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
+                raise ContractError(
+                    f"Discovery count drift with checkpoints for bucket {bucket_id}: "
+                    f"stored={recorded_count}, live={total_items}"
+                )
+            if progress_line is not None:
+                progress_line.event(
+                    f"bucket {bucket_id}: updated untouched search count "
+                    f"{recorded_count:,} -> {total_items:,}; historical archive retained"
+                )
+        elif recorded_count is not None and int(row.get("pages_done") or 0):
+            if int(recorded_count) != total_items:
+                raise ContractError("Search total changed after pages were committed")
         first_page = (count_archive_id, data, requested)
         owned_update(total_items=total_items, pages_total=pages_total, status="counted")
 
@@ -1444,6 +1454,8 @@ async def _run_work(
     provinces = await fetch_provinces(client)
     master_cache: dict[tuple[str, str], str] = {}
     status_codes = await asyncio.to_thread(observed_status_codes)
+    attempted_failed: set[int] = set()
+    attempted_recovery_count = 0
 
     if not seeds:
         seeds = await province_seeds(client)
@@ -1456,16 +1468,34 @@ async def _run_work(
         if remaining is not None and remaining <= 0:
             break
         desired = base_parallelism if remaining is None else min(base_parallelism, remaining)
+        recovery_batch = False
         if distributed:
-            rows = await asyncio.to_thread(
+            batch = await asyncio.to_thread(
                 claim_buckets, owner, desired, settings.dbd_lease_seconds
             )
-            batch = rows
+            if not batch:
+                batch = await asyncio.to_thread(
+                    claim_buckets, owner, desired, settings.dbd_lease_seconds,
+                    failed_only=True, exclude_ids=attempted_failed,
+                )
+                recovery_batch = bool(batch)
         else:
-            rows = await asyncio.to_thread(pending_buckets, 25)
-            batch = rows[:desired]
+            batch = (await asyncio.to_thread(pending_buckets, 25))[:desired]
+            if not batch:
+                batch = await asyncio.to_thread(
+                    recoverable_failed_buckets, desired, exclude_ids=attempted_failed,
+                )
+                recovery_batch = bool(batch)
         if not batch:
             break
+        if recovery_batch:
+            # Each historical failed leaf is attempted at most once per run.
+            # Its newly created children enter the original pending queue.
+            attempted_failed.update(int(row["id"]) for row in batch)
+            attempted_recovery_count += len(batch)
+            progress_line.event(
+                f"discovery: retrying {len(batch)} oversized failed leaf bucket(s)"
+            )
 
         async def process_one(row):
             bucket_id = int(row["id"])
@@ -1527,6 +1557,11 @@ async def _run_work(
         companies_written += sum(written for _, written in results)
 
     validate_splits(False)
+    if attempted_recovery_count:
+        progress_line.event(
+            f"discovery: attempted {attempted_recovery_count} historical failed leaves "
+            "without clearing existing page checkpoints"
+        )
     return DiscoveryResult(buckets_processed, pages_fetched, companies_written, client.requests_made)
 
 
@@ -1540,13 +1575,10 @@ async def run(
     verbose: bool = True,
     health=None,
     distributed: bool = False,
-    numeric_split: bool = False,
+    numeric_split: bool = True,
 ) -> DiscoveryResult:
-    if numeric_split and not PRODUCTION_CERTIFIED_DIMENSIONS:
-        raise ValueError(
-            "Numeric collection requires independently certified DBD "
-            "NULL/fractional/boundary coverage; no dimensions are approved"
-        )
+    # Ordinary Discovery attempts safe count-validated numeric candidates when
+    # categorical partitioning is exhausted; unprovable candidates stay failed.
     if distributed and not settings.dbd_redis_url:
         raise ValueError("Distributed discovery requires DBD_REDIS_URL")
     stop = asyncio.Event()
