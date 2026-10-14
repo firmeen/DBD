@@ -230,8 +230,17 @@ def split(conn, parent: dict, children: list[SearchFilters],
         raise ContractError("Only counted parents may be split into distinct children")
     if len({f.key() for f in children}) != len(children):
         raise ContractError("Duplicate Discovery child key")
-    if counts is not None and len(counts) != len(children):
+    # A durable SPLIT with uncounted children can never certify coverage.
+    # This is a storage invariant, not just a best-effort pipeline check.
+    if counts is None or len(counts) != len(children):
         raise ContractError("Every Discovery child must have a count and page total")
+    if parent.get("total_items") is None or sum(total for total, _ in counts) != int(parent["total_items"]):
+        raise ContractError("Discovery split child totals do not reconcile with the parent")
+    if any(
+        total < 0 or pages != (total + 9) // 10
+        for total, pages in counts
+    ):
+        raise ContractError("Invalid Discovery child pagination snapshot")
     for index, child in enumerate(children):
         child_id = _add(conn, int(parent["generation"]), parent["scope_key"],
                         child, int(parent["work_id"]))
