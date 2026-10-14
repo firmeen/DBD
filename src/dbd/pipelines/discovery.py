@@ -837,6 +837,7 @@ async def run(
     from ..storage.production import production_repository
 
     repo = repository if repository is not None else production_repository()
+    explicitly_scoped = bool(seeds or search_type or max_buckets is not None)
     global_rate = settings.dbd_rate_per_second if rate is None else rate
     admission = None
     if getattr(repo, "backend", None) == "sqlserver":
@@ -913,6 +914,7 @@ async def run(
                 refresh_mask=int(refresh_mask),
                 concurrency=int(concurrency or settings.dbd_concurrency),
                 max_buckets=max_buckets, event=event, health=health,
+                explicitly_scoped=explicitly_scoped,
             )
 
         queue = deque(
@@ -1060,7 +1062,7 @@ async def _run_durable_discovery(
     repo, client: FixedRateDbdClient, seeds: list[str], *,
     search_type: str, provinces: list[str], generation: int,
     refresh_mask: int, concurrency: int, max_buckets: int | None,
-    event=None, health=None,
+    event=None, health=None, explicitly_scoped: bool = False,
 ) -> DiscoveryResult:
     """SQL Server G2+ Discovery: one durable tree and atomic page checkpoints.
 
@@ -1070,13 +1072,17 @@ async def _run_durable_discovery(
     """
     from ..storage.sqlserver import discovery_repository as work
 
-    full = not search_type and max_buckets is None and not getattr(
-        _run_durable_discovery, "_scoped", False
+    # A manually supplied keyword, search type or bound is diagnostic only.
+    # These may never share the monthly full-universe durable root set.
+    full = not explicitly_scoped
+    scope = "full" if full else (
+        "diag:" + sha256(
+            json.dumps(
+                {"seeds": sorted(set(seeds)), "type": search_type},
+                sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:40]
     )
-    # Explicit keywords define a diagnostic scope; only the unscoped monthly
-    # runner is allowed to create a full-universe completion certificate.
-    # Seeds are already expanded from the province catalog by run().
-    scope = "full" if full else "diagnostic"
     roots = [SearchFilters(keyword=seed, search_type=search_type)
              for seed in sorted(set(seeds))]
     processed = pages_fetched = written = invalid = 0
@@ -1241,6 +1247,7 @@ async def _run_durable_discovery(
 
                 active["stage"] = "PERSISTING"
                 notify("discovery_progress", **active)
+                staged_written = 0
                 with repo.transaction() as conn:
                     size = max(1, int(settings.dbd_write_batch_size))
                     for offset in range(0, len(batch), size):
@@ -1248,8 +1255,9 @@ async def _run_durable_discovery(
                             conn, batch[offset:offset + size],
                             generation=generation, financial_mask=FINANCIAL_MASK,
                             refresh_mask=refresh_mask)
-                        written += int(result["inserted"]) + int(result["updated"])
+                        staged_written += int(result["inserted"]) + int(result["updated"])
                     work.checkpoint(conn, bucket_id, previous, numbers[-1])
+                written += staged_written
                 previous = numbers[-1]
                 next_page = previous + 1
                 active.update(stage="FETCHING", pages_done=previous)
