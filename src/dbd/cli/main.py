@@ -928,6 +928,7 @@ def main():
                 recovered_generation, result = asyncio.run(discover(
                     backend=selected, event=v06_terminal.event,
                     recovery_limit=args.limit,
+                    recovery_pass=True,
                 ))
                 with connection() as conn:
                     remaining = discovery_work.coverage(
