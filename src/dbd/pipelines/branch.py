@@ -260,7 +260,7 @@ def collect(*, event=None, limit: int | None = None) -> dict:
     repo = ProductionSqlServerRepository()
     client = BranchHttp()
     stats = {"checked":0,"verified":0,"branches":0,"deferred":0,
-             "http_requests":0}
+             "skipped":0,"http_requests":0}
     codes = tuple(x.strip().upper() for x in settings.dataforthai_status_codes.split(",")
                   if x.strip())
     with repo.manager_lock(resource="TIPDI:DBD:v0.6:branch") as lock:
@@ -285,14 +285,17 @@ def collect(*, event=None, limit: int | None = None) -> dict:
                         output = future.result()
                         with repo.transaction() as conn:
                             if output["status"] == "COMPLETE":
-                                store.save_snapshot(
+                                saved = store.save_snapshot(
                                     conn,company_id=row["company_id"],
                                     branches=output["branches"],
                                     establishment_count=output["total"],
                                     verified_at=datetime.now(timezone.utc),
                                     url=output["url"])
-                                stats["verified"] += 1
-                                stats["branches"] += len(output["branches"])
+                                if saved:
+                                    stats["verified"] += 1
+                                    stats["branches"] += len(output["branches"])
+                                else:
+                                    stats["skipped"] += 1
                             else:
                                 status = str(output["status"])
                                 if status not in _RECHECK_HOURS:
@@ -335,8 +338,8 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
     state = repo.generation_state()
     if int(state.get("finalized_generation") or 0) < 1:
         raise BranchError("Generation 1 cutover must be finalized before branch import")
-    stats = {"selected":0,"imported":0,"skipped":0,"conflicted":0,
-             "branches":0,"check":bool(check)}
+    stats = {"selected":0,"eligible":0,"imported":0,"skipped":0,
+             "conflicted":0,"branches":0,"check":bool(check)}
     from ..storage.mysql.engine import connect as legacy_connection
     with legacy_connection() as legacy:
         with legacy.cursor() as cur:
@@ -428,7 +431,10 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                         if target is None:
                             stats["skipped"] += 1
                             continue
-                        if not check:
+                        if check:
+                            stats["eligible"] += 1
+                            stats["branches"] += len(branches)
+                        else:
                             changed = store.save_snapshot(
                                 conn,company_id=int(target[0]),branches=branches,
                                 establishment_count=None,verified_at=stamp,
@@ -438,8 +444,8 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                             if not changed:
                                 stats["skipped"] += 1
                                 continue
-                        stats["imported"] += 1
-                        stats["branches"] += len(branches)
+                            stats["imported"] += 1
+                            stats["branches"] += len(branches)
                     if event:
                         try: event("branch_progress",dict(stats))
                         except Exception: pass
