@@ -110,8 +110,13 @@ def _partition_plans(
     for field, values in dimensions:
         if getattr(filters, field) or not values:
             continue
+        # API/observed enumerations can contain duplicate or empty codes.
+        # Never produce duplicate child identities or a blank categorical filter.
+        distinct_values = tuple(dict.fromkeys(str(value) for value in values if value))
+        if not distinct_values:
+            continue
         options = []
-        for value in values:
+        for value in distinct_values:
             kwargs = {
                 "keyword": filters.keyword,
                 "search_type": filters.search_type,
@@ -494,15 +499,18 @@ async def _process_bucket(
     if total_items > MAX_ROWS_PER_QUERY:
         if count_archive_id is not None:
             await asyncio.to_thread(mark_search_archive, count_archive_id, "processed")
+        rejected_plans: list[str] = []
         children = await _validated_children(
-            client, bucket_id, filters, provinces, status_codes or [], int(total_items)
+            client, bucket_id, filters, provinces, status_codes or [], int(total_items),
+            rejection_reasons=rejected_plans,
         )
         if not children:
+            reason = "; ".join(rejected_plans) if rejected_plans else "no_usable_partition"
             owned_update(
                 status="failed",
                 last_error=(
                     f"{total_items} rows exceeds the {MAX_ROWS_PER_QUERY} ceiling; "
-                    "no count-validated, non-overlapping split is available"
+                    f"no count-validated, non-overlapping split is available: {reason}"
                 ),
             )
             return 0, 0
@@ -601,17 +609,30 @@ async def _probe_partition(
     filters: SearchFilters,
     parent_count: int,
     candidates: list[SearchFilters],
+    rejection_reasons: list[str] | None = None,
 ) -> bool:
-    """Count every proposed child and recheck parent before admitting a split."""
+    """Validate an existing categorical plan; never accept no-progress or overlap."""
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
-    child_counts = []
+    def reject(reason: str) -> bool:
+        if rejection_reasons is not None:
+            rejection_reasons.append(reason)
+        return False
+
+    keys = [child.key() for child in candidates]
+    if not keys or len(set(keys)) != len(keys) or filters.key() in keys:
+        return reject("duplicate_or_unchanged_child_key")
+
+    child_counts: list[int] = []
+    sampled_identities: set[tuple[str, str]] = set()
     for child in candidates:
         page, archive_id, _, _ = await _count(client, bucket_id, child)
         await asyncio.to_thread(mark_search_archive, archive_id, "processed")
         if page.current_page != 1 or (page.total_items > 0 and not page.rows):
             raise ContractError("Invalid Discovery split count response")
-        # Check sampled search rows against the proposed categorical constraints.
+
+        # Samples cannot certify the entire partition, but a contradiction
+        # must disqualify it immediately. Preserve all parent constraints.
         for raw in page.rows:
             for field, key in (
                 ("jp_types", "jpTypeCode"),
@@ -620,27 +641,42 @@ async def _probe_partition(
                 ("business_sizes", "businessSizeCode"),
             ):
                 selected = getattr(child, field)
-                if selected and key in raw and str(raw[key]) not in selected:
-                    return False
+                if selected and (raw.get(key) is None or str(raw[key]) not in selected):
+                    return reject(f"sample_filter_mismatch:{field}")
+            jp_type, jp_no = raw.get("jpTypeCode"), raw.get("jpNo")
+            if jp_type is not None and jp_no is not None:
+                identity = (str(jp_type), str(jp_no))
+                if identity in sampled_identities:
+                    return reject("sample_identity_overlap")
+                sampled_identities.add(identity)
+
         if child.numeric_range() is not None:
             from ..contracts.common import money
 
             for raw in page.rows:
                 amount = money(raw.get("capAmt"))
                 if amount is None:
-                    return False
+                    return reject("sample_capital_unavailable")
                 if child.cap_amt_min is not None and amount < child.cap_amt_min:
-                    return False
+                    return reject("sample_capital_below_min")
                 if child.cap_amt_max is not None and amount > child.cap_amt_max:
-                    return False
+                    return reject("sample_capital_above_max")
         child_counts.append(page.total_items)
 
-    if sum(child_counts) != parent_count or max(child_counts, default=0) >= parent_count:
-        return False
-    # Count metadata may drift while children are probed; fail closed.
+    child_total = sum(child_counts)
+    if child_total != parent_count:
+        return reject(f"count_mismatch:parent={parent_count},children={child_total}")
+    if max(child_counts, default=0) >= parent_count:
+        return reject("no_progress:child_not_smaller_than_parent")
+
+    # One more parent count, after all children, guards against API drift.
     latest, archive_id, _, _ = await _count(client, bucket_id, filters)
     await asyncio.to_thread(mark_search_archive, archive_id, "processed")
-    return latest.current_page == 1 and latest.total_items == parent_count
+    if latest.current_page != 1 or latest.total_items != parent_count:
+        return reject(
+            f"parent_count_drift:before={parent_count},after={latest.total_items}"
+        )
+    return True
 
 
 async def _validated_children(
@@ -650,9 +686,35 @@ async def _validated_children(
     provinces: list[str],
     statuses: list[str],
     parent_count: int,
+    *,
+    rejection_reasons: list[str] | None = None,
 ) -> list[SearchFilters]:
-    for options in _partition_plans(filters, provinces, statuses):
-        if await _probe_partition(client, bucket_id, filters, parent_count, options):
+    """Try only unused categorical dimensions in the established priority order.
+
+    Numeric fallback is deliberately not enabled: NULL/fractional coverage
+    and production count reconciliation are not yet proven.
+    """
+    plans = _partition_plans(filters, provinces, statuses)
+    if not plans and rejection_reasons is not None:
+        rejection_reasons.append("categorical_dimensions_exhausted_or_unavailable")
+    for options in plans:
+        dimension = next(
+            field for field in ("jp_types", "pv_codes", "jp_statuses", "business_sizes")
+            if getattr(options[0], field) and not getattr(filters, field)
+        )
+        if rejection_reasons is None:
+            accepted = await _probe_partition(
+                client, bucket_id, filters, parent_count, options
+            )
+        else:
+            failures: list[str] = []
+            accepted = await _probe_partition(
+                client, bucket_id, filters, parent_count, options, failures
+            )
+            if not accepted:
+                reason = ",".join(failures) if failures else "unverified_split"
+                rejection_reasons.append(f"{dimension}:{reason}")
+        if accepted:
             return options
     return []
 
@@ -1151,7 +1213,9 @@ async def recover_discovery(
                     elif state["status"] == "done":
                         recovered += 1
                     else:
-                        failures.append(f"{bucket_id}: no validated split available")
+                        failures.append(
+                            f"{bucket_id}: {(state.get('last_error') or 'no validated split available')[:250]}"
+                        )
             except DiscoveryLeaseLost:
                 raise
             except Exception as exc:
