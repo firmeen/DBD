@@ -499,6 +499,16 @@ class ControlRepository:
                 and int(generation_state.get("next_generation") or 0)
                     > int(active.get("generation") or 0)
             ):
+                from . import discovery_repository as discovery_work
+                evidence = discovery_work.coverage(
+                    conn, int(active["generation"]), "full"
+                )
+                if not evidence["ok"]:
+                    raise ControlError(
+                        "Cannot reconcile completed business Generation while "
+                        "durable Discovery coverage remains incomplete: "
+                        + str(evidence)
+                    )
                 cur = conn.cursor()
                 try:
                     cur.execute(
