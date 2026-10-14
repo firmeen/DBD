@@ -194,7 +194,11 @@ def _select(conn, predicate: str, params: tuple):
             "SELECT TOP(1) work_id,generation,scope_key,parent_work_id,"
             "filter_key,filters_json,status,total_items,total_pages,"
             "last_committed_page,partition_lossless,split_dimension,last_error,attempts "
-            f"FROM {TABLE} WHERE {predicate} ORDER BY work_id",
+            f"FROM {TABLE} WHERE {predicate} "
+            "ORDER BY CASE status "
+            "WHEN 'FETCHING' THEN 0 WHEN 'COUNTED' THEN 1 ELSE 2 END, "
+            "CASE WHEN parent_work_id IS NULL THEN 1 ELSE 0 END, "
+            "work_id DESC",
             params,
         )
         return _row(cur)
