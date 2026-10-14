@@ -314,7 +314,48 @@ def blocked(conn, work_id: int, reason: str) -> None:
 
 
 def coverage(conn, generation: int, scope: str) -> dict[str, int | bool]:
+    """Certify a complete *registered tree*, never merely an empty work queue.
+
+    The SQL checks are used for the final monthly transition, not each UI
+    refresh. A SPLIT row is not sufficient evidence without lossless children.
+    """
     values = report(conn, generation, scope)
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            f"SELECT COUNT_BIG(*) FROM {TABLE} "
+            "WHERE generation=%s AND scope_key=%s AND parent_work_id IS NULL",
+            (generation, scope),
+        )
+        roots = int(cur.fetchone()[0] or 0)
+        cur.execute(
+            f"SELECT COUNT_BIG(*) FROM {TABLE} p "
+            "WHERE p.generation=%s AND p.scope_key=%s "
+            "AND ("
+            "  (p.status='SPLIT' AND (p.partition_lossless<>1 OR "
+            f"     NOT EXISTS(SELECT 1 FROM {TABLE} c WHERE c.parent_work_id=p.work_id))) "
+            "  OR (p.parent_work_id IS NOT NULL AND NOT EXISTS("
+            f"     SELECT 1 FROM {TABLE} parent "
+            "     WHERE parent.work_id=p.parent_work_id "
+            "       AND parent.generation=p.generation "
+            "       AND parent.scope_key=p.scope_key "
+            "       AND parent.status='SPLIT' "
+            "       AND parent.partition_lossless=1)) "
+            "  OR (p.status='DONE' AND (p.total_items IS NULL OR "
+            "       p.total_pages IS NULL OR "
+            "       (p.total_items>0 AND p.last_committed_page<>p.total_pages)"
+            "       OR (p.total_items=0 AND p.last_committed_page<>0)))"
+            ")",
+            (generation, scope),
+        )
+        invalid_tree = int(cur.fetchone()[0] or 0)
+    finally:
+        cur.close()
     incomplete = sum(values.get(x, 0) for x in
-                     ("pending","counted","fetching","failed","blocked"))
-    return {**values, "ok": bool(values["total_buckets"] and not incomplete)}
+                     ("pending", "counted", "fetching", "failed", "blocked"))
+    return {
+        **values,
+        "roots": roots,
+        "invalid_tree": invalid_tree,
+        "ok": bool(roots and not incomplete and not invalid_tree),
+    }
