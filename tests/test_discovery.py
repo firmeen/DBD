@@ -513,3 +513,169 @@ async def test_split_overflow_stays_failed_when_no_valid_plan(monkeypatch):
     assert updates[-1]["status"] == "failed"
     assert "no count-validated" in updates[-1]["last_error"]
     assert not split_calls
+
+
+def test_recovery_classification_respects_descendant_checkpoint_before_zero_recount():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        _classify_recovery_partition,
+    )
+
+    row = {
+        "total_items": 100,
+        "child_total": 100,
+        "children": 2,
+        "known_children": 2,
+        "zero_children": 1,
+        "blocked_children": 1,
+    }
+    assert _classify_recovery_partition(row) == "descendant_incomplete"
+
+    row["blocked_children"] = 0
+    assert _classify_recovery_partition(row) == "ready_to_validate"
+
+    row["child_total"] = 99
+    assert _classify_recovery_partition(row) == "stale_zero"
+
+    row["zero_children"] = 0
+    assert _classify_recovery_partition(row) == "count_mismatch"
+
+    row["known_children"] = 1
+    assert _classify_recovery_partition(row) == "count_unavailable"
+
+
+@pytest.mark.asyncio
+async def test_recovery_blocked_candidates_do_not_open_http_client(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository
+
+    monkeypatch.setattr(
+        discovery_repository, "recovery_candidates",
+        lambda _limit, _parent: [
+            {"bucket_id": 13316, "reason": "partition_exhausted"},
+            {"bucket_id": 62, "reason": "descendant_incomplete"},
+        ],
+    )
+
+    class ForbiddenClient:
+        def __init__(self, **_kwargs):
+            raise AssertionError("Blocked recovery must not make HTTP calls")
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", ForbiddenClient)
+    monkeypatch.setattr(discovery, "validate_splits", lambda _verbose: 3)
+
+    preview = await discovery.recover_discovery(limit=10)
+    assert preview["mode"] == "preview"
+    assert preview["blocked"] == 2
+    assert preview["reason_counts"]["partition_exhausted"] == 1
+    assert preview["reason_counts"]["descendant_incomplete"] == 1
+
+    executed = await discovery.recover_discovery(limit=10, execute=True)
+    assert executed["partitions_checked"] == 3
+    assert executed["unresolved"] == 2
+    assert executed["blocked"] == 2
+
+
+@pytest.mark.asyncio
+async def test_numeric_probe_uses_four_live_requests_but_does_not_persist(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository
+
+    bucket = {
+        "id": 13316,
+        "status": "failed",
+        "total_items": 271406,
+        "keyword": "010",
+        "search_type": "",
+        "jp_types": "5",
+        "pv_codes": "10",
+        "jp_statuses": "1",
+        "business_sizes": "S",
+    }
+    monkeypatch.setattr(discovery_repository, "get_bucket", lambda _id: bucket)
+
+    def forbid(*_a, **_kw):
+        raise AssertionError("Probe must never persist count archives or bucket changes")
+
+    monkeypatch.setattr(discovery, "_count", forbid)
+    monkeypatch.setattr(discovery, "update_bucket", forbid)
+    monkeypatch.setattr(discovery_repository, "archive_search", forbid)
+    observed = []
+
+    class Client:
+        def __init__(self, **options):
+            assert options["concurrency"] == 1
+            assert options["rate_per_second"] == 0.25
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, path, payload, **_kwargs):
+            assert path == discovery.SEARCH_PATH
+            observed.append(dict(payload))
+            total = 100
+            if payload["capAmtMax"] == 0:
+                total = 40
+            elif payload["capAmtMin"] == 0:
+                total = 60
+            return {
+                "meta": {"currentPage": 1, "totalItems": total, "totalPages": 10},
+                "contents": [{"jpTypeCode": "5", "jpNo": "0105559999999"}],
+            }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    result = await discovery.probe_discovery_partition(parent_id=13316, rate=0.25)
+
+    assert result["mode"] == "probe"
+    assert result["request_count"] == 4
+    assert result["count_stable"] is True
+    assert result["null_coverage"] == "UNKNOWN"
+    assert result["decision"] == "OBSERVATION_ONLY"
+    assert len(observed) == 4
+    assert observed[0] == observed[3]
+    assert observed[1]["capAmtMax"] == 0
+    assert observed[2]["capAmtMin"] == 0
+    assert bucket["status"] == "failed"
+
+
+@pytest.mark.asyncio
+async def test_numeric_probe_never_approves_drifting_parent(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository
+
+    monkeypatch.setattr(
+        discovery_repository, "get_bucket",
+        lambda _id: {
+            "status": "failed",
+            "total_items": 20000,
+            "keyword": "010",
+            "search_type": "",
+            "jp_types": "",
+            "pv_codes": "",
+            "jp_statuses": "",
+            "business_sizes": "",
+        },
+    )
+
+    class Client:
+        def __init__(self, **_kwargs):
+            self.calls = 0
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def post(self, _path, _payload, **_kwargs):
+            self.calls += 1
+            total = 100 if self.calls < 4 else 101
+            return {
+                "meta": {"currentPage": 1, "totalItems": total, "totalPages": 11},
+                "contents": [{"jpTypeCode": "5", "jpNo": "0105559999999"}],
+            }
+
+    monkeypatch.setattr(discovery, "AsyncDbdClient", Client)
+    result = await discovery.probe_discovery_partition(parent_id=13316)
+    assert result["count_stable"] is False
+    assert result["decision"] == "OBSERVATION_ONLY"
+    assert "drifted" in result["reason"]
