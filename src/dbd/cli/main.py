@@ -955,6 +955,10 @@ def main():
                     "pages": result.pages_fetched,
                     "companies": result.companies_written,
                     "requests": result.requests_made,
+                    "recovery_attempts": result.recovery_attempts,
+                    "new_splits": result.split_created,
+                    "failed_remaining": result.remaining_failed,
+                    "lossy_remaining": result.remaining_lossy,
                 },
             )
     except KeyboardInterrupt:

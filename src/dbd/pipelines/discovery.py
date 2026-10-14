@@ -26,7 +26,6 @@ from ..storage.mysql.repositories.discovery_repository import (
     DiscoveryLeaseLost,
     claim_buckets,
     discovery_summary,
-    get_bucket,
     bucket_has_pages,
     recoverable_failed_buckets,
     heartbeat_bucket_claims,
@@ -41,7 +40,6 @@ from .discovery_numeric import (
     NUMERIC_DIMENSIONS,
     PRODUCTION_CERTIFIED_DIMENSIONS,
     NumericObservation,
-    NUMERIC_DIMENSIONS,
     numeric_partition_structure,
     plan_numeric_split,
 )
@@ -57,6 +55,10 @@ class DiscoveryResult:
     pages_fetched: int
     companies_written: int
     requests_made: int
+    recovery_attempts: int = 0
+    split_created: int = 0
+    remaining_failed: int = 0
+    remaining_lossy: int = 0
 
 
 @dataclass
@@ -1498,9 +1500,13 @@ async def _run_work(
     status_codes = await asyncio.to_thread(observed_status_codes)
     attempted_failed: set[int] = set()
     attempted_recovery_count = 0
+    baseline = await asyncio.to_thread(discovery_summary)
 
     if not seeds:
-        seeds = await province_seeds(client)
+        seeds = sorted(
+            {f"0{str(province).zfill(2)}" for province in provinces if str(province).strip()}
+            | set(EXTRA_PREFIX_SEEDS)
+        )
     for seed in seeds:
         upsert_bucket(SearchFilters(keyword=seed, search_type=search_type))
 
@@ -1599,12 +1605,21 @@ async def _run_work(
         companies_written += sum(written for _, written in results)
 
     validate_splits(False)
+    latest = await asyncio.to_thread(discovery_summary)
     if attempted_recovery_count:
         progress_line.event(
             f"discovery: attempted {attempted_recovery_count} historical failed leaves "
             "without clearing existing page checkpoints"
         )
-    return DiscoveryResult(buckets_processed, pages_fetched, companies_written, client.requests_made)
+    return DiscoveryResult(
+        buckets_processed, pages_fetched, companies_written, client.requests_made,
+        recovery_attempts=attempted_recovery_count,
+        split_created=max(
+            0, int(latest.get("buckets_split") or 0) - int(baseline.get("buckets_split") or 0)
+        ),
+        remaining_failed=int(latest.get("buckets_failed") or 0),
+        remaining_lossy=int(latest.get("partitions_lossy") or 0),
+    )
 
 
 async def run(
