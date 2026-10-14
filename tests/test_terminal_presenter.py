@@ -794,3 +794,27 @@ def test_v06_terminal_shows_operator_node_and_auto_mode_without_leaking_secret()
     assert "node-test-123" in text
     assert "AUTO" in text
     assert "MSSQL_PASSWORD" not in text
+
+
+def test_v06_recovery_pass_is_not_reported_as_global_discovery_complete() -> None:
+    stream = StringIO()
+    terminal = V06Terminal(
+        "recover", app="DBD DATA", stream=stream, tty=False,
+        clock=lambda: 100.0, wall_clock=_v06_wall_clock,
+    ).start(backend="sqlserver")
+    terminal.event("discovery_progress", {
+        "stage": "RECONCILING", "work_id": 42, "blocked": 3,
+        "pending": 0, "done": 7, "rate_limit_hits": 1,
+    })
+    terminal.finish({
+        "generation": 2, "recovery_pass": "FINISHED",
+        "coverage": "INCOMPLETE", "unresolved": 3,
+        "partitions": 10, "pages": 25,
+    }, status="COMPLETE_WITH_FAILURES")
+    output = stream.getvalue()
+    assert "DBD DATA / RECOVER" in output
+    assert "pass=FINISHED" in output
+    assert "coverage=INCOMPLETE" in output
+    assert "unresolved=3" in output
+    assert "Completed with failures" in output
+    assert "\\x1b[" not in output and "\\r" not in output
