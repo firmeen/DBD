@@ -554,7 +554,7 @@ class V06Terminal:
             "fetching", "done", "blocked", "failed", "split",
             "rate_limit_hits", "configured_rate", "cooldown_seconds",
             "actual_http_rate_1m", "saved_page_rate_1m", "saved_pages_run",
-            "work_stage", "elapsed_seconds", "scope", "error",
+            "reopened_buckets", "work_stage", "elapsed_seconds", "scope", "error",
         ):
             source = target
             if source not in payload:
@@ -821,6 +821,11 @@ class V06Terminal:
                 ("Blocked",values.get("blocked",0),"discovery.blocked"),
                 ("Committed pages",values.get("committed_pages",0),"discovery.committed"),
             ],width)])
+        if values.get("reopened_buckets") is not None:
+            content.append(Text(
+                f"Safe recovery reopened {int(values['reopened_buckets']):,} buckets",
+                style="cyan",
+            ))
         if values.get("configured_rate") is not None:
             content.extend([Text(), self._metric_grid([
                 ("Target req/s",values.get("configured_rate"),"discovery.rate"),
