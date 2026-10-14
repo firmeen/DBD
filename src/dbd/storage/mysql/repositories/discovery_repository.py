@@ -768,6 +768,16 @@ def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[d
                    COALESCE(SUM(
                        c.status IN ('pending','counted','draining','failed')
                        OR (c.status='split' AND COALESCE(c.partition_lossless,0)<>1)
+                       OR (c.status='done' AND c.total_items IS NOT NULL
+                           AND (
+                               (c.total_items=0 AND
+                                   (COALESCE(c.pages_total,0)<>0
+                                    OR COALESCE(c.pages_done,0)<>0))
+                               OR (c.total_items>0 AND
+                                   (COALESCE(c.pages_total,0)=0
+                                    OR c.pages_total>1000
+                                    OR c.pages_done<>c.pages_total))
+                           ))
                    ),0) AS blocked_children
             FROM discovery_buckets p
             JOIN discovery_buckets c ON c.parent_id=p.id
