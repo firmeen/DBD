@@ -625,6 +625,88 @@ async def _validated_children(
     return []
 
 
+async def probe_discovery_partition(
+    *,
+    parent_id: int,
+    rate: float = 0.25,
+    health=None,
+) -> dict:
+    """Observe one numeric filter boundary without altering persisted discovery.
+
+    The probe deliberately cannot approve range splits: numeric boundary
+    inclusivity and NULL/unfiltered coverage have not been proven. No archive,
+    bucket, page, or checkpoint writes occur here.
+    """
+    from ..storage.mysql.repositories.discovery_repository import get_bucket
+
+    if rate <= 0:
+        raise ValueError("Probe rate must be positive")
+    row = await asyncio.to_thread(get_bucket, parent_id)
+    if row is None:
+        raise ValueError(f"Unknown discovery bucket {parent_id}")
+    if row["status"] != "failed" or int(row.get("total_items") or 0) <= MAX_ROWS_PER_QUERY:
+        raise ValueError("Probe requires a failed bucket exceeding 10000 rows")
+
+    base = _filters_from_row(row).payload(page=1)
+    # These intentionally overlap at zero. They test backend filter behavior,
+    # not a certified non-overlapping plan.
+    variants = (
+        ("parent_before", {}),
+        ("cap_amt_at_most_zero", {"capAmtMax": 0}),
+        ("cap_amt_at_least_zero", {"capAmtMin": 0}),
+        ("parent_after", {}),
+    )
+    observations: dict[str, int] = {}
+    samples: dict[str, list[tuple[str, str]]] = {}
+    async with AsyncDbdClient(
+        concurrency=1,
+        rate_per_second=rate,
+        endpoint_rates={"search": rate},
+    ) as client:
+        for label, patch in variants:
+            if health is not None:
+                await asyncio.to_thread(health)
+            data = await client.post(
+                SEARCH_PATH,
+                {**base, **patch},
+                referer=SEARCH_REFERER,
+                timeout=settings.dbd_count_timeout_seconds,
+                rate_key="search",
+            )
+            page = parse_search_response(data)
+            if page.current_page != 1 or (page.total_items and not page.rows):
+                raise ContractError(f"Invalid probe response for {label}")
+            observations[label] = page.total_items
+            samples[label] = [
+                (str(item["jpTypeCode"]), str(item["jpNo"]))
+                for item in page.rows
+                if item.get("jpTypeCode") is not None and item.get("jpNo") is not None
+            ]
+
+    stable = observations["parent_before"] == observations["parent_after"]
+    overlap = len(set(samples["cap_amt_at_most_zero"]) & set(samples["cap_amt_at_least_zero"]))
+    return {
+        "mode": "probe",
+        "bucket_id": parent_id,
+        "filter": "capAmt",
+        "request_count": len(variants),
+        "parent_before": observations["parent_before"],
+        "parent_after": observations["parent_after"],
+        "at_most_zero": observations["cap_amt_at_most_zero"],
+        "at_least_zero": observations["cap_amt_at_least_zero"],
+        "count_stable": stable,
+        "sample_overlap": overlap,
+        "null_coverage": "UNKNOWN",
+        "boundary_semantics": "UNKNOWN",
+        "decision": "OBSERVATION_ONLY",
+        "reason": (
+            "Parent count drifted; numeric range split is not approved"
+            if not stable
+            else "Range boundary and NULL coverage are unverified; no split approved"
+        ),
+    }
+
+
 async def recover_discovery(
     *,
     parent_id: int | None = None,
@@ -647,11 +729,20 @@ async def recover_discovery(
     )
 
     candidates = await asyncio.to_thread(recovery_candidates, limit, parent_id)
+    reason_counts = {
+        reason: sum(item["reason"] == reason for item in candidates)
+        for reason in sorted({item["reason"] for item in candidates})
+    }
+    actionable = {"stale_zero", "overflow"}
+    blocked = sum(item["reason"] not in actionable | {"ready_to_validate"} for item in candidates)
     report: dict = {
         "mode": "execute" if execute else "preview",
         "candidates": len(candidates),
-        "stale_zero": sum(item["reason"] == "stale_zero" for item in candidates),
-        "overflow": sum(item["reason"] == "overflow" for item in candidates),
+        "stale_zero": reason_counts.get("stale_zero", 0),
+        "overflow": reason_counts.get("overflow", 0),
+        "blocked": blocked,
+        "ready_to_validate": reason_counts.get("ready_to_validate", 0),
+        "reason_counts": reason_counts,
         "bucket_ids": ",".join(str(item["bucket_id"]) for item in candidates),
     }
     if not execute or not candidates:
@@ -669,6 +760,10 @@ async def recover_discovery(
         statuses = await asyncio.to_thread(observed_status_codes)
         provinces = None
         for item in candidates:
+            # Blocked children and exhausted categorical dimensions must not
+            # trigger repeated expensive API recounts.
+            if item["reason"] not in actionable:
+                continue
             bucket_id = int(item["bucket_id"])
             if health is not None:
                 await asyncio.to_thread(health)
@@ -751,7 +846,7 @@ async def recover_discovery(
         "split": split,
         "recovered": recovered,
         "partitions_checked": checked,
-        "unresolved": len(failures),
+        "unresolved": blocked + len(failures),
         "sample_errors": "; ".join(failures[:5]),
     })
     return report
