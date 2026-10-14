@@ -7,8 +7,8 @@ import sys
 import time
 from contextlib import contextmanager
 
-import mysql.connector
 from dotenv import load_dotenv
+import mysql.connector
 
 
 # ============================================================
