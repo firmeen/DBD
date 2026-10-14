@@ -995,3 +995,198 @@ async def test_numeric_parent_probe_rejects_invalid_gap_before_http(monkeypatch)
         await discovery.probe_discovery_partition(
             parent_id=13316, cap_max="1", cap_next_min="1",
         )
+
+
+def test_recursive_categorical_plans_accumulate_filters_in_stable_order():
+    base = SearchFilters("010")
+    codes = {
+        "jp_types": ["5", "5", "2", ""],
+        "pv_codes": ["10", "20", "10"],
+        "jp_statuses": ["1", "2"],
+        "business_sizes": ["S", "M"],
+    }
+    plans = discovery._partition_plans(
+        base, codes["pv_codes"], codes["jp_statuses"]
+    )
+    assert [p[0].jp_types or p[0].pv_codes or p[0].jp_statuses or p[0].business_sizes
+            for p in plans] == [["0"], ["10"], ["1"], ["S"]]
+    assert [f.pv_codes for f in plans[1]] == [["10"], ["20"]]
+    assert len({f.key() for f in plans[1]}) == 2
+
+    # The dimension that is already selected must never be split again.
+    selected = SearchFilters(
+        "010", jp_types=["5"], pv_codes=["10"], jp_statuses=["1"]
+    )
+    remaining = discovery._partition_plans(selected, ["10", "20"], ["1", "2"])
+    assert len(remaining) == 1
+    assert [f.business_sizes for f in remaining[0]] == [
+        ["S"], ["M"], ["L"], ["X"]
+    ]
+    assert all(f.jp_types == ["5"] and f.pv_codes == ["10"] and f.jp_statuses == ["1"]
+               for f in remaining[0])
+
+
+@pytest.mark.asyncio
+async def test_recursive_split_only_tries_unused_dimension_then_stops(monkeypatch):
+    checked = []
+
+    async def accept(_client, _bucket, parent, _count, children):
+        dimension = next(
+            name for name in ("jp_types", "pv_codes", "jp_statuses", "business_sizes")
+            if getattr(children[0], name) and not getattr(parent, name)
+        )
+        checked.append(dimension)
+        return True
+
+    monkeypatch.setattr(discovery, "_probe_partition", accept)
+    parent = SearchFilters("010")
+    for dimension, chosen in (
+        ("jp_types", "5"),
+        ("pv_codes", "10"),
+        ("jp_statuses", "1"),
+        ("business_sizes", "S"),
+    ):
+        result = await discovery._validated_children(
+            object(), 42, parent, ["10", "20"], ["1", "2"], 20000
+        )
+        assert result
+        assert getattr(result[0], dimension) == [chosen] if dimension != "jp_types" else (
+            getattr(result[0], dimension) == ["0"]
+        )
+        from dataclasses import replace
+
+        parent = replace(parent, **{dimension: [chosen]})
+    assert checked == ["jp_types", "pv_codes", "jp_statuses", "business_sizes"]
+    assert await discovery._validated_children(
+        object(), 42, parent, ["10", "20"], ["1", "2"], 20000
+    ) == []
+
+
+@pytest.mark.asyncio
+async def test_categorical_validation_reports_failed_dimension_and_tries_next(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repo
+
+    requests = []
+
+    async def fake_count(_client, _bucket, filters):
+        requests.append(filters)
+        if filters.jp_types:
+            count = 1
+            fields = {"jpTypeCode": filters.jp_types[0]}
+        elif filters.pv_codes:
+            count = 12 if filters.pv_codes == ["10"] else 13
+            fields = {"jpTypeCode": "5", "pvCode": filters.pv_codes[0]}
+        else:
+            count = 25
+            fields = {"jpTypeCode": "5", "pvCode": "10"}
+        return (
+            type("Page", (), {
+                "current_page": 1, "total_items": count,
+                "rows": [{"jpNo": "0100000000001", **fields}],
+            })(),
+            len(requests), {}, None,
+        )
+
+    monkeypatch.setattr(discovery, "_count", fake_count)
+    monkeypatch.setattr(repo, "mark_search_archive", lambda *_a: None)
+    failures = []
+    selected = await discovery._validated_children(
+        object(), 42, SearchFilters("010"), ["10", "20"], ["1", "2"], 25,
+        rejection_reasons=failures,
+    )
+    assert [f.pv_codes for f in selected] == [["10"], ["20"]]
+    assert len(failures) == 1
+    assert failures[0].startswith("jp_types:count_mismatch:")
+    assert requests[-1].pv_codes == []  # parent recheck after successful province plan
+
+
+@pytest.mark.asyncio
+async def test_no_progress_split_is_rejected_even_when_count_sum_matches(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repo
+
+    calls = []
+
+    async def fake_count(_client, _bucket, filters):
+        code = filters.jp_types[0]
+        value = 100 if code == "5" else 0
+        calls.append(code)
+        return (
+            type("Page", (), {
+                "current_page": 1, "total_items": value,
+                "rows": [{"jpTypeCode": code, "jpNo": "0100000000001"}] if value else [],
+            })(),
+            len(calls), {}, None,
+        )
+
+    monkeypatch.setattr(discovery, "_count", fake_count)
+    monkeypatch.setattr(repo, "mark_search_archive", lambda *_a: None)
+    reasons = []
+    children = [SearchFilters("010", jp_types=[code]) for code in ("5", "2")]
+    assert not await discovery._probe_partition(
+        object(), 42, SearchFilters("010"), 100, children, reasons,
+    )
+    assert reasons == ["no_progress:child_not_smaller_than_parent"]
+    assert calls == ["5", "2"]
+
+
+@pytest.mark.asyncio
+async def test_invalid_categorical_sample_blocks_split_without_recount(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repo
+
+    requested = []
+
+    async def fake_count(_client, _bucket, filters):
+        requested.append(filters)
+        return (
+            type("Page", (), {
+                "current_page": 1, "total_items": 50,
+                "rows": [{"jpTypeCode": "5", "jpNo": "0100000000001"}],
+            })(),
+            len(requested), {}, None,
+        )
+
+    monkeypatch.setattr(discovery, "_count", fake_count)
+    monkeypatch.setattr(repo, "mark_search_archive", lambda *_a: None)
+    failures = []
+    assert not await discovery._probe_partition(
+        object(), 42, SearchFilters("010"), 100,
+        [SearchFilters("010", jp_types=["2"]), SearchFilters("010", jp_types=["5"])],
+        failures,
+    )
+    assert failures == ["sample_filter_mismatch:jp_types"]
+    assert len(requested) == 1
+
+
+@pytest.mark.asyncio
+async def test_failed_overflow_receipt_retains_rejected_partition_details(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repo
+
+    async def fake_count(_client, _id, _filters):
+        return (
+            type("Page", (), {
+                "current_page": 1, "total_items": 12000,
+                "total_pages": 1200, "rows": [{"jpTypeCode": "5"}],
+            })(),
+            42, {}, None,
+        )
+
+    async def no_plan(_client, _bid, _filters, _pv, _st, _count, *, rejection_reasons):
+        rejection_reasons.extend(["jp_types:count_mismatch:parent=12000,children=9000"])
+        return []
+
+    updates = []
+    monkeypatch.setattr(discovery, "_count", fake_count)
+    monkeypatch.setattr(discovery, "_validated_children", no_plan)
+    monkeypatch.setattr(repo, "mark_search_archive", lambda *_a: None)
+    monkeypatch.setattr(discovery, "update_bucket", lambda _id, **kw: updates.append(kw))
+    await discovery._process_bucket(
+        object(),
+        {
+            "id": 42, "keyword": "010", "search_type": "", "pv_codes": "",
+            "jp_statuses": "", "jp_types": "", "business_sizes": "",
+            "depth": 0, "total_items": 12000, "pages_total": 1200, "pages_done": 0,
+        },
+        ["10"], master_cache={}, progress_line=None, status_codes=["1"],
+    )
+    assert updates[-1]["status"] == "failed"
+    assert "jp_types:count_mismatch:" in updates[-1]["last_error"]
