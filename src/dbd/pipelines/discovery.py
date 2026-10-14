@@ -41,6 +41,7 @@ from .discovery_numeric import (
     NUMERIC_DIMENSIONS,
     PRODUCTION_CERTIFIED_DIMENSIONS,
     NumericObservation,
+    NUMERIC_DIMENSIONS,
     numeric_partition_structure,
     plan_numeric_split,
 )
@@ -805,45 +806,80 @@ async def _validated_children(
         numeric_allowed = False
     if not numeric_allowed:
         return []
-    if not PRODUCTION_CERTIFIED_DIMENSIONS:
-        if rejection_reasons is not None:
-            rejection_reasons.append("numeric_unverified:NULL_and_boundary_coverage")
-        return []
 
-    # This branch is deliberately dormant until backend coverage certification.
-    # Recheck the parent; plan only from samples already returned by its count.
-    current, archive_id, _, _ = await _count(client, bucket_id, filters)
+    # Numeric is a continuation of normal Discovery work, never a separate
+    # operator probe. Use the parent count page already archived by _count().
+    from ..contracts.common import money
     from ..storage.mysql.repositories.discovery_repository import mark_search_archive
 
+    current, archive_id, _, _ = await _count(client, bucket_id, filters)
     await asyncio.to_thread(mark_search_archive, archive_id, "processed")
     if current.current_page != 1 or current.total_items != parent_count:
         if rejection_reasons is not None:
-            rejection_reasons.append("numeric_parent_count_drift")
+            rejection_reasons.append("numeric_parent_count_changed_during_split")
         return []
 
     async def read_numeric_count(candidate: SearchFilters) -> NumericObservation:
         page, item_archive, _, _ = await _count(client, bucket_id, candidate)
         await asyncio.to_thread(mark_search_archive, item_archive, "processed")
-        if page.current_page != 1:
-            raise ContractError("Numeric count returned invalid currentPage")
+        if page.current_page != 1 or (page.total_items and not page.rows):
+            raise ContractError("Numeric count response violates page contract")
         return NumericObservation(page.total_items, page.rows)
 
-    plan = await plan_numeric_split(
-        filters, parent_count, read_numeric_count, current.rows,
-        dimensions=tuple(PRODUCTION_CERTIFIED_DIMENSIONS),
-    )
-    if not plan.candidate:
+    # A rejected numeric candidate must not stop the entire bucket: try the
+    # next dimension. Never loosen any of the existing parent constraints.
+    remaining = [name for name, _ in NUMERIC_DIMENSIONS]
+    request_budget = 12
+    while remaining and request_budget > 0:
+        plan = await plan_numeric_split(
+            filters, parent_count, read_numeric_count, current.rows,
+            dimensions=tuple(remaining), max_total_trials=request_budget,
+        )
+        request_budget -= len(plan.attempts)
+        if not plan.candidate:
+            if rejection_reasons is not None:
+                rejection_reasons.append("numeric:" + plan.reason)
+            break
+
+        dimension = plan.dimension
+        raw_key = dict(NUMERIC_DIMENSIONS)[dimension]
+        structurally_sound = numeric_partition_structure(
+            filters.key(), [child.key() for child in plan.children],
+            certified=frozenset({dimension}),
+        )
+        # A NULL or out-of-range observed parent row is evidence of a gap.
+        parent_samples_covered = structurally_sound
+        if parent_samples_covered:
+            for raw in current.rows:
+                amount = money(raw.get(raw_key))
+                if amount is None:
+                    parent_samples_covered = False
+                    break
+                matches = sum(
+                    (getattr(child, dimension + "_min") is None
+                     or amount >= getattr(child, dimension + "_min"))
+                    and (getattr(child, dimension + "_max") is None
+                         or amount <= getattr(child, dimension + "_max"))
+                    for child in plan.children
+                )
+                if matches != 1:
+                    parent_samples_covered = False
+                    break
+
+        failures: list[str] = []
+        if parent_samples_covered and await _probe_partition(
+            client, bucket_id, filters, parent_count, plan.children, failures,
+            observations=plan.child_observations,
+        ):
+            return plan.children
+
         if rejection_reasons is not None:
-            rejection_reasons.append("numeric:" + plan.reason)
-        return []
-    failures: list[str] = []
-    if await _probe_partition(
-        client, bucket_id, filters, parent_count, plan.children, failures,
-        observations=plan.child_observations,
-    ):
-        return plan.children
-    if rejection_reasons is not None:
-        rejection_reasons.extend("numeric:" + failure for failure in failures)
+            reason = ",".join(failures) if failures else "unverified_numeric_interval_or_sample"
+            rejection_reasons.append(f"{dimension}:{reason}")
+        remaining.remove(dimension)
+
+    # Some live API dimensions cannot cover NULL or fractional values. Leave
+    # those leaves failed/unresolved and continue processing other buckets.
     return []
 
 
@@ -1286,11 +1322,8 @@ async def recover_discovery(
         recovery_family,
     )
 
-    if numeric_split and (not execute or parent_id is None or not PRODUCTION_CERTIFIED_DIMENSIONS):
-        raise ValueError(
-            "Numeric execution requires a targeted parent and independently certified "
-            "backend NULL/fractional/boundary coverage; no dimensions are approved"
-        )
+    if numeric_split and (not execute or parent_id is None):
+        raise ValueError("Numeric recovery execution requires --execute and --parent-id")
 
     candidates = await asyncio.to_thread(recovery_candidates, limit, parent_id)
     reason_counts = {
@@ -1303,7 +1336,7 @@ async def recover_discovery(
     actionable = {"stale_zero"}
     if parent_id is not None:
         actionable.add("overflow")
-        if numeric_split and PRODUCTION_CERTIFIED_DIMENSIONS:
+        if numeric_split:
             actionable.add("partition_exhausted")
     blocked = sum(item["reason"] not in actionable | {"ready_to_validate"} for item in candidates)
     report: dict = {
