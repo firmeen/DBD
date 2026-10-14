@@ -186,10 +186,11 @@ def save_snapshot(conn, *, company_id: int, branches: list[dict],
         cur.execute(
             "UPDATE dbo.DBD_COMPANY SET branch_count=%s,establishment_count=%s,"
             "branch_status=%s,branch_source=%s,branch_checked_at=%s,"
-            "branch_verified_at=%s,branch_retry_at=NULL,branch_last_error=NULL "
+            "branch_verified_at=%s,branch_retry_at=DATEADD(day,30,%s),"
+            "branch_last_error=NULL "
             "WHERE company_id=%s",
             (len(branches),establishment_count,
-             "COMPLETE" if branches else "NO_BRANCH",source,now,now,company_id),
+             "COMPLETE" if branches else "NO_BRANCH",source,now,now,now,company_id),
         )
         return True
     finally:
@@ -199,7 +200,11 @@ def save_snapshot(conn, *, company_id: int, branches: list[dict],
 def defer(conn, *, company_id: int, reason: str,
           retry_at: datetime | None = None,
           status: str = "UNAVAILABLE") -> None:
-    """Failures never erase the previously certified branch count/snapshot."""
+    """Failures never erase the last certified snapshot or branch count.
+
+    Retry timing is explicit so permanent-looking missing/invalid pages can
+    be rechecked later instead of silently disappearing from selection.
+    """
     if status not in {"RETRY", "UNAVAILABLE", "NOT_LISTED", "INVALID"}:
         raise ContractError("Unknown branch failure status")
     if status == "RETRY" and retry_at is None:
