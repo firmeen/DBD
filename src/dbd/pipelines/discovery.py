@@ -62,6 +62,7 @@ class DiscoveryResult:
     remaining_lossy: int = 0
     remaining_open: int = 0
     remaining_partial: int = 0
+    remaining_failed_pages: int = 0
     remaining_quarantine: int = 0
 
 
@@ -1797,6 +1798,7 @@ async def _run_work(
         remaining_lossy=int(latest.get("partitions_lossy") or 0),
         remaining_open=int(latest.get("buckets_open") or 0),
         remaining_partial=int(latest.get("pages_partial") or 0),
+        remaining_failed_pages=int(latest.get("pages_failed") or 0),
         remaining_quarantine=int(latest.get("unresolved_rejections") or 0),
     )
 
@@ -1899,6 +1901,8 @@ async def run(
         blockers.append(f"{status['buckets_failed']} failed bucket(s)")
     if int(status.get("pages_partial") or 0):
         blockers.append(f"{status['pages_partial']} partial page(s)")
+    if int(status.get("pages_failed") or 0):
+        blockers.append(f"{status['pages_failed']} failed page(s)")
     if int(status.get("unresolved_rejections") or 0):
         blockers.append(f"{status['unresolved_rejections']} quarantined row(s)")
     if int(status.get("partitions_lossy") or 0):

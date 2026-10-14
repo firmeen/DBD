@@ -961,12 +961,13 @@ def main():
                     "lossy_remaining": result.remaining_lossy,
                     "open_remaining": result.remaining_open,
                     "partial_pages_remaining": result.remaining_partial,
+                    "failed_pages_remaining": result.remaining_failed_pages,
                     "quarantined_remaining": result.remaining_quarantine,
                     "status": (
                         "COMPLETE" if not any((
                             result.remaining_failed, result.remaining_lossy,
                             result.remaining_open, result.remaining_partial,
-                            result.remaining_quarantine,
+                            result.remaining_failed_pages, result.remaining_quarantine,
                         )) else "INCOMPLETE"
                     ),
                 },
