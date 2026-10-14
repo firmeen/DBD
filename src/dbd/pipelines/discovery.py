@@ -1234,6 +1234,12 @@ async def recover_discovery(
         recovery_family,
     )
 
+    if numeric_split and (not execute or parent_id is None or not PRODUCTION_CERTIFIED_DIMENSIONS):
+        raise ValueError(
+            "Numeric execution requires a targeted parent and independently certified "
+            "backend NULL/fractional/boundary coverage; no dimensions are approved"
+        )
+
     candidates = await asyncio.to_thread(recovery_candidates, limit, parent_id)
     reason_counts = {
         reason: sum(item["reason"] == reason for item in candidates)
@@ -1262,12 +1268,6 @@ async def recover_discovery(
         return report
     if rate <= 0:
         raise ValueError("Recovery rate must be positive")
-    if numeric_split and (parent_id is None or not PRODUCTION_CERTIFIED_DIMENSIONS):
-        raise ValueError(
-            "Numeric execution requires a targeted parent and independently certified "
-            "backend NULL/fractional/boundary coverage; no dimensions are approved"
-        )
-
     # No actionable candidates: reconcile existing checkpoints, but do not
     # authenticate or issue even one Search request.
     if not any(item["reason"] in actionable for item in candidates):

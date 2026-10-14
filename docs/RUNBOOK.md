@@ -3,6 +3,25 @@
 Operational path from an empty MySQL schema to a durable DBD collection. Current
 production scope is tabs 1-2: seven endpoints per company.
 
+## Discovery — numeric recovery preview (PR #101, not activated)
+
+```powershell
+dbd-data discover-status
+dbd-data discover-recover --limit 400
+dbd-data discover-recover --probe --numeric-plan --parent-id 13966 --rate 0.25
+```
+
+The preview is **read-only**, apart from network requests to the DBD Search
+API. It never creates child buckets, resets existing pages, or updates MySQL.
+It reports count-only *candidates*, not certified complete partitions.
+
+`--numeric-split --execute --parent-id ID` intentionally fails closed until
+backend NULL handling, fractional boundary precision, count stability, and
+identity coverage are independently certified. Historical count drift must be
+reconciled; never overwrite a previously observed larger count just to split.
+Do not run bulk retry/refresh on the 35 failed leaves or reset the 286
+unverified split parents.
+
 ## Standalone Deep — current direct path
 
 ถ้าต้องการใช้ collector ใหม่แบบตรงไปตรงมา ให้ใช้ flow นี้แทนการสร้าง Campaign run

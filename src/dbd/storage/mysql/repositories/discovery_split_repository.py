@@ -30,10 +30,30 @@ def split_bucket(
     with connect() as conn, conn.cursor() as cur:
         if lease_owner is not None:
             assert_bucket_lease(cur, int(parent_id), lease_owner, int(lease_version))
-        else:
-            cur.execute("SELECT id FROM discovery_buckets WHERE id=%s FOR UPDATE", (int(parent_id),))
-            if cur.fetchone() is None:
-                raise ValueError(f"Discovery bucket {parent_id} not found")
+        cur.execute(
+            "SELECT id,status,pages_done,keyword,search_type,"
+            "pv_codes,jp_statuses,jp_types,business_sizes "
+            "FROM discovery_buckets WHERE id=%s FOR UPDATE",
+            (int(parent_id),),
+        )
+        parent = cur.fetchone()
+        if parent is None:
+            raise ValueError(f"Discovery bucket {parent_id} not found")
+
+        # A split must refine the exact parent query, never replace the
+        # keyword or remove an already-selected categorical constraint.
+        for child in children:
+            if child.keyword != parent["keyword"] or child.search_type != parent["search_type"]:
+                raise ValueError("Split child changed its parent search identity")
+            for attribute, column in (
+                ("pv_codes", "pv_codes"),
+                ("jp_statuses", "jp_statuses"),
+                ("jp_types", "jp_types"),
+                ("business_sizes", "business_sizes"),
+            ):
+                selected = set(filter(None, (parent[column] or "").split(",")))
+                if selected and not set(getattr(child, attribute)) <= selected:
+                    raise ValueError(f"Split child broadened parent {attribute}")
 
         keys = [_bucket_key(filters) for filters in children]
         if len(set(keys)) != len(keys):
@@ -51,6 +71,38 @@ def split_bucket(
                     "would double-count search coverage"
                 )
             return [int(row["id"]) for row in existing]
+
+        if parent["status"] in ("done", "split") or int(parent["pages_done"] or 0):
+            raise RuntimeError("Refusing to replace a completed or checkpointed parent")
+
+        # Numeric parent bounds are checked only when the optional migrated
+        # column is actually needed. Legacy categorical splitting works before
+        # migration 0013 and must not gain an implicit schema dependency.
+        if any(child.numeric_range() is not None for child in children):
+            from decimal import Decimal
+
+            cur.execute(
+                "SELECT numeric_filters FROM discovery_buckets WHERE id=%s",
+                (int(parent_id),),
+            )
+            source = cur.fetchone()
+            raw = source["numeric_filters"] if source is not None else None
+            persisted = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            for child in children:
+                numeric = child.numeric_range() or {}
+                for prefix in ("capAmt", "totalAsset", "totalIncome", "netProfit"):
+                    for bound in ("Min", "Max"):
+                        name = prefix + bound
+                        stored = persisted.get(name)
+                        current = numeric.get(name)
+                        if stored is None:
+                            continue
+                        if current is None or (
+                            bound == "Min" and Decimal(current) < Decimal(str(stored))
+                        ) or (
+                            bound == "Max" and Decimal(current) > Decimal(str(stored))
+                        ):
+                            raise ValueError(f"Split child removed parent numeric constraint: {name}")
 
         placeholders = ",".join(["%s"] * len(keys))
         cur.execute(

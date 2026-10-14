@@ -178,6 +178,23 @@ dbd-data master-status
 
 Discovery มี durable checkpoint ดังนั้นไม่ควร reset ใหม่เพียงเพราะ network error ชั่วคราว
 
+Numeric Recovery ใน PR #101 ยังอยู่ในโหมดตรวจสอบเท่านั้น: ระบบรองรับ
+Capital, Assets, Income และ Profit ใน Search Filter และมี Count-aware preview
+แต่ยัง **ไม่อนุญาตให้สร้าง Numeric Children ใน Production** จนกว่า DBD API
+จะผ่านการพิสูจน์ NULL, ทศนิยม, ขอบเขตช่วง และ Count Drift
+
+```powershell
+# อ่านสถานะ Recovery จาก MySQL ไม่ยิง API
+dbd-data discover-recover --limit 400
+
+# ยิง Count Probe อย่างจำกัด ไม่เขียน Bucket/Page/Archive
+dbd-data discover-recover --probe --numeric-plan --parent-id 13966 --rate 0.25
+```
+
+`--numeric-split --execute --parent-id ID` เป็นทางเข้าที่ปิดไว้แบบ fail-closed
+ขณะยังไม่มีมิติใดผ่านการรับรอง ห้ามใช้ `discover-refresh` เพื่อแก้
+Oversized Bucket; ใช้ MySQL Checkpoint เดิมต่อไป
+
 ระบบเก็บ valid rows ที่ผ่าน validation และ quarantine row ที่ผิด contract แยกไว้ ไม่ทิ้งทั้ง page เพียงเพราะมีบาง row ผิด
 
 `discover-status` บอก coverage ที่ระบบสังเกตได้ แต่ไม่ได้หมายความโดยอัตโนมัติว่า upstream ส่งบริษัททั้งหมดครบ 100%

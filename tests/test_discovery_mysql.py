@@ -331,3 +331,37 @@ def test_recursive_categorical_split_preserves_existing_siblings_and_resume_stat
     assert all(_filters_from_row(row).jp_types == ["5"] for row in second_level)
     assert set(split_bucket(large_id, province_children, 2)) == set(grandchild_ids)
     assert len(recovery_family(large_id)[1]) == 2
+
+def test_combined_numeric_range_persists_in_existing_bucket_json_column():
+    """Disposable MySQL only: no refresh, deletion or production writes."""
+    from dbd.pipelines.discovery import _filters_from_row
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    keyword = "numeric-four-" + uuid4().hex
+    parent_filters = SearchFilters(keyword, jp_types=["5"], pv_codes=["10"])
+    parent_id = upsert_bucket(parent_filters)
+    children = [
+        SearchFilters(
+            keyword, jp_types=["5"], pv_codes=["10"],
+            cap_amt_max="1000000", total_asset_min="0",
+            total_income_max="2500000.50", net_profit_min="-200",
+        ),
+        SearchFilters(
+            keyword, jp_types=["5"], pv_codes=["10"],
+            cap_amt_min="1000000.01", total_asset_min="0",
+            total_income_max="2500000.50", net_profit_min="-200",
+        ),
+    ]
+    child_ids = split_bucket(parent_id, children, 1)
+    restored = [_filters_from_row(get_bucket(i)) for i in child_ids]
+    assert {item.key() for item in restored} == {item.key() for item in children}
+    assert all(item.payload()["totalAssetMin"] == 0 for item in restored)
+    assert all(item.payload()["totalIncomeMax"] == "2500000.5" for item in restored)
+    assert all(item.payload()["netProfitMin"] == -200 for item in restored)
+    assert set(split_bucket(parent_id, children, 1)) == set(child_ids)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM discovery_pages WHERE bucket_id IN (%s,%s)",
+            tuple(child_ids),
+        )
+        assert int(cur.fetchone()["n"]) == 0

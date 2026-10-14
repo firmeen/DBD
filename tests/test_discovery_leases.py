@@ -179,3 +179,23 @@ def test_split_refuses_a_second_incompatible_child_plan() -> None:
             (parent,),
         )
         assert int(cur.fetchone()["n"]) == 1
+
+def test_split_rejects_checkpointed_or_completed_parent_without_deleting_pages():
+    from dbd.storage.mysql.repositories.discovery_repository import update_bucket
+
+    parent_filter = SearchFilters("safe-parent-" + uuid4().hex)
+    parent_id = upsert_bucket(parent_filter)
+    update_bucket(parent_id, status="done", total_items=1, pages_total=1, pages_done=1)
+    child = SearchFilters(parent_filter.keyword, jp_types=["5"])
+    with pytest.raises(RuntimeError, match="completed or checkpointed"):
+        split_bucket(parent_id, [child], 1)
+    assert get_bucket(parent_id)["status"] == "done"
+
+
+def test_split_refuses_child_that_drops_fixed_categorical_filter():
+    parent_filter = SearchFilters("fixed-cat-" + uuid4().hex, jp_types=["5"])
+    parent_id = upsert_bucket(parent_filter)
+    child = SearchFilters(parent_filter.keyword, jp_types=["2"], pv_codes=["10"])
+    with pytest.raises(ValueError, match="broadened parent"):
+        split_bucket(parent_id, [child], 1)
+    assert get_bucket(parent_id)["status"] == "pending"
