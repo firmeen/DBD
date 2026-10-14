@@ -103,6 +103,10 @@ def parse_printview(html: str, jp_no: str) -> tuple[list[dict], int]:
         })
     if headquarters > 1 or len(branches)+headquarters != expected:
         raise BranchError(f"{jp_no}: establishment total mismatch")
+    if not branches and headquarters != 1:
+        # An empty printview is not proof of a zero-branch company. Require
+        # positive headquarters evidence before certifying NO_BRANCH.
+        raise BranchError(f"{jp_no}: no headquarters evidence for zero branches")
     return branches, expected
 
 
