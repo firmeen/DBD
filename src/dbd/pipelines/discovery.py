@@ -844,14 +844,18 @@ async def run(
         from ..storage.sqlserver.control_repository import ControlRepository
         control = ControlRepository()
         active = await asyncio.to_thread(control.active_generation)
-        if active is not None:
-            if active.get("state") != "DISCOVERING" or int(active.get("generation") or 0) != int(generation):
-                raise RuntimeError("SQL Server Discovery conflicts with the active monthly cycle")
-            node_id = local_node_id()
-            if node_id is None:
-                raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
-            await asyncio.to_thread(control.require_admin, node_id)
-            admission = lambda: control.admit(node_id, int(generation))
+        if active is None or active.get("state") != "DISCOVERING" or (
+            int(active.get("generation") or 0) != int(generation)
+        ):
+            raise RuntimeError(
+                "SQL Server Discovery requires the matching authorized "
+                "DISCOVERING monthly Generation; start with dbd-data cycle run"
+            )
+        node_id = local_node_id()
+        if node_id is None:
+            raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
+        await asyncio.to_thread(control.require_admin, node_id)
+        admission = lambda: control.admit(node_id, int(generation))
 
     buckets_processed = 0
     pages_fetched = 0
@@ -900,6 +904,15 @@ async def run(
                     if str(province).strip()
                 }
                 | set(EXTRA_PREFIX_SEEDS)
+            )
+
+        if getattr(repo, "backend", None) == "sqlserver":
+            return await _run_durable_discovery(
+                repo, client, seeds, search_type=search_type,
+                provinces=provinces, generation=int(generation),
+                refresh_mask=int(refresh_mask),
+                concurrency=int(concurrency or settings.dbd_concurrency),
+                max_buckets=max_buckets, event=event, health=health,
             )
 
         queue = deque(
@@ -1041,3 +1054,224 @@ async def run(
         requests_made=client.requests_made,
         invalid_rows=invalid_rows,
     )
+
+
+async def _run_durable_discovery(
+    repo, client: FixedRateDbdClient, seeds: list[str], *,
+    search_type: str, provinces: list[str], generation: int,
+    refresh_mask: int, concurrency: int, max_buckets: int | None,
+    event=None, health=None,
+) -> DiscoveryResult:
+    """SQL Server G2+ Discovery: one durable tree and atomic page checkpoints.
+
+    No second HTTP client, queue service, or company writer. The Core-7
+    repository owns business writes and shares the checkpoint transaction.
+    Uncertified partition dimensions remain BLOCKED, never marked complete.
+    """
+    from ..storage.sqlserver import discovery_repository as work
+
+    full = not search_type and max_buckets is None and not getattr(
+        _run_durable_discovery, "_scoped", False
+    )
+    # Explicit keywords define a diagnostic scope; only the unscoped monthly
+    # runner is allowed to create a full-universe completion certificate.
+    # Seeds are already expanded from the province catalog by run().
+    scope = "full" if full else "diagnostic"
+    roots = [SearchFilters(keyword=seed, search_type=search_type)
+             for seed in sorted(set(seeds))]
+    processed = pages_fetched = written = invalid = 0
+    started = time.monotonic()
+    active = None
+
+    def notify(name: str, **values) -> None:
+        if event is None:
+            return
+        try:
+            event(name, {
+                **values, "buckets_processed": processed,
+                "pages_fetched": pages_fetched, "companies_written": written,
+                "invalid_rows": invalid, "requests_made": client.requests_made,
+                "rate_limit_hits": client.rate_limit_hits,
+                "configured_rate": client.rate_per_second,
+                "cooldown_seconds": client.cooldown_remaining(),
+                "elapsed_seconds": max(0, time.monotonic() - started),
+                "generation": generation, "scope": scope,
+            })
+        except Exception:
+            # Rendering/telemetry failures never fail persistence.
+            pass
+
+    with repo.transaction() as conn:
+        work.validate_schema(conn)
+        work.register_roots(conn, generation, scope, roots)
+
+    async def pulse() -> None:
+        while True:
+            notify("discovery_progress", **(active or {}))
+            await asyncio.sleep(1.0)
+
+    task = asyncio.create_task(pulse())
+    try:
+        while True:
+            with repo.transaction() as conn:
+                bucket = work.next_work(conn, generation, scope)
+            if bucket is None:
+                break
+            if max_buckets is not None and processed >= max_buckets:
+                break
+            if health is not None:
+                await asyncio.to_thread(health)
+            filters = work.filters_for(bucket)
+            bucket_id = int(bucket["work_id"])
+            active = {"work_id": bucket_id, "bucket": filters.key(),
+                      "stage": "COUNTING"}
+            notify("discovery_progress", **active)
+            response, _ = await _direct_page(client, filters, 1)
+            parent = parse_search_response(response)
+            pages_fetched += 1
+            processed += 1
+            if bucket["status"] == "PENDING":
+                with repo.transaction() as conn:
+                    work.count(conn, bucket_id, parent.total_items, parent.total_pages)
+                bucket["status"] = "COUNTED"
+                bucket["total_items"] = parent.total_items
+                bucket["total_pages"] = parent.total_pages
+            elif (int(bucket["total_items"]) != parent.total_items
+                  or int(bucket["total_pages"]) != parent.total_pages):
+                with repo.transaction() as conn:
+                    work.blocked(conn, bucket_id, "count_or_pagination_drift")
+                notify("discovery_progress", **active,
+                       stage="RECONCILING", error="count_or_pagination_drift")
+                continue
+
+            if parent.total_items == 0:
+                with repo.transaction() as conn:
+                    work.done(conn, bucket, empty=True)
+                notify("discovery_progress", **active, stage="DONE")
+                continue
+
+            if parent.total_items > MAX_ROWS_PER_QUERY:
+                active["stage"] = "VALIDATING_SPLIT"
+                notify("discovery_progress", **active)
+                children = _children_for(filters, provinces)
+                if not children:
+                    # Numeric plans are hypotheses until their API boundary,
+                    # NULL and identity coverage have been certified. Never
+                    # fetch the first 1000 pages and call an overflow DONE.
+                    reason = "no_certified_lossless_split"
+                    with repo.transaction() as conn:
+                        work.blocked(conn, bucket_id, reason)
+                    notify("discovery_progress", **active,
+                           stage="BLOCKED", error=reason)
+                    continue
+                counts = []
+                identities = set()
+                parity = True
+                for child in children:
+                    child_data, _ = await _direct_page(client, child, 1)
+                    observed = parse_search_response(child_data)
+                    pages_fetched += 1
+                    counts.append((observed.total_items, observed.total_pages))
+                    # First-page identity overlap is an early contradiction,
+                    # not proof that every page is disjoint.
+                    for row in observed.rows:
+                        identifier = (row.get("jpType"), row.get("jpNo"))
+                        if all(identifier):
+                            if identifier in identities:
+                                parity = False
+                            identities.add(identifier)
+                parity = parity and sum(x[0] for x in counts) == parent.total_items
+                if not parity:
+                    with repo.transaction() as conn:
+                        work.blocked(conn, bucket_id, "child_count_or_identity_mismatch")
+                    notify("discovery_progress", **active,
+                           stage="BLOCKED", error="child_count_or_identity_mismatch")
+                    continue
+                active["stage"] = "SPLITTING"
+                with repo.transaction() as conn:
+                    # Child counts and parent split are committed together.
+                    work.split(conn, bucket, children,
+                               "categorical", counts)
+                notify("discovery_split", **active, children=len(children))
+                continue
+
+            if bucket["status"] == "COUNTED":
+                with repo.transaction() as conn:
+                    work.fetching(conn, bucket)
+            previous = int(bucket["last_committed_page"])
+            total_pages = int(parent.total_pages)
+            active.update(stage="FETCHING", pages_done=previous,
+                          pages_total=total_pages)
+            chunk_size = max(1, min(32, concurrency * 2))
+            next_page = previous + 1
+            while next_page <= total_pages:
+                numbers = list(range(next_page, min(total_pages + 1,
+                                                    next_page + chunk_size)))
+                tasks = {
+                    p: asyncio.create_task(_direct_page(client, filters, p))
+                    for p in numbers if p != 1
+                }
+                batch = []
+                try:
+                    for p in numbers:
+                        if p == 1:
+                            obj = parent
+                        else:
+                            page_data, _ = await tasks[p]
+                            obj = parse_search_response(page_data)
+                            pages_fetched += 1
+                        if (obj.total_items != parent.total_items or
+                            obj.total_pages != parent.total_pages or
+                            len(obj.rows) == 0):
+                            raise ContractError("Discovery pagination drift or empty page")
+                        rows, rejected = _normalize_direct_rows(
+                            obj.rows, published_at=_now())
+                        invalid += rejected
+                        if rejected:
+                            raise ContractError(
+                                "Invalid company row; refusing to checkpoint incomplete page")
+                        batch.extend(rows)
+                except BaseException:
+                    for pending in tasks.values():
+                        if not pending.done():
+                            pending.cancel()
+                    if tasks:
+                        await asyncio.gather(*tasks.values(), return_exceptions=True)
+                    raise
+
+                active["stage"] = "PERSISTING"
+                notify("discovery_progress", **active)
+                with repo.transaction() as conn:
+                    size = max(1, int(settings.dbd_write_batch_size))
+                    for offset in range(0, len(batch), size):
+                        result = repo.upsert_discovered_companies(
+                            conn, batch[offset:offset + size],
+                            generation=generation, financial_mask=FINANCIAL_MASK,
+                            refresh_mask=refresh_mask)
+                        written += int(result["inserted"]) + int(result["updated"])
+                    work.checkpoint(conn, bucket_id, previous, numbers[-1])
+                previous = numbers[-1]
+                next_page = previous + 1
+                active.update(stage="FETCHING", pages_done=previous)
+                notify("discovery_progress", **active)
+            with repo.transaction() as conn:
+                work.done(conn, bucket)
+            notify("discovery_progress", **active, stage="DONE")
+
+        with repo.transaction() as conn:
+            report = work.coverage(conn, generation, scope)
+        notify("discovery_progress", **report, stage="RECONCILING")
+        if max_buckets is not None or not report["ok"]:
+            raise ContractError(
+                "Discovery coverage incomplete: " + ", ".join(
+                    f"{key}={value}" for key, value in sorted(report.items())
+                )
+            )
+        return DiscoveryResult(
+            buckets_processed=processed, pages_fetched=pages_fetched,
+            companies_written=written, requests_made=client.requests_made,
+            invalid_rows=invalid,
+        )
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
