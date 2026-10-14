@@ -285,3 +285,49 @@ def test_optional_numeric_split_children_persist_and_resume_without_duplicate_ke
             tuple(ids),
         )
         assert int(cur.fetchone()["n"]) == 0
+
+
+def test_recursive_categorical_split_preserves_existing_siblings_and_resume_state():
+    from dbd.pipelines.discovery import _filters_from_row
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        get_bucket,
+        recovery_family,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    keyword = "recursive-categories-" + uuid4().hex
+    root = upsert_bucket(SearchFilters(keyword))
+    jp_children = [
+        SearchFilters(keyword, jp_types=["2"]),
+        SearchFilters(keyword, jp_types=["5"]),
+    ]
+    jp_ids = split_bucket(root, jp_children, 1)
+    assert len(jp_ids) == 2
+
+    sibling_id, large_id = jp_ids
+    sibling_before = get_bucket(sibling_id)
+    large_before = get_bucket(large_id)
+    assert sibling_before["status"] == "pending"
+    assert large_before["status"] == "pending"
+
+    province_children = [
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["10"]),
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["20"]),
+    ]
+    grandchild_ids = split_bucket(large_id, province_children, 2)
+    assert len(grandchild_ids) == 2
+
+    parent, first_level = recovery_family(root)
+    assert parent["status"] == "split"
+    assert {int(row["id"]) for row in first_level} == set(jp_ids)
+    assert get_bucket(sibling_id)["status"] == "pending"
+    assert get_bucket(large_id)["status"] == "split"
+    assert get_bucket(sibling_id)["bucket_key"] == sibling_before["bucket_key"]
+
+    large, second_level = recovery_family(large_id)
+    assert large["status"] == "split"
+    assert {int(row["id"]) for row in second_level} == set(grandchild_ids)
+    assert all(row["status"] == "pending" for row in second_level)
+    assert all(_filters_from_row(row).jp_types == ["5"] for row in second_level)
+    assert set(split_bucket(large_id, province_children, 2)) == set(grandchild_ids)
+    assert len(recovery_family(large_id)[1]) == 2
