@@ -57,39 +57,38 @@ def assert_bucket_lease(cur, bucket_id: int, owner: str | None, lease_version: i
 
 def upsert_bucket(filters: SearchFilters, *, parent_id: int | None = None, depth: int = 0) -> int:
     now = _now()
+    columns = [
+        "parent_id", "bucket_key", "keyword", "search_type",
+        "pv_codes", "jp_statuses", "jp_types", "business_sizes",
+        "depth", "created_at", "updated_at",
+    ]
+    values = [
+        parent_id, filters.key(), filters.keyword, filters.search_type,
+        ",".join(filters.pv_codes), ",".join(filters.jp_statuses),
+        ",".join(filters.jp_types), ",".join(filters.business_sizes),
+        depth, now, now,
+    ]
+    # Legacy buckets keep their old insert shape and work without schema
+    # migration. Only opt-in numeric children require the new JSON column.
+    if filters.numeric_range() is not None:
+        columns.append("numeric_filters")
+        values.append(json.dumps(filters.numeric_range(), sort_keys=True))
+    placeholders = ",".join(["%s"] * len(columns))
+    sql = (
+        f"INSERT INTO discovery_buckets ({','.join(columns)}) "
+        f"VALUES ({placeholders}) "
+        "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),updated_at=VALUES(updated_at)"
+    )
     with connect() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO discovery_buckets (
-                        parent_id,bucket_key,keyword,search_type,
-                        pv_codes,jp_statuses,jp_types,business_sizes,
-                        depth,created_at,updated_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),updated_at=VALUES(updated_at)
-                    """,
-                    (
-                        parent_id,
-                        filters.key(),
-                        filters.keyword,
-                        filters.search_type,
-                        ",".join(filters.pv_codes),
-                        ",".join(filters.jp_statuses),
-                        ",".join(filters.jp_types),
-                        ",".join(filters.business_sizes),
-                        depth,
-                        now,
-                        now,
-                    ),
-                )
+                cur.execute(sql, values)
                 bucket_id = int(cur.lastrowid)
             conn.commit()
             return bucket_id
         except Exception:
             conn.rollback()
             raise
-
 
 def update_bucket(
     bucket_id: int,
