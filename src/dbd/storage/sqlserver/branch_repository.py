@@ -123,13 +123,16 @@ def candidates(conn, *, after: int = 0, limit: int = 100,
 
 
 def save_snapshot(conn, *, company_id: int, branches: list[dict],
-                  establishment_count: int, verified_at: datetime,
+                  establishment_count: int | None, verified_at: datetime,
                   url: str, source: str = "DATAFORTHAI") -> bool:
     """Replace a complete company snapshot atomically; never accept partial HTML."""
-    if establishment_count < 0 or establishment_count < len(branches):
-        raise ContractError("External establishment total does not match branches")
-    if establishment_count - len(branches) not in (0, 1):
-        raise ContractError("Unexpected headquarters count in branch snapshot")
+    if establishment_count is not None:
+        if establishment_count < 0 or establishment_count < len(branches):
+            raise ContractError("External establishment total does not match branches")
+        if establishment_count - len(branches) not in (0, 1):
+            raise ContractError("Unexpected headquarters count in branch snapshot")
+    elif source != "DATAFORTHAI_IMPORT":
+        raise ContractError("Live branch snapshot requires a validated establishment total")
     numbers = [str(item["branch_no"]) for item in branches]
     if len(numbers) != len(set(numbers)) or any(
         len(no)!=5 or not no.isascii() or not no.isdecimal() for no in numbers
