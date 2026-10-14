@@ -8,9 +8,9 @@ import time
 from contextlib import contextmanager
 from decimal import Decimal
 
+from dotenv import load_dotenv
 import mysql.connector
 import pymssql
-from dotenv import load_dotenv
 
 
 # ============================================================
