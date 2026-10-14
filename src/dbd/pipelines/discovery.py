@@ -4,7 +4,7 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from uuid import uuid4
@@ -644,6 +644,105 @@ async def _validated_children(
     return []
 
 
+async def _probe_capital_boundary(
+    row: dict, *, cap_max: str, cap_next_min: str, rate: float, health=None,
+) -> dict:
+    """Preview a candidate two-way capital split; never write or certify it.
+
+    Numeric bounds have not yet been proven to cover NULLs or every fractional
+    value in DBD. Count parity and first-page samples are diagnostics ONLY.
+    """
+    from ..contracts.common import money
+
+    parent = _filters_from_row(row)
+    left_bound = money(cap_max)
+    right_bound = money(cap_next_min)
+    if left_bound is None or right_bound is None or left_bound >= right_bound:
+        raise ValueError("Split probe requires cap_max < cap_next_min")
+    if parent.cap_amt_min is not None and left_bound < parent.cap_amt_min:
+        raise ValueError("Lower child lies outside persisted parent capital range")
+    if parent.cap_amt_max is not None and right_bound > parent.cap_amt_max:
+        raise ValueError("Upper child lies outside persisted parent capital range")
+    left = replace(parent, cap_amt_max=left_bound)
+    right = replace(parent, cap_amt_min=right_bound)
+    candidates = (
+        ("parent_before", parent),
+        ("left", left),
+        ("right", right),
+        ("parent_after", parent),
+    )
+    counts: dict[str, int] = {}
+    samples: dict[str, set[tuple[str, str]]] = {}
+    invalid_capital = 0
+    async with AsyncDbdClient(
+        concurrency=1,
+        rate_per_second=rate,
+        endpoint_rates={"search": rate},
+    ) as client:
+        for label, filters in candidates:
+            if health is not None:
+                await asyncio.to_thread(health)
+            data = await client.post(
+                SEARCH_PATH,
+                filters.payload(page=1),
+                referer=SEARCH_REFERER,
+                timeout=settings.dbd_count_timeout_seconds,
+                rate_key="search",
+            )
+            page = parse_search_response(data)
+            if page.current_page != 1 or (page.total_items and not page.rows):
+                raise ContractError(f"Invalid capital range probe response: {label}")
+            counts[label] = page.total_items
+            identities: set[tuple[str, str]] = set()
+            for raw in page.rows:
+                jp_type, jp_no = raw.get("jpTypeCode"), raw.get("jpNo")
+                if not jp_type or not jp_no:
+                    raise ContractError(f"Missing identity in capital probe: {label}")
+                identity = (str(jp_type), str(jp_no))
+                if identity in identities:
+                    raise ContractError(f"Duplicate sampled identity in capital probe: {label}")
+                identities.add(identity)
+                if label in ("left", "right"):
+                    capital = money(raw.get("capAmt"))
+                    if capital is None or (
+                        label == "left" and capital > left_bound
+                    ) or (
+                        label == "right" and capital < right_bound
+                    ):
+                        invalid_capital += 1
+            samples[label] = identities
+
+    stable = counts["parent_before"] == counts["parent_after"]
+    parity = counts["left"] + counts["right"] == counts["parent_before"]
+    sampled_overlap = len(samples["left"] & samples["right"])
+    return {
+        "mode": "numeric_plan_preview",
+        "bucket_id": int(row["id"]),
+        "stored_count": row.get("total_items"),
+        "parent_before": counts["parent_before"],
+        "parent_after": counts["parent_after"],
+        "cap_max": str(left_bound),
+        "cap_next_min": str(right_bound),
+        "left_count": counts["left"],
+        "right_count": counts["right"],
+        "count_parity": parity,
+        "count_stable": stable,
+        "stored_count_drift": (
+            row.get("total_items") is not None
+            and int(row["total_items"]) != counts["parent_before"]
+        ),
+        "sample_overlap": sampled_overlap,
+        "invalid_sample_capital": invalid_capital,
+        "request_count": len(candidates),
+        "decision": "OBSERVATION_ONLY",
+        "reason": (
+            "Count-only evidence cannot establish NULL coverage, fractional "
+            "boundary completeness, or historical count reconciliation; "
+            "no numeric children created"
+        ),
+    }
+
+
 async def _probe_keyword_cohort(
     keyword: str, *, rate: float, health=None,
 ) -> dict:
@@ -797,6 +896,8 @@ async def probe_discovery_partition(
     *,
     parent_id: int | None = None,
     keyword: str | None = None,
+    cap_max: str | None = None,
+    cap_next_min: str | None = None,
     rate: float = 0.25,
     health=None,
 ) -> dict:
@@ -812,6 +913,10 @@ async def probe_discovery_partition(
         raise ValueError("Probe rate must be positive")
     if (parent_id is None) == (keyword is None):
         raise ValueError("Probe requires exactly one of parent_id or keyword")
+    if (cap_max is None) != (cap_next_min is None):
+        raise ValueError("Capital boundary probe needs both cap_max and cap_next_min")
+    if keyword is not None and cap_max is not None:
+        raise ValueError("Capital boundary probe requires parent_id, not keyword")
     if keyword is not None:
         keyword = keyword.strip()
         if len(keyword) < 3:
@@ -822,6 +927,10 @@ async def probe_discovery_partition(
         raise ValueError(f"Unknown discovery bucket {parent_id}")
     if row["status"] != "failed" or int(row.get("total_items") or 0) <= MAX_ROWS_PER_QUERY:
         raise ValueError("Probe requires a failed bucket exceeding 10000 rows")
+    if cap_max is not None:
+        return await _probe_capital_boundary(
+            row, cap_max=cap_max, cap_next_min=cap_next_min, rate=rate, health=health
+        )
 
     base = _filters_from_row(row).payload(page=1)
     # These intentionally overlap at zero. They test backend filter behavior,
