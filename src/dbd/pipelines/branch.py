@@ -388,8 +388,17 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                     date_set = {row["fetched_at"] for row in source}
                     counts = {int(row["branch_count"]) for row in source
                               if row["branch_count"] is not None}
+                    urls = {str(row["source_url"] or "") for row in source}
+                    source_url = next(iter(urls)) if len(urls) == 1 else ""
+                    source_path = urlparse(source_url)
                     if (len(date_set)!=1 or len(counts)!=1
-                        or next(iter(counts)) != len(source)):
+                        or any(row["branch_count"] is None for row in source)
+                        or next(iter(counts), None) != len(source)
+                        or len({str(row["branch_no"]) for row in source}) != len(source)
+                        or source_path.scheme != "https"
+                        or source_path.hostname != "www.dataforthai.com"
+                        or source_path.path.rstrip("/") !=
+                            f"/company-branch/{jp_no}/show/printview"):
                         stats["conflicted"] += 1
                         continue
                     stamp = next(iter(date_set))
@@ -423,7 +432,7 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                             changed = store.save_snapshot(
                                 conn,company_id=int(target[0]),branches=branches,
                                 establishment_count=None,verified_at=stamp,
-                                url=str(source[0]["source_url"]),
+                                url=source_url,
                                 source="DATAFORTHAI_IMPORT",
                             )
                             if not changed:
