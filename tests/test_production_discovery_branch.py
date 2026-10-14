@@ -225,3 +225,71 @@ def test_external_branch_missing_and_invalid_pages_are_retryable() -> None:
     assert _RECHECK_HOURS["UNAVAILABLE"] > _RECHECK_HOURS["RETRY"]
     assert _RECHECK_HOURS["NOT_LISTED"] > _RECHECK_HOURS["RETRY"]
     assert _RECHECK_HOURS["INVALID"] > _RECHECK_HOURS["RETRY"]
+
+
+def test_durable_split_rejects_missing_or_mismatched_child_count_evidence() -> None:
+    from dbd.core.exceptions import ContractError
+
+    parent = {
+        "status": "COUNTED", "total_items": 20_000, "work_id": 17,
+        "generation": 2, "scope_key": "full",
+    }
+    children = [
+        SearchFilters(keyword="010", jp_types=["2"]),
+        SearchFilters(keyword="010", jp_types=["5"]),
+    ]
+    with pytest.raises(ContractError, match="count and page total"):
+        discovery_repository.split(None, parent, children, "juristic_type")
+    with pytest.raises(ContractError, match="reconcile"):
+        discovery_repository.split(
+            None, parent, children, "juristic_type",
+            [(9_000,900),(10_000,1_000)],
+        )
+    with pytest.raises(ContractError, match="pagination"):
+        discovery_repository.split(
+            None, parent, children, "juristic_type",
+            [(9_000,0),(11_000,1_000)],
+        )
+
+
+def test_durable_split_allows_uncapped_child_count_with_bounded_page_metadata(
+    monkeypatch,
+) -> None:
+    """A large child's API count is real even if pagination metadata is capped."""
+    from dbd.storage.sqlserver import discovery_repository as work
+
+    added = []
+    monkeypatch.setattr(
+        work, "_add",
+        lambda conn, generation, scope, filters, parent_id: (
+            added.append(filters.key()) or len(added)
+        ),
+    )
+    monkeypatch.setattr(work, "count", lambda *_: None)
+
+    class Cursor:
+        rowcount = 1
+
+        def execute(self, sql, params):
+            assert "SET status='SPLIT'" in sql
+
+        def close(self):
+            pass
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+    parent = {
+        "status": "COUNTED", "total_items": 30_000, "work_id": 17,
+        "generation": 2, "scope_key": "full",
+    }
+    children = [
+        SearchFilters(keyword="010", jp_types=["2"]),
+        SearchFilters(keyword="010", jp_types=["5"]),
+    ]
+    work.split(
+        Connection(), parent, children, "juristic_type",
+        [(10_000,1_000),(20_000,1_000)],
+    )
+    assert len(added) == 2
