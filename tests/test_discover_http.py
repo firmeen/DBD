@@ -263,3 +263,94 @@ async def test_real_discovery_count_passes_separate_timeout_without_changing_pay
     assert kwargs["timeout"] == discovery.settings.dbd_count_timeout_seconds
     assert kwargs["rate_key"] == "search"
     assert page.total_items == 1 and archive_id == 99
+
+
+@pytest.mark.asyncio
+async def test_http_401_renews_token_before_retry(monkeypatch):
+    client = client_for(monkeypatch, [Response(401), Response()], retries=1)
+    tokens = iter(("expired", "renewed"))
+    refreshes = []
+
+    async def admission():
+        return next(tokens)
+
+    async def refresh(**kwargs):
+        refreshes.append(kwargs)
+        return "renewed"
+
+    monkeypatch.setattr(client, "_admitted_token", admission)
+    monkeypatch.setattr(client, "_ensure_token", refresh)
+    monkeypatch.setattr(client, "_backoff", lambda *a, **k: 0)
+    assert await client.post("/search", {}) == {"ok": True}
+    assert refreshes == [{"rejected": "expired"}]
+    assert len(client._session.calls) == 2
+    assert client._session.calls[0][2]["headers"]["Authorization"] == "Bearer expired"
+    assert client._session.calls[1][2]["headers"]["Authorization"] == "Bearer renewed"
+
+
+@pytest.mark.asyncio
+async def test_403_exhausts_retries_with_forbidden_error(monkeypatch):
+    client = client_for(monkeypatch, [Response(403), Response(403)], retries=1)
+
+    async def refresh(**kwargs):
+        return "renewed"
+
+    monkeypatch.setattr(client, "_ensure_token", refresh)
+    monkeypatch.setattr(client, "_backoff", lambda *a, **k: 0)
+    with pytest.raises(http_module.DbdForbiddenError):
+        await client.post("/search", {})
+    assert len(client._session.calls) == 2
+
+
+@pytest.mark.asyncio
+async def test_http_503_retry_after_sets_shared_cooldown(monkeypatch):
+    client = client_for(
+        monkeypatch, [Response(503, headers={"retry-after": "4"}), Response()],
+        retries=1,
+    )
+    observed = []
+
+    async def cooldown(value):
+        observed.append(value)
+
+    monkeypatch.setattr(client, "_set_cooldown", cooldown)
+    monkeypatch.setattr(client, "_backoff", lambda attempt, server_seconds=0: server_seconds)
+    assert await client.post("/search", {}) == {"ok": True}
+    assert observed == [4]
+    assert client.rate_per_second == 1000
+
+
+@pytest.mark.asyncio
+async def test_fixed_http_rejects_invalid_timeout_before_request(monkeypatch):
+    client = client_for(monkeypatch, [Response()])
+    for timeout in (0, -1, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="timeout"):
+            await client.post("/search", {}, timeout=timeout)
+    assert client._session.calls == []
+
+
+@pytest.mark.asyncio
+async def test_retry_reenters_fixed_rate_admission(monkeypatch):
+    client = client_for(monkeypatch, [Response(429), Response()], retries=1)
+    admissions = []
+
+    async def admit():
+        admissions.append(1)
+        return "token"
+
+    async def cooldown(value):
+        pass
+
+    monkeypatch.setattr(client, "_admitted_token", admit)
+    monkeypatch.setattr(client, "_set_cooldown", cooldown)
+    monkeypatch.setattr(client, "_backoff", lambda *a, **k: 0)
+    assert await client.post("/search", {}) == {"ok": True}
+    assert len(admissions) == 2
+    assert client.requests_made == 2
+
+
+@pytest.mark.asyncio
+async def test_deep_404_error_contract_is_preserved(monkeypatch):
+    client = client_for(monkeypatch, [Response(404)])
+    with pytest.raises(http_module.DeepNotAvailable):
+        await client.fetch("GET", "/api/deep/company")
