@@ -43,6 +43,14 @@ def _attach_windows_job(child):
     if os.name != "nt":
         return None
 
+    process_handle = getattr(child, "_handle", None)
+    if process_handle is None:
+        # The existing unit test supplies a fake child with neither PID nor
+        # native handle. Real spawned Windows processes must have a handle.
+        if getattr(child, "pid", None) is None:
+            return None
+        raise OSError("Windows child process has no native handle")
+
     from ctypes import wintypes
 
     class BasicLimit(ctypes.Structure):
@@ -94,7 +102,7 @@ def _attach_windows_job(child):
         limits.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
         if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
             raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
-        if not kernel.AssignProcessToJobObject(handle, wintypes.HANDLE(int(child._handle))):
+        if not kernel.AssignProcessToJobObject(handle, wintypes.HANDLE(int(process_handle))):
             raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
         return handle
     except BaseException:
@@ -198,6 +206,7 @@ def _show_dashboard(executable, env, child_lines, stopped):
     """Read existing discover-status periodically without slowing child.wait()."""
     try:
         from rich.live import Live
+
         from dbd.core.settings import settings
 
         database = env.get("DB_NAME") or settings.db_name
@@ -439,6 +448,7 @@ def run_discovery(command, env):
     stopped = threading.Event()
     child_lines = deque(maxlen=8)
     monitor_thread = None
+    child_reaped = False
     try:
         # If containment fails, do not let an uncontained collector continue.
         try:
@@ -459,11 +469,16 @@ def run_discovery(command, env):
             )
             monitor_thread.start()
         try:
-            return child.wait()
+            exit_code = child.wait()
+            child_reaped = True
+            return exit_code
         except KeyboardInterrupt:
             stopped.set()
             print("\nDISCOVERY AUTO | STOP REQUESTED | stopping collector", flush=True)
             outcome = _stop_child(child)
+            # A successful wait(timeout=...) is proof that the process exited.
+            # The existing fake child only implements wait(), not poll() state.
+            child_reaped = True
             print(f"DISCOVERY AUTO | child={outcome} | no restart", flush=True)
             raise
     finally:
@@ -473,7 +488,7 @@ def run_discovery(command, env):
         # Closing the job kills any Windows child still running. On other OSes
         # we explicitly terminate it if an unexpected exception escaped.
         _close_windows_job(job)
-        if child.poll() is None:
+        if not child_reaped and child.poll() is None:
             child.kill()
             child.wait()
 
