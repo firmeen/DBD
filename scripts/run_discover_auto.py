@@ -525,70 +525,90 @@ def discovery_command(executable, args):
 
 
 def run_discovery(command, env):
-    """Keep one child at a time, including on Ctrl+C or terminal closure."""
+    """One collector and one terminal, with Ctrl+C taking priority over retry."""
     kwargs = {
         "env": env, "shell": False, "stdout": subprocess.PIPE,
-        "stderr": subprocess.STDOUT, "text": True,
-        "encoding": "utf-8", "errors": "replace", "bufsize": 1,
+        "stderr": subprocess.STDOUT, "bufsize": 0,
     }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    # JSON output disables the child's in-loop console rendering. The runner
-    # alone owns the live UI and reuses the existing discover-status command.
-    actual_command = list(command)
-    if "--json" not in actual_command:
-        actual_command.append("--json")
     child_env = dict(env)
     child_env.setdefault("PYTHONIOENCODING", "utf-8")
-    child = subprocess.Popen(actual_command, **{**kwargs, "env": child_env})
+    # Do not append --json: ProgressLine's bucket frames are part of the UI.
+    child = subprocess.Popen(command, **{**kwargs, "env": child_env})
     job = None
     stopped = threading.Event()
-    child_lines = deque(maxlen=8)
-    monitor_thread = None
+    lock = threading.Lock()
+    state = {
+        "progress": None, "progress_at": None, "event": None, "warning": None,
+        "snapshot": None, "snapshot_at": None, "status_error": None,
+        "samples": deque(maxlen=160), "session_start": None,
+    }
+    reader = None
+    sampler = None
     child_reaped = False
     try:
-        # If containment fails, do not let an uncontained collector continue.
         try:
             job = _attach_windows_job(child)
         except BaseException:
             if child.poll() is None:
                 child.kill()
                 child.wait()
+            child_reaped = True
             raise
 
         if getattr(child, "stdout", None) is not None:
-            threading.Thread(
-                target=_drain_output, args=(child.stdout, child_lines), daemon=True,
-            ).start()
-            monitor_thread = threading.Thread(
-                target=_show_dashboard, args=(command[0], env, child_lines, stopped),
-                daemon=True,
+            reader = threading.Thread(
+                target=_drain_output, args=(child.stdout, state, lock), daemon=True,
             )
-            monitor_thread.start()
+            reader.start()
+            sampler = threading.Thread(
+                target=_show_dashboard,
+                args=(command[0], env, state, lock, stopped), daemon=True,
+            )
+            sampler.start()
         try:
-            exit_code = child.wait()
+            if reader is not None:
+                try:
+                    from rich.live import Live
+
+                    database = env.get("DB_NAME") or settings.db_name
+                    with Live(
+                        _discovery_panel(database, _view(state, lock)),
+                        auto_refresh=False, transient=False,
+                        redirect_stdout=False, redirect_stderr=False,
+                    ) as live:
+                        while child.poll() is None:
+                            live.update(
+                                _discovery_panel(database, _view(state, lock)),
+                                refresh=True,
+                            )
+                            stopped.wait(0.8)
+                except Exception:
+                    # A failing terminal renderer must not stop collection.
+                    pass
+            code = child.wait()
             child_reaped = True
-            return exit_code
+            return code
         except KeyboardInterrupt:
+            # The Rich context has exited, so shutdown messages cannot clash
+            # with the live dashboard.
             stopped.set()
-            print("\nDISCOVERY AUTO | STOP REQUESTED | stopping collector", flush=True)
+            print("\nDISCOVERY | STOP REQUESTED", flush=True)
             outcome = _stop_child(child)
-            # A successful wait(timeout=...) is proof that the process exited.
-            # The existing fake child only implements wait(), not poll() state.
             child_reaped = True
-            print(f"DISCOVERY AUTO | child={outcome} | no restart", flush=True)
+            print(f"DISCOVERY | CHILD STOPPED ({outcome})", flush=True)
             raise
     finally:
         stopped.set()
-        if monitor_thread is not None:
-            monitor_thread.join(timeout=1.0)
-        # Closing the job kills any Windows child still running. On other OSes
-        # we explicitly terminate it if an unexpected exception escaped.
+        if sampler is not None:
+            sampler.join(timeout=0.2)
+        if reader is not None:
+            reader.join(timeout=0.2)
         _close_windows_job(job)
         if not child_reaped and child.poll() is None:
             child.kill()
             child.wait()
-
 
 def read_status(executable, env):
     try:
@@ -626,7 +646,7 @@ def read_status(executable, env):
 
 def evaluate_progress(before, after, returncode):
     """Pure function: evaluate recorded checkpoints and process result."""
-    if returncode == 130:
+    if returncode in (130, -2, 0xC000013A, -1073741510):
         return "interrupted"
     progressed = any(after[key] > before[key] for key in PROGRESS_FIELDS)
     if returncode != 0:
@@ -681,8 +701,8 @@ def main(argv=None):
                 flush=True,
             )
             rc = run_discovery(discovery_command(executable, args), env)
-            if rc == 130:
-                print("DISCOVERY AUTO | collector interrupted; no restart", flush=True)
+            if evaluate_progress(before, before, rc) == "interrupted":
+                print("DISCOVERY | STOPPED | NO RESTART | COMMITTED CHECKPOINTS PRESERVED", flush=True)
                 return 130
             after = check_with_retries(
                 lambda: read_status(executable, env), "status-after"
@@ -711,7 +731,7 @@ def main(argv=None):
             )
             time.sleep(RETRY_DELAY_SECONDS)
     except KeyboardInterrupt:
-        print("DISCOVERY AUTO | stopped by user; no restart", flush=True)
+        print("DISCOVERY | NO RESTART | COMMITTED CHECKPOINTS PRESERVED", flush=True)
         return 130
     except (RuntimeError, OSError) as exc:
         print(f"DISCOVERY AUTO | stopped: {exc}", file=sys.stderr, flush=True)
