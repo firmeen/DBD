@@ -240,8 +240,8 @@ async def test_internal_recovery_shared_client_is_not_closed(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_real_discovery_count_passes_separate_timeout_without_changing_payload(monkeypatch):
-    from dbd.storage.mysql.repositories import discovery_repository
     from dbd.client.endpoints.search import SearchFilters
+    from dbd.storage.mysql.repositories import discovery_repository
 
     class Stub:
         async def post(self, path, body, **kw):
