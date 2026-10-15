@@ -432,10 +432,13 @@ def run_discovery(command, env):
     actual_command = list(command)
     if "--json" not in actual_command:
         actual_command.append("--json")
-    child = subprocess.Popen(actual_command, **kwargs)
+    child_env = dict(env)
+    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+    child = subprocess.Popen(actual_command, **{**kwargs, "env": child_env})
     job = None
     stopped = threading.Event()
     child_lines = deque(maxlen=8)
+    monitor_thread = None
     try:
         # If containment fails, do not let an uncontained collector continue.
         try:
@@ -450,19 +453,23 @@ def run_discovery(command, env):
             threading.Thread(
                 target=_drain_output, args=(child.stdout, child_lines), daemon=True,
             ).start()
-            threading.Thread(
+            monitor_thread = threading.Thread(
                 target=_show_dashboard, args=(command[0], env, child_lines, stopped),
                 daemon=True,
-            ).start()
+            )
+            monitor_thread.start()
         try:
             return child.wait()
         except KeyboardInterrupt:
             stopped.set()
+            print("\nDISCOVERY AUTO | STOP REQUESTED | stopping collector", flush=True)
             outcome = _stop_child(child)
-            print(f"\nDISCOVERY AUTO | STOP REQUESTED | child={outcome} | no restart", flush=True)
+            print(f"DISCOVERY AUTO | child={outcome} | no restart", flush=True)
             raise
     finally:
         stopped.set()
+        if monitor_thread is not None:
+            monitor_thread.join(timeout=1.0)
         # Closing the job kills any Windows child still running. On other OSes
         # we explicitly terminate it if an unexpected exception escaped.
         _close_windows_job(job)
