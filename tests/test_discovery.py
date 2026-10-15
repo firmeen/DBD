@@ -1513,7 +1513,7 @@ async def test_discover_missing_numeric_schema_defers_numeric_without_real_http(
 
 
 @pytest.mark.asyncio
-async def test_oversized_bucket_refuses_automatic_count_growth(monkeypatch):
+async def test_checkpointed_oversized_bucket_refuses_automatic_count_growth(monkeypatch):
     from dbd.storage.mysql.repositories import discovery_repository as repository
 
     row = {
@@ -1532,6 +1532,9 @@ async def test_oversized_bucket_refuses_automatic_count_growth(monkeypatch):
         )
 
     monkeypatch.setattr(discovery, "_count", count)
+    # The recorded population is protected when any page checkpoint exists.
+    # Untouched oversized buckets may refresh cached counts.
+    monkeypatch.setattr(discovery, "bucket_has_pages", lambda _bucket_id: True)
     monkeypatch.setattr(repository, "mark_search_archive", lambda *a: recorded.append(a))
     monkeypatch.setattr(
         discovery, "update_bucket",
@@ -1539,7 +1542,7 @@ async def test_oversized_bucket_refuses_automatic_count_growth(monkeypatch):
             AssertionError("Count drift must not overwrite the historical bucket")
         ),
     )
-    with pytest.raises(ContractError, match="refusing automatic growth"):
+    with pytest.raises(ContractError, match="count drift with checkpoints"):
         await discovery._process_bucket(
             object(), row, [], master_cache={}, progress_line=None,
         )
