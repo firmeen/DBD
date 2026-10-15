@@ -46,7 +46,7 @@ try:
         row = cur.fetchone()
         revision = row["version_num"] if row else None
         cur.execute(
-            "SELECT table_name FROM information_schema.tables WHERE table_schema=DATABASE()"
+            "SELECT TABLE_NAME AS table_name FROM information_schema.tables WHERE table_schema=DATABASE()"
         )
         tables = {row["table_name"] for row in cur.fetchall()}
         absent = sorted(required - tables)

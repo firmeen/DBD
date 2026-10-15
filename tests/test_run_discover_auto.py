@@ -138,6 +138,74 @@ def test_preflight_rejects_wrong_database_and_missing_lock_evidence(monkeypatch)
     assert "IS_USED_LOCK(%s)" in auto.PREFLIGHT_CODE
 
 
+def test_preflight_reads_mysql_information_schema_table_name_with_stable_alias(
+    monkeypatch, capsys,
+):
+    """MySQL returns TABLE_NAME unless SQL specifies a lowercase result alias."""
+    from dbd.core import settings as settings_module
+    from dbd.storage.mysql import engine as engine_module
+
+    required = {
+        "discovery_buckets", "discovery_pages", "discovery_sightings",
+        "discovery_rejections", "response_archive", "company_master",
+    }
+    queries = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params=None):
+            queries.append(sql)
+            if "SELECT DATABASE()" in sql:
+                self.rows = [{"db": "dbd_test_discovery"}]
+            elif "FROM alembic_version" in sql:
+                self.rows = [{"version_num": auto.EXPECTED_REVISION}]
+            elif "FROM information_schema.tables" in sql:
+                key = "table_name" if "TABLE_NAME AS table_name" in sql else "TABLE_NAME"
+                self.rows = [{key: name} for name in sorted(required)]
+            elif "FROM information_schema.columns" in sql:
+                self.rows = [{"n": 1}]
+            elif "IS_USED_LOCK" in sql:
+                self.rows = [{"holder": None}]
+            else:
+                raise AssertionError("Unexpected preflight SQL: " + sql)
+
+        def fetchone(self):
+            return self.rows[0]
+
+        def fetchall(self):
+            return self.rows
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(engine_module, "connect", lambda: Connection())
+    monkeypatch.setattr(
+        settings_module, "settings",
+        SimpleNamespace(db_name="dbd_test_discovery"),
+    )
+    monkeypatch.setenv("DBD_AUTO_PRODUCTION_DB", "dbd")
+    exec(auto.PREFLIGHT_CODE, {})
+    output = json.loads(capsys.readouterr().out)
+
+    assert output["database"] == "dbd_test_discovery"
+    assert output["missing_tables"] == []
+    assert output["numeric_column"] is True
+    assert not any(value for key, value in output.items() if key.endswith("_active"))
+    assert any("TABLE_NAME AS table_name" in sql for sql in queries)
+
+
 def test_preflight_temporary_connection_failure_is_retriable(monkeypatch):
     monkeypatch.setattr(
         auto.subprocess, "run",
