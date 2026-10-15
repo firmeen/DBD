@@ -10,6 +10,8 @@ from hashlib import sha256
 from uuid import uuid4
 
 from ..client.async_client import AsyncDbdClient
+from ..deep.http import FixedRateDbdClient
+from contextlib import nullcontext
 from ..client.endpoints.search import (
     ITEMS_PER_PAGE,
     MAX_ROWS_PER_QUERY,
@@ -1473,6 +1475,7 @@ async def recover_discovery(
     rate: float = 1.0,
     health=None,
     numeric_split: bool = False,
+    shared_client=None,
 ) -> dict:
     """Preview or selectively recover historical count failures.
 
@@ -1534,11 +1537,16 @@ async def recover_discovery(
 
     reopened = split = recovered = 0
     failures: list[str] = []
-    async with AsyncDbdClient(
-        concurrency=1,
-        rate_per_second=rate,
-        endpoint_rates={"search": rate},
-    ) as client:
+    # When invoked inside normal Discovery, reuse the same admitted fixed-rate
+    # client. Standalone recovery keeps its existing adaptive transport.
+    recovery_context = (
+        nullcontext(shared_client) if shared_client is not None
+        else AsyncDbdClient(
+            concurrency=1, rate_per_second=rate,
+            endpoint_rates={"search": rate},
+        )
+    )
+    async with recovery_context as client:
         statuses = await asyncio.to_thread(observed_status_codes)
         provinces = None
         for item in candidates:
@@ -1704,6 +1712,7 @@ async def _run_work(
                 if any(item["reason"] == "stale_zero" for item in candidates):
                     report = await recover_discovery(
                         limit=400, execute=True, rate=recovery_rate,
+                        shared_client=client,
                     )
                     progress_line.event(
                         "discovery: stale-zero reconciliation "
@@ -1840,13 +1849,25 @@ async def run(
         )
     global_rate = settings.dbd_rate_per_second if rate is None else rate
 
-    async with AsyncDbdClient(
-        concurrency=concurrency,
-        rate_per_second=global_rate,
-        endpoint_rates={"search": global_rate},
-        redis_url=settings.dbd_redis_url if distributed else None,
-        redis_key=settings.dbd_redis_rate_key,
-    ) as client:
+    # Normal Discovery uses the exact fixed-rate HTTP execution used by
+    # Collect. Distributed Discovery retains the Redis-coordinated path.
+    http_client = (
+        AsyncDbdClient(
+            concurrency=concurrency,
+            rate_per_second=global_rate,
+            endpoint_rates={"search": global_rate},
+            redis_url=settings.dbd_redis_url,
+            redis_key=settings.dbd_redis_rate_key,
+        )
+        if distributed else
+        FixedRateDbdClient(
+            concurrency=settings.dbd_concurrency if concurrency is None else concurrency,
+            rate_per_second=global_rate,
+            max_retries=settings.dbd_http_retries,
+            timeout=settings.request_timeout,
+        )
+    )
+    async with http_client as client:
 
         async def monitor_health():
             while not stop.is_set():
