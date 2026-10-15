@@ -5,6 +5,7 @@ The runner does not create schemas, mutate checkpoints, or launch concurrent chi
 from __future__ import annotations
 
 import argparse
+import codecs
 import ctypes
 import json
 import os
@@ -19,7 +20,7 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-from dbd.core.settings import ENV_FILE
+from dbd.core.settings import ENV_FILE, settings
 
 RETRY_DELAY_SECONDS = 50
 MAX_CONSECUTIVE_STALLED_FAILURES = 3
@@ -27,8 +28,7 @@ TEST_DB_PATTERN = re.compile(r"dbd_test_[A-Za-z0-9_]+\Z")
 EXPECTED_REVISION = "0013_discovery_capital_ranges"
 
 
-# All presentation runs in a daemon thread. Neither a broken console nor a
-# slow status query is permitted to participate in the child lifecycle.
+# Render in the main thread; background readers never control child lifecycle.
 MONITOR_INTERVAL_SECONDS = 30
 MONITOR_STATUS_TIMEOUT_SECONDS = 20
 GRACEFUL_STOP_SECONDS = 30
@@ -135,113 +135,210 @@ def _stop_child(child):
         return "FORCED"
 
 
-def _drain_output(pipe, lines):
-    if pipe is None:
-        return
+_PROGRESS_RE = re.compile(
+    r"DISCOVERY\s+\[[^\]\r\n]*\]\s*([\d,]+)/([\d,]+)\s+[\d.]+%"
+    r"\s*\|\s*bucket\s+(\d+)\s*\|\s*rows\s+([\d,]+)"
+    r"\s*\|\s*partial\s+(\d+)\s*\|\s*batch\s+(\d+)\s*\|\s*q\s+(\d+)"
+)
+_SPLIT_RE = re.compile(r"bucket\s+\d+:\s+[\d,]+\s+rows\s+->\s+split", re.I)
+
+
+def _record_output(text, state, lock, progress_only=False):
+    # Logging can append a timestamp immediately after a carriage-return frame.
+    for part in re.split(r"(?=20\d\d-\d\d-\d\dT\d\d:\d\d:\d\d)", text):
+        part = part.strip()
+        if not part:
+            continue
+        found = _PROGRESS_RE.search(part)
+        if found:
+            cur, total, bucket, rows, partial, batch, queue = (
+                int(v.replace(",", "")) for v in found.groups()
+            )
+            with lock:
+                state["progress"] = (cur, total, bucket, rows, partial, batch, queue)
+                state["progress_at"] = time.monotonic()
+            if progress_only:
+                continue
+            part = part[found.end():].strip()
+            if not part:
+                continue
+        elif progress_only:
+            continue
+        if _SPLIT_RE.search(part):
+            with lock:
+                state["event"] = part[-160:]
+        elif "rate_penalty" in part or "status=429" in part:
+            rate = re.search(r"new_rate=([\d.]+)", part)
+            cooldown = re.search(r"cooldown_seconds=([\d.]+)", part)
+            detail = "HTTP 429 · Search rate penalty"
+            if rate:
+                detail += f" · {rate.group(1)} req/s"
+            if cooldown:
+                detail += f" · cooldown {float(cooldown.group(1)):g}s"
+            with lock:
+                state["warning"] = detail
+        elif " [warning" in part or part.startswith(("WARN ", "ERROR ")):
+            with lock:
+                state["warning"] = part[-160:]
+        elif "rate_recovered" in part or part.startswith("bucket "):
+            with lock:
+                state["event"] = part[-160:]
+
+
+def _drain_output(pipe, state, lock):
+    """Drain without line buffering: ProgressLine sends CR but no trailing LF."""
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    pending = ""
     try:
         with pipe:
-            for line in pipe:
-                line = line.strip()
-                if line and not line.startswith(("{", "}", '"')):
-                    lines.append(line[-240:])
-    except (OSError, UnicodeError):
+            while True:
+                chunk = pipe.read(4096)
+                if not chunk:
+                    break
+                pending += decoder.decode(chunk) if isinstance(chunk, bytes) else chunk
+                parts = re.split(r"[\r\n]", pending)
+                pending = parts.pop()
+                for part in parts:
+                    _record_output(part, state, lock)
+                if pending and len(pending) < 4096:
+                    _record_output(pending, state, lock, progress_only=True)
+                if len(pending) > 8192:
+                    _record_output(pending, state, lock)
+                    pending = ""
+            pending += decoder.decode(b"", final=True)
+            if pending:
+                _record_output(pending, state, lock)
+    except (OSError, UnicodeError, ValueError):
         pass
 
 
 def _pages_per_minute(samples, seconds):
     if len(samples) < 2:
+        return "COLLECTING"
+    latest_at, latest_pages = samples[-1]
+    if seconds == 0:
+        before_at, before_pages = samples[-2]
+        if latest_at - before_at > MONITOR_INTERVAL_SECONDS * 3:
+            return "--"
+    else:
+        valid = [sample for sample in samples if sample[0] <= latest_at - seconds]
+        if not valid:
+            return "COLLECTING"
+        before_at, before_pages = valid[-1]
+    duration = latest_at - before_at
+    if duration <= 0 or latest_pages < before_pages:
         return "--"
-    now, latest = samples[-1]
-    candidates = [item for item in samples if item[0] >= now - seconds]
-    if not candidates:
-        return "--"
-    start, first = candidates[0]
-    elapsed = now - start
-    if elapsed < seconds * 0.8 or latest < first:
-        return "--"
-    return f"{(latest - first) * 60 / elapsed:,.1f}"
+    return f"{(latest_pages - before_pages) * 60 / duration:,.1f}"
 
 
-def _discovery_panel(database, snapshot, samples, child_lines, status_error):
+def _view(state, lock):
+    with lock:
+        return {key: list(value) if key == "samples" else value for key, value in state.items()}
+
+
+def _discovery_panel(database, state):
     from rich.console import Group
     from rich.panel import Panel
+    from rich.progress_bar import ProgressBar
     from rich.table import Table
+    from rich.text import Text
 
-    fields = Table.grid(expand=True, padding=(0, 2))
-    fields.add_column(ratio=1)
-    fields.add_column(justify="right", ratio=1)
-    fields.add_row("DATABASE", database)
-    fields.add_row("PROCESS", "RUNNING")
-    fields.add_row("", "")
-    if snapshot is None:
-        fields.add_row("MySQL snapshot", "WAITING")
+    content = [Text(f"DATABASE  {database}     PROCESS  RUNNING", style="bold")]
+    progress = state["progress"]
+    if progress is None:
+        content.append(Text("\nCURRENT BUCKET   WAITING FOR PROGRESS", style="dim"))
     else:
-        for label, key in (
-            ("UNIQUE COMPANIES", "unique_companies"),
-            ("ROWS FETCHED", "rows_fetched"),
-            ("PAGES DONE", "pages_done"),
-            ("BUCKETS TOTAL", "buckets"),
-            ("BUCKETS SPLIT", "buckets_split"),
-            ("BUCKETS OPEN", "buckets_open"),
-            ("FAILED BUCKETS", "buckets_failed"),
-            ("FAILED PAGES", "pages_failed"),
-            ("PARTIAL PAGES", "pages_partial"),
-            ("LOSSY PARTITIONS", "partitions_lossy"),
-            ("KNOWN PAGES REMAINING", "remaining_counted_pages"),
+        cur, total, bucket, rows, partial, batch, queue = progress
+        pct = cur * 100 / total if total else 0
+        content.append(Text(
+            f"\nCURRENT BUCKET #{bucket}     {pct:.1f}%     {cur:,}/{total:,} pages",
+            style="bold",
+        ))
+        content.append(ProgressBar(total=max(total, 1), completed=cur, width=44))
+        content.append(Text(
+            f"ROWS {rows:,}    PARTIAL {partial}    BATCH {batch}    QUEUE {queue}"
+        ))
+        age = time.monotonic() - state["progress_at"]
+        if age > 10:
+            content.append(Text(f"Last bucket update {int(age)}s ago", style="dim"))
+    if state["event"]:
+        content.append(Text(f"EVENT  {state['event']}", style="dim"))
+
+    samples = state["samples"]
+    flow = Table.grid(expand=True, padding=(0, 2))
+    flow.add_column(ratio=1)
+    flow.add_column(ratio=1)
+    flow.add_row(
+        f"NOW   {_pages_per_minute(samples, 0)} pages/min",
+        f"1 MIN   {_pages_per_minute(samples, 60)} pages/min",
+    )
+    flow.add_row(
+        f"5 MIN   {_pages_per_minute(samples, 300)} pages/min",
+        f"1 HOUR   {_pages_per_minute(samples, 3600)} pages/min",
+    )
+    session = state["session_start"]
+    if samples and session is not None:
+        elapsed = samples[-1][0] - session[0]
+        pages = max(0, samples[-1][1] - session[1])
+        average = f"{pages * 60 / elapsed:,.1f}" if elapsed > 0 else "--"
+        flow.add_row(f"SESSION   +{pages:,} pages", f"AVG   {average} pages/min")
+    content.extend([Text("\nCOLLECTION FLOW", style="bold"), flow])
+
+    total = Table.grid(expand=True, padding=(0, 2))
+    total.add_column(ratio=1)
+    total.add_column(ratio=1)
+    snapshot = state["snapshot"]
+    if snapshot:
+        for left, right in (
+            (("UNIQUE COMPANIES", "unique_companies"), ("PAGES DONE", "pages_done")),
+            (("ROWS FETCHED", "rows_fetched"), ("BUCKETS OPEN", "buckets_open")),
+            (("FAILED BUCKETS", "buckets_failed"), ("FAILED PAGES", "pages_failed")),
+            (("PARTIAL PAGES", "pages_partial"), ("LOSSY PARTITIONS", "partitions_lossy")),
+            (("BUCKETS SPLIT", "buckets_split"), ("KNOWN PAGES LEFT", "remaining_counted_pages")),
         ):
-            fields.add_row(label, f"{int(snapshot.get(key, 0)):,}")
-    fields.add_row("", "")
-    fields.add_row("FLOW 1m (pages/min)", _pages_per_minute(samples, 60))
-    fields.add_row("FLOW 5m (pages/min)", _pages_per_minute(samples, 300))
-    if status_error:
-        fields.add_row("MONITOR", f"STALE / {status_error[:65]}")
-    if child_lines:
-        fields.add_row("LAST CHILD EVENT", child_lines[-1][:90])
-    fields.add_row("", "")
-    fields.add_row("CONTROL", "Ctrl+C = STOP RUNNER + CHILD")
-    return Panel(Group(fields), title="DBD · DISCOVERY", border_style="cyan")
+            total.add_row(
+                f"{left[0]}   {int(snapshot.get(left[1], 0)):,}",
+                f"{right[0]}   {int(snapshot.get(right[1], 0)):,}",
+            )
+    else:
+        total.add_row("Waiting for MySQL snapshot", "")
+    content.extend([Text("\nTOTAL DISCOVERY · MYSQL", style="bold"), total])
+    if state["status_error"]:
+        age = (
+            f" · last good snapshot {int(time.monotonic() - state['snapshot_at'])}s ago"
+            if state["snapshot_at"] is not None else ""
+        )
+        content.append(Text(f"MONITOR STALE   {state['status_error'][:90]}{age}", style="yellow"))
+    if state["warning"]:
+        content.extend([
+            Text("\nLATEST WARNING", style="bold yellow"),
+            Text(state["warning"], style="yellow"),
+        ])
+    content.append(Text("\nCtrl+C → Stop Collector and Runner · Keep committed checkpoints", style="dim"))
+    return Panel(Group(*content), title="DBD · DISCOVERY", border_style="cyan")
 
 
-def _show_dashboard(executable, env, child_lines, stopped):
-    """Read existing discover-status periodically without slowing child.wait()."""
-    try:
-        from rich.live import Live
-
-        from dbd.core.settings import settings
-
-        database = env.get("DB_NAME") or settings.db_name
-        snapshot = None
-        error = None
-        samples = deque(maxlen=32)
-        with Live(
-            _discovery_panel(database, snapshot, samples, child_lines, error),
-            auto_refresh=False, transient=False, redirect_stdout=False,
-            redirect_stderr=False,
-        ) as live:
-            next_read = 0.0
-            while not stopped.is_set():
-                now = time.monotonic()
-                if now >= next_read:
-                    next_read = now + MONITOR_INTERVAL_SECONDS
-                    try:
-                        current = read_status(executable, env)
-                        pages = int(current["pages_done"])
-                        if samples and pages < samples[-1][1]:
-                            samples.clear()
-                        samples.append((time.monotonic(), pages))
-                        snapshot, error = current, None
-                    except Exception as exc:
-                        error = type(exc).__name__
-                if stopped.is_set():
-                    break
-                live.update(
-                    _discovery_panel(database, snapshot, samples, child_lines, error),
-                    refresh=True,
-                )
-                stopped.wait(2.0)
-    except Exception:
-        # Dashboard problems never become collection or restart failures.
-        return
+def _show_dashboard(executable, env, state, lock, stopped):
+    """Sample existing discover-status only; rendering belongs to main thread."""
+    while not stopped.is_set():
+        try:
+            snapshot = read_status(executable, env)
+            now = time.monotonic()
+            with lock:
+                pages = snapshot["pages_done"]
+                if state["samples"] and pages < state["samples"][-1][1]:
+                    state["samples"].clear()
+                    state["session_start"] = None
+                state["samples"].append((now, pages))
+                if state["session_start"] is None:
+                    state["session_start"] = (now, pages)
+                state["snapshot"] = snapshot
+                state["snapshot_at"] = now
+                state["status_error"] = None
+        except Exception as exc:
+            with lock:
+                state["status_error"] = f"{type(exc).__name__}: {str(exc)[-100:]}"
+        stopped.wait(MONITOR_INTERVAL_SECONDS)
 
 
 # Runs inside the selected child environment. The SQL statements are read-only.
