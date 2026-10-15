@@ -295,9 +295,12 @@ class FixedRateDbdClient:
             raise RuntimeError("Use async with FixedRateDbdClient")
 
         referer = referer or WARMUP_PAGE_URL
-        # rate_key is accepted for Discovery's existing call signature; this
-        # client applies one aggregate fixed rate to all requests.
+        # Discovery passes rate_key="search"; pacing remains one fixed aggregate.
         _ = rate_key
+        if timeout is not None and (
+            not math.isfinite(float(timeout)) or float(timeout) <= 0
+        ):
+            raise ValueError("request timeout must be finite and positive")
         last_error: BaseException | None = None
 
         for attempt in range(1, self.max_retries + 2):

@@ -4,14 +4,13 @@ import asyncio
 import json
 import os
 import time
+from contextlib import nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from hashlib import sha256
 from uuid import uuid4
 
 from ..client.async_client import AsyncDbdClient
-from ..deep.http import FixedRateDbdClient
-from contextlib import nullcontext
 from ..client.endpoints.search import (
     ITEMS_PER_PAGE,
     MAX_ROWS_PER_QUERY,
@@ -24,6 +23,7 @@ from ..contracts.company import normalize
 from ..core.exceptions import ContractError
 from ..core.progress import ProgressLine
 from ..core.settings import settings
+from ..deep.http import FixedRateDbdClient
 from ..runtime.delta import master_fingerprint
 from ..storage.mysql.repositories.discovery_repository import (
     DiscoveryLeaseLost,
