@@ -5,13 +5,16 @@ The runner does not create schemas, mutate checkpoints, or launch concurrent chi
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 from dotenv import dotenv_values
@@ -22,6 +25,215 @@ RETRY_DELAY_SECONDS = 50
 MAX_CONSECUTIVE_STALLED_FAILURES = 3
 TEST_DB_PATTERN = re.compile(r"dbd_test_[A-Za-z0-9_]+\Z")
 EXPECTED_REVISION = "0013_discovery_capital_ranges"
+
+
+# All presentation runs in a daemon thread. Neither a broken console nor a
+# slow status query is permitted to participate in the child lifecycle.
+MONITOR_INTERVAL_SECONDS = 30
+MONITOR_STATUS_TIMEOUT_SECONDS = 20
+GRACEFUL_STOP_SECONDS = 30
+
+
+def _attach_windows_job(child):
+    """Bind the child to a kill-on-close Job Object; fail closed if this fails.
+
+    This is a process-containment fallback for terminal/window closure. Normal
+    Ctrl+C uses graceful CTRL_BREAK before the job is closed.
+    """
+    if os.name != "nt":
+        return None
+
+    from ctypes import wintypes
+
+    class BasicLimit(ctypes.Structure):
+        _fields_ = [
+            ("PerProcessUserTimeLimit", ctypes.c_longlong),
+            ("PerJobUserTimeLimit", ctypes.c_longlong),
+            ("LimitFlags", wintypes.DWORD),
+            ("MinimumWorkingSetSize", ctypes.c_size_t),
+            ("MaximumWorkingSetSize", ctypes.c_size_t),
+            ("ActiveProcessLimit", wintypes.DWORD),
+            ("Affinity", ctypes.c_size_t),
+            ("PriorityClass", wintypes.DWORD),
+            ("SchedulingClass", wintypes.DWORD),
+        ]
+
+    class IoCounters(ctypes.Structure):
+        _fields_ = [(name, ctypes.c_ulonglong) for name in (
+            "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+            "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+        )]
+
+    class ExtendedLimit(ctypes.Structure):
+        _fields_ = [
+            ("BasicLimitInformation", BasicLimit),
+            ("IoInfo", IoCounters),
+            ("ProcessMemoryLimit", ctypes.c_size_t),
+            ("JobMemoryLimit", ctypes.c_size_t),
+            ("PeakProcessMemoryUsed", ctypes.c_size_t),
+            ("PeakJobMemoryUsed", ctypes.c_size_t),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateJobObjectW.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p]
+    kernel.CreateJobObjectW.restype = wintypes.HANDLE
+    kernel.SetInformationJobObject.argtypes = [
+        wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+    ]
+    kernel.SetInformationJobObject.restype = wintypes.BOOL
+    kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+    kernel.AssignProcessToJobObject.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+    kernel.CloseHandle.restype = wintypes.BOOL
+
+    handle = kernel.CreateJobObjectW(None, None)
+    if not handle:
+        raise OSError(ctypes.get_last_error(), "CreateJobObjectW failed")
+    try:
+        limits = ExtendedLimit()
+        limits.BasicLimitInformation.LimitFlags = 0x00002000  # KILL_ON_JOB_CLOSE
+        if not kernel.SetInformationJobObject(handle, 9, ctypes.byref(limits), ctypes.sizeof(limits)):
+            raise OSError(ctypes.get_last_error(), "SetInformationJobObject failed")
+        if not kernel.AssignProcessToJobObject(handle, wintypes.HANDLE(int(child._handle))):
+            raise OSError(ctypes.get_last_error(), "AssignProcessToJobObject failed")
+        return handle
+    except BaseException:
+        kernel.CloseHandle(handle)
+        raise
+
+
+def _close_windows_job(handle):
+    if handle is not None:
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel.CloseHandle.restype = ctypes.c_int
+        kernel.CloseHandle(handle)
+
+
+def _stop_child(child):
+    if child.poll() is not None:
+        return "ALREADY EXITED"
+    try:
+        if os.name == "nt":
+            child.send_signal(signal.CTRL_BREAK_EVENT)
+        else:
+            child.terminate()
+        child.wait(timeout=GRACEFUL_STOP_SECONDS)
+        return "GRACEFUL"
+    except (OSError, subprocess.TimeoutExpired):
+        if child.poll() is None:
+            child.kill()
+            child.wait()
+        return "FORCED"
+
+
+def _drain_output(pipe, lines):
+    if pipe is None:
+        return
+    try:
+        with pipe:
+            for line in pipe:
+                line = line.strip()
+                if line and not line.startswith(("{", "}", '"')):
+                    lines.append(line[-240:])
+    except (OSError, UnicodeError):
+        pass
+
+
+def _pages_per_minute(samples, seconds):
+    if len(samples) < 2:
+        return "--"
+    now, latest = samples[-1]
+    candidates = [item for item in samples if item[0] >= now - seconds]
+    if not candidates:
+        return "--"
+    start, first = candidates[0]
+    elapsed = now - start
+    if elapsed < seconds * 0.8 or latest < first:
+        return "--"
+    return f"{(latest - first) * 60 / elapsed:,.1f}"
+
+
+def _discovery_panel(database, snapshot, samples, child_lines, status_error):
+    from rich.console import Group
+    from rich.panel import Panel
+    from rich.table import Table
+
+    fields = Table.grid(expand=True, padding=(0, 2))
+    fields.add_column(ratio=1)
+    fields.add_column(justify="right", ratio=1)
+    fields.add_row("DATABASE", database)
+    fields.add_row("PROCESS", "RUNNING")
+    fields.add_row("", "")
+    if snapshot is None:
+        fields.add_row("MySQL snapshot", "WAITING")
+    else:
+        for label, key in (
+            ("UNIQUE COMPANIES", "unique_companies"),
+            ("ROWS FETCHED", "rows_fetched"),
+            ("PAGES DONE", "pages_done"),
+            ("BUCKETS TOTAL", "buckets"),
+            ("BUCKETS SPLIT", "buckets_split"),
+            ("BUCKETS OPEN", "buckets_open"),
+            ("FAILED BUCKETS", "buckets_failed"),
+            ("FAILED PAGES", "pages_failed"),
+            ("PARTIAL PAGES", "pages_partial"),
+            ("LOSSY PARTITIONS", "partitions_lossy"),
+            ("KNOWN PAGES REMAINING", "remaining_counted_pages"),
+        ):
+            fields.add_row(label, f"{int(snapshot.get(key, 0)):,}")
+    fields.add_row("", "")
+    fields.add_row("FLOW 1m (pages/min)", _pages_per_minute(samples, 60))
+    fields.add_row("FLOW 5m (pages/min)", _pages_per_minute(samples, 300))
+    if status_error:
+        fields.add_row("MONITOR", f"STALE / {status_error[:65]}")
+    if child_lines:
+        fields.add_row("LAST CHILD EVENT", child_lines[-1][:90])
+    fields.add_row("", "")
+    fields.add_row("CONTROL", "Ctrl+C = STOP RUNNER + CHILD")
+    return Panel(Group(fields), title="DBD · DISCOVERY", border_style="cyan")
+
+
+def _show_dashboard(executable, env, child_lines, stopped):
+    """Read existing discover-status periodically without slowing child.wait()."""
+    try:
+        from rich.live import Live
+        from dbd.core.settings import settings
+
+        database = env.get("DB_NAME") or settings.db_name
+        snapshot = None
+        error = None
+        samples = deque(maxlen=32)
+        with Live(
+            _discovery_panel(database, snapshot, samples, child_lines, error),
+            auto_refresh=False, transient=False, redirect_stdout=False,
+            redirect_stderr=False,
+        ) as live:
+            next_read = 0.0
+            while not stopped.is_set():
+                now = time.monotonic()
+                if now >= next_read:
+                    next_read = now + MONITOR_INTERVAL_SECONDS
+                    try:
+                        current = read_status(executable, env)
+                        pages = int(current["pages_done"])
+                        if samples and pages < samples[-1][1]:
+                            samples.clear()
+                        samples.append((time.monotonic(), pages))
+                        snapshot, error = current, None
+                    except Exception as exc:
+                        error = type(exc).__name__
+                if stopped.is_set():
+                    break
+                live.update(
+                    _discovery_panel(database, snapshot, samples, child_lines, error),
+                    refresh=True,
+                )
+                stopped.wait(2.0)
+    except Exception:
+        # Dashboard problems never become collection or restart failures.
+        return
+
 
 # Runs inside the selected child environment. The SQL statements are read-only.
 PREFLIGHT_CODE = """
@@ -207,35 +419,67 @@ def discovery_command(executable, args):
 
 
 def run_discovery(command, env):
-    """Keep one child at a time and stop it before returning from Ctrl+C."""
-    kwargs = {"env": env, "shell": False}
+    """Keep one child at a time, including on Ctrl+C or terminal closure."""
+    kwargs = {
+        "env": env, "shell": False, "stdout": subprocess.PIPE,
+        "stderr": subprocess.STDOUT, "text": True,
+        "encoding": "utf-8", "errors": "replace", "bufsize": 1,
+    }
     if os.name == "nt":
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
-    child = subprocess.Popen(command, **kwargs)
+    # JSON output disables the child's in-loop console rendering. The runner
+    # alone owns the live UI and reuses the existing discover-status command.
+    actual_command = list(command)
+    if "--json" not in actual_command:
+        actual_command.append("--json")
+    child = subprocess.Popen(actual_command, **kwargs)
+    job = None
+    stopped = threading.Event()
+    child_lines = deque(maxlen=8)
     try:
-        return child.wait()
-    except KeyboardInterrupt:
-        if child.poll() is None:
-            if os.name == "nt":
-                try:
-                    child.send_signal(signal.CTRL_BREAK_EVENT)
-                except OSError:
-                    child.terminate()
-            else:
-                child.terminate()
-            try:
-                child.wait(timeout=10)
-            except subprocess.TimeoutExpired:
+        # If containment fails, do not let an uncontained collector continue.
+        try:
+            job = _attach_windows_job(child)
+        except BaseException:
+            if child.poll() is None:
                 child.kill()
                 child.wait()
-        raise
+            raise
+
+        if getattr(child, "stdout", None) is not None:
+            threading.Thread(
+                target=_drain_output, args=(child.stdout, child_lines), daemon=True,
+            ).start()
+            threading.Thread(
+                target=_show_dashboard, args=(command[0], env, child_lines, stopped),
+                daemon=True,
+            ).start()
+        try:
+            return child.wait()
+        except KeyboardInterrupt:
+            stopped.set()
+            outcome = _stop_child(child)
+            print(f"\nDISCOVERY AUTO | STOP REQUESTED | child={outcome} | no restart", flush=True)
+            raise
+    finally:
+        stopped.set()
+        # Closing the job kills any Windows child still running. On other OSes
+        # we explicitly terminate it if an unexpected exception escaped.
+        _close_windows_job(job)
+        if child.poll() is None:
+            child.kill()
+            child.wait()
 
 
 def read_status(executable, env):
-    process = subprocess.run(
-        [executable, "discover-status", "--json"],
-        env=env, capture_output=True, text=True, check=False,
-    )
+    try:
+        process = subprocess.run(
+            [executable, "discover-status", "--json"],
+            env=env, capture_output=True, text=True, check=False,
+            timeout=MONITOR_STATUS_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ConnectionError("Discovery status query timed out") from exc
     if process.returncode:
         raise ConnectionError(
             "Cannot read Discovery status (exit "
@@ -277,6 +521,9 @@ def evaluate_progress(before, after, returncode):
 
 def main(argv=None):
     args = parse_args(argv)
+    previous_break = None
+    if os.name == "nt" and hasattr(signal, "SIGBREAK"):
+        previous_break = signal.signal(signal.SIGBREAK, signal.default_int_handler)
     try:
         executable = resolve_executable()
         env = build_environment(args)
@@ -350,6 +597,10 @@ def main(argv=None):
     except (RuntimeError, OSError) as exc:
         print(f"DISCOVERY AUTO | stopped: {exc}", file=sys.stderr, flush=True)
         return 1
+
+    finally:
+        if previous_break is not None:
+            signal.signal(signal.SIGBREAK, previous_break)
 
 
 if __name__ == "__main__":
