@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
+from contextlib import contextmanager
 
 from .._version import __version__
 from ..contracts.identity import parse_code
@@ -87,6 +89,20 @@ def endpoint_rate_map(value):
         raise argparse.ArgumentTypeError("at least one endpoint=rate is required")
     return result
 
+
+
+
+@contextmanager
+def _discovery_windows_break():
+    """Treat the runner's CTRL_BREAK as a cancellable Discovery interrupt."""
+    if os.name != "nt" or not hasattr(signal, "SIGBREAK"):
+        yield
+        return
+    previous = signal.signal(signal.SIGBREAK, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGBREAK, previous)
 
 def safe_error(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
@@ -919,23 +935,10 @@ def main():
             if any(len(seed) < 3 for seed in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
             configure(args.metrics_port)
-            if args.distributed:
-                if not settings.dbd_redis_url:
-                    raise ValueError("--distributed discovery requires DBD_REDIS_URL")
-                result = asyncio.run(
-                    discovery.run(
-                        seeds,
-                        search_type=args.type,
-                        concurrency=args.concurrency,
-                        rate=args.rate,
-                        max_buckets=args.max_buckets,
-                        verbose=not bool(getattr(args, "json", False)),
-                        distributed=True,
-                        numeric_split=args.numeric_split,
-                    )
-                )
-            else:
-                with manager_lock() as conn:
+            with _discovery_windows_break():
+                if args.distributed:
+                    if not settings.dbd_redis_url:
+                        raise ValueError("--distributed discovery requires DBD_REDIS_URL")
                     result = asyncio.run(
                         discovery.run(
                             seeds,
@@ -944,10 +947,24 @@ def main():
                             rate=args.rate,
                             max_buckets=args.max_buckets,
                             verbose=not bool(getattr(args, "json", False)),
-                            health=lambda: assert_manager_lock(conn),
+                            distributed=True,
                             numeric_split=args.numeric_split,
                         )
                     )
+                else:
+                    with manager_lock() as conn:
+                        result = asyncio.run(
+                            discovery.run(
+                                seeds,
+                                search_type=args.type,
+                                concurrency=args.concurrency,
+                                rate=args.rate,
+                                max_buckets=args.max_buckets,
+                                verbose=not bool(getattr(args, "json", False)),
+                                health=lambda: assert_manager_lock(conn),
+                                numeric_split=args.numeric_split,
+                            )
+                        )
             presenter.command_result(
                 "DBD · DISCOVERY RESULT",
                 {
