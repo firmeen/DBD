@@ -1,7 +1,6 @@
 """Focused tests for the no-limit 50-second Discovery process supervisor."""
 import importlib.util
 import json
-import subprocess
 from argparse import Namespace
 from pathlib import Path
 from types import SimpleNamespace
