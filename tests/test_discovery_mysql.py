@@ -365,3 +365,41 @@ def test_combined_numeric_range_persists_in_existing_bucket_json_column():
             tuple(child_ids),
         )
         assert int(cur.fetchone()["n"]) == 0
+
+
+def test_full_discovery_test_database_is_isolated_by_existing_connection_settings():
+    """Uses disposable integration fixture; never opens the production database."""
+    from dbd.core.settings import settings
+
+    assert settings.db_name.startswith("dbd_test_")
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT DATABASE() AS actual")
+        assert cur.fetchone()["actual"] == settings.db_name
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == "0013_discovery_capital_ranges"
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name='discovery_buckets' "
+            "AND column_name='numeric_filters'"
+        )
+        assert int(cur.fetchone()["n"]) == 1
+
+
+def test_discovery_writes_are_only_visible_in_selected_disposable_schema():
+    """Reuse repository identity/path against the explicitly selected test DB."""
+    from dbd.core.settings import settings
+
+    assert settings.db_name.startswith("dbd_test_")
+    key = "test-" + uuid4().hex
+    identity = SearchFilters(key)
+    bucket_id = upsert_bucket(identity)
+    assert upsert_bucket(identity) == bucket_id  # no duplicate bucket
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT DATABASE() AS actual, COUNT(*) AS n "
+            "FROM discovery_buckets WHERE id=%s AND bucket_key=%s",
+            (bucket_id, identity.key()),
+        )
+        row = cur.fetchone()
+        assert row["actual"] == settings.db_name
+        assert int(row["n"]) == 1
