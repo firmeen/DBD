@@ -246,7 +246,8 @@ def _discovery_panel(database, state):
     content = [Text(f"DATABASE  {database}     PROCESS  RUNNING", style="bold")]
     progress = state["progress"]
     if progress is None:
-        content.append(Text("\nCURRENT BUCKET   WAITING FOR PROGRESS", style="dim"))
+        stage = "SPLITTING" if state["event"] and "-> split" in state["event"] else "WAITING FOR PROGRESS"
+        content.append(Text(f"\nCURRENT BUCKET   {stage}", style="dim"))
     else:
         cur, total, bucket, rows, partial, batch, queue = progress
         pct = cur * 100 / total if total else 0
