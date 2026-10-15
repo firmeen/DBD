@@ -42,7 +42,7 @@ def client_for(monkeypatch, responses, retries=0, rate=1000):
 
 @pytest.mark.asyncio
 async def test_collect_get_transport_remains_backward_compatible(monkeypatch):
-    client = client_for(monkeypatch, [Response(payload={"value": 12})])
+    client = client_for(monkeypatch, [Response(payload={"value": 12}), Response(payload={"value": 13})])
     result = await client.fetch("GET", "/api/test", params={"x": 1})
     method, path, kw = client._session.calls[0]
     assert isinstance(result, http_module.DeepResponse)
@@ -51,7 +51,9 @@ async def test_collect_get_transport_remains_backward_compatible(monkeypatch):
     assert kw["params"] == {"x": 1}
     assert kw["timeout"] == client.timeout
     assert "json" not in kw
-    assert (await client.get("/api/test", params={"x": 1}) if False else result.data) == {"value": 12}
+    assert await client.get("/api/test", params={"x": 1}) == {"value": 13}
+    assert len(client._session.calls) == 2
+    assert "json" not in client._session.calls[1][2]
 
 
 @pytest.mark.asyncio
@@ -66,6 +68,7 @@ async def test_discovery_post_json_and_count_override(monkeypatch):
     method, _, kw = client._session.calls[0]
     assert method == "POST" and kw["json"] == payload
     assert kw["headers"]["Referer"].endswith("/juristic/searchInfo")
+    assert kw["headers"]["Content-Type"] == "application/json"
     assert kw["timeout"] == 120
     assert decoded["meta"]["totalItems"] == 2
     assert client.rate_per_second == 1000
@@ -233,3 +236,30 @@ async def test_internal_recovery_shared_client_is_not_closed(monkeypatch):
     assert report["mode"] == "execute"
     assert report["unresolved"] >= 1
     assert not shared.exited
+
+
+@pytest.mark.asyncio
+async def test_real_discovery_count_passes_separate_timeout_without_changing_payload(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository
+    from dbd.client.endpoints.search import SearchFilters
+
+    class Stub:
+        async def post(self, path, body, **kw):
+            self.received = (path, body, kw)
+            return {
+                "meta": {
+                    "currentPage": 1, "totalItems": 1, "totalPages": 1,
+                    "itemsPerPage": 10,
+                },
+                "contents": [{"jpTypeCode": "5", "jpNo": "0100000000001"}],
+            }
+
+    monkeypatch.setattr(discovery_repository, "archive_search", lambda *a, **kw: 99)
+    client = Stub()
+    page, archive_id, _, _ = await discovery._count(client, 42, SearchFilters(keyword="010"))
+    path, body, kwargs = client.received
+    assert path == "/api/v1/company-profiles/infos"
+    assert body["keyword"] == "010" and body["currentPage"] == 1
+    assert kwargs["timeout"] == discovery.settings.dbd_count_timeout_seconds
+    assert kwargs["rate_key"] == "search"
+    assert page.total_items == 1 and archive_id == 99
