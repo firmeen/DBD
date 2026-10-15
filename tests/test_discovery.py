@@ -65,12 +65,19 @@ async def test_failed_middle_page_is_retried_without_redoing_completed_pages(mon
     filters = SearchFilters("010")
     await discovery._drain_bucket(Client(), 1, filters, 3, 1, verbose=False)
     assert updates[-1]["status"] == "failed"
-    assert updates[-1]["pages_done"] == 2
+    # An exhausted page failure prevents buffered, uncommitted results from
+    # being written. Only durable DONE checkpoints can be skipped on resume.
+    completed_before_resume = {
+        page for page, state in states.items() if state == "done"
+    }
+    assert updates[-1]["pages_done"] == len(completed_before_resume)
+    assert completed_before_resume.issubset({1, 3})
 
     fail = False
     requested.clear()
     await discovery._drain_bucket(Client(), 1, filters, 3, 3, verbose=False)
-    assert requested == [2]
+    assert set(requested) == {1, 2, 3} - completed_before_resume
+    assert len(requested) == len(set(requested))
     assert updates[-1]["status"] == "done"
     assert updates[-1]["rows_seen"] == 3
 
@@ -837,7 +844,7 @@ async def test_keyword_probe_refuses_large_cohort_before_reading_more_pages(monk
 
 
 @pytest.mark.asyncio
-async def test_oversized_discovery_bucket_refuses_silent_count_shrink(monkeypatch):
+async def test_checkpointed_oversized_discovery_bucket_refuses_count_shrink(monkeypatch):
     from dbd.storage.mysql.repositories import discovery_repository as repository
 
     row = {
@@ -859,11 +866,14 @@ async def test_oversized_discovery_bucket_refuses_silent_count_shrink(monkeypatc
 
     monkeypatch.setattr(discovery, "_count", fake_count)
     monkeypatch.setattr(discovery, "update_bucket", forbid_update)
+    # Snapshot-protected page evidence forbids count drift. Untouched oversized
+    # leaves are intentionally allowed to refresh their cached search count.
+    monkeypatch.setattr(discovery, "bucket_has_pages", lambda _bucket_id: True)
     monkeypatch.setattr(
         repository, "mark_search_archive",
         lambda archive_id, status: archived.append((archive_id, status)),
     )
-    with pytest.raises(ContractError, match="refusing automatic shrink"):
+    with pytest.raises(ContractError, match="count drift with checkpoints"):
         await discovery._process_bucket(
             None, row, [], master_cache={}, progress_line=None,
         )
@@ -1170,7 +1180,11 @@ async def test_failed_overflow_receipt_retains_rejected_partition_details(monkey
             42, {}, None,
         )
 
-    async def no_plan(_client, _bid, _filters, _pv, _st, _count, *, rejection_reasons):
+    async def no_plan(
+        _client, _bid, _filters, _pv, _st, _count, *,
+        rejection_reasons, parent_rows=None,
+    ):
+        assert parent_rows == [{"jpTypeCode": "5"}]
         rejection_reasons.extend(["jp_types:count_mismatch:parent=12000,children=9000"])
         return []
 
@@ -1343,14 +1357,20 @@ async def test_numeric_plan_preview_is_read_only_and_reports_bounded_counts(monk
 
 
 @pytest.mark.asyncio
-async def test_numeric_execution_is_blocked_without_certified_api_coverage():
-    with pytest.raises(ValueError, match="certified"):
+@pytest.mark.parametrize(
+    "execute,parent_id",
+    [(False, 9001), (True, None)],
+)
+async def test_numeric_recovery_requires_execute_and_explicit_parent_before_io(
+    execute, parent_id,
+):
+    with pytest.raises(ValueError, match="--execute and --parent-id"):
         await discovery.recover_discovery(
-            parent_id=9001, execute=True, numeric_split=True
+            parent_id=parent_id, execute=execute, numeric_split=True
         )
 
 @pytest.mark.asyncio
-async def test_numeric_fallback_refuses_uncertified_dimensions_without_http(monkeypatch):
+async def test_numeric_fallback_is_not_called_without_explicit_opt_in(monkeypatch):
     from dbd.client.endpoints.search import SearchFilters
 
     filters = SearchFilters(
@@ -1360,10 +1380,10 @@ async def test_numeric_fallback_refuses_uncertified_dimensions_without_http(monk
     reasons = []
     result = await discovery._validated_children(
         object(), 12, filters, ["10"], ["1"], 30000,
-        rejection_reasons=reasons, numeric_allowed=True,
+        rejection_reasons=reasons, numeric_allowed=False,
     )
     assert result == []
-    assert "numeric_unverified:NULL_and_boundary_coverage" in reasons
+    assert "categorical_dimensions_exhausted_or_unavailable" in reasons
 
 @pytest.mark.asyncio
 async def test_checkpointed_numeric_page_rejects_changed_total_items(monkeypatch):
@@ -1452,9 +1472,44 @@ async def test_normal_discovery_path_never_auto_enables_numeric(monkeypatch):
     ) == []
 
 @pytest.mark.asyncio
-async def test_numeric_discover_run_requires_explicit_certification_before_http():
-    with pytest.raises(ValueError, match="certified"):
-        await discovery.run(["010"], numeric_split=True)
+async def test_discover_missing_numeric_schema_defers_numeric_without_real_http(monkeypatch):
+    from dbd.storage.mysql.repositories import discovery_repository as repository
+
+    monkeypatch.setattr(repository, "numeric_schema_ready", lambda: False)
+    opened = []
+
+    class NoHttpClient:
+        def __init__(self, **_kwargs):
+            self.requests_made = 0
+
+        async def __aenter__(self):
+            opened.append("enter")
+            return self
+
+        async def __aexit__(self, *_args):
+            opened.append("exit")
+
+    class QuietProgress:
+        def __init__(self, *_args, **_kwargs):
+            self.events = []
+
+        def event(self, message):
+            self.events.append(message)
+
+        def close(self, **_kwargs):
+            pass
+
+    async def fake_work(_client, *_args, **kwargs):
+        assert kwargs["numeric_split"] is False
+        return discovery.DiscoveryResult(0, 0, 0, 0)
+
+    monkeypatch.setattr(discovery, "FixedRateDbdClient", NoHttpClient)
+    monkeypatch.setattr(discovery, "ProgressLine", QuietProgress)
+    monkeypatch.setattr(discovery, "_run_work", fake_work)
+    monkeypatch.setattr(discovery, "discovery_summary", lambda: {})
+    result = await discovery.run(["010"], numeric_split=True, verbose=False)
+    assert result.buckets_processed == 0
+    assert opened == ["enter", "exit"]
 
 
 @pytest.mark.asyncio
