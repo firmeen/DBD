@@ -489,7 +489,11 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                                     stats["http_requests"]=client.requests
                                     record_flow()
                                     if event:
-                                        event("branch_progress",dict(stats))
+                                        try:
+                                            event("branch_progress",dict(stats))
+                                        except Exception:
+                                            # Rendering must not undo committed DB work.
+                                            pass
                             except BaseException:
                                 client.stop.set()
                                 for future in pending:
@@ -512,7 +516,10 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                             "NEEDS_REVIEW" if stats["review"] else
                             "PARTIAL - DEFERRED" if stats["deferred"] else "CAUGHT_UP")
             if event:
-                event("branch_progress",dict(stats))
+                try:
+                    event("branch_progress",dict(stats))
+                except Exception:
+                    pass
             return stats
         finally:
             client.stop.set()
@@ -913,7 +920,10 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                                 if status=="NO_BRANCH":
                                     stats["no_branch_results"]+=1
                             if event:
-                                event("branch_progress",dict(stats))
+                                try:
+                                    event("branch_progress",dict(stats))
+                                except Exception:
+                                    pass
                     complete=stats["selected"]==state["records"]
                     if complete and not stats["conflicted"] and not stats["missing_target"]:
                         if selected=="sqlserver":
