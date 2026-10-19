@@ -253,12 +253,18 @@ def test_prior_hq_inclusive_count_is_never_reduced_by_incoming_no_branch(
         conn,company={
             "company_id":42,"juristic_type_code":"5",
             "registration_no":"0105559000001",
+            "company_name_th":"Legal name from DBD",
+            "address_th":"DBD ADDRESS IS NOT VERIFIED HEADQUARTERS",
         },
         phase_id=1,fingerprint="f"*64,status="NO_BRANCH",branches=[],
         total=1,
         source_url="https://www.dataforthai.com/company-branch/0105559000001/show/printview",
     )
     assert result=="STALE_BRANCHES"
+    assert not any(
+        "DBD ADDRESS IS NOT VERIFIED HEADQUARTERS" in tuple(map(str,params))
+        for _,params in conn.queries
+    )
     assert not any(
         "UPDATE DBD_COMPANY SET branch_count" in sql or
         "UPDATE dbo.DBD_COMPANY SET branch_count" in sql
