@@ -57,12 +57,16 @@ def phase(conn, *, codes: tuple[str, ...], new_phase: bool = False,
         if legacy_phase is not None and legacy_phase < 1:
             raise ContractError("Invalid legacy Branch Phase")
         state = {"phase": legacy_phase or 1, "scope": list(codes),
-                 "origin": "legacy" if legacy_phase is not None else "initial"}
+                 "origin": "legacy" if legacy_phase is not None else "initial",
+                 "import_complete": legacy_phase is None}
     else:
         if not isinstance(prior.get("phase"), int) or prior["phase"] < 1:
             raise ContractError("Corrupt durable branch phase marker")
         if legacy_phase is not None and int(prior["phase"]) != legacy_phase:
             raise ContractError("Legacy Phase does not match existing Production Branch Phase")
+        if (prior.get("origin") == "legacy" and not prior.get("import_complete")
+            and legacy_phase is None):
+            raise ContractError("Legacy Branch Import is incomplete; finish import before live HTTP")
         scope = prior.get("scope")
         if not isinstance(scope,list) or not scope:
             raise ContractError("Corrupt branch phase scope")
@@ -79,6 +83,19 @@ def phase(conn, *, codes: tuple[str, ...], new_phase: bool = False,
         ControlRepository._put(conn, "AUDIT", PHASE_RECORD_KEY, state)
         ControlRepository._audit(conn, "BRANCH_PHASE_START", state)
     return state
+
+
+def finish_legacy_import(conn, phase_id: int) -> None:
+    """Only after all historical identities reconcile without conflicts."""
+    state=ControlRepository._read(conn,"AUDIT",PHASE_RECORD_KEY,lock=True)
+    if (state is None or state.get("phase")!=phase_id
+        or state.get("origin")!="legacy"):
+        raise ContractError("No matching legacy Branch Phase to finalize")
+    if state.get("import_complete"):
+        return
+    state["import_complete"]=True
+    ControlRepository._put(conn,"AUDIT",PHASE_RECORD_KEY,state)
+    ControlRepository._audit(conn,"BRANCH_LEGACY_IMPORT_COMPLETE",{"phase":phase_id})
 
 
 def candidates(conn, *, after: tuple[str,str] | None = None,
