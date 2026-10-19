@@ -793,6 +793,8 @@ def main():
     branch_parser.add_argument("--check", "-c", action="store_true",
                                help="Read-only preview")
     branch_parser.add_argument("--limit", "-l", type=positive)
+    branch_parser.add_argument("--new-phase", action="store_true",
+                               help="Explicitly refresh Branch in a new Phase; never for ordinary resume")
     branch_parser.add_argument("--db", "-d", "--backend",
                                choices=("sqlserver", "mysql"))
 
@@ -880,27 +882,24 @@ def main():
         elif args.command == "branch":
             from ..pipelines.branch import collect as collect_branches, import_mysql
             selected = args.backend or settings.dbd_production_backend
-            if selected != "sqlserver":
-                raise ValueError("Branch enrichment currently requires SQL Server production")
             if args.action == "import":
-                result = import_mysql(check=args.check, limit=args.limit)
+                if args.new_phase:
+                    raise ValueError("Branch import cannot start a new refresh phase")
+                result = import_mysql(check=args.check, limit=args.limit, backend=selected)
                 presenter.command_result("DBD · BRANCH IMPORT", result)
             elif args.check:
-                from ..storage.sqlserver import branch_repository
-                from ..storage.sqlserver.engine import connection
-                with connection() as conn:
-                    branch_repository.validate_schema(conn)
-                    pending = branch_repository.candidates(conn, limit=min(args.limit or 50, 1000))
-                presenter.command_result(
-                    "DBD · BRANCH PREVIEW",
-                    {"read_only": True, "candidate_sample": len(pending),
-                     "first_company_id": pending[0]["company_id"] if pending else None},
-                )
+                if args.new_phase:
+                    raise ValueError("--check and --new-phase cannot be combined")
+                result = collect_branches(backend=selected,preflight=True)
+                presenter.command_result("DBD · BRANCH PREVIEW", result)
             else:
                 v06_terminal = V06Terminal("branch", app="DBD DATA").start(
                     backend=selected,
                 )
-                result = collect_branches(event=v06_terminal.event, limit=args.limit)
+                result = collect_branches(
+                    event=v06_terminal.event, limit=args.limit,
+                    backend=selected, new_phase=args.new_phase,
+                )
                 v06_terminal.finish(result)
         elif args.command == "recover":
             from ..storage.sqlserver import discovery_repository as discovery_work
