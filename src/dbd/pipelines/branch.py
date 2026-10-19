@@ -905,3 +905,194 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                     return stats
         finally:
             staging.close()
+
+
+def import_sqlserver_extension(*, check: bool = False, limit: int | None = None) -> dict:
+    """Explicit, conservative PR #100 extension migration; no DDL, no deletes.
+
+    Old DBD_COMPANY_BRANCH is immutable historical input. Import a coherent
+    snapshot or record its previous failure, keeping the original table and
+    old DBD_COMPANY branch metadata for audit. Never infer verified zero from
+    absent detail records.
+    """
+    import os
+    from pathlib import Path
+    from ..storage.production import production_repository
+    from ..storage.sqlserver import branch_repository as store
+    from ..storage.sqlserver.control_repository import ControlRepository
+    from ..presentation.setup import local_node_id
+
+    node=local_node_id()
+    if node is None:
+        raise BranchError("SQL Server Admin setup required for historical extension import")
+    ControlRepository().require_admin(node)
+    if limit is not None and limit<=0:
+        raise BranchError("Import limit must be positive")
+    repo=production_repository("sqlserver")
+    codes=tuple(sorted({s.strip().upper() for s in
+                        settings.dataforthai_status_codes.split(",") if s.strip()}))
+    stats={"check":bool(check),"source":"DBD_COMPANY_BRANCH","selected":0,
+           "imported":0,"skipped":0,"conflicted":0,"branches":0,
+           "state":"READ_ONLY" if check else "INCOMPLETE"}
+    # A separate legacy JSONL/checkpoint is authoritative for zero-branch
+    # outcomes not present in the PR #100 extension. Migrate that history first.
+    journal=Path(os.environ.get("DBD_BRANCH_JOURNAL_PATH",".dbd_branch_results.jsonl"))
+    checkpoint=Path(".dbd_branch_checkpoint.json")
+    with repo.manager_lock(resource="TIPDI:DBD:v0.6:branch") as lock:
+        with repo.transaction() as conn:
+            store.validate_schema(conn)
+            with conn.cursor() as cur:
+                cur.execute("SELECT OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH',N'U')")
+                if cur.fetchone()[0] is None:
+                    return {**stats,"state":"NO_LEGACY_EXTENSION"}
+                cur.execute(
+                    "SELECT COUNT_BIG(*) FROM dbo.DBD_COMPANY c WHERE "
+                    "c.branch_status IS NOT NULL OR EXISTS("
+                    "SELECT 1 FROM dbo.DBD_COMPANY_BRANCH b "
+                    "WHERE b.company_id=c.company_id)"
+                )
+                stats["source_companies"]=int(cur.fetchone()[0] or 0)
+            prior=ControlRepository._read(conn,"AUDIT",store.PHASE_RECORD_KEY)
+            if prior is None and (checkpoint.exists() or
+                (journal.exists() and journal.stat().st_size)):
+                raise BranchError(
+                    "Standalone legacy Journal/checkpoint must be imported first; "
+                    "the old SQL branch extension cannot certify those results"
+                )
+            if prior and (
+                prior.get("phase")!=1 or prior.get("origin")!="legacy"
+            ):
+                raise BranchError(
+                    "Active Branch Phase conflicts with SQL extension history; "
+                    "refusing to overwrite a newer collection"
+                )
+            if check:
+                return {**stats,"read_only":True}
+            store.phase(conn,codes=codes,legacy_phase=1)
+        cursor=0
+        while True:
+            repo.assert_manager_lock(lock,resource="TIPDI:DBD:v0.6:branch")
+            remaining=100 if limit is None else min(100,limit-stats["selected"])
+            if remaining<=0:
+                break
+            with repo.transaction() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        f"SELECT TOP ({int(remaining)}) c.company_id,"
+                        "c.juristic_type_code,c.registration_no,c.company_name_th,"
+                        "c.address_th,c.branch_status,c.establishment_count,"
+                        "c.branch_verified_at,c.branch_source "
+                        "FROM dbo.DBD_COMPANY c WHERE c.company_id>%s AND ("
+                        "c.branch_status IS NOT NULL OR EXISTS("
+                        "SELECT 1 FROM dbo.DBD_COMPANY_BRANCH b "
+                        "WHERE b.company_id=c.company_id)) ORDER BY c.company_id",
+                        (cursor,),
+                    )
+                    rows=cur.fetchall()
+            if not rows:
+                break
+            for item in rows:
+                (company_id,jp_type,jp_no,name,address,old_status,
+                 source_total,verified_at,source)=item
+                cursor=int(company_id)
+                stats["selected"]+=1
+                with repo.transaction() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT branch_no,branch_name,address_th,province_name,"
+                            "district_name,subdistrict_name,postal_code,source_url,"
+                            "is_current,last_verified_at FROM dbo.DBD_COMPANY_BRANCH "
+                            "WHERE company_id=%s ORDER BY branch_no",(company_id,),
+                        )
+                        old_rows=cur.fetchall()
+                        cur.execute(
+                            "SELECT checked_phase,collection_status FROM dbo.DBD_BRANCH "
+                            "WHERE company_id=%s AND branch_no=N'00000'",(company_id,),
+                        )
+                        existing=cur.fetchone()
+                if existing is not None:
+                    stats["skipped"]+=1
+                    continue
+                current=[row for row in old_rows if bool(row[8])]
+                details=[{
+                    "branch_no":str(row[0]),"branch_name":row[1],
+                    "address_th":row[2],"province_name":row[3],
+                    "district_name":row[4],"subdistrict_name":row[5],
+                    "postal_code":row[6],
+                } for row in current]
+                sources={str(row[7]) for row in current}
+                stamps={row[9] for row in current}
+                url=(next(iter(sources)) if sources else
+                     f"{SITE}/company-branch/{jp_no}/show/printview")
+                if details:
+                    if (len(sources)!=1 or len(stamps)!=1 or
+                        any(not re.fullmatch(r"[0-9]{5}",b["branch_no"]) or
+                            b["branch_no"]=="00000" or
+                            not str(b["address_th"] or "").strip() for b in details)
+                        or len({b["branch_no"] for b in details})!=len(details)):
+                        stats["conflicted"]+=1
+                        continue
+                    u=urlparse(url)
+                    if (u.scheme!="https" or u.hostname!="www.dataforthai.com"
+                        or u.path.rstrip("/")!=
+                        f"/company-branch/{jp_no}/show/printview"):
+                        stats["conflicted"]+=1
+                        continue
+                mapping={
+                    "COMPLETE":"OK" if details and source_total==len(details)+1
+                               else "LEGACY_OK" if details else "UNAVAILABLE",
+                    "NO_BRANCH":"NO_BRANCH" if not details and source_total==1
+                                else "UNAVAILABLE",
+                    "RETRY":"DEFERRED_NETWORK",
+                    "INVALID":"DEFERRED_PARSE",
+                    "UNAVAILABLE":"UNAVAILABLE",
+                    "NOT_LISTED":"NOT_LISTED",
+                }
+                status=mapping.get(str(old_status or "").upper(),
+                                   "LEGACY_OK" if details else "UNAVAILABLE")
+                if status=="LEGACY_OK" and source not in ("DATAFORTHAI","DATAFORTHAI_IMPORT",None):
+                    stats["conflicted"]+=1
+                    continue
+                fp=fingerprint({
+                    "juristic_type_code":str(jp_type),
+                    "registration_no":str(jp_no),
+                    "company_name_th":name,"address_th":address,
+                })
+                company={"company_id":int(company_id),
+                         "juristic_type_code":str(jp_type),
+                         "registration_no":str(jp_no),
+                         "company_name_th":name,"address_th":address}
+                try:
+                    with repo.transaction() as conn:
+                        if details and status not in ("OK","LEGACY_OK"):
+                            store.import_preserved_details(
+                                conn,company_id=int(company_id),
+                                branches=details,source_url=url,
+                            )
+                        outcome=store.persist(
+                            conn,company=company,phase_id=1,fingerprint=fp,
+                            status=status,
+                            branches=details if status in ("OK","LEGACY_OK") else [],
+                            total=len(details)+1 if status in ("OK","LEGACY_OK") else
+                                  (1 if status=="NO_BRANCH" else None),
+                            source_url=url,source_kind="DATAFORTHAI_IMPORT",
+                            reason="migrated from PR100 SQL extension",
+                            verified_at=verified_at if isinstance(verified_at,datetime)
+                                         and status in ("OK","LEGACY_OK") else None,
+                        )
+                except (BranchError,ContractError,ValueError):
+                    stats["conflicted"]+=1
+                    continue
+                if outcome=="SKIPPED":
+                    stats["skipped"]+=1
+                else:
+                    stats["imported"]+=1
+                    stats["branches"]+=len(details)
+        if (limit is None and stats["selected"]==stats["source_companies"]
+            and not stats["conflicted"]):
+            with repo.transaction() as conn:
+                store.finish_legacy_import(conn,1)
+            stats["state"]="IMPORTED"
+        else:
+            stats["state"]="INCOMPLETE_REVIEW"
+    return stats
