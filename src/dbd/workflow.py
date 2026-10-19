@@ -888,10 +888,13 @@ async def _cycle_run_core(
             invalid_rows=discovery_result.invalid_rows,
         )
 
-        if control is not None:
-            # SQL durable Discovery is the sole authority for full-universe
-            # completion; an empty transient queue is not a coverage certificate.
-            from .storage.sqlserver import discovery_repository as discovery_work
+        if control is not None or getattr(repo, "backend", None) == "mysql":
+            # Both production backends require durable full-universe certification
+            # before preparing Core-7 claims. A drained queue is insufficient.
+            if getattr(repo, "backend", None) == "mysql":
+                from .storage.mysql import discovery_repository as discovery_work
+            else:
+                from .storage.sqlserver import discovery_repository as discovery_work
             with repo.transaction() as conn:
                 evidence = discovery_work.coverage(conn, generation, "full")
             if not evidence["ok"]:
@@ -899,7 +902,8 @@ async def _cycle_run_core(
                     "Monthly Core Discovery is incomplete; cannot PREPARE: "
                     + str(evidence)
                 )
-            control.transition(control_node, cycle_month, "PREPARING")
+            if control is not None:
+                control.transition(control_node, cycle_month, "PREPARING")
         _emit(event, "phase_started", phase="PREPARE", generation=generation)
         repo.assert_manager_lock(lock_conn)
         prepare_result = await asyncio.to_thread(
