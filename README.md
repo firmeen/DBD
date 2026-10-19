@@ -78,6 +78,12 @@ dbd-data branch -d sqlserver --new-phase
 
 ~~~powershell
 dbd-data branch import -c -d sqlserver
+# เมื่อผ่านการตรวจสอบและได้รับอนุมัติ จึงนำเข้าข้อมูลจริง
+# dbd-data branch import -d sqlserver
+# หากใช้ส่วนขยายสาขาเดิมใน PR #100:
+dbd-data branch import -c -d sqlserver --source sqlserver-extension
+# หลังตรวจ Conflict และได้รับอนุมัติ:
+# dbd-data branch import -d sqlserver --source sqlserver-extension
 ~~~
 
 หากมี `.dbd_branch_results.jsonl`, `.dbd_branch_checkpoint.json` หรือข้อมูลสาขาเก่าที่ยังไม่ได้ Reconcile ต้อง Import ให้ครบและแก้ Conflict ก่อนเริ่ม HTTP จริง ระบบต้องไม่ถือว่าไม่มีสาขาเพียงเพราะไม่มี Branch Rows
