@@ -269,7 +269,8 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
             "AND juristic_type_code=%s AND registration_no=%s FOR UPDATE",
             (company_id,str(company["juristic_type_code"]),str(company["registration_no"])),
         )
-        if cur.fetchone() is None:
+        current=cur.fetchone()
+        if current is None:
             raise ContractError("Company identity changed during Branch write")
         cur.execute(
             f"SELECT checked_phase,collection_status,verified_phase FROM {TABLE} "
@@ -292,6 +293,13 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
             "historical import must not replace a potentially newer snapshot"
         )
 
+    if verified and total is not None and int(current[0] or 1)>total:
+        status="STALE_BRANCHES"
+        verified=False
+        reason=(
+            f"Incoming total {total} is below preserved count {current[0]}; "
+            "manual reconciliation required"
+        )
     if verified and old_numbers-set(numbers):
         status="STALE_BRANCHES"
         verified=False
