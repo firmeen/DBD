@@ -1049,16 +1049,23 @@ async def cycle_run(
     can resume the active Branch Phase without another monthly generation.
     """
     from dataclasses import replace
+    # Defer the final cycle-completed event until Branch has been reported.
+    # Otherwise the single terminal can show COMPLETE while HTTP is still live.
+    def relay(name: str, payload: dict[str, Any]) -> None:
+        if name != "cycle_completed" and event is not None:
+            event(name,payload)
+
     core = await _cycle_run_core(
         phase=phase,refresh=refresh,seeds=seeds,search_type=search_type,
         concurrency=concurrency,rate=rate,http_retries=http_retries,
         max_buckets=max_buckets,repository=repository,backend=backend,
-        event=event,verbose=verbose,auto=auto,manual_confirmed=manual_confirmed,
+        event=relay,verbose=verbose,auto=auto,manual_confirmed=manual_confirmed,
     )
     # Never launch a live external HTTP client from a test-injected repository.
     if repository is not None or phase!="core" or core.status not in (
         "COMPLETE","COMPLETE_WITH_FAILURES","ALREADY_COMPLETED"
     ):
+        _emit(event,"cycle_completed",**asdict(core))
         return core
     selected=backend or settings.dbd_production_backend
     from .pipelines.branch import collect as branch_collect
@@ -1075,7 +1082,9 @@ async def cycle_run(
         _emit(event,"warning",message="Branch phase incomplete: "+str(exc))
     _emit(event,"phase_completed",phase="BRANCH",generation=core.generation,
           stage=branch_state.get("stage","UNKNOWN"))
-    return replace(core,branch=branch_state)
+    result=replace(core,branch=branch_state)
+    _emit(event,"cycle_completed",**asdict(result))
+    return result
 
 
 async def cycle_loop(
