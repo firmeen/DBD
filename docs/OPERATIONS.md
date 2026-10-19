@@ -346,3 +346,30 @@ request rate. Never bypass an application lock or retry by deleting data.
 ## Monthly control recovery
 
 `--auto` exits without starting when not due/already completed; this is not a failure. Manual early start requires confirmation and audit. If a Generation was interrupted, run the same Core cycle to resume before the next month. An Admin may approve/revoke a Worker node using `dbd-data setup`; revocation blocks new claims and in-flight commits at the SQL gate. Remote workers do not acquire Coordinator locks. During `DRAINING` the Coordinator waits for live company leases, then verifies before Finalize. Shared Rate admission failure must **not** fall back to local rate. A Windows Task that runs under a noninteractive logon does not show the Terminal UI; use current-user interactive principal without highest privileges. See [Admin setup](ADMIN_SETUP.md) and [Worker setup](WORKER_SETUP.md).
+
+## Branch Resume / Import Troubleshooting (PR #102 Draft)
+
+Check actual durable Core state and independent Branch Phase:
+~~~powershell
+dbd-data status -d sqlserver
+dbd-data branch -c -d sqlserver
+dbd-data branch import -c -d sqlserver
+dbd-data branch import -c -d sqlserver --source sqlserver-extension
+~~~
+
+- **No Phase Marker but legacy data exists:** stop; restore original Journal/
+  Checkpoint and perform historical import. Do not delete the files or start
+  a new Phase to evade the blocker.
+- **`DEFERRED_*`:** rerun the same `dbd-data branch` command next invocation.
+  One invocation must not amplify repeated retries of the same identity.
+- **`STALE_BRANCHES`:** review missing old branch numbers and source evidence.
+  Existing verified count and rows stay untouched. Do not delete them.
+- **`UNAVAILABLE` / `NO_BRANCH_LISTED`:** historical terminal outcomes,
+  never a verified count of zero branches. Ordinary rerun skips them until
+  explicitly refreshed in a new Phase.
+- **HTTP 401/403/429:** stop safely; do not rotate identity or bypass source
+  restrictions. Core-7 completion must not be invalidated.
+- **Schema differs from six-table contract:** stop normal collection; review
+  additive migration separately, including old nullable summary fields.
+- **Ctrl+C:** after the process finishes stopping, rerun the same command.
+  Do not run two writers against the same Branch Phase.
