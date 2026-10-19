@@ -371,7 +371,7 @@ JSON_CHECKS = {
 
 EXTRA_CHECKS = {
     "dbo.DBD_BRANCH": (
-        ("CK_DBD_BRANCH_NUMBER", "LEN([branch_no])=5 AND [branch_no] NOT LIKE '%[^0-9]%'"),
+        ("CK_DBD_BRANCH_NUMBER", "LEN([branch_no])=5 AND [branch_no] COLLATE Latin1_General_100_BIN2 NOT LIKE '%[^0-9]%'"),
         ("CK_DBD_BRANCH_PHASE", "([checked_phase] IS NULL OR [checked_phase]>=1) AND ([verified_phase] IS NULL OR [verified_phase]>=1)"),
     ),
     "dbo.DBD_COMPANY": (
