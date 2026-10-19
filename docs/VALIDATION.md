@@ -292,3 +292,29 @@ The implementation introduces offline tests
 `tests/test_v06_production_completion.py` and
 `tests/test_v06_completion_guards.py`. These tests do **not** substitute for
 isolated SQL Server/MySQL integration and Windows runtime validation.
+
+
+## Production Completion hardening — source evidence before release
+
+The branch printview parser now requires company identity evidence from the
+HTML or a trusted same-host canonical URL. If identity cannot be proved or
+another company appears, record a recoverable invalid-HTML result; do not mark
+`NO_BRANCH`. This is intentionally fail-closed until the source HTML contract
+is confirmed using approved, controlled evidence.
+
+The branch writer blocks any reduction of a previously known HQ-inclusive
+establishment count even if historical detail rows are incomplete; the new
+result becomes `STALE_BRANCHES` for review. Canonical old branch addresses
+are never overwritten by a conflicting Legacy Import. Old PR100
+`DBD_COMPANY.branch_status` is treated as historical outcome evidence even
+without old branch detail rows.
+
+Discovery checks a second parent count after categorical child queries,
+enforces the source's 10-row page contract, and detects duplicate identities
+across newly fetched pages of a partition. This is not proof of a stable
+snapshot across an interrupted multi-day enumeration. Nationwide coverage
+must remain unverified without upstream consistency evidence.
+
+`dbd-data branch import --source sqlserver-extension -c -d sqlserver`
+performs read-only source preflight before approved canonical schema DDL and
+reports blockers without creating a Phase or issuing HTTP requests.
