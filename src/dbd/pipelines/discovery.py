@@ -861,7 +861,7 @@ async def _direct_page(
         raise ContractError(
             f"Search page {page_no} violated its 10-row pagination contract"
         )
-    if page.total_pages != (page.total_items+9)//10:
+    if page.total_items <= MAX_ROWS_PER_QUERY and page.total_pages != (page.total_items+9)//10:
         raise ContractError(
             f"Search page {page_no} pagination total does not reconcile"
         )
