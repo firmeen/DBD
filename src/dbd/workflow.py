@@ -500,6 +500,12 @@ async def discover(
     backend: str | None = None,
     event: EventCallback | None = None,
 ) -> tuple[int, DiscoveryResult]:
+    # Refuse an uncertified full-universe request before acquiring locks or
+    # transitioning monthly control state to DISCOVERING.
+    discovery.require_certified_full_universe_discovery(
+        seeds=seeds,search_type=search_type,max_buckets=max_buckets,
+        recovery_pass=recovery_pass,
+    )
     repo = _repo(repository, backend)
     _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
@@ -800,6 +806,11 @@ async def _cycle_run_core(
         raise ValueError(
             "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
         )
+    # This guard must precede monthly-control transitions, PRECHECK events and
+    # any durable generation mutation; an uncertified root strategy is a hard stop.
+    discovery.require_certified_full_universe_discovery(
+        seeds=None,search_type="",max_buckets=None,
+    )
     repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
         _emit(event, "phase_started", phase="PRECHECK")
