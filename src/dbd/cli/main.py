@@ -924,6 +924,7 @@ def main():
                 from ..storage.sqlserver import discovery_repository as discovery_work
             current = repo.generation_state()
             generation = current.get("active_generation")
+            from ..pipelines.discovery import PRODUCTION_ROOT_COVERAGE_CERTIFIED
             with repo.transaction() as conn:
                 discovery_work.validate_schema(conn)
                 if selected == "mysql":
@@ -937,7 +938,18 @@ def main():
                         generation = int(tree_generation)
                 if generation is None:
                     raise ValueError("No durable active Discovery tree/generation to recover")
-                preview = discovery_work.coverage(conn,int(generation),"full")
+                tree_preview = discovery_work.coverage(conn,int(generation),"full")
+                preview = {
+                    **tree_preview,
+                    "tree_ok":bool(tree_preview["ok"]),
+                    "root_scope_certified":PRODUCTION_ROOT_COVERAGE_CERTIFIED,
+                    "ok":bool(tree_preview["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED),
+                    "coverage_claim":(
+                        "VERIFIED" if tree_preview["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED
+                        else "UNVERIFIED_ROOT_SCOPE" if tree_preview["ok"]
+                        else "INCOMPLETE"
+                    ),
+                }
             if args.check:
                 presenter.command_result("DBD · RECOVERY PREVIEW", {
                     "read_only":True,"generation":int(generation),**preview})
@@ -951,19 +963,29 @@ def main():
                     recovery_limit=args.limit, recovery_pass=True,
                 ))
                 with repo.transaction() as conn:
-                    remaining = discovery_work.coverage(
+                    tree_remaining = discovery_work.coverage(
                         conn, int(recovered_generation), "full"
                     )
+                root_certified=PRODUCTION_ROOT_COVERAGE_CERTIFIED
+                coverage_claim=(
+                    "VERIFIED" if tree_remaining["ok"] and root_certified
+                    else "UNVERIFIED_ROOT_SCOPE" if tree_remaining["ok"]
+                    else "INCOMPLETE"
+                )
                 v06_terminal.finish({
                     "generation":recovered_generation,
                     "partitions":result.buckets_processed,
                     "pages":result.pages_fetched,
                     "companies":result.companies_written,
                     "recovery_pass":"FINISHED",
-                    "coverage":"VERIFIED" if remaining["ok"] else "INCOMPLETE",
-                    "unresolved":sum(remaining.get(k,0) for k in
+                    "tree_ok":bool(tree_remaining["ok"]),
+                    "root_scope_certified":root_certified,
+                    "coverage":coverage_claim,
+                    "unresolved":sum(tree_remaining.get(k,0) for k in
                                      ("pending","counted","fetching","failed","blocked")),
-                },status="COMPLETE" if remaining["ok"] else "COMPLETE_WITH_FAILURES")
+                },status="COMPLETE" if tree_remaining["ok"] and root_certified else "FAILED")
+                if not (tree_remaining["ok"] and root_certified):
+                    raise SystemExit(1)
         elif args.command == "status":
             from dataclasses import asdict
             from ..workflow import status as production_status
@@ -971,17 +993,30 @@ def main():
             data = asyncio.run(production_status(
                 phase="core",backend=selected,coverage=False))
             result = asdict(data)
-            if selected == "sqlserver":
-                from ..storage.sqlserver import discovery_repository as discovery_work
-                from ..storage.sqlserver.engine import connection
+            if selected in ("sqlserver","mysql"):
+                from ..pipelines.discovery import PRODUCTION_ROOT_COVERAGE_CERTIFIED
                 from ..storage.production import production_repository
-                state = production_repository(selected).generation_state()
+                if selected == "mysql":
+                    from ..storage.mysql import discovery_repository as discovery_work
+                else:
+                    from ..storage.sqlserver import discovery_repository as discovery_work
+                repo = production_repository(selected)
+                state = repo.generation_state()
                 gen = state.get("active_generation")
                 if gen is not None:
-                    with connection() as conn:
-                        result["discovery"] = discovery_work.coverage(
-                            conn,int(gen),"full"
-                        )
+                    with repo.transaction() as conn:
+                        tree = discovery_work.coverage(conn,int(gen),"full")
+                    result["discovery"] = {
+                        **tree,
+                        "tree_ok":bool(tree["ok"]),
+                        "root_scope_certified":PRODUCTION_ROOT_COVERAGE_CERTIFIED,
+                        "ok":bool(tree["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED),
+                        "coverage_claim":(
+                            "VERIFIED" if tree["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED
+                            else "UNVERIFIED_ROOT_SCOPE" if tree["ok"]
+                            else "INCOMPLETE"
+                        ),
+                    }
             from ..pipelines.branch import status as branch_status
             try:
                 result["branch"] = branch_status(backend=selected)
