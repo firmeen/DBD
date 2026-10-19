@@ -227,7 +227,8 @@ def _branch_numbers(conn, company_id: int) -> set[str]:
 def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
             status: str, branches: list[dict] | None = None,
             total: int | None = None, source_url: str | None = None,
-            source_kind: str = "DATAFORTHAI", reason: str | None = None) -> str:
+            source_kind: str = "DATAFORTHAI", reason: str | None = None,
+            verified_at: datetime | None = None) -> str:
     if phase_id<1 or re.fullmatch(r"[0-9a-f]{64}",fingerprint) is None:
         raise ContractError("Invalid Phase/fingerprint")
     if status not in TERMINAL | REVIEW and not re.fullmatch(r"DEFERRED_[A-Z0-9_]+",status):
@@ -257,6 +258,11 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     # The manager lock must be held for all Phase transitions and writes.
     company_id=int(company["company_id"])
     now=datetime.now(timezone.utc).replace(tzinfo=None)
+    if verified_at is not None and source_kind != "DATAFORTHAI_IMPORT":
+        raise ContractError("Only historical imports may supply verified_at")
+    observed_at = (verified_at.astimezone(timezone.utc).replace(tzinfo=None)
+                   if verified_at is not None and verified_at.tzinfo is not None
+                   else verified_at or now)
     with conn.cursor() as cur:
         cur.execute(
             "SELECT branch_count FROM DBD_COMPANY WHERE company_id=%s "
@@ -302,7 +308,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                     "last_checked_at=VALUES(last_checked_at),last_verified_at=VALUES(last_verified_at)",
                     (company_id,str(b["branch_no"]),b.get("branch_name"),b["address_th"],
                      b.get("province_name"),b.get("district_name"),b.get("subdistrict_name"),
-                     b.get("postal_code"),source_url,source_kind,now,now,now),
+                     b.get("postal_code"),source_url,source_kind,now,now,observed_at),
                 )
             if verified:
                 cur.execute("UPDATE DBD_COMPANY SET branch_count=%s WHERE company_id=%s",
@@ -317,7 +323,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                 "collection_status,checked_phase,verified_phase,source_fingerprint,"
                 "reported_total,last_error) VALUES (%s,'00000',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (company_id,company.get("company_name_th"),company.get("address_th"),
-                 source_url,source_kind,now,now,now if directly_verified else None,
+                 source_url,source_kind,now,now,observed_at if directly_verified else None,
                  status,phase_id,phase_id if directly_verified else None,fingerprint,
                  total if verified else None,(reason or "")[:1024] or None),
             )
@@ -329,7 +335,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                 "last_error=NULL WHERE company_id=%s AND branch_no='00000'",
                 (status,phase_id,phase_id if directly_verified else None,
                  fingerprint,total,source_url,source_kind,now,
-                 now if directly_verified else None,company_id),
+                 observed_at if directly_verified else None,company_id),
             )
         else:
             cur.execute(
