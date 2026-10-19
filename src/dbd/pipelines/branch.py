@@ -103,7 +103,7 @@ def parse_printview(html: str, jp_no: str) -> tuple[list[dict], int]:
             continue
         numbers = re.findall(r"(?<!\d)\d{5}(?!\d)", label)
         if len(numbers)!=1 or numbers[0] in found or numbers[0]=="00000":
-            raise BranchError(f"{jp_no}: duplicate/invalid branch code")
+            raise BranchError(f"{jp_no}: duplicate/invalid/reserved branch code")
         found.add(numbers[0])
         details = info.find_all("div", recursive=False)
         if len(details) < 2:
