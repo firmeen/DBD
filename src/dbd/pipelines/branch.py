@@ -697,40 +697,46 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                 positives_adopted=0
                 positives_invalid=0
                 if source_data:
-                    with legacy.cursor() as cur:
-                        cur.execute(
-                            "SELECT jp_type_code,jp_no FROM dbd_company_branch "
-                            "GROUP BY jp_type_code,jp_no ORDER BY jp_type_code,jp_no"
-                        )
-                        while True:
-                            identities=cur.fetchmany(500)
-                            if not identities:
-                                break
-                            for item in identities:
-                                jp_type=str(item["jp_type_code"])
-                                jp_no=str(item["jp_no"])
-                                if staging.execute(
-                                    "SELECT 1 FROM results WHERE t=? AND j=?",
-                                    (jp_type,jp_no),
-                                ).fetchone() is not None:
-                                    continue
-                                source_rows=_legacy_source_rows(legacy,jp_type,jp_no)
-                                try:
-                                    _validate_legacy_details(
-                                        source_rows,jp_no,expected=len(source_rows)
+                    import pymysql
+                    # Unbuffered natural-identity enumeration. The details
+                    # connection is separate to avoid invalidating the stream.
+                    with legacy_connection() as details:
+                        with legacy.raw.cursor(pymysql.cursors.SSDictCursor) as cur:
+                            cur.execute(
+                                "SELECT jp_type_code,jp_no FROM dbd_company_branch "
+                                "GROUP BY jp_type_code,jp_no ORDER BY jp_type_code,jp_no"
+                            )
+                            while True:
+                                identities=cur.fetchmany(500)
+                            while True:
+                                identities=cur.fetchmany(500)
+                                if not identities:
+                                    break
+                                for item in identities:
+                                    jp_type=str(item["jp_type_code"])
+                                    jp_no=str(item["jp_no"])
+                                    if staging.execute(
+                                        "SELECT 1 FROM results WHERE t=? AND j=?",
+                                        (jp_type,jp_no),
+                                    ).fetchone() is not None:
+                                        continue
+                                    source_rows=_legacy_source_rows(details,jp_type,jp_no)
+                                    try:
+                                        _validate_legacy_details(
+                                            source_rows,jp_no,expected=len(source_rows)
+                                        )
+                                    except (BranchError,ValueError,TypeError):
+                                        positives_invalid+=1
+                                        continue
+                                    fp=hashlib.sha256(
+                                        ("legacy-positive:"+jp_type+":"+jp_no).encode("utf-8")
+                                    ).hexdigest()
+                                    staging.execute(
+                                        "INSERT INTO results(t,j,fp,status,n,method) "
+                                        "VALUES (?,?,?,?,?,?)",
+                                        (jp_type,jp_no,fp,"LEGACY_OK",len(source_rows),"legacy"),
                                     )
-                                except (BranchError,ValueError,TypeError):
-                                    positives_invalid+=1
-                                    continue
-                                fp=hashlib.sha256(
-                                    ("legacy-positive:"+jp_type+":"+jp_no).encode("utf-8")
-                                ).hexdigest()
-                                staging.execute(
-                                    "INSERT INTO results(t,j,fp,status,n,method) "
-                                    "VALUES (?,?,?,?,?,?)",
-                                    (jp_type,jp_no,fp,"LEGACY_OK",len(source_rows),"legacy"),
-                                )
-                                positives_adopted+=1
+                                    positives_adopted+=1
                     staging.commit()
                 if positives_invalid:
                     raise BranchError(
