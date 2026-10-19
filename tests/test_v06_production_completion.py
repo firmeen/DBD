@@ -18,6 +18,7 @@ from dbd.pipelines.branch import (
     fingerprint,
     parse_printview,
     _map_sql_extension_status,
+    classify_company_page,
 )
 from dbd.storage.sqlserver.schema import (
     BRANCH_COLUMNS,
@@ -214,6 +215,25 @@ def test_sqlserver_extension_import_never_invents_branch_verification():
         _map_sql_extension_status("COMPLETE",current_branches=3,reported_total=99)
     with pytest.raises(BranchError):
         _map_sql_extension_status("NO_BRANCH",current_branches=2,reported_total=1)
+
+
+def test_company_page_canonical_identity_must_use_trusted_https_origin():
+    number="0105559000001"
+    evil=(
+        f'<link rel="canonical" href="https://evil.example/company/{number}">'
+        '<p>company page without branch link</p>'
+    )
+    wrong_port=(
+        f'<link rel="canonical" href="https://www.dataforthai.com:444/company/{number}">'
+        '<p>company page without branch link</p>'
+    )
+    trusted=(
+        f'<link rel="canonical" href="https://www.dataforthai.com/company/{number}/">'
+        '<p>company page without branch link</p>'
+    )
+    assert classify_company_page(evil,number)=="UNAVAILABLE"
+    assert classify_company_page(wrong_port,number)=="UNAVAILABLE"
+    assert classify_company_page(trusted,number)=="NO_BRANCH_LISTED"
 
 
 def test_printview_requires_matching_registration_identity():
