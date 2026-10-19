@@ -264,3 +264,31 @@ for actual executed tests.
 The sole newly added extension test module for these features is
 `tests/test_production_discovery_branch.py`; extend existing test modules
 instead of adding separate ones for each new domain.
+
+## PR #102 — Branch and MySQL Discovery acceptance gates
+
+Canonical business tables: **six**. Branch is DataForThai enrichment,
+**not** an eighth DBD endpoint. `branch_count` includes HQ and may default to
+1 before verification, which must be distinguished by HQ `collection_status`.
+
+Required tests before Production rollout:
+- MySQL and SQL Server durable Discovery page checkpoint and company write
+  must commit/roll back atomically in **isolated test databases**.
+- Numeric split remains uncertified until real-source filter behavior and
+  complete, disjoint coverage are demonstrated; the planner alone cannot
+  certify nationwide completeness.
+- A newly inserted identity before an old cursor must be processed. A terminal
+  current-phase HQ outcome must not trigger duplicate DataForThai HTTP.
+- Journal/checkpoint and PR100 SQL branch extension imports require an explicit
+  preview, validation of original timestamps/branches, and idempotent reruns.
+- Old verified branch details/count must not disappear on timeout, stale
+  printview or import conflict.
+- Core-7 and Branch statuses must be reported separately. Branch source failure
+  must not undo Core Completion.
+- Windows PowerShell 5.1/7 Ctrl+C tests and CI must run successfully or remain
+  explicitly **unverified**.
+
+The implementation introduces offline tests
+`tests/test_v06_production_completion.py` and
+`tests/test_v06_completion_guards.py`. These tests do **not** substitute for
+isolated SQL Server/MySQL integration and Windows runtime validation.
