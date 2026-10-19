@@ -41,7 +41,7 @@ def phase(conn, *, codes: tuple[str, ...], new_phase: bool = False,
     prior = ControlRepository._read(conn, "AUDIT", PHASE_RECORD_KEY, lock=not read_only)
     if prior is None:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT TOP (1) company_id FROM {TABLE} WHERE collection_status IS NOT NULL")
+            cur.execute(f"SELECT TOP (1) company_id FROM {TABLE}")
             orphaned = cur.fetchone() is not None
             cur.execute("SELECT OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH',N'U')")
             if cur.fetchone()[0] is not None:
