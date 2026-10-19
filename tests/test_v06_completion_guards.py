@@ -200,3 +200,67 @@ def test_legacy_detail_import_rejects_conflicting_canonical_address(repository):
     assert len(db.cur.executed)==2
     assert all(sql.lstrip().upper().startswith("SELECT")
                for sql,_ in db.cur.executed)
+
+
+class ReplayCursor:
+    def __init__(self,conn):
+        self.conn=conn
+        self.statement=""
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self,*args):
+        return False
+
+    def execute(self,sql,params=()):
+        self.statement=sql
+        self.conn.queries.append((sql,params))
+
+    def fetchone(self):
+        query=self.statement
+        if "SELECT branch_count FROM" in query:
+            return (4,)
+        if "SELECT checked_phase,collection_status,verified_phase" in query:
+            return None
+        raise AssertionError("unexpected fetchone: "+query)
+
+    def fetchall(self):
+        if "SELECT branch_no FROM" in self.statement:
+            return []
+        raise AssertionError("unexpected fetchall: "+self.statement)
+
+
+class ReplayConn:
+    def __init__(self):
+        self.queries=[]
+
+    def cursor(self):
+        return ReplayCursor(self)
+
+
+@pytest.mark.parametrize("repository",[ms_branch,my_branch])
+def test_prior_hq_inclusive_count_is_never_reduced_by_incoming_no_branch(
+    repository,monkeypatch
+):
+    if repository is ms_branch:
+        monkeypatch.setattr(
+            ms_branch.ControlRepository,"_read",
+            staticmethod(lambda *args,**kwargs:{"phase":1}),
+        )
+    conn=ReplayConn()
+    result=repository.persist(
+        conn,company={
+            "company_id":42,"juristic_type_code":"5",
+            "registration_no":"0105559000001",
+        },
+        phase_id=1,fingerprint="f"*64,status="NO_BRANCH",branches=[],
+        total=1,
+        source_url="https://www.dataforthai.com/company-branch/0105559000001/show/printview",
+    )
+    assert result=="STALE_BRANCHES"
+    assert not any(
+        "UPDATE DBD_COMPANY SET branch_count" in sql or
+        "UPDATE dbo.DBD_COMPANY SET branch_count" in sql
+        for sql,_ in conn.queries
+    )
