@@ -166,6 +166,9 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if verified and (total!=len(branches)+1 or not source_url or
                      (status in ("OK","LEGACY_OK")) != bool(branches)):
         raise ContractError("Verified branch total/HQ mismatch")
+    seed_stale = status=="STALE_BRANCHES" and source_kind=="DATAFORTHAI_IMPORT"
+    if seed_stale and total != len(branches)+1:
+        raise ContractError("Historical stale branch count must include HQ")
     if status=="LEGACY_OK" and source_kind!="DATAFORTHAI_IMPORT":
         raise ContractError("Imported legacy result requires explicit legacy source kind")
     if not verified and branches and status not in REVIEW:
@@ -197,7 +200,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if status=="STALE_BRANCHES" and not reason:
         reason="Branch snapshot requires review"
     with conn.cursor() as cur:
-        if verified:
+        if verified or seed_stale:
             for b in branches:
                 cur.execute(
                     f"INSERT INTO {TABLE} (company_id,branch_no,branch_name,address_th,"
@@ -214,8 +217,12 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                      b.get("province_name"),b.get("district_name"),b.get("subdistrict_name"),
                      b.get("postal_code"),source_url,source_kind,now,now,now),
                 )
-            cur.execute("UPDATE DBD_COMPANY SET branch_count=%s WHERE company_id=%s",
-                        (total,company_id))
+            if verified:
+                cur.execute("UPDATE DBD_COMPANY SET branch_count=%s WHERE company_id=%s",
+                            (total,company_id))
+            elif seed_stale:
+                cur.execute("UPDATE DBD_COMPANY SET branch_count=GREATEST(branch_count,%s) WHERE company_id=%s",
+                            (total,company_id))
         if old_hq is None:
             cur.execute(
                 f"INSERT INTO {TABLE} (company_id,branch_no,branch_name,address_th,"
