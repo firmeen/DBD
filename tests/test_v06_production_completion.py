@@ -92,7 +92,8 @@ def test_branch_policy_classifies_no_branch_and_deferred():
 
 
 def _html(cards: str, expected: int):
-    return (f'<div id="divbranchsummary"><table><tr>'
+    return (f'<div id="juristic-code">เลขทะเบียน 0105559000001</div>'
+            f'<div id="divbranchsummary"><table><tr>'
             f'<td>รวม</td><td>{expected}</td></tr></table></div>'
             f'<div id="divbranch">{cards}</div>')
 
@@ -211,3 +212,18 @@ def test_sqlserver_extension_import_never_invents_branch_verification():
         _map_sql_extension_status("COMPLETE",current_branches=0,reported_total=1)
     with pytest.raises(BranchError):
         _map_sql_extension_status("NO_BRANCH",current_branches=2,reported_total=1)
+
+
+def test_printview_requires_matching_registration_identity():
+    good=_html(_headquarters(),1)
+    with pytest.raises(BranchError,match="legal identity"):
+        parse_printview(good.replace("0105559000001","0105559000002"),"0105559000001")
+    with pytest.raises(BranchError,match="legal identity"):
+        parse_printview(good.replace("0105559000001",""),"0105559000001")
+    with pytest.raises(BranchError,match="legal identity"):
+        parse_printview(good.replace("0105559000001","0105559000001 0105559000002"),"0105559000001")
+
+
+def test_printview_rejects_reserved_headquarters_branch_number():
+    with pytest.raises(BranchError,match="reserved"):
+        parse_printview(_html(_headquarters()+_branch("00000"),2),"0105559000001")
