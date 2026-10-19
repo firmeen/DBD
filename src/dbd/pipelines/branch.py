@@ -476,12 +476,20 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                             previous=company.get("collection_status")
                             active_result=company.get("checked_phase")==phase_id
                             if active_result and previous in store.TERMINAL | store.REVIEW:
+                                fingerprint_changed = (
+                                    not company.get("source_fingerprint")
+                                    or company["source_fingerprint"] != fp
+                                )
                                 if pass_no==1:
-                                    stats["skipped"]+=1
-                                    if (company.get("source_fingerprint")
-                                        and company["source_fingerprint"]!=fp):
+                                    if fingerprint_changed:
                                         stats["source_changed"]+=1
-                                continue
+                                    else:
+                                        stats["skipped"]+=1
+                                # A terminal result is reusable only for the same
+                                # source identity snapshot. Recheck changed/missing
+                                # fingerprints instead of reporting stale data caught up.
+                                if not fingerprint_changed:
+                                    continue
                             if ident in attempted:
                                 continue
                             if pass_no==1 and not active_result:
