@@ -18,15 +18,7 @@ from ..core.settings import settings
 
 SITE = "https://www.dataforthai.com"
 
-# Missing/invalid external pages are not evidence of zero branches. Retry
-# them at a bounded cadence; verified snapshots refresh every 30 days in SQL.
-_RECHECK_HOURS = {
-    "RETRY": 1,
-    "UNAVAILABLE": 24,
-    "NOT_LISTED": 168,
-    "INVALID": 168,
-}
-
+# Phase-based branch collection; timestamps are audit only, never work selectors.
 
 class BranchError(RuntimeError):
     pass
@@ -85,7 +77,7 @@ def parse_printview(html: str, jp_no: str) -> tuple[list[dict], int]:
             headquarters += 1
             continue
         numbers = re.findall(r"(?<!\d)\d{5}(?!\d)", label)
-        if len(numbers)!=1 or numbers[0] in found:
+        if len(numbers)!=1 or numbers[0] in found or numbers[0]=="00000":
             raise BranchError(f"{jp_no}: duplicate/invalid branch code")
         found.add(numbers[0])
         details = info.find_all("div", recursive=False)
@@ -175,7 +167,7 @@ class BranchHttp:
 
     def get(self, url: str, follow_depth: int = 0) -> tuple[str | None, str]:
         if follow_depth > 2:
-            return None, "UNAVAILABLE"
+            return None, "INVALID"
         if self.stop.is_set():
             raise SourceAccessDenied("External branch source is access restricted")
         for attempt in range(settings.dataforthai_http_attempts):
@@ -212,7 +204,7 @@ class BranchHttp:
                         target_path.startswith(f"/company/{src.group(1)}/")
                         or target_path.startswith(f"/company-branch/{src.group(1)}/")
                     )):
-                    return None, "UNAVAILABLE"
+                    return None, "INVALID"
                 # Never follow an arbitrary login, homepage, or foreign redirect.
                 return self.get(target, follow_depth + 1)
             if status == 404:
@@ -224,9 +216,9 @@ class BranchHttp:
                     continue
                 return None, "RETRY"
             if status != 200 or "html" not in response.headers.get("content-type","").lower():
-                return None, "UNAVAILABLE"
+                return None, "INVALID"
             if len(response.content) > 5_000_000:
-                return None, "UNAVAILABLE"
+                return None, "INVALID"
             return response.text, "OK"
         return None, "RETRY"
 
@@ -253,6 +245,8 @@ class BranchHttp:
                 return {"status":"INVALID","reason":"printview_validation_failed"}
         if state == "RETRY":
             return {"status":"RETRY","reason":"external_http_transient"}
+        if state == "INVALID":
+            return {"status":"INVALID","reason":"external_http_invalid_response"}
         if state != "NOT_FOUND" and state != "UNAVAILABLE":
             return {"status":"UNAVAILABLE","reason":state}
         company_url = f"{SITE}/company/{jp_no}/"
@@ -260,8 +254,11 @@ class BranchHttp:
         if fallback == "OK":
             return {"status":classify_company_page(other or "",jp_no),
                     "reason":"no_verified_printview"}
-        return {"status":"NOT_LISTED" if fallback=="NOT_FOUND" else "UNAVAILABLE",
-                "reason":"no_verified_printview"}
+        return {"status":(
+                    "NOT_LISTED" if fallback=="NOT_FOUND" else
+                    "RETRY" if fallback=="RETRY" else
+                    "INVALID" if fallback=="INVALID" else "UNAVAILABLE"
+                ), "reason":"no_verified_printview"}
 
 
 FINGERPRINT_FIELDS = (
