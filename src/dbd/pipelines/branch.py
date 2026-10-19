@@ -101,7 +101,7 @@ def parse_printview(html: str, jp_no: str) -> tuple[list[dict], int]:
             "branch_name":_clean(details[0].get_text(" ", strip=True)) or None,
             "address_th":address, **_address_parts(address),
         })
-    if headquarters > 1 or len(branches)+headquarters != expected:
+    if headquarters != 1 or len(branches)+headquarters != expected:
         raise BranchError(f"{jp_no}: establishment total mismatch")
     if not branches and headquarters != 1:
         # An empty printview is not proof of a zero-branch company. Require
@@ -136,8 +136,8 @@ def classify_company_page(html: str, jp_no: str) -> str:
         if (path.startswith(f"/company-branch/{jp_no}/")
             or "ข้อมูลสาขา" in label
             or "ตำแหน่งที่ตั้งของสาขา" in label):
-            return "UNAVAILABLE"  # link exists but printview not verifiable
-    return "UNAVAILABLE"  # no link is not proof of zero branches
+            return "DEFERRED_BRANCH"  # link exists but printview not verifiable
+    return "NO_BRANCH_LISTED"  # never verified zero branches
 
 
 class _RateGate:
@@ -249,75 +249,217 @@ class BranchHttp:
                 "reason":"no_verified_printview"}
 
 
-def collect(*, event=None, limit: int | None = None) -> dict:
-    """Run a single Admin-owned SQL Server Branch Enrichment pass."""
+FINGERPRINT_FIELDS = (
+    "juristic_type_code", "registration_no", "company_name_th",
+    "company_name_en", "status_code", "address_th", "province_code",
+    "district_code", "subdistrict_code", "postal_code",
+)
+
+
+def fingerprint(company: dict) -> str:
+    """Stable business-field audit hash; never include runtime timestamps."""
+    import hashlib
+    import json
+
+    raw = json.dumps(
+        [company.get(k) for k in FINGERPRINT_FIELDS],
+        ensure_ascii=False, separators=(",", ":"), default=str,
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _key(company: dict) -> tuple[str, str]:
+    return str(company["juristic_type_code"]), str(company["registration_no"])
+
+
+def _policy(output: dict) -> tuple[str,list[dict],int | None,str | None,str | None]:
+    state = str(output["status"])
+    branches = output.get("branches") or []
+    total = output.get("total")
+    url = output.get("url")
+    reason = output.get("reason")
+    if state == "COMPLETE":
+        return ("OK" if branches else "NO_BRANCH",branches,total,url,reason)
+    if state == "RETRY":
+        return ("DEFERRED_NETWORK",[],None,url,reason)
+    if state == "INVALID":
+        return ("DEFERRED_PARSE",[],None,url,reason)
+    if state == "DEFERRED_BRANCH":
+        return ("DEFERRED_BRANCH",[],None,url,reason)
+    if state in ("UNAVAILABLE","NOT_LISTED","NO_BRANCH_LISTED"):
+        return (state,[],None,url,reason)
+    raise BranchError(f"Unknown DataForThai result {state!r}")
+
+
+def collect(*, event=None, limit: int | None = None, backend: str | None = None,
+            preflight: bool = False, new_phase: bool = False,
+            repository=None) -> dict:
+    """One command for initial, resume, new/unchecked identities and deferred retry.
+
+    Every invocation scans from the smallest natural identity; the keyset cursor
+    belongs only to the current pass, never to durable completion. All HTTP
+    workers are read-only and one caller thread owns database writes.
+    """
+    from ..storage.production import production_repository
     from ..presentation.setup import local_node_id
-    from ..storage.sqlserver.control_repository import ControlRepository
-    node = local_node_id()
-    if node is None:
-        raise BranchError("Admin setup required")
-    ControlRepository().require_admin(node)
-    repo = ProductionSqlServerRepository()
-    client = BranchHttp()
-    stats = {"checked":0,"verified":0,"branches":0,"deferred":0,
-             "skipped":0,"http_requests":0}
-    codes = tuple(x.strip().upper() for x in settings.dataforthai_status_codes.split(",")
-                  if x.strip())
-    with repo.manager_lock(resource="TIPDI:DBD:v0.6:branch") as lock:
+
+    repo = repository or production_repository(backend)
+    selected = getattr(repo, "backend", None)
+    if selected == "sqlserver":
+        from ..storage.sqlserver import branch_repository as store
+        from ..storage.sqlserver.control_repository import ControlRepository
+        node = local_node_id()
+        if node is None:
+            raise BranchError("Admin setup required for SQL Server Branch collection")
+        ControlRepository().require_admin(node)
+    elif selected == "mysql":
+        from ..storage.mysql import branch_repository as store
+    else:
+        raise BranchError(f"Unsupported Production Branch backend {selected!r}")
+    if limit is not None and limit <= 0:
+        raise ValueError("Branch limit must be positive")
+    codes = tuple(sorted({s.strip().upper() for s in
+                          settings.dataforthai_status_codes.split(",") if s.strip()}))
+    if not codes or any(not re.fullmatch(r"[A-Z0-9]{1,4}",s) for s in codes):
+        raise BranchError("Invalid DataForThai company status scope")
+    import contextlib
+
+    # Use the existing SQL branch manager lock or the MySQL production manager.
+    manager = (repo.manager_lock(resource="TIPDI:DBD:v0.6:branch")
+               if selected=="sqlserver" else repo.manager_lock())
+    with manager as lock:
+        repo.assert_manager_lock(
+            lock,resource="TIPDI:DBD:v0.6:branch"
+        ) if selected=="sqlserver" else repo.assert_manager_lock(lock)
         with repo.transaction() as conn:
             store.validate_schema(conn)
-        last = 0
-        with ThreadPoolExecutor(max_workers=settings.dataforthai_concurrency) as pool:
-            while limit is None or stats["checked"] < limit:
-                repo.assert_manager_lock(lock,resource="TIPDI:DBD:v0.6:branch")
-                size = min(60,max(1,limit-stats["checked"])) if limit else 60
-                with repo.transaction() as conn:
-                    due = store.candidates(conn, after=last, limit=size,
-                                           status_codes=codes)
-                if not due:
-                    break
-                futures = {pool.submit(client.collect,row["registration_no"]):row
-                           for row in due}
-                try:
-                    for future in as_completed(futures):
-                        row = futures[future]
-                        last = max(last, row["company_id"])
-                        output = future.result()
+            current=store.phase(conn,codes=codes,new_phase=new_phase,read_only=preflight)
+        phase_id=int(current["phase"])
+        stats={"phase":phase_id,"scope":",".join(codes),"pass":0,
+               "examined":0,"scanned_total":0,"terminal":0,
+               "deferred":0,"review":0,"unchecked":0,"source_changed":0,
+               "skipped":0,"checked":0,"verified":0,"branches":0,
+               "http_requests":0,"stage":"READY","limit_reached":False}
+        if preflight:
+            with repo.transaction() as conn:
+                stats.update(store.summary(conn,phase_id))
+            return {"read_only":True,**stats}
+
+        client=BranchHttp()
+        attempted:set[tuple[str,str]]=set()
+        quiet=0
+        try:
+            with ThreadPoolExecutor(max_workers=settings.dataforthai_concurrency,
+                                    thread_name_prefix="branch-http") as pool:
+                # Two quiet passes are sufficient to catch observed source changes;
+                # a hard cap prevents an unbounded run if writers keep adding rows.
+                for pass_no in range(1,5):
+                    stats["pass"]=pass_no
+                    position=None
+                    activity=0
+                    stats["stage"]="RECONCILE"
+                    while True:
+                        repo.assert_manager_lock(
+                            lock,resource="TIPDI:DBD:v0.6:branch"
+                        ) if selected=="sqlserver" else repo.assert_manager_lock(lock)
                         with repo.transaction() as conn:
-                            if output["status"] == "COMPLETE":
-                                saved = store.save_snapshot(
-                                    conn,company_id=row["company_id"],
-                                    branches=output["branches"],
-                                    establishment_count=output["total"],
-                                    verified_at=datetime.now(timezone.utc),
-                                    url=output["url"])
-                                if saved:
-                                    stats["verified"] += 1
-                                    stats["branches"] += len(output["branches"])
-                                else:
-                                    stats["skipped"] += 1
-                            else:
-                                status = str(output["status"])
-                                if status not in _RECHECK_HOURS:
-                                    raise BranchError(f"Unknown external branch status: {status}")
-                                until = datetime.now(timezone.utc) + timedelta(
-                                    hours=_RECHECK_HOURS[status]
-                                )
-                                store.defer(conn,company_id=row["company_id"],
-                                            reason=output.get("reason",status),
-                                            retry_at=until, status=status)
-                                stats["deferred"] += 1
-                        stats["checked"] += 1
-                        stats["http_requests"] = client.requests
-                        if event:
-                            try: event("branch_progress",dict(stats))
-                            except Exception: pass
-                except BaseException:
-                    client.stop.set()
-                    for future in futures:
-                        future.cancel()
-                    raise
-    return stats
+                            page=store.candidates(conn,after=position,limit=100,
+                                                  status_codes=codes)
+                        if not page:
+                            break
+                        position=_key(page[-1])
+                        stats["examined"]+=len(page)
+                        stats["scanned_total"]+=len(page)
+                        candidates=[]
+                        for company in page:
+                            ident=_key(company)
+                            fp=fingerprint(company)
+                            company["_fingerprint"]=fp
+                            previous=company.get("collection_status")
+                            active_result=company.get("checked_phase")==phase_id
+                            if active_result and previous in store.TERMINAL | store.REVIEW:
+                                if pass_no==1:
+                                    stats["skipped"]+=1
+                                    if (company.get("source_fingerprint")
+                                        and company["source_fingerprint"]!=fp):
+                                        stats["source_changed"]+=1
+                                continue
+                            if ident in attempted:
+                                continue
+                            if pass_no==1 and not active_result:
+                                stats["unchecked"]+=1
+                            candidates.append(company)
+                        if not candidates:
+                            continue
+                        if limit is not None:
+                            remaining=limit-len(attempted)
+                            if remaining<=0:
+                                stats["limit_reached"]=True
+                                break
+                            candidates=candidates[:remaining]
+                        # Completion-driven bounded futures; no worker writes DB.
+                        width=max(1,int(settings.dataforthai_concurrency)*2)
+                        for offset in range(0,len(candidates),width):
+                            group=candidates[offset:offset+width]
+                            pending={}
+                            for company in group:
+                                ident=_key(company)
+                                if ident in attempted:
+                                    continue
+                                attempted.add(ident)
+                                pending[pool.submit(client.collect,ident[1])]=company
+                            from concurrent.futures import as_completed
+                            try:
+                                for future in as_completed(pending):
+                                    company=pending[future]
+                                    output=future.result()
+                                    status,branches,total,url,reason=_policy(output)
+                                    with repo.transaction() as conn:
+                                        durable=store.persist(
+                                            conn,company=company,phase_id=phase_id,
+                                            fingerprint=company["_fingerprint"],
+                                            status=status,branches=branches,
+                                            total=total,source_url=url,reason=reason,
+                                        )
+                                    if durable!="SKIPPED":
+                                        stats["checked"]+=1
+                                        activity+=1
+                                        if durable in ("OK","NO_BRANCH"):
+                                            stats["verified"]+=1
+                                            stats["branches"]+=len(branches)
+                                    else:
+                                        stats["skipped"]+=1
+                                    stats["http_requests"]=client.requests
+                                    if event:
+                                        event("branch_progress",dict(stats))
+                            except BaseException:
+                                client.stop.set()
+                                for future in pending:
+                                    future.cancel()
+                                raise
+                        if limit is not None and len(attempted)>=limit:
+                            stats["limit_reached"]=True
+                            break
+                    if stats["limit_reached"]:
+                        break
+                    quiet=quiet+1 if activity==0 else 0
+                    if quiet>=2:
+                        break
+            with repo.transaction() as conn:
+                snapshot=store.summary(conn,phase_id)
+            stats.update(snapshot)
+            stats["http_requests"]=client.requests
+            stats["stage"]=("LIMIT REACHED" if stats["limit_reached"] else
+                            "NEEDS_REVIEW" if stats["review"] else
+                            "PARTIAL - DEFERRED" if stats["deferred"] else "CAUGHT_UP")
+            if event:
+                event("branch_progress",dict(stats))
+            return stats
+        finally:
+            client.stop.set()
+            # HTTP sessions are per-thread. ThreadPoolExecutor has drained.
+            # Keep close() idempotent for clients that already stopped.
+            client.close()
 
 
 def import_mysql(*, check: bool = False, limit: int | None = None,
