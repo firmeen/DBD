@@ -32,6 +32,21 @@ def _clean(value) -> str:
     return " ".join(str(value or "").split())
 
 
+def _trusted_dataforthai_url(raw_url: str) -> bool:
+    """Reject canonical/redirect evidence that points off the verified source origin."""
+    try:
+        parsed=urlparse(urljoin(SITE,str(raw_url)))
+        return (
+            parsed.scheme=="https"
+            and parsed.hostname=="www.dataforthai.com"
+            and parsed.port in (None,443)
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except (TypeError,ValueError):
+        return False
+
+
 def _address_parts(address: str) -> dict:
     province = "กรุงเทพมหานคร" if "กรุงเทพมหานคร" in address else None
     if province is None:
@@ -67,8 +82,8 @@ def parse_printview(html: str, jp_no: str) -> tuple[list[dict], int]:
     for raw_url in identity_links:
         if not raw_url:
             continue
-        parsed=urlparse(urljoin(SITE,str(raw_url)))
-        if parsed.scheme=="https" and parsed.hostname=="www.dataforthai.com":
+        if _trusted_dataforthai_url(raw_url):
+            parsed=urlparse(urljoin(SITE,str(raw_url)))
             match=re.search(
                 r"/(?:company|company-branch)/([0-9]{13})(?:/|$)",parsed.path
             )
@@ -141,7 +156,8 @@ def classify_company_page(html: str, jp_no: str) -> str:
         el.get("content") for el in soup.select('meta[property="og:url"]')
     ]
     if not any(
-        urlparse(urljoin(SITE, x)).path.rstrip("/") == f"/company/{jp_no}"
+        _trusted_dataforthai_url(x)
+        and urlparse(urljoin(SITE,x)).path.rstrip("/") == f"/company/{jp_no}"
         for x in identity if x
     ):
         return "UNAVAILABLE"
