@@ -40,17 +40,60 @@ SQL Server Production Dataset
 
 ## Production Storage
 
-Production ใช้ SQL Server เป็นฐานข้อมูลหลัก
+Production v0.6 ใช้ **6 ตารางธุรกิจ** ที่มี Contract ร่วมกันสำหรับ SQL Server และ Production MySQL แยกจากฐาน Legacy Dataset 1:
 
-ฐานข้อมูลที่ตั้งค่าโดยทั่วไปคือ TIPDataIntelligence และระบบ v0.6 ดูแล 5 ตาราง:
-
-| Table | หน้าที่ |
+| ตาราง | หน้าที่ |
 | --- | --- |
-| dbo.DBD_COMPANY | ข้อมูลหลักบริษัท สถานะการเก็บข้อมูล lease และ Generation |
-| dbo.DBD_COMPANY_RELATION | กรรมการ ผู้มีอำนาจลงนาม และความสัมพันธ์แบบรายการ |
-| dbo.DBD_COMPANY_EVENT | เหตุการณ์เปลี่ยนแปลง โอน แปรสภาพ หรือควบรวม |
-| dbo.DBD_FINANCIAL | ข้อมูลการนำส่งและงบการเงินแยกตามปี |
-| dbo.DBD_INDUSTRY | ข้อมูล benchmark และข้อมูลอุตสาหกรรม |
+| `DBD_COMPANY` | ตัวตนบริษัท Core-7 และ `branch_count` (จำนวนสถานประกอบการ **รวมสำนักงานใหญ่**) |
+| `DBD_COMPANY_RELATION` | กรรมการ ผู้เกี่ยวข้อง และอำนาจลงนาม |
+| `DBD_COMPANY_EVENT` | เหตุการณ์เปลี่ยนแปลง |
+| `DBD_FINANCIAL` | ข้อมูลการเงินตามปีบัญชี |
+| `DBD_INDUSTRY` | Industry Benchmark |
+| `DBD_BRANCH` | สำนักงานใหญ่ (เลขภายใน `00000`), สาขา และผลตรวจรายบริษัท |
+
+`branch_count=1` **ไม่ได้** แปลว่าไม่มีสาขาที่ตรวจยืนยันแล้ว ต้องดู `DBD_BRANCH.collection_status` ของสำนักงานใหญ่ด้วย
+
+นอกจากนี้ SQL Server มี `DBD_CONTROL` และ `DBD_DISCOVERY_WORK` สำหรับสิทธิ์/รอบงานและ Durable Page Resume ตามเดิม ส่วน Production MySQL มีตารางงาน Discovery เท่าที่จำเป็นเพื่อให้ Resume แบบ Transactional ได้ ไม่เพิ่ม Redis หรือ Service ใหม่
+
+> **ข้อควรระวัง:** PR #102 เป็น Draft Implementation ยังไม่ได้รับรองว่า Production Migration, MySQL/SQL Server Integration และ Windows Ctrl+C ผ่านการทดสอบจริง ห้ามรัน `migrate`, `cutover` หรือ Collector ในฐาน Production จาก Draft Branch โดยไม่มีการตรวจสอบและอนุมัติ
+
+## Branch Collection และ Resume
+
+DataForThai เป็นแหล่งข้อมูลเพิ่มเติม ไม่ใช่ Endpoint ที่ 8 ของ DBD Core-7 และมี **Branch Phase แยกจาก Monthly Core Generation** รันคำสั่งเดิมเพื่อ Resume หรือรับบริษัทที่เพิ่งค้นพบ:
+
+~~~powershell
+dbd-data branch -c -d sqlserver
+dbd-data branch -d sqlserver
+# หากหยุดแล้วกลับมา ให้ใช้คำสั่งเดิม ไม่ต้องสร้าง Phase ใหม่
+dbd-data branch -d sqlserver
+~~~
+
+เมื่อต้องการ Refresh ทุกบริษัทใน Scope อีกครั้งอย่างชัดแจ้งเท่านั้น:
+
+~~~powershell
+dbd-data branch -d sqlserver --new-phase
+~~~
+
+ตรวจการนำเข้าข้อมูลเก่าก่อนทำจริง (อ่าน Legacy MySQL และไฟล์ Journal/Checkpoint แบบ Read-only):
+
+~~~powershell
+dbd-data branch import -c -d sqlserver
+~~~
+
+หากมี `.dbd_branch_results.jsonl`, `.dbd_branch_checkpoint.json` หรือข้อมูลสาขาเก่าที่ยังไม่ได้ Reconcile ต้อง Import ให้ครบและแก้ Conflict ก่อนเริ่ม HTTP จริง ระบบต้องไม่ถือว่าไม่มีสาขาเพียงเพราะไม่มี Branch Rows
+
+`NO_BRANCH` = ตรวจ HQ-only สำเร็จ, `NO_BRANCH_LISTED` = ไม่พบลิงก์รายการสาขา, `UNAVAILABLE` = ข้อมูลไม่พร้อม (Legacy Terminal), `DEFERRED_*` = ยังตรวจไม่สำเร็จและรอ Run ถัดไป, `STALE_BRANCHES` = สาขาที่เคยมีหายจากภาพใหม่และต้อง Review โดยไม่ลบข้อมูลเก่า
+
+Production MySQL ใช้ `-d mysql` กับคำสั่งเดียวกัน แต่ Phase Marker บนไฟล์ต้องสำรองและเก็บคู่กับฐาน Production MySQL; อย่าย้ายฐานข้อมูลโดยไม่ย้ายไฟล์ Phase Marker ที่เกี่ยวข้อง
+
+### Full Production Cycle
+
+~~~powershell
+dbd-data cycle run -d sqlserver
+~~~
+
+Cycle เรียก Discovery → Core-7 → Verification/Finalization → Branch Reconciliation จาก Terminal เดียว โดยรายงานสถานะ Core และ Branch แยกจากกัน หาก DataForThai ไม่พร้อม Core ที่ Complete แล้วจะไม่ถูกเปิดใหม่เพราะเหตุนี้
+
 
 ## เริ่มใช้งาน
 
