@@ -344,6 +344,27 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
         ) if selected=="sqlserver" else repo.assert_manager_lock(lock)
         with repo.transaction() as conn:
             store.validate_schema(conn)
+            if selected == "sqlserver":
+                # Files used by the old standalone collector prove there may be
+                # terminal results outside the new Production HQ table. Refuse
+                # initial HTTP instead of silently repeating requests.
+                from pathlib import Path
+                import os
+                journal = Path(os.environ.get(
+                    "DBD_BRANCH_JOURNAL_PATH",".dbd_branch_results.jsonl"
+                ))
+                checkpoint = Path(".dbd_branch_checkpoint.json")
+                marker = ControlRepository._read(
+                    conn,"AUDIT",store.PHASE_RECORD_KEY
+                )
+                if marker is None and (
+                    checkpoint.exists() or (journal.exists() and journal.stat().st_size)
+                ):
+                    raise BranchError(
+                        "Historical Branch Journal/checkpoint detected without "
+                        "Production Phase state; run 'dbd-data branch import -c' "
+                        "and complete the legacy import before live collection"
+                    )
             current=store.phase(conn,codes=codes,new_phase=new_phase,read_only=preflight)
         phase_id=int(current["phase"])
         stats={"phase":phase_id,"scope":",".join(codes),"pass":0,
