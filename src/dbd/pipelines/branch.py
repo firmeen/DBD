@@ -975,7 +975,14 @@ def _map_sql_extension_status(old_status: str | None, *,
     if previous == "NO_BRANCH" and current_branches:
         raise BranchError("Old SQL NO_BRANCH contradicts active branch rows")
     if previous == "COMPLETE":
-        return "OK" if reported_total == current_branches+1 else "LEGACY_OK"
+        if reported_total is None:
+            # Unknown historical count may be preserved, but not newly certified.
+            return "LEGACY_OK"
+        if reported_total != current_branches+1:
+            raise BranchError(
+                "Old SQL COMPLETE count contradicts preserved branch details"
+            )
+        return "OK"
     if previous == "NO_BRANCH":
         return "NO_BRANCH" if reported_total == 1 else "UNAVAILABLE"
     return {
