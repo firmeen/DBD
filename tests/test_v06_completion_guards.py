@@ -135,3 +135,26 @@ def test_mysql_phase_with_existing_company_results_but_no_journal_blocks(tmp_pat
     monkeypatch.setenv("DBD_BRANCH_JOURNAL_PATH",str(tmp_path/"missing.jsonl"))
     with pytest.raises(ContractError,match="missing"):
         my_branch.phase(Conn([(1,)]),codes=("1","A","B"),read_only=True)
+
+
+def test_search_partition_rejects_rows_outside_requested_categorical_scope():
+    from dbd.client.endpoints.search import SearchFilters
+    from dbd.pipelines.discovery import validate_search_scope
+
+    item={
+        "jpNo":"0105559000001", "jpTypeCode":"5", "pvCode":"10",
+        "jpStatCode":"1", "businessSizeCode":"S",
+    }
+    filters=SearchFilters(keyword="010",jp_types=["5"],pv_codes=["10"],
+                          jp_statuses=["1"],business_sizes=["S"])
+    validate_search_scope([item],filters)
+    with pytest.raises(ContractError,match="jpTypeCode"):
+        validate_search_scope([{**item,"jpTypeCode":"3"}],filters)
+    with pytest.raises(ContractError,match="pvCode"):
+        validate_search_scope([{**item,"pvCode":"20"}],filters)
+    with pytest.raises(ContractError,match="jpStatCode"):
+        validate_search_scope([{**item,"jpStatCode":"A"}],filters)
+    with pytest.raises(ContractError,match="businessSizeCode"):
+        validate_search_scope([{**item,"businessSizeCode":None}],filters)
+    with pytest.raises(ContractError,match="non-object"):
+        validate_search_scope([None],filters)
