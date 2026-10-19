@@ -1070,11 +1070,24 @@ async def cycle_run(
     selected=backend or settings.dbd_production_backend
     from .pipelines.branch import collect as branch_collect
     _emit(event,"phase_started",phase="BRANCH",generation=core.generation)
+    import threading
+    branch_stop=threading.Event()
+    # asyncio.shield preserves the thread while the outer task is being
+    # cancelled; its stop event is delivered to every HTTP admission path.
+    branch_task=asyncio.create_task(asyncio.to_thread(
+        branch_collect,backend=selected,event=event,stop=branch_stop,
+    ))
     try:
-        branch_state=await asyncio.to_thread(
-            branch_collect,backend=selected,event=event,
-        )
+        branch_state=await asyncio.shield(branch_task)
+    except asyncio.CancelledError:
+        branch_stop.set()
+        try:
+            await asyncio.shield(branch_task)
+        except Exception:
+            pass
+        raise
     except (KeyboardInterrupt,SystemExit):
+        branch_stop.set()
         raise
     except Exception as exc:
         # A source-specific failure must not rewrite a finalized Core state.
