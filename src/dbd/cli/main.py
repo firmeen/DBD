@@ -969,6 +969,13 @@ def main():
                         result["discovery"] = discovery_work.coverage(
                             conn,int(gen),"full"
                         )
+            from ..pipelines.branch import status as branch_status
+            try:
+                result["branch"] = branch_status(backend=selected)
+            except Exception as exc:
+                # A missing external Branch schema/phase must not hide healthy
+                # Core-7 state; expose the blocker instead of claiming success.
+                result["branch"] = {"state":"BLOCKED","reason":safe_error(exc)}
             presenter.command_result("DBD · PRODUCTION STATUS", result)
         elif args.command == "collect":
             from ..workflow import collect as production_collect
