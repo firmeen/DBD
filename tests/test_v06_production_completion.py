@@ -4,7 +4,6 @@ No live database or external HTTP requests are performed.
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import sqlite3
 from pathlib import Path
@@ -19,7 +18,6 @@ from dbd.pipelines.branch import (
     fingerprint,
     parse_printview,
 )
-from dbd.storage.sqlserver import branch_repository as sql_branch
 from dbd.storage.sqlserver.schema import (
     BRANCH_COLUMNS,
     COMPANY_COLUMNS,
