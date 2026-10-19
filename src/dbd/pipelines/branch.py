@@ -475,133 +475,325 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
             client.close()
 
 
-def import_mysql(*, check: bool = False, limit: int | None = None,
-                 event=None) -> dict:
-    """Copy already fetched Dataset 1 branch rows without calling DataForThai.
 
-    Missing rows do NOT mean no branch. Inconsistent/partial generations are
-    skipped instead of marking them complete. Source remains read-only.
+def _stage_legacy_journal(path, stage) -> dict:
+    """Replay historical JSONL into a bounded on-disk temporary SQLite index.
+
+    Earlier phases are retained in the original immutable journal. Only the
+    latest per-identity record in the active Phase is copied into temporary
+    staging; no legacy or production database rows are modified by staging.
     """
-    from ..presentation.setup import local_node_id
-    from ..storage.sqlserver.control_repository import ControlRepository
+    import json
+    import re
 
-    node = local_node_id()
-    if node is None:
-        raise BranchError("Admin setup required")
-    ControlRepository().require_admin(node)
-    repo = ProductionSqlServerRepository()
-    state = repo.generation_state()
-    if int(state.get("finalized_generation") or 0) < 1:
-        raise BranchError("Generation 1 cutover must be finalized before branch import")
-    stats = {"selected":0,"eligible":0,"imported":0,"skipped":0,
-             "conflicted":0,"branches":0,"check":bool(check)}
-    from ..storage.mysql.engine import connect as legacy_connection
-    with legacy_connection() as legacy:
-        with legacy.cursor() as cur:
-            cur.execute(
-                "SELECT TABLE_NAME FROM information_schema.TABLES "
-                "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='dbd_company_branch'"
+    stage.execute(
+        "CREATE TABLE results (t TEXT NOT NULL,j TEXT NOT NULL,fp TEXT NOT NULL,"
+        "status TEXT NOT NULL,n INTEGER NOT NULL,method TEXT NOT NULL,"
+        "PRIMARY KEY(t,j))"
+    )
+    current_phase=1
+    last_event=0
+    scope=None
+    lines=0
+    legacy=0
+    if not path.exists():
+        return {"phase":1,"scope":None,"records":0,"lines":0,"phase_event":False}
+    with path.open("rb") as source:
+        while True:
+            raw=source.readline()
+            if not raw:
+                break
+            lines+=1
+            if not raw.endswith(b"\n"):
+                raise BranchError(f"Journal partial tail at line {lines}; recover a backup")
+            try:
+                obj=json.loads(raw)
+            except (ValueError,UnicodeDecodeError) as exc:
+                raise BranchError(f"Malformed complete Journal line {lines}") from exc
+            if not isinstance(obj,dict):
+                raise BranchError(f"Invalid Journal object at line {lines}")
+            if "event" in obj:
+                if obj.get("event")=="production_import_complete":
+                    # A prior completed import is idempotently replayable.
+                    if obj.get("p")!=current_phase:
+                        raise BranchError("Journal import-complete phase mismatch")
+                    continue
+                if obj.get("event")!="phase_start" or obj.get("v")!=2:
+                    raise BranchError("Unknown Journal phase event")
+                phase=obj.get("p")
+                if type(phase) is not int or phase<1 or phase!=last_event+1:
+                    raise BranchError("Non-monotonic Journal phase history")
+                codes=obj.get("scope")
+                if (not isinstance(codes,list) or not codes or
+                    any(not isinstance(x,str) for x in codes) or
+                    codes!=sorted(set(codes))):
+                    raise BranchError("Invalid Journal scope")
+                last_event=phase
+                current_phase=phase
+                scope=codes
+                if phase>1:
+                    stage.execute("DELETE FROM results")  # temporary staging only
+                continue
+            required={"t","j","f","s","n","m"}
+            if not required <= set(obj) or set(obj)-required-{"p"}:
+                raise BranchError("Unknown Journal result fields")
+            ident=(obj["t"],obj["j"])
+            fp=obj["f"]
+            status=obj["s"]
+            n=obj["n"]
+            method=obj["m"]
+            if (not all(isinstance(x,str) and x for x in ident)
+                or not isinstance(fp,str) or not re.fullmatch(r"[0-9a-f]{64}",fp)
+                or type(n) is not int or n<0
+                or method not in ("http","legacy")):
+                raise BranchError("Invalid Journal result")
+            if (status not in ("OK","NO_BRANCH","LEGACY_OK","NO_BRANCH_LISTED",
+                              "UNAVAILABLE","NOT_LISTED","STALE_BRANCHES")
+                and not re.fullmatch(r"DEFERRED_[A-Z0-9_]+",str(status))):
+                raise BranchError(f"Invalid Journal status {status}")
+            if (status in ("OK","LEGACY_OK") and n<1) or (
+                status in ("NO_BRANCH","NO_BRANCH_LISTED","UNAVAILABLE","NOT_LISTED")
+                and n!=0):
+                raise BranchError("Journal result/branch-count mismatch")
+            phase=obj.get("p",1)
+            if type(phase) is not int or phase!=current_phase:
+                raise BranchError("Journal result outside active phase boundary")
+            if method=="legacy" and status!="LEGACY_OK":
+                raise BranchError("Invalid Journal legacy method")
+            stage.execute(
+                "INSERT INTO results(t,j,fp,status,n,method) VALUES (?,?,?,?,?,?) "
+                "ON CONFLICT(t,j) DO UPDATE SET fp=excluded.fp,status=excluded.status,"
+                "n=excluded.n,method=excluded.method",
+                (*ident,fp,status,n,method),
             )
-            if cur.fetchone() is None:
-                raise BranchError("Missing Dataset 1 dbd_company_branch source table")
-        last_type, last_no = "", ""
-        with repo.manager_lock(resource="TIPDI:DBD:v0.6:branch") as lock:
-            with repo.transaction() as conn:
-                store.validate_schema(conn)
-            while limit is None or stats["selected"] < limit:
-                repo.assert_manager_lock(lock,resource="TIPDI:DBD:v0.6:branch")
-                size = min(100,limit-stats["selected"]) if limit else 100
+            legacy+=1
+            if lines % 10000==0:
+                stage.commit()
+    stage.commit()
+    count=int(stage.execute("SELECT COUNT(*) FROM results").fetchone()[0])
+    return {"phase":current_phase,"scope":scope,"records":count,
+            "lines":lines,"phase_event":bool(last_event),"historical_results":legacy}
+
+
+def _legacy_source_rows(legacy, jp_type: str, jp_no: str) -> list[dict]:
+    with legacy.cursor() as cur:
+        cur.execute(
+            "SELECT branch_no,branch_name,branch_address,province_name,"
+            "district_name,subdistrict_name,postal_code,branch_count,"
+            "source_url,fetched_at FROM dbd_company_branch "
+            "WHERE jp_type_code=%s AND jp_no=%s ORDER BY branch_no",
+            (jp_type,jp_no),
+        )
+        return list(cur.fetchall())
+
+
+def _validate_legacy_details(rows: list[dict], jp_no: str, *,
+                             expected: int | None = None) -> tuple[list[dict],str]:
+    numbers=[str(r["branch_no"]) for r in rows]
+    if not rows or len(numbers)!=len(set(numbers)) or any(
+        not re.fullmatch(r"[0-9]{5}",x) or x=="00000" for x in numbers
+    ):
+        raise BranchError("Missing/duplicate/invalid historical branch number")
+    if any(not str(r["branch_address"] or "").strip() for r in rows):
+        raise BranchError("Historical branch address is empty")
+    urls={str(r.get("source_url") or "") for r in rows}
+    if len(urls)!=1:
+        raise BranchError("Mixed historical branch URLs")
+    url=next(iter(urls))
+    u=urlparse(url)
+    if (u.scheme!="https" or u.hostname!="www.dataforthai.com" or
+        u.path.rstrip("/")!=f"/company-branch/{jp_no}/show/printview"):
+        raise BranchError("Unexpected historical branch source URL")
+    if expected is not None:
+        counts={int(r["branch_count"]) for r in rows if r["branch_count"] is not None}
+        stamps={r["fetched_at"] for r in rows}
+        if (len(rows)!=expected or len(counts)!=1 or expected not in counts
+            or any(r["branch_count"] is None for r in rows) or len(stamps)!=1):
+            raise BranchError("Incomplete or mixed historical positive snapshot")
+    return ([{"branch_no":r["branch_no"],"branch_name":r["branch_name"],
+              "address_th":r["branch_address"],
+              "province_name":r["province_name"],"district_name":r["district_name"],
+              "subdistrict_name":r["subdistrict_name"],"postal_code":r["postal_code"]}
+             for r in rows],url)
+
+
+def import_mysql(*, check: bool = False, limit: int | None = None,
+                 backend: str | None = None, event=None) -> dict:
+    """Reconcile ALL current-phase Journal results, including zero-branch cases.
+
+    Reads Legacy MySQL/Journals; never writes them. A temporary local SQLite
+    index prevents unbounded RAM use for millions of JSONL result records.
+    The Production target alone receives transactional per-identity writes.
+    """
+    import os
+    import json
+    import sqlite3
+    import tempfile
+    from pathlib import Path
+    from ..storage.production import production_repository
+    from ..storage.mysql.engine import connect as legacy_connection
+
+    repo=production_repository(backend)
+    selected=getattr(repo,"backend",None)
+    if selected=="sqlserver":
+        from ..storage.sqlserver import branch_repository as store
+        from ..storage.sqlserver.control_repository import ControlRepository
+        from ..presentation.setup import local_node_id
+        node=local_node_id()
+        if node is None:
+            raise BranchError("Admin setup required for SQL Server Legacy Import")
+        ControlRepository().require_admin(node)
+    elif selected=="mysql":
+        from ..storage.mysql import branch_repository as store
+    else:
+        raise BranchError("Unknown Production import backend")
+    if limit is not None and limit<=0:
+        raise BranchError("Import limit must be positive")
+    codes=tuple(sorted(set(x.strip().upper() for x in
+                 settings.dataforthai_status_codes.split(",") if x.strip())))
+    path=Path(os.environ.get("DBD_BRANCH_JOURNAL_PATH",".dbd_branch_results.jsonl")).resolve()
+    old_checkpoint=Path(".dbd_branch_checkpoint.json")
+    if old_checkpoint.exists():
+        try:
+            obj=json.loads(old_checkpoint.read_text(encoding="utf-8"))
+            if not isinstance(obj,dict) or not isinstance(obj.get("deferred",[]),list):
+                raise ValueError("Invalid historical deferred list")
+        except (OSError,ValueError) as exc:
+            raise BranchError("Cannot safely read historical checkpoint") from exc
+
+    with tempfile.TemporaryDirectory(prefix="dbd-branch-journal-") as temp:
+        staging=sqlite3.connect(str(Path(temp)/"results.sqlite"))
+        try:
+            state=_stage_legacy_journal(path,staging)
+            if state["scope"] is not None and tuple(state["scope"])!=codes:
+                raise BranchError("Import scope must equal active legacy Journal scope")
+            phase_id=int(state["phase"])
+            stats={"check":bool(check),"phase":phase_id,
+                   "historical_records":state["records"],"selected":0,
+                   "imported":0,"skipped":0,"conflicted":0,"branches":0,
+                   "missing_target":0,"no_branch_results":0,"journal":str(path)}
+            with legacy_connection() as legacy:
                 with legacy.cursor() as cur:
                     cur.execute(
-                        "SELECT jp_type_code,jp_no FROM dbd_company_branch "
-                        "WHERE (jp_type_code>%s OR "
-                        "(jp_type_code=%s AND jp_no>%s)) "
-                        "GROUP BY jp_type_code,jp_no "
-                        "ORDER BY jp_type_code,jp_no LIMIT %s",
-                        (last_type,last_type,last_no,size),
+                        "SELECT TABLE_NAME FROM information_schema.TABLES "
+                        "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME='dbd_company_branch'"
                     )
-                    keys = list(cur.fetchall())
-                if not keys:
-                    break
-                for key in keys:
-                    jp_type = key["jp_type_code"]
-                    jp_no = key["jp_no"]
-                    last_type,last_no = jp_type,jp_no
-                    stats["selected"] += 1
-                    with legacy.cursor() as cur:
-                        cur.execute(
-                            "SELECT branch_no,branch_name,branch_address,"
-                            "province_name,district_name,subdistrict_name,"
-                            "postal_code,branch_count,source_url,fetched_at "
-                            "FROM dbd_company_branch "
-                            "WHERE jp_type_code=%s AND jp_no=%s ORDER BY branch_no",
-                            (jp_type,jp_no),
-                        )
-                        source = list(cur.fetchall())
-                    if not source:
-                        stats["skipped"] += 1
-                        continue
-                    # Only an internally coherent source snapshot can be copied.
-                    # Earlier refreshes may leave stale rows in Dataset 1.
-                    date_set = {row["fetched_at"] for row in source}
-                    counts = {int(row["branch_count"]) for row in source
-                              if row["branch_count"] is not None}
-                    urls = {str(row["source_url"] or "") for row in source}
-                    source_url = next(iter(urls)) if len(urls) == 1 else ""
-                    source_path = urlparse(source_url)
-                    if (len(date_set)!=1 or len(counts)!=1
-                        or any(row["branch_count"] is None for row in source)
-                        or next(iter(counts), None) != len(source)
-                        or len({str(row["branch_no"]) for row in source}) != len(source)
-                        or source_path.scheme != "https"
-                        or source_path.hostname != "www.dataforthai.com"
-                        or source_path.path.rstrip("/") !=
-                            f"/company-branch/{jp_no}/show/printview"):
-                        stats["conflicted"] += 1
-                        continue
-                    stamp = next(iter(date_set))
-                    if not isinstance(stamp, datetime):
-                        stats["conflicted"] += 1
-                        continue
-                    branches = [
-                        {"branch_no":row["branch_no"],"branch_name":row["branch_name"],
-                         "address_th":row["branch_address"],
-                         "province_name":row["province_name"],
-                         "district_name":row["district_name"],
-                         "subdistrict_name":row["subdistrict_name"],
-                         "postal_code":row["postal_code"]}
-                        for row in source
-                    ]
+                    source_exists=cur.fetchone() is not None
+                    if source_exists:
+                        cur.execute("SELECT 1 FROM dbd_company_branch LIMIT 1")
+                        source_data=cur.fetchone() is not None
+                    else:
+                        source_data=False
+                if not source_exists:
+                    raise BranchError("Missing Legacy dbd_company_branch source")
+                if not path.exists() and (source_data or old_checkpoint.exists()):
+                    raise BranchError(
+                        "Historical Journal is missing while branch/checkpoint data exist; "
+                        "recover original Journal before import"
+                    )
+                if check:
+                    # No Production writes, no HTTP, no journal changes.
+                    return {**stats,"read_only":True,"source_has_rows":source_data,
+                            "historical_scope_verified":state["scope"] is not None}
+
+                generation=repo.generation_state()
+                if int(generation.get("finalized_generation") or 0)<1:
+                    raise BranchError("Generation 1 cutover must be finalized before Legacy Branch Import")
+                manager=(repo.manager_lock(resource="TIPDI:DBD:v0.6:branch")
+                         if selected=="sqlserver" else repo.manager_lock())
+                with manager as lock:
                     with repo.transaction() as conn:
-                        cur = conn.cursor()
-                        try:
-                            cur.execute(
-                                "SELECT company_id FROM dbo.DBD_COMPANY "
-                                "WHERE juristic_type_code=%s AND registration_no=%s",
-                                (jp_type,jp_no),
-                            )
-                            target = cur.fetchone()
-                        finally:
-                            cur.close()
-                        if target is None:
-                            stats["skipped"] += 1
-                            continue
-                        if check:
-                            stats["eligible"] += 1
-                            stats["branches"] += len(branches)
+                        store.validate_schema(conn)
+                        if selected=="sqlserver":
+                            store.phase(conn,codes=codes,legacy_phase=phase_id)
+                    previous=("","")
+                    while True:
+                        if selected=="sqlserver":
+                            repo.assert_manager_lock(lock,resource="TIPDI:DBD:v0.6:branch")
                         else:
-                            changed = store.save_snapshot(
-                                conn,company_id=int(target[0]),branches=branches,
-                                establishment_count=None,verified_at=stamp,
-                                url=source_url,
-                                source="DATAFORTHAI_IMPORT",
-                            )
-                            if not changed:
-                                stats["skipped"] += 1
+                            repo.assert_manager_lock(lock)
+                        remaining=100 if limit is None else min(100,limit-stats["selected"])
+                        if remaining<=0:
+                            break
+                        batch=staging.execute(
+                            "SELECT t,j,fp,status,n,method FROM results "
+                            "WHERE t>? OR (t=? AND j>?) ORDER BY t,j LIMIT ?",
+                            (*previous[:1],previous[0],previous[1],remaining),
+                        ).fetchall()
+                        if not batch:
+                            break
+                        for jp_type,jp_no,fp,status,count,method in batch:
+                            previous=(jp_type,jp_no)
+                            stats["selected"]+=1
+                            source_rows=_legacy_source_rows(legacy,jp_type,jp_no)
+                            branches=[]
+                            source_url=f"{SITE}/company-branch/{jp_no}/show/printview"
+                            if source_rows:
+                                try:
+                                    branches,source_url=_validate_legacy_details(
+                                        source_rows,jp_no,
+                                        expected=int(count) if status in ("OK","LEGACY_OK") else None,
+                                    )
+                                except (BranchError,ValueError,TypeError):
+                                    stats["conflicted"]+=1
+                                    continue
+                            if status in ("OK","LEGACY_OK") and not branches:
+                                stats["conflicted"]+=1
                                 continue
-                            stats["imported"] += 1
-                            stats["branches"] += len(branches)
-                    if event:
-                        try: event("branch_progress",dict(stats))
-                        except Exception: pass
-    return stats
+                            if status=="NO_BRANCH" and branches:
+                                stats["conflicted"]+=1
+                                continue
+                            with repo.transaction() as conn:
+                                with conn.cursor() as cur:
+                                    sql=("SELECT company_id,company_name_th,address_th "
+                                         "FROM dbo.DBD_COMPANY WHERE juristic_type_code=%s "
+                                         "AND registration_no=%s" if selected=="sqlserver"
+                                         else "SELECT company_id,company_name_th,address_th "
+                                         "FROM DBD_COMPANY WHERE juristic_type_code=%s "
+                                         "AND registration_no=%s")
+                                    cur.execute(sql,(jp_type,jp_no))
+                                    target=cur.fetchone()
+                                if target is None:
+                                    stats["missing_target"]+=1
+                                    continue
+                                company={"company_id":int(target[0]),
+                                         "juristic_type_code":jp_type,
+                                         "registration_no":jp_no,
+                                         "company_name_th":target[1],"address_th":target[2]}
+                                if branches and status not in ("OK","LEGACY_OK"):
+                                    store.import_preserved_details(
+                                        conn,company_id=company["company_id"],
+                                        branches=branches,source_url=source_url,
+                                    )
+                                result=store.persist(
+                                    conn,company=company,phase_id=phase_id,
+                                    fingerprint=fp,status=status,
+                                    branches=branches if status in ("OK","LEGACY_OK") else [],
+                                    total=len(branches)+1 if status in ("OK","LEGACY_OK") else
+                                          (1 if status=="NO_BRANCH" else None),
+                                    source_url=source_url,source_kind="DATAFORTHAI_IMPORT",
+                                    reason="preserved legacy result" if status=="STALE_BRANCHES" else None,
+                                )
+                            if result=="SKIPPED":
+                                stats["skipped"]+=1
+                            else:
+                                stats["imported"]+=1
+                                stats["branches"]+=len(branches)
+                                if status=="NO_BRANCH":
+                                    stats["no_branch_results"]+=1
+                            if event:
+                                event("branch_progress",dict(stats))
+                    complete=stats["selected"]==state["records"]
+                    if complete and not stats["conflicted"] and not stats["missing_target"]:
+                        if selected=="sqlserver":
+                            with repo.transaction() as conn:
+                                store.finish_legacy_import(conn,phase_id)
+                        else:
+                            with repo.transaction() as conn:
+                                store.finish_legacy_import(conn,phase_id,codes)
+                        stats["state"]="IMPORTED"
+                    else:
+                        stats["state"]="INCOMPLETE_REVIEW"
+                    return stats
+        finally:
+            staging.close()
