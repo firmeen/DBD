@@ -851,10 +851,8 @@ async def run(
 ) -> DiscoveryResult:
     """Direct v0.6 Search traversal into the selected production DBD_COMPANY.
 
-    SQL Server resumes a durable Generation-scoped bucket tree and commits
-    company writes with contiguous page checkpoints. The separate Production
-    MySQL path currently retains in-memory traversal with idempotent upserts;
-    do not advertise MySQL page-level resume until its extension is built.
+    Both Production backends use a durable Generation-scoped bucket tree.
+    Company writes and contiguous page checkpoints share one transaction.
     """
     if distributed:
         raise ValueError(
@@ -937,7 +935,7 @@ async def run(
                 | set(EXTRA_PREFIX_SEEDS)
             )
 
-        if getattr(repo, "backend", None) == "sqlserver":
+        if getattr(repo, "backend", None) in ("sqlserver", "mysql"):
             return await _run_durable_discovery(
                 repo, client, seeds, search_type=search_type,
                 provinces=provinces, generation=int(generation),
@@ -1098,13 +1096,16 @@ async def _run_durable_discovery(
     recovery_limit: int | None = None,
     recovery_pass: bool = False,
 ) -> DiscoveryResult:
-    """SQL Server G2+ Discovery: one durable tree and atomic page checkpoints.
+    """Production G2+ Discovery: one durable tree and atomic page checkpoints.
 
     No second HTTP client, queue service, or company writer. The Core-7
     repository owns business writes and shares the checkpoint transaction.
     Uncertified partition dimensions remain BLOCKED, never marked complete.
     """
-    from ..storage.sqlserver import discovery_repository as work
+    if getattr(repo, "backend", None) == "mysql":
+        from ..storage.mysql import discovery_repository as work
+    else:
+        from ..storage.sqlserver import discovery_repository as work
 
     # A manually supplied keyword, search type or bound is diagnostic only.
     # These may never share the monthly full-universe durable root set.
@@ -1179,6 +1180,13 @@ async def _run_durable_discovery(
     def observed_statuses(conn):
         cur = conn.cursor()
         try:
+            if getattr(repo, "backend", None) == "mysql":
+                cur.execute(
+                    "SELECT DISTINCT status_code FROM DBD_COMPANY "
+                    "WHERE status_code IS NOT NULL AND status_code<>'' "
+                    "ORDER BY status_code LIMIT 16"
+                )
+                return tuple(str(row["status_code"]) for row in cur.fetchall())
             cur.execute(
                 "SELECT DISTINCT TOP (16) status_code FROM dbo.DBD_COMPANY "
                 "WHERE status_code IS NOT NULL AND status_code<>N'' "
