@@ -272,6 +272,45 @@ def test_prior_hq_inclusive_count_is_never_reduced_by_incoming_no_branch(
     )
 
 
+class ChangedFingerprintCursor(ReplayCursor):
+    def fetchone(self):
+        query=self.statement
+        if "SELECT branch_count FROM" in query:
+            return (1,)
+        if "SELECT checked_phase,collection_status,verified_phase" in query:
+            return (1,"NO_BRANCH",1,"e"*64)
+        raise AssertionError("unexpected fetchone: "+query)
+
+
+class ChangedFingerprintConn(ReplayConn):
+    def cursor(self):
+        return ChangedFingerprintCursor(self)
+
+
+@pytest.mark.parametrize("repository",[ms_branch,my_branch])
+def test_terminal_branch_result_is_not_skipped_when_company_fingerprint_changes(
+    repository,monkeypatch
+):
+    if repository is ms_branch:
+        monkeypatch.setattr(
+            ms_branch.ControlRepository,"_read",
+            staticmethod(lambda *args,**kwargs:{"phase":1}),
+        )
+    conn=ChangedFingerprintConn()
+    result=repository.persist(
+        conn,company={
+            "company_id":42,"juristic_type_code":"5",
+            "registration_no":"0105559000001",
+        },
+        phase_id=1,fingerprint="f"*64,status="NO_BRANCH",branches=[],
+        total=1,
+        source_url="https://www.dataforthai.com/company-branch/0105559000001/show/printview",
+    )
+    assert result=="NO_BRANCH"
+    assert any("SET collection_status=%s,checked_phase=%s" in sql
+               for sql,_ in conn.queries)
+
+
 def test_direct_discovery_rejects_paginated_overrun_and_inconsistent_counts():
     import asyncio
     from types import SimpleNamespace
