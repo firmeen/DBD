@@ -132,13 +132,19 @@ class ProductionMySqlRepository:
         return isinstance(exc, (pymysql.err.OperationalError, pymysql.err.InterfaceError))
 
     def ensure_schema(self) -> dict[str, object]:
-        # MySQL DDL is auto-committing. It is always an explicit migrate action.
+        # Explicit migrate only. MySQL DDL auto-commits, never mix with page writes.
+        from . import discovery_repository as discovery_work
         with connection() as conn:
-            return ensure_schema(conn)
+            result = ensure_schema(conn)
+            discovery_work.ensure_schema(conn)
+            return result
 
     def validate_schema(self) -> dict[str, object]:
+        from . import discovery_repository as discovery_work
         with connection() as conn:
-            return validate_schema(conn)
+            result = validate_schema(conn)
+            discovery_work.validate_schema(conn)
+            return result
 
     def check_database(self) -> dict[str, object]:
         info = check_connection()
