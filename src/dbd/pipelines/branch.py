@@ -1017,6 +1017,58 @@ def import_sqlserver_extension(*, check: bool = False, limit: int | None = None)
     # outcomes not present in the PR #100 extension. Migrate that history first.
     journal=Path(os.environ.get("DBD_BRANCH_JOURNAL_PATH",".dbd_branch_results.jsonl"))
     checkpoint=Path(".dbd_branch_checkpoint.json")
+    if check:
+        # Read-only preflight is usable BEFORE the canonical six-table DDL
+        # has been approved. Never acquire a writer lock or create a Phase.
+        with repo.transaction() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH',N'U')")
+                legacy_table=cur.fetchone()[0] is not None
+                cur.execute("SELECT OBJECT_ID(N'dbo.DBD_BRANCH',N'U')")
+                canonical_table=cur.fetchone()[0] is not None
+                cur.execute(
+                    "SELECT 1 FROM sys.columns WHERE "
+                    "object_id=OBJECT_ID(N'dbo.DBD_COMPANY') AND name=N'branch_status'"
+                )
+                old_status_column=cur.fetchone() is not None
+                if legacy_table:
+                    if old_status_column:
+                        cur.execute(
+                            "SELECT COUNT_BIG(*) FROM dbo.DBD_COMPANY c "
+                            "WHERE c.branch_status IS NOT NULL OR EXISTS ("
+                            "SELECT 1 FROM dbo.DBD_COMPANY_BRANCH b "
+                            "WHERE b.company_id=c.company_id)"
+                        )
+                    else:
+                        cur.execute(
+                            "SELECT COUNT(DISTINCT company_id) FROM dbo.DBD_COMPANY_BRANCH"
+                        )
+                    stats["source_companies"]=int(cur.fetchone()[0] or 0)
+                elif old_status_column:
+                    cur.execute(
+                        "SELECT COUNT_BIG(*) FROM dbo.DBD_COMPANY "
+                        "WHERE branch_status IS NOT NULL"
+                    )
+                    stats["source_companies"]=int(cur.fetchone()[0] or 0)
+                else:
+                    stats["source_companies"]=0
+            marker=ControlRepository._read(conn,"AUDIT",store.PHASE_RECORD_KEY)
+        blockers=[]
+        if not canonical_table:
+            blockers.append("canonical_DBD_BRANCH_schema_missing")
+        if stats["source_companies"] and not legacy_table:
+            blockers.append("legacy_summary_without_extension_table")
+        if marker is None and (checkpoint.exists() or
+            (journal.exists() and journal.stat().st_size)):
+            blockers.append("standalone_Journal_checkpoint_import_required")
+        if marker is not None and (
+            marker.get("phase")!=1 or marker.get("origin")!="legacy"
+        ):
+            blockers.append("current_phase_conflicts_with_historical_SQL_extension")
+        return {**stats,"read_only":True,"canonical_table":canonical_table,
+                "legacy_extension_table":legacy_table,"blockers":blockers,
+                "state":"BLOCKED" if blockers else "READY_TO_REVIEW"}
+
     with repo.manager_lock(resource="TIPDI:DBD:v0.6:branch") as lock:
         with repo.transaction() as conn:
             store.validate_schema(conn)
