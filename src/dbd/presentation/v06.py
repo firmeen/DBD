@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-_CYCLE_PHASES = ("PRECHECK", "DISCOVER", "PREPARE", "COLLECT", "VERIFY", "FINALIZE")
+_CYCLE_PHASES = ("PRECHECK", "DISCOVER", "PREPARE", "COLLECT", "VERIFY", "FINALIZE", "BRANCH")
 _COLLECTION_COUNTERS = (
     "companies_claimed",
     "companies_finished",
@@ -861,17 +861,29 @@ class V06Terminal:
         return self._panel(heading, Group(*content), status, active=not self.state.result)
 
     def _render_branch(self, width: int):
-        values = self.state.result or self.state.branch
+        nested = ((self.state.result.get("branch") or {}) if
+                  self.state.command in {"cycle-run", "cycle-loop"} else {})
+        values = nested or self.state.result or self.state.branch
+        phase_id = values.get("phase")
         items = [
-            ("Checked",values.get("checked",0),"branch.checked"),
-            ("Verified",values.get("verified",0),"branch.verified"),
-            ("Branches",values.get("branches",0),"branch.branches"),
-            ("Deferred",values.get("deferred",0),"branch.deferred"),
-            ("HTTP attempts",values.get("http_requests",0),"branch.requests"),
+            ("Branch phase", phase_id, "branch.phase"),
+            ("Pass", values.get("pass"), "branch.pass"),
+            ("Source examined", values.get("examined",0), "branch.examined"),
+            ("Terminal", values.get("terminal",0), "branch.terminal"),
+            ("Unchecked", values.get("unchecked",0), "branch.unchecked"),
+            ("Deferred", values.get("deferred",0), "branch.deferred"),
+            ("Review", values.get("review",0), "branch.review"),
+            ("Skipped HTTP", values.get("skipped",0), "branch.skipped"),
+            ("Committed checks", values.get("checked",0), "branch.checked"),
+            ("Verified", values.get("verified",0), "branch.verified"),
+            ("Branch rows", values.get("branches",0), "branch.branches"),
+            ("HTTP requests", values.get("http_requests",0), "branch.requests"),
         ]
-        status = self.state.status if self.state.result else "RUNNING"
-        body = self._metric_grid(items,width)
-        return self._panel("BRANCH ENRICHMENT",body,status,active=not bool(self.state.result))
+        status = (str(values.get("stage") or self.state.status).upper()
+                  if self.state.result else "RUNNING")
+        return self._panel("BRANCH ENRICHMENT",
+                           self._metric_grid(items,width),status,
+                           active=not bool(self.state.result))
 
     def _render_prepare(self, width: int):
         if self.state.result:
@@ -1171,6 +1183,8 @@ class V06Terminal:
             verification = dict(result.get("verification") or {})
             if self._verification_significant(result, verification):
                 blocks.append(self._render_verification_result(verification, width))
+            if result.get("branch"):
+                blocks.append(self._render_branch(width))
             return blocks
 
         active_phase = self.state.phase or "PRECHECK"
@@ -1192,6 +1206,8 @@ class V06Terminal:
                 self._active_status(),
                 width,
             )
+        elif active_phase == "BRANCH":
+            active = self._render_branch(width)
         elif active_phase == "FINALIZE":
             active = self._render_activity_panel(
                 "FINALIZATION",
