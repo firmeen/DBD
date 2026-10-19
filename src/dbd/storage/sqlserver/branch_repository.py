@@ -34,7 +34,7 @@ def validate_schema(conn) -> None:
 
 
 def phase(conn, *, codes: tuple[str, ...], new_phase: bool = False,
-          read_only: bool = False) -> dict:
+          read_only: bool = False, legacy_phase: int | None = None) -> dict:
     """The manager lock must be held by the caller before any phase mutation."""
     if not codes or tuple(sorted(set(codes))) != tuple(codes):
         raise ContractError("Branch phase scope must be normalized")
@@ -47,17 +47,22 @@ def phase(conn, *, codes: tuple[str, ...], new_phase: bool = False,
             if cur.fetchone()[0] is not None:
                 cur.execute("SELECT TOP (1) company_id FROM dbo.DBD_COMPANY_BRANCH")
                 orphaned = orphaned or cur.fetchone() is not None
-        if orphaned:
+        if orphaned and legacy_phase is None:
             raise ContractError(
                 "Historical branch rows exist without a durable Phase marker; "
                 "review/import historical branch state before initial collection"
             )
         if new_phase:
             raise ContractError("--new-phase requires an existing Phase")
-        state = {"phase": 1, "scope": list(codes), "origin": "initial"}
+        if legacy_phase is not None and legacy_phase < 1:
+            raise ContractError("Invalid legacy Branch Phase")
+        state = {"phase": legacy_phase or 1, "scope": list(codes),
+                 "origin": "legacy" if legacy_phase is not None else "initial"}
     else:
         if not isinstance(prior.get("phase"), int) or prior["phase"] < 1:
             raise ContractError("Corrupt durable branch phase marker")
+        if legacy_phase is not None and int(prior["phase"]) != legacy_phase:
+            raise ContractError("Legacy Phase does not match existing Production Branch Phase")
         scope = prior.get("scope")
         if not isinstance(scope,list) or not scope:
             raise ContractError("Corrupt branch phase scope")
