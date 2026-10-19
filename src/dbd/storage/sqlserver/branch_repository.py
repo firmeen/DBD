@@ -166,6 +166,9 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if verified and (total != len(branches)+1 or not source_url or
                      (status in ("OK","LEGACY_OK")) != bool(branches)):
         raise ContractError("Verified branch snapshot requires HQ and exact total")
+    seed_stale = status=="STALE_BRANCHES" and source_kind=="DATAFORTHAI_IMPORT"
+    if seed_stale and total != len(branches)+1:
+        raise ContractError("Historical stale branch count must include HQ")
     if status=="LEGACY_OK" and source_kind!="DATAFORTHAI_IMPORT":
         raise ContractError("Imported legacy result requires explicit legacy source kind")
     if not verified and branches and status not in REVIEW:
@@ -198,7 +201,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if status=="STALE_BRANCHES" and not reason:
         reason="Branch snapshot requires manual review"
     with conn.cursor() as cur:
-        if verified:
+        if verified or seed_stale:
             for branch in branches:
                 no=str(branch["branch_no"])
                 values=(branch.get("branch_name"),branch["address_th"],
@@ -225,10 +228,16 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                          branch.get("subdistrict_name"),branch.get("postal_code"),
                          source_url,source_kind,now,now,now),
                     )
-            cur.execute(
-                "UPDATE dbo.DBD_COMPANY SET branch_count=%s WHERE company_id=%s",
-                (total,company_id),
-            )
+            if verified:
+                cur.execute(
+                    "UPDATE dbo.DBD_COMPANY SET branch_count=%s WHERE company_id=%s",
+                    (total,company_id),
+                )
+            elif seed_stale:
+                cur.execute(
+                    "UPDATE dbo.DBD_COMPANY SET branch_count=CASE WHEN branch_count<%s THEN %s ELSE branch_count END WHERE company_id=%s",
+                    (total,total,company_id),
+                )
         # Preserve prior verified metadata when recording a failure or review.
         if old_hq is None:
             cur.execute(
