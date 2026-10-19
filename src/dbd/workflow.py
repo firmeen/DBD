@@ -111,6 +111,7 @@ class CycleResult:
     collection: dict[str, Any]
     verification: dict[str, Any]
     finalized_rows: int
+    branch: dict[str, Any] | None = None
 
 
 def _utcnow() -> datetime:
@@ -776,7 +777,7 @@ async def fetch_company(
     )
 
 
-async def cycle_run(
+async def _cycle_run_core(
     *,
     phase: str = "core",
     refresh: bool = False,
@@ -1018,6 +1019,59 @@ async def cycle_run(
         _emit(event, "phase_completed", phase="FINALIZE", generation=generation)
         _emit(event, "cycle_completed", **asdict(result))
         return result
+
+
+async def cycle_run(
+    *,
+    phase: str = "core",
+    refresh: bool = False,
+    seeds: list[str] | None = None,
+    search_type: str = "",
+    concurrency: int | None = None,
+    rate: float | None = None,
+    http_retries: int | None = None,
+    max_buckets: int | None = None,
+    repository: Any | None = None,
+    backend: str | None = None,
+    event: EventCallback | None = None,
+    verbose: bool = True,
+    auto: bool = False,
+    manual_confirmed: bool = False,
+) -> CycleResult:
+    """Core first, then independent Branch Phase after releasing Core lock.
+
+    A completed Core generation remains completed even if the external Branch
+    source is restricted or partial. Reinvocation skips completed Core work and
+    can resume the active Branch Phase without another monthly generation.
+    """
+    from dataclasses import replace
+    core = await _cycle_run_core(
+        phase=phase,refresh=refresh,seeds=seeds,search_type=search_type,
+        concurrency=concurrency,rate=rate,http_retries=http_retries,
+        max_buckets=max_buckets,repository=repository,backend=backend,
+        event=event,verbose=verbose,auto=auto,manual_confirmed=manual_confirmed,
+    )
+    # Never launch a live external HTTP client from a test-injected repository.
+    if repository is not None or phase!="core" or core.status not in (
+        "COMPLETE","COMPLETE_WITH_FAILURES","ALREADY_COMPLETED"
+    ):
+        return core
+    selected=backend or settings.dbd_production_backend
+    from .pipelines.branch import collect as branch_collect
+    _emit(event,"phase_started",phase="BRANCH",generation=core.generation)
+    try:
+        branch_state=await asyncio.to_thread(
+            branch_collect,backend=selected,event=event,
+        )
+    except (KeyboardInterrupt,SystemExit):
+        raise
+    except Exception as exc:
+        # A source-specific failure must not rewrite a finalized Core state.
+        branch_state={"stage":"PARTIAL","error":str(exc)}
+        _emit(event,"warning",message="Branch phase incomplete: "+str(exc))
+    _emit(event,"phase_completed",phase="BRANCH",generation=core.generation,
+          stage=branch_state.get("stage","UNKNOWN"))
+    return replace(core,branch=branch_state)
 
 
 async def cycle_loop(
