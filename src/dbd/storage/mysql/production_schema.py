@@ -42,6 +42,9 @@ def _column_definition(column) -> str:
 
 
 def _check(expression: str) -> str:
+    # SQL Server LEN/LIKE character class is not MySQL syntax.
+    if expression.startswith("LEN([branch_no])=5"):
+        return "`branch_no` REGEXP '^[0-9]{5}$'"
     return expression.replace("[", "`").replace("]", "`").replace("N'", "'")
 
 
@@ -200,6 +203,10 @@ def validate_schema(conn) -> dict[str, object]:
 def ensure_schema(conn) -> dict[str, object]:
     existing = _tables(conn)
     created = []
+    # DDL is allowed only from explicit migrate, never normal collection.
+    if "DBD_COMPANY" in existing and "branch_count" not in _columns(conn, "DBD_COMPANY"):
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE `DBD_COMPANY` ADD COLUMN `branch_count` INT NOT NULL DEFAULT 1")
     for table in TABLES:
         if table.upper() not in existing:
             with conn.cursor() as cur:
