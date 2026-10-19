@@ -857,6 +857,14 @@ async def _direct_page(
         raise ContractError(
             f"Search returned page {page.current_page} for requested page {page_no}"
         )
+    if page.items_per_page != 10 or len(page.rows)>10:
+        raise ContractError(
+            f"Search page {page_no} violated its 10-row pagination contract"
+        )
+    if page.total_pages != (page.total_items+9)//10:
+        raise ContractError(
+            f"Search page {page_no} pagination total does not reconcile"
+        )
     if not page.rows and page.total_items > 0:
         raise ContractError(f"Search page {page_no} is empty for a non-empty partition")
     return data, response.requested_at
@@ -1407,6 +1415,10 @@ async def _run_durable_discovery(
             active.update(stage="FETCHING", pages_done=previous,
                           pages_total=total_pages)
             chunk_size = max(1, min(32, concurrency * 2))
+            # Bounded to at most one source partition (<=10,000 identities).
+            # Detect API pages with repeated companies before committing a
+            # second copy as though it represented a different page.
+            observed_identities: set[tuple[str,str]] = set()
             next_page = previous + 1
             while next_page <= total_pages:
                 numbers = list(range(next_page, min(total_pages + 1,
@@ -1435,6 +1447,15 @@ async def _run_durable_discovery(
                         if rejected:
                             raise ContractError(
                                 "Invalid company row; refusing to checkpoint incomplete page")
+                        for row in rows:
+                            identity=(str(row["juristic_type_code"]),
+                                      str(row["registration_no"]))
+                            if identity in observed_identities:
+                                raise ContractError(
+                                    "Search pagination repeated a company identity "
+                                    "within the current discovery partition"
+                                )
+                            observed_identities.add(identity)
                         batch.extend(rows)
                 except BaseException:
                     for pending in tasks.values():
