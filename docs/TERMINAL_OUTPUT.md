@@ -189,3 +189,17 @@ cutover แสดง:
 ## Setup / Monthly Auto Mode
 
 `dbd-data setup` provides the single interactive Admin/Worker readiness wizard (Rich output and prompt_toolkit input). `↑/↓` move through choices, `Enter` confirms, `Esc` backs out, `Ctrl+C` cancels; Password entry is masked. In non-TTY mode Setup prints readiness without waiting for input. `cycle run --auto` uses the existing v0.6 Terminal only when the monthly cycle is due; statuses `NOT_DUE` and `ALREADY_COMPLETED` are successful no-work results and close the Task console. The Admin can still execute the exact old Manual cycle command. See [Admin](ADMIN_SETUP.md) / [Worker](WORKER_SETUP.md).
+
+## Branch Phase display — PR #102
+
+`dbd-data branch` reports **Phase**, Scope, Pass, examined identities,
+unchecked candidates, skipped terminal results, verified results, deferred
+outcomes, review outcomes, HTTP requests and branch records committed.
+A full-identity pass may scan rows without making HTTP requests; do not present
+`scanned` as `checked`. `LIMIT REACHED` is not full coverage.
+
+`dbd-data status -d sqlserver` includes independent Core and Branch summaries,
+or an explicit `BLOCKED` explanation for missing Branch schema/Phase evidence.
+A completed Core Generation may legitimately coexist with incomplete Branch
+Coverage. Terminal progress must represent durable committed state, not just
+future completion order. Source rate and retries are independent of Core-7.
