@@ -305,7 +305,7 @@ def _policy(output: dict) -> tuple[str,list[dict],int | None,str | None,str | No
 
 def collect(*, event=None, limit: int | None = None, backend: str | None = None,
             preflight: bool = False, new_phase: bool = False,
-            repository=None) -> dict:
+            repository=None, stop: threading.Event | None = None) -> dict:
     """One command for initial, resume, new/unchecked identities and deferred retry.
 
     Every invocation scans from the smallest natural identity; the keyset cursor
@@ -378,6 +378,8 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
             return {"read_only":True,**stats}
 
         client=BranchHttp()
+        if stop is not None:
+            client.stop=stop
         attempted:set[tuple[str,str]]=set()
         quiet=0
         try:
@@ -391,6 +393,8 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                     activity=0
                     stats["stage"]="RECONCILE"
                     while True:
+                        if client.stop.is_set():
+                            raise BranchError("Branch stop requested: durable results preserved")
                         repo.assert_manager_lock(
                             lock,resource="TIPDI:DBD:v0.6:branch"
                         ) if selected=="sqlserver" else repo.assert_manager_lock(lock)
