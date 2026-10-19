@@ -245,13 +245,16 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if verified and (total!=len(branches)+1 or not source_url or
                      (status in ("OK","LEGACY_OK")) != bool(branches)):
         raise ContractError("Verified branch total/HQ mismatch")
-    seed_stale = status=="STALE_BRANCHES" and source_kind=="DATAFORTHAI_IMPORT"
+    seed_stale = (status=="STALE_BRANCHES"
+                  and source_kind=="DATAFORTHAI_IMPORT" and bool(branches))
     if seed_stale and total != len(branches)+1:
         raise ContractError("Historical stale branch count must include HQ")
     if status=="LEGACY_OK" and source_kind!="DATAFORTHAI_IMPORT":
         raise ContractError("Imported legacy result requires explicit legacy source kind")
     if not verified and branches and status not in REVIEW:
         raise ContractError("Unverified snapshot cannot replace branch data")
+    # A transactionally isolated filesystem phase marker is unavailable.
+    # The manager lock must be held for all Phase transitions and writes.
     company_id=int(company["company_id"])
     now=datetime.now(timezone.utc).replace(tzinfo=None)
     with conn.cursor() as cur:
