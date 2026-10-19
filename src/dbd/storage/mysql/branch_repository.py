@@ -263,6 +263,12 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     observed_at = (verified_at.astimezone(timezone.utc).replace(tzinfo=None)
                    if verified_at is not None and verified_at.tzinfo is not None
                    else verified_at or now)
+    # Retain a validated historical fetch timestamp for audit, but never
+    # advance verified_phase as if the imported rows were collected live.
+    has_verified_time = directly_verified or (
+        source_kind=="DATAFORTHAI_IMPORT" and verified_at is not None
+        and status in {"OK","LEGACY_OK"}
+    )
     with conn.cursor() as cur:
         cur.execute(
             "SELECT branch_count FROM DBD_COMPANY WHERE company_id=%s "
@@ -337,7 +343,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                 "collection_status,checked_phase,verified_phase,source_fingerprint,"
                 "reported_total,last_error) VALUES (%s,'00000',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (company_id,company.get("company_name_th"),company.get("address_th"),
-                 source_url,source_kind,now,now,observed_at if directly_verified else None,
+                 source_url,source_kind,now,now,observed_at if has_verified_time else None,
                  status,phase_id,phase_id if directly_verified else None,fingerprint,
                  total if verified else None,(reason or "")[:1024] or None),
             )
@@ -349,7 +355,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                 "last_error=NULL WHERE company_id=%s AND branch_no='00000'",
                 (status,phase_id,phase_id if directly_verified else None,
                  fingerprint,total,source_url,source_kind,now,
-                 observed_at if directly_verified else None,company_id),
+                 observed_at if has_verified_time else None,company_id),
             )
         else:
             cur.execute(
