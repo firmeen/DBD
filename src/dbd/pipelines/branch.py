@@ -654,7 +654,8 @@ def _validate_legacy_details(rows: list[dict], jp_no: str, *,
         counts={int(r["branch_count"]) for r in rows if r["branch_count"] is not None}
         stamps={r["fetched_at"] for r in rows}
         if (len(rows)!=expected or len(counts)!=1 or expected not in counts
-            or any(r["branch_count"] is None for r in rows) or len(stamps)!=1):
+            or any(r["branch_count"] is None for r in rows) or len(stamps)!=1
+            or not isinstance(next(iter(stamps)),datetime)):
             raise BranchError("Incomplete or mixed historical positive snapshot")
     return ([{"branch_no":r["branch_no"],"branch_name":r["branch_name"],
               "address_th":r["branch_address"],
@@ -830,6 +831,7 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                             stats["selected"]+=1
                             source_rows=_legacy_source_rows(legacy,jp_type,jp_no)
                             branches=[]
+                            import_stamp=None
                             source_url=f"{SITE}/company-branch/{jp_no}/show/printview"
                             if source_rows:
                                 try:
@@ -837,6 +839,8 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                                         source_rows,jp_no,
                                         expected=int(count) if status in ("OK","LEGACY_OK") else None,
                                     )
+                                    if status in ("OK","LEGACY_OK"):
+                                        import_stamp=source_rows[0]["fetched_at"]
                                 except (BranchError,ValueError,TypeError):
                                     stats["conflicted"]+=1
                                     continue
@@ -876,6 +880,7 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                                           (1 if status=="NO_BRANCH" else None),
                                     source_url=source_url,source_kind="DATAFORTHAI_IMPORT",
                                     reason="preserved legacy result" if status=="STALE_BRANCHES" else None,
+                                    verified_at=import_stamp,
                                 )
                             if result=="SKIPPED":
                                 stats["skipped"]+=1
