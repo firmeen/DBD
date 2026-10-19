@@ -54,7 +54,10 @@ def _upsert_many(conn, table: str, rows: list[dict[str, Any]], *,
     """Bounded multi-row upserts; PyMySQL splits statements by max packet length."""
     if not rows:
         return 0
-    columns = _columns(table)
+    # Branch count is exclusively owned by the Branch snapshot writer.
+    # Initial company UPSERT uses the SQL default; refresh preserves last verified count.
+    columns = tuple(c for c in _columns(table)
+                    if not (table == "DBD_COMPANY" and c == "branch_count"))
     preserve = set(natural_key) | {"first_seen_generation"}
     unknown = set().union(*(set(row) for row in rows)) - set(columns)
     if unknown:
