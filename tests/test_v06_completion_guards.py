@@ -285,14 +285,14 @@ def test_direct_discovery_rejects_paginated_overrun_and_inconsistent_counts():
         async def fetch(self,*args,**kwargs):
             return SimpleNamespace(data=self.page,requested_at=None)
 
-    async def attempt(page):
-        return await _direct_page(FakeHttp(page),SearchFilters(keyword="010"),1)
+    async def attempt(page,page_no=1):
+        return await _direct_page(FakeHttp(page),SearchFilters(keyword="010"),page_no)
 
-    def sample(total,pages,contents,per_page=10):
-        return {"meta":{
-            "totalItems":total,"totalPages":pages,"currentPage":1,
-            "itemsPerPage":per_page,
-        },"contents":contents}
+    def sample(total,pages,contents,per_page=10,current_page=1):
+        meta={"totalItems":total,"totalPages":pages,"currentPage":current_page}
+        if per_page is not None:
+            meta["itemsPerPage"]=per_page
+        return {"meta":meta,"contents":contents}
 
     one={"jpTypeCode":"5","jpNo":"0105559000001"}
     asyncio.run(attempt(sample(1,1,[one])))
@@ -302,6 +302,29 @@ def test_direct_discovery_rejects_paginated_overrun_and_inconsistent_counts():
         asyncio.run(attempt(sample(11,1,[one])))
     with pytest.raises(ContractError,match="10-row"):
         asyncio.run(attempt(sample(1,1,[one],per_page=20)))
+    with pytest.raises(ContractError,match="missing the source"):
+        asyncio.run(attempt(sample(1,1,[one],per_page=None)))
+    with pytest.raises(ContractError,match="incomplete"):
+        asyncio.run(attempt(sample(20,2,[one]*9)))
+    with pytest.raises(ContractError,match="incomplete"):
+        asyncio.run(attempt(sample(11,2,[],current_page=2),page_no=2))
+    asyncio.run(attempt(sample(11,2,[one],current_page=2),page_no=2))
+
+
+def test_uncertified_full_universe_discovery_fails_closed():
+    from dbd.pipelines.discovery import require_certified_full_universe_discovery
+
+    with pytest.raises(ContractError,match="not proven exhaustive"):
+        require_certified_full_universe_discovery(
+            seeds=None,search_type="",max_buckets=None,
+        )
+    # Scoped diagnostics and a recovery pass must remain available.
+    require_certified_full_universe_discovery(
+        seeds=["010"],search_type="",max_buckets=None,
+    )
+    require_certified_full_universe_discovery(
+        seeds=None,search_type="",max_buckets=None,recovery_pass=True,
+    )
 
 
 def test_sqlserver_phase_checks_legacy_company_summary_even_without_branch_rows(
