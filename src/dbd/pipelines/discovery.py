@@ -1342,6 +1342,15 @@ async def _run_durable_discovery(
                     if sum(item[0] for item in candidate_counts) != parent.total_items:
                         reasons.append(dimension + ":count_parity_failed")
                         continue
+                    # Child counts were collected at different times. Verify
+                    # the parent has not drifted before certifying the tree.
+                    current_data, _ = await _direct_page(client,filters,1)
+                    current_parent = parse_search_response(current_data)
+                    pages_fetched += 1
+                    if (current_parent.total_items != parent.total_items or
+                        current_parent.total_pages != parent.total_pages):
+                        reasons.append(dimension + ":parent_count_drift")
+                        continue
                     children = planned
                     counts = candidate_counts
                     split_dimension = dimension
