@@ -795,6 +795,8 @@ def main():
     branch_parser.add_argument("--limit", "-l", type=positive)
     branch_parser.add_argument("--new-phase", action="store_true",
                                help="Explicitly refresh Branch in a new Phase; never for ordinary resume")
+    branch_parser.add_argument("--source", choices=("legacy-mysql","sqlserver-extension"),
+                               default="legacy-mysql", help="Import source; only used with branch import")
     branch_parser.add_argument("--db", "-d", "--backend",
                                choices=("sqlserver", "mysql"))
 
@@ -880,13 +882,24 @@ def main():
             )
             v06_terminal.finish(result)
         elif args.command == "branch":
-            from ..pipelines.branch import collect as collect_branches, import_mysql
+            from ..pipelines.branch import (
+                collect as collect_branches,
+                import_mysql,
+                import_sqlserver_extension,
+            )
             selected = args.backend or settings.dbd_production_backend
             if args.action == "import":
                 if args.new_phase:
                     raise ValueError("Branch import cannot start a new refresh phase")
-                result = import_mysql(check=args.check, limit=args.limit, backend=selected)
+                if args.source == "sqlserver-extension":
+                    if selected!="sqlserver":
+                        raise ValueError("The SQL Server extension exists only on the SQL Server backend")
+                    result=import_sqlserver_extension(check=args.check,limit=args.limit)
+                else:
+                    result=import_mysql(check=args.check,limit=args.limit,backend=selected)
                 presenter.command_result("DBD · BRANCH IMPORT", result)
+            elif args.source != "legacy-mysql":
+                raise ValueError("--source is only allowed with 'dbd-data branch import'")
             elif args.check:
                 if args.new_phase:
                     raise ValueError("--check and --new-phase cannot be combined")
