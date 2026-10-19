@@ -213,7 +213,7 @@ def candidates(conn, *, after: tuple[str,str] | None = None,
             "ORDER BY c.juristic_type_code,c.registration_no LIMIT %s",
             tuple(args),
         )
-        return list(cur.fetchall())
+        return [dict(zip(("company_id","juristic_type_code","registration_no","company_name_th","company_name_en","status_code","address_th","province_code","district_code","subdistrict_code","postal_code","branch_count","collection_status","checked_phase","verified_phase","source_fingerprint","reported_total"),row,strict=True)) for row in cur.fetchall()]
 
 
 def _branch_numbers(conn, company_id: int) -> set[str]:
@@ -222,7 +222,7 @@ def _branch_numbers(conn, company_id: int) -> set[str]:
             f"SELECT branch_no FROM {TABLE} WHERE company_id=%s "
             "AND branch_no<>'00000' AND is_current=1 FOR UPDATE",(company_id,)
         )
-        return {str(r["branch_no"]) for r in cur.fetchall()}
+        return {str(r[0]) for r in cur.fetchall()}
 
 
 def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
@@ -267,8 +267,8 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
             "WHERE company_id=%s AND branch_no='00000' FOR UPDATE",(company_id,)
         )
         old_hq=cur.fetchone()
-    if old_hq and old_hq["checked_phase"]==phase_id and (
-        old_hq["collection_status"] in TERMINAL | REVIEW
+    if old_hq and old_hq[0]==phase_id and (
+        old_hq[1] in TERMINAL | REVIEW
     ):
         return "SKIPPED"
     old_numbers=_branch_numbers(conn,company_id)
@@ -370,7 +370,7 @@ def summary(conn, phase_id: int) -> dict:
             "WHERE branch_no='00000' AND checked_phase=%s GROUP BY collection_status",
             (phase_id,),
         )
-        counts={str(r["collection_status"]):int(r["n"]) for r in cur.fetchall()}
+        counts={str(r[0]):int(r[1]) for r in cur.fetchall()}
     terminal=sum(n for s,n in counts.items() if s in TERMINAL)
     deferred=sum(n for s,n in counts.items() if s.startswith("DEFERRED_"))
     review=sum(n for s,n in counts.items() if s in REVIEW)
