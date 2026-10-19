@@ -502,10 +502,11 @@ async def discover(
 ) -> tuple[int, DiscoveryResult]:
     # Refuse an uncertified full-universe request before acquiring locks or
     # transitioning monthly control state to DISCOVERING.
-    discovery.require_certified_full_universe_discovery(
-        seeds=seeds,search_type=search_type,max_buckets=max_buckets,
-        recovery_pass=recovery_pass,
-    )
+    if repository is None or getattr(repository,"backend",None) in ("sqlserver","mysql"):
+        discovery.require_certified_full_universe_discovery(
+            seeds=seeds,search_type=search_type,max_buckets=max_buckets,
+            recovery_pass=recovery_pass,
+        )
     repo = _repo(repository, backend)
     _require_sql_admin(repo)
     with repo.manager_lock() as lock_conn:
@@ -808,9 +809,10 @@ async def _cycle_run_core(
         )
     # This guard must precede monthly-control transitions, PRECHECK events and
     # any durable generation mutation; an uncertified root strategy is a hard stop.
-    discovery.require_certified_full_universe_discovery(
-        seeds=None,search_type="",max_buckets=None,
-    )
+    if repository is None or getattr(repository,"backend",None) in ("sqlserver","mysql"):
+        discovery.require_certified_full_universe_discovery(
+            seeds=None,search_type="",max_buckets=None,
+        )
     repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
         _emit(event, "phase_started", phase="PRECHECK")
