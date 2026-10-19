@@ -708,8 +708,6 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                             )
                             while True:
                                 identities=cur.fetchmany(500)
-                            while True:
-                                identities=cur.fetchmany(500)
                                 if not identities:
                                     break
                                 for item in identities:
