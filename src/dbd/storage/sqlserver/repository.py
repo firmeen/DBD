@@ -669,7 +669,7 @@ def _table_write_columns(table_name: str) -> tuple[str, ...]:
     return tuple(
         column.name
         for column in TABLE_COLUMNS[table_name]
-        if not column.identity
+        if not column.identity and not (table_name == "dbo.DBD_COMPANY" and column.name == "branch_count")
     )
 
 
