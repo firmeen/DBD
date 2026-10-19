@@ -242,7 +242,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if any(not str(b.get("address_th") or "").strip() for b in branches):
         raise ContractError("Missing branch address")
     verified=status in {"OK","NO_BRANCH","LEGACY_OK"}
-    directly_verified = status in {"OK","NO_BRANCH"}
+    directly_verified = status in {"OK","NO_BRANCH"} and source_kind != "DATAFORTHAI_IMPORT"
     if verified and (total!=len(branches)+1 or not source_url or
                      (status in ("OK","LEGACY_OK")) != bool(branches)):
         raise ContractError("Verified branch total/HQ mismatch")
