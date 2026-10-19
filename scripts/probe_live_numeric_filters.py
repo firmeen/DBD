@@ -494,10 +494,19 @@ async def _explore_node(
         if context.stop_reason:
             node.update(status="INCOMPLETE", reason=context.stop_reason)
             return node
-        if any(money(row.get(raw_key)) is None for row in current.rows):
-            reason = "parent_first_page_has_null_or_missing_numeric_value"
-            node["dimension_failures"].append({"dimension": dimension, "reason": reason})
-            context.event("DIMENSION_SKIPPED", path=path, dimension=dimension, reason=reason)
+        sample_problem = None
+        for sample in current.rows:
+            try:
+                sample_amount = money(sample.get(raw_key))
+            except ContractError:
+                sample_problem = "parent_first_page_has_invalid_numeric_value"
+                break
+            if sample_amount is None:
+                sample_problem = "parent_first_page_has_null_or_missing_numeric_value"
+                break
+        if sample_problem:
+            node["dimension_failures"].append({"dimension": dimension, "reason": sample_problem})
+            context.event("DIMENSION_SKIPPED", path=path, dimension=dimension, reason=sample_problem)
             continue
 
         trial_index = 0
@@ -534,6 +543,11 @@ async def _explore_node(
         except (ProbeBudgetExceeded, ProbeRequestFailed) as exc:
             node.update(status="INCOMPLETE", reason=context.stop_reason or str(exc))
             return node
+        except ContractError as exc:
+            reason = f"numeric_sample_contract_error:{str(exc)[:120]}"
+            node["dimension_failures"].append({"dimension": dimension, "reason": reason})
+            context.event("DIMENSION_REJECTED", path=path, dimension=dimension, reason=reason)
+            continue
 
         node["attempts"].extend(
             {"dimension": dimension, **attempt} for attempt in plan.attempts
@@ -743,8 +757,20 @@ async def _run_live_probe(
                 item_report.update(result="NOT_ATTEMPTED", reason=context.stop_reason)
                 reports.append(item_report)
                 continue
+            context.leaf_identity_owner.clear()
+            context.leaf_counts.clear()
             try:
                 filters = _filters_from_row(row)
+                if filters.key() != row.get("bucket_key"):
+                    item_report.update(
+                        result="BLOCKED_FILTER_RECONSTRUCTION_MISMATCH",
+                        reason=(
+                            "Persisted numeric_filters do not reconstruct the exact bucket_key; "
+                            "refusing to send a different query to DBD."
+                        ),
+                    )
+                    reports.append(item_report)
+                    continue
                 tree = await _explore_node(
                     context,
                     filters,
@@ -907,7 +933,9 @@ def main() -> int:
             )
         )
 
-    all_complete = bool(reports) and all(_tree_complete(item["tree"]) for item in reports if item.get("tree"))
+    all_complete = bool(reports) and all(
+        item.get("tree") is not None and _tree_complete(item["tree"]) for item in reports
+    )
     any_tree = any(item.get("tree") for item in reports)
     if all_complete and any_tree:
         if args.verify_pages and all(
@@ -951,7 +979,11 @@ def main() -> int:
         },
     }
     _print_report(output, json_output=args.json)
-    return 0 if conclusion != "NUMERIC_PARTITION_PROBE_INCOMPLETE_OR_UNSPLITTABLE" else 2
+    successful_observations = {
+        "COUNT_PARTITIONS_LOOK_FEASIBLE_PAGE_COVERAGE_NOT_VERIFIED",
+        "OBSERVED_BUCKET_PAGE_AUDITS_PASSED_NOT_PRODUCTION_CERTIFIED",
+    }
+    return 0 if conclusion in successful_observations else 2
 
 
 if __name__ == "__main__":
