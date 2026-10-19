@@ -47,6 +47,18 @@ def phase(conn, *, codes: tuple[str, ...], new_phase: bool = False,
             if cur.fetchone()[0] is not None:
                 cur.execute("SELECT TOP (1) company_id FROM dbo.DBD_COMPANY_BRANCH")
                 orphaned = orphaned or cur.fetchone() is not None
+            # PR #100 also stored terminal outcomes in company summary
+            # columns; these can exist even if there are no detail rows.
+            cur.execute(
+                "SELECT 1 FROM sys.columns WHERE "
+                "object_id=OBJECT_ID(N'dbo.DBD_COMPANY') AND name=N'branch_status'"
+            )
+            if cur.fetchone() is not None:
+                cur.execute(
+                    "SELECT TOP (1) company_id FROM dbo.DBD_COMPANY "
+                    "WHERE branch_status IS NOT NULL"
+                )
+                orphaned = orphaned or cur.fetchone() is not None
         if orphaned and legacy_phase is None:
             raise ContractError(
                 "Historical branch rows exist without a durable Phase marker; "
