@@ -907,6 +907,27 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
             staging.close()
 
 
+def _map_sql_extension_status(old_status: str | None, *,
+                              current_branches: int,
+                              reported_total: int | None) -> str:
+    """Never certify a contradictory legacy extension snapshot."""
+    previous = str(old_status or "").upper()
+    if previous == "COMPLETE" and current_branches == 0:
+        raise BranchError("Old SQL COMPLETE state lacks active branch evidence")
+    if previous == "NO_BRANCH" and current_branches:
+        raise BranchError("Old SQL NO_BRANCH contradicts active branch rows")
+    if previous == "COMPLETE":
+        return "OK" if reported_total == current_branches+1 else "LEGACY_OK"
+    if previous == "NO_BRANCH":
+        return "NO_BRANCH" if reported_total == 1 else "UNAVAILABLE"
+    return {
+        "RETRY":"DEFERRED_NETWORK",
+        "INVALID":"DEFERRED_PARSE",
+        "UNAVAILABLE":"UNAVAILABLE",
+        "NOT_LISTED":"NOT_LISTED",
+    }.get(previous, "LEGACY_OK" if current_branches else "DEFERRED_LEGACY")
+
+
 def import_sqlserver_extension(*, check: bool = False, limit: int | None = None) -> dict:
     """Explicit, conservative PR #100 extension migration; no DDL, no deletes.
 
@@ -1038,24 +1059,14 @@ def import_sqlserver_extension(*, check: bool = False, limit: int | None = None)
                         f"/company-branch/{jp_no}/show/printview"):
                         stats["conflicted"]+=1
                         continue
-                if (str(old_status or "").upper()=="COMPLETE" and not details
-                    or str(old_status or "").upper()=="NO_BRANCH" and details):
-                    # A contradictory old status must be reviewed, not silently
-                    # rewritten into a new terminal result.
+                try:
+                    status=_map_sql_extension_status(
+                        old_status,current_branches=len(details),
+                        reported_total=source_total,
+                    )
+                except BranchError:
                     stats["conflicted"]+=1
                     continue
-                mapping={
-                    "COMPLETE":"OK" if details and source_total==len(details)+1
-                               else "LEGACY_OK" if details else "UNAVAILABLE",
-                    "NO_BRANCH":"NO_BRANCH" if not details and source_total==1
-                                else "UNAVAILABLE",
-                    "RETRY":"DEFERRED_NETWORK",
-                    "INVALID":"DEFERRED_PARSE",
-                    "UNAVAILABLE":"UNAVAILABLE",
-                    "NOT_LISTED":"NOT_LISTED",
-                }
-                status=mapping.get(str(old_status or "").upper(),
-                                   "LEGACY_OK" if details else "DEFERRED_LEGACY")
                 if status=="LEGACY_OK" and source not in ("DATAFORTHAI","DATAFORTHAI_IMPORT",None):
                     stats["conflicted"]+=1
                     continue
