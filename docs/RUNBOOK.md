@@ -479,3 +479,48 @@ A Source or Database failure must not trigger deletion of previously committed
 company, branch, or page checkpoint data. SQL Server page-level Resume and
 the Dataset 1 MySQL checkpoint Resume are different storage contracts; do not
 interchange their identities.
+
+## Branch Phase — PR #102 target workflow (Draft)
+
+Six business tables: `DBD_COMPANY`, `DBD_COMPANY_RELATION`,
+`DBD_COMPANY_EVENT`, `DBD_FINANCIAL`, `DBD_INDUSTRY`, `DBD_BRANCH`.
+DataForThai enrichment is **outside Core-7** and uses its own phase, HTTP budget
+and terminal outcome codes. Never start a new phase for a normal Ctrl+C resume.
+
+Read-only checks:
+~~~powershell
+dbd-data check-db --backend sqlserver
+dbd-data status -d sqlserver
+dbd-data branch -c -d sqlserver
+dbd-data branch import -c -d sqlserver
+dbd-data branch import -c -d sqlserver --source sqlserver-extension
+~~~
+
+The two historical sources are **not equivalent**: the standalone Legacy MySQL
+journal has per-company zero/Unavailable/Deferred outcomes, while the old PR100
+`dbo.DBD_COMPANY_BRANCH` is a separate SQL Server extension. Review both.
+The original legacy tables, original JSONL, checkpoint, and old SQL extension
+remain immutable during canonical import. Fix all reported conflicts before
+declaring migration complete. Source data with missing historical evidence is
+blocked, not automatically refetched.
+
+After **separate schema migration approval**, isolated database integration
+tests, and legacy reconciliation approval:
+~~~powershell
+dbd-data branch import -d sqlserver
+dbd-data branch import -d sqlserver --source sqlserver-extension
+dbd-data branch -d sqlserver
+~~~
+
+Normal rerun is the same `dbd-data branch -d sqlserver` command.
+Use `--new-phase` only to explicitly refresh a fully reconciled scope. A
+completed Core monthly generation stays complete if DataForThai has a failure.
+Run `dbd-data cycle run -d sqlserver` for a normal combined Core→Branch cycle.
+
+Production MySQL equivalents use `-d mysql` and an append-only Phase event in
+`.dbd_branch_results.jsonl`. Back up this file together with Production MySQL.
+Never copy the old Legacy dataset into the Production MySQL schema in place.
+
+**PR #102 remains DRAFT until CI, isolated database migrations, transaction
+fault-injection tests, and Windows Ctrl+C tests are evidenced.** Do not execute
+real Production migration or collection from this branch without authorization.
