@@ -60,7 +60,7 @@ def validate_schema(conn) -> None:
             "SELECT COLUMN_NAME FROM information_schema.COLUMNS "
             "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s", (TABLE,)
         )
-        actual = {str(row["COLUMN_NAME"]) for row in cur.fetchall()}
+        actual = {str(row[0]) for row in cur.fetchall()}
         required = {
             "work_id","generation","scope_key","parent_work_id","filter_hash",
             "filter_key","filters_json","status","total_items","total_pages",
@@ -73,14 +73,14 @@ def validate_schema(conn) -> None:
             "SELECT INDEX_NAME FROM information_schema.STATISTICS "
             "WHERE TABLE_SCHEMA=DATABASE() AND TABLE_NAME=%s", (TABLE,)
         )
-        indexes = {str(row["INDEX_NAME"]) for row in cur.fetchall()}
+        indexes = {str(row[0]) for row in cur.fetchall()}
         if not {"PRIMARY","UQ_DBD_DISCOVERY_WORK","IX_DBD_DISCOVERY_WORK_QUEUE"} <= indexes:
             raise ContractError("Production MySQL discovery indexes missing")
         cur.execute(
             "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
             "WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME=%s", (TABLE,)
         )
-        constraints = {str(row["CONSTRAINT_NAME"]) for row in cur.fetchall()}
+        constraints = {str(row[0]) for row in cur.fetchall()}
         if not {"FK_DBD_DISCOVERY_WORK_PARENT","CK_DBD_DISCOVERY_WORK_JSON",
                 "CK_DBD_DISCOVERY_WORK_STATUS","CK_DBD_DISCOVERY_WORK_PAGES"} <= constraints:
             raise ContractError("Production MySQL discovery constraints missing")
@@ -98,10 +98,10 @@ def _add(conn, generation: int, scope: str, filters, parent_id: int | None = Non
         )
         existing = cur.fetchone()
         if existing is not None:
-            if (existing["filter_key"] != key or existing["filters_json"] != data
-                or existing["parent_work_id"] != parent_id):
+            if (existing[1] != key or existing[2] != data
+                or existing[3] != parent_id):
                 raise ContractError("Discovery filter hash or parent conflicts with durable checkpoint")
-            return int(existing["work_id"])
+            return int(existing[0])
         cur.execute(
             f"INSERT INTO {TABLE} "
             "(generation,scope_key,parent_work_id,filter_hash,filter_key,filters_json) "
@@ -119,7 +119,7 @@ def register_roots(conn, generation: int, scope: str, roots: list) -> None:
             f"SELECT filter_key FROM {TABLE} WHERE generation=%s AND scope_key=%s "
             "AND parent_work_id IS NULL FOR UPDATE", (generation,scope),
         )
-        prior = {str(r["filter_key"]) for r in cur.fetchall()}
+        prior = {str(r[0]) for r in cur.fetchall()}
     desired = {f.key() for f in roots}
     if prior and prior != desired:
         raise ContractError("Discovery root scope changed during generation")
@@ -139,7 +139,10 @@ def next_work(conn, generation: int, scope: str) -> dict | None:
             "CASE WHEN parent_work_id IS NULL THEN 1 ELSE 0 END, work_id DESC LIMIT 1",
             (generation,scope),
         )
-        return cur.fetchone()
+        row=cur.fetchone()
+        return None if row is None else dict(zip(
+            ("work_id","generation","scope_key","parent_work_id","filter_key","filters_json","status","total_items","total_pages","last_committed_page","partition_lossless","split_dimension","last_error","attempts"),row,strict=True
+        ))
 
 
 def reopen_blocked_numeric(conn, generation: int, scope: str, *, limit: int = 100) -> int:
@@ -152,7 +155,7 @@ def reopen_blocked_numeric(conn, generation: int, scope: str, *, limit: int = 10
             "AND last_error LIKE 'no_certified_lossless_split:%' "
             "ORDER BY updated_at,work_id LIMIT %s FOR UPDATE", (generation,scope,limit),
         )
-        ids = [int(r["work_id"]) for r in cur.fetchall()]
+        ids = [int(r[0]) for r in cur.fetchall()]
         for work_id in ids:
             cur.execute(
                 f"UPDATE {TABLE} SET status='COUNTED',updated_at=UTC_TIMESTAMP(6) "
@@ -170,12 +173,12 @@ def report(conn, generation: int, scope: str) -> dict[str,int]:
             f"SELECT status,COUNT(*) AS n FROM {TABLE} "
             "WHERE generation=%s AND scope_key=%s GROUP BY status", (generation,scope),
         )
-        values = {str(r["status"]).lower():int(r["n"]) for r in cur.fetchall()}
+        values = {str(r[0]).lower():int(r[1]) for r in cur.fetchall()}
         cur.execute(
             f"SELECT COALESCE(SUM(last_committed_page),0) AS n FROM {TABLE} "
             "WHERE generation=%s AND scope_key=%s", (generation,scope),
         )
-        values["committed_pages"] = int(cur.fetchone()["n"] or 0)
+        values["committed_pages"] = int(cur.fetchone()[0] or 0)
     values["total_buckets"] = sum(n for k,n in values.items() if k!="committed_pages")
     return values
 
@@ -262,7 +265,7 @@ def coverage(conn, generation: int, scope: str) -> dict[str,int | bool]:
             f"SELECT COUNT(*) AS n FROM {TABLE} WHERE generation=%s AND scope_key=%s "
             "AND parent_work_id IS NULL", (generation,scope),
         )
-        roots=int(cur.fetchone()["n"] or 0)
+        roots=int(cur.fetchone()[0] or 0)
         cur.execute(
             f"SELECT COUNT(*) AS n FROM {TABLE} p WHERE p.generation=%s AND p.scope_key=%s "
             "AND ((p.status='SPLIT' AND (p.partition_lossless<>1 OR "
@@ -276,7 +279,7 @@ def coverage(conn, generation: int, scope: str) -> dict[str,int | bool]:
             "OR (p.total_items=0 AND p.last_committed_page<>0))))",
             (generation,scope),
         )
-        invalid=int(cur.fetchone()["n"] or 0)
+        invalid=int(cur.fetchone()[0] or 0)
     incomplete=sum(values.get(s,0) for s in
                    ("pending","counted","fetching","failed","blocked"))
     return {**values,"roots":roots,"invalid_tree":invalid,
