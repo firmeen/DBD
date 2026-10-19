@@ -57,39 +57,38 @@ def assert_bucket_lease(cur, bucket_id: int, owner: str | None, lease_version: i
 
 def upsert_bucket(filters: SearchFilters, *, parent_id: int | None = None, depth: int = 0) -> int:
     now = _now()
+    columns = [
+        "parent_id", "bucket_key", "keyword", "search_type",
+        "pv_codes", "jp_statuses", "jp_types", "business_sizes",
+        "depth", "created_at", "updated_at",
+    ]
+    values = [
+        parent_id, filters.key(), filters.keyword, filters.search_type,
+        ",".join(filters.pv_codes), ",".join(filters.jp_statuses),
+        ",".join(filters.jp_types), ",".join(filters.business_sizes),
+        depth, now, now,
+    ]
+    # Legacy buckets keep their old insert shape and work without schema
+    # migration. Only opt-in numeric children require the new JSON column.
+    if filters.numeric_range() is not None:
+        columns.append("numeric_filters")
+        values.append(json.dumps(filters.numeric_range(), sort_keys=True))
+    placeholders = ",".join(["%s"] * len(columns))
+    sql = (
+        f"INSERT INTO discovery_buckets ({','.join(columns)}) "
+        f"VALUES ({placeholders}) "
+        "ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),updated_at=VALUES(updated_at)"
+    )
     with connect() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO discovery_buckets (
-                        parent_id,bucket_key,keyword,search_type,
-                        pv_codes,jp_statuses,jp_types,business_sizes,
-                        depth,created_at,updated_at
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON DUPLICATE KEY UPDATE id=LAST_INSERT_ID(id),updated_at=VALUES(updated_at)
-                    """,
-                    (
-                        parent_id,
-                        filters.key(),
-                        filters.keyword,
-                        filters.search_type,
-                        ",".join(filters.pv_codes),
-                        ",".join(filters.jp_statuses),
-                        ",".join(filters.jp_types),
-                        ",".join(filters.business_sizes),
-                        depth,
-                        now,
-                        now,
-                    ),
-                )
+                cur.execute(sql, values)
                 bucket_id = int(cur.lastrowid)
             conn.commit()
             return bucket_id
         except Exception:
             conn.rollback()
             raise
-
 
 def update_bucket(
     bucket_id: int,
@@ -135,6 +134,100 @@ def get_bucket(bucket_id: int) -> dict | None:
         return cur.fetchone()
 
 
+def bucket_has_pages(bucket_id: int) -> bool:
+    """Protect any existing page checkpoint, including failed/partial pages."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT 1 FROM discovery_pages WHERE bucket_id=%s LIMIT 1",
+            (int(bucket_id),),
+        )
+        return cur.fetchone() is not None
+
+
+def numeric_schema_ready() -> bool:
+    """Validate the existing 0013 JSON column without changing any schema."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT 1 FROM information_schema.columns
+            WHERE table_schema=DATABASE() AND table_name='discovery_buckets'
+              AND column_name='numeric_filters' AND data_type='json'
+            LIMIT 1
+            """
+        )
+        return cur.fetchone() is not None
+
+
+def completed_page_evidence(bucket_id: int) -> dict | None:
+    """Return the earliest committed page and its archived identity order."""
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT p.page_no,a.payload FROM discovery_pages p
+            JOIN response_archive a ON a.id=p.archive_id
+            WHERE p.bucket_id=%s AND p.status='done'
+            ORDER BY p.page_no LIMIT 1
+            """,
+            (int(bucket_id),),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    try:
+        payload = json.loads(row["payload"])
+        contents = payload["contents"]
+        metadata = payload["meta"]
+        if not isinstance(contents, list) or not isinstance(metadata, dict):
+            raise ValueError("invalid archived page structure")
+        identities = [(str(item["jpTypeCode"]), str(item["jpNo"])) for item in contents]
+        return {
+            "page_no": int(row["page_no"]),
+            "identities": identities,
+            "total_items": metadata["totalItems"],
+            "total_pages": metadata["totalPages"],
+        }
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Discovery bucket {bucket_id} has an unreadable archived done page"
+        ) from exc
+
+
+def recoverable_failed_buckets(
+    limit: int = 50, *, exclude_ids: set[int] | None = None,
+) -> list[dict]:
+    """Select unfinished failed leaves and untouched oversized leaves without resetting pages."""
+    excluded = sorted(int(item) for item in (exclude_ids or set()))
+    not_seen = (
+        f" AND b.id NOT IN ({','.join(['%s'] * len(excluded))})"
+        if excluded else ""
+    )
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            """
+            SELECT b.* FROM discovery_buckets b
+            WHERE b.status='failed'
+              AND (b.lease_owner IS NULL OR b.lease_expires_at<UTC_TIMESTAMP(6))
+              AND NOT EXISTS (
+                SELECT 1 FROM discovery_buckets child WHERE child.parent_id=b.id
+              )
+              AND (
+                (b.total_items>10000 AND COALESCE(b.pages_done,0)=0
+                 AND NOT EXISTS (
+                   SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+                 ))
+                OR (b.total_items BETWEEN 1 AND 10000
+                    AND b.pages_total BETWEEN 1 AND 1000
+                    AND COALESCE(b.pages_done,0)<b.pages_total)
+              )
+            """ + not_seen + """
+            ORDER BY (b.total_items<=10000) DESC,b.total_items ASC,b.depth DESC,b.id
+            LIMIT %s
+            """,
+            (*excluded, int(limit)),
+        )
+        return cur.fetchall()
+
+
 def pending_buckets(limit: int = 50) -> list[dict]:
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
@@ -149,23 +242,57 @@ def pending_buckets(limit: int = 50) -> list[dict]:
         return cur.fetchall()
 
 
-def claim_buckets(owner: str, limit: int, lease_seconds: int) -> list[dict]:
-    """Atomically claim buckets across Discovery processes without overlap."""
+def claim_buckets(
+    owner: str, limit: int, lease_seconds: int,
+    *, failed_only: bool = False, exclude_ids: set[int] | None = None,
+) -> list[dict]:
+    """Atomically claim open or recoverable failed leaves under the original lease."""
     if limit < 1:
         return []
     with connect() as conn:
         try:
             with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    SELECT * FROM discovery_buckets
-                    WHERE status IN ('pending','counted','draining')
-                      AND (lease_owner IS NULL OR lease_expires_at<UTC_TIMESTAMP(6))
-                    ORDER BY depth,id
-                    LIMIT %s FOR UPDATE SKIP LOCKED
-                    """,
-                    (limit,),
-                )
+                if failed_only:
+                    excluded = sorted(int(item) for item in (exclude_ids or set()))
+                    exclude_sql = (
+                        " AND b.id NOT IN (" + ",".join(["%s"] * len(excluded)) + ")"
+                        if excluded else ""
+                    )
+                    cur.execute(
+                        """
+                        SELECT b.* FROM discovery_buckets b
+                        WHERE b.status='failed'
+                          AND (b.lease_owner IS NULL
+                               OR b.lease_expires_at<UTC_TIMESTAMP(6))
+                          AND NOT EXISTS (
+                            SELECT 1 FROM discovery_buckets child WHERE child.parent_id=b.id
+                          )
+                          AND (
+                            (b.total_items>10000 AND COALESCE(b.pages_done,0)=0
+                             AND NOT EXISTS (
+                               SELECT 1 FROM discovery_pages pg WHERE pg.bucket_id=b.id
+                             ))
+                            OR (b.total_items BETWEEN 1 AND 10000
+                                AND b.pages_total BETWEEN 1 AND 1000
+                                AND COALESCE(b.pages_done,0)<b.pages_total)
+                          )
+                        """ + exclude_sql + """
+                        ORDER BY (b.total_items<=10000) DESC,b.total_items ASC,b.depth DESC,b.id
+                        LIMIT %s FOR UPDATE SKIP LOCKED
+                        """,
+                        (*excluded, int(limit)),
+                    )
+                else:
+                    cur.execute(
+                        """
+                        SELECT * FROM discovery_buckets
+                        WHERE status IN ('pending','counted','draining')
+                          AND (lease_owner IS NULL OR lease_expires_at<UTC_TIMESTAMP(6))
+                        ORDER BY depth,id
+                        LIMIT %s FOR UPDATE SKIP LOCKED
+                        """,
+                        (int(limit),),
+                    )
                 rows = cur.fetchall()
                 if not rows:
                     conn.commit()
@@ -634,6 +761,9 @@ def fail_page(
     lease_owner: str | None = None,
     lease_version: int | None = None,
 ):
+    # A late or duplicate failure cannot downgrade an already committed page.
+    detail = str(error)[:900]
+    changed = False
     with connect() as conn:
         try:
             with conn.cursor() as cur:
@@ -643,23 +773,22 @@ def fail_page(
                     INSERT INTO discovery_pages(bucket_id,page_no,status,last_error)
                     VALUES (%s,%s,'failed',%s)
                     ON DUPLICATE KEY UPDATE
-                      status='failed',last_error=VALUES(last_error),updated_at=UTC_TIMESTAMP(6)
+                      last_error=IF(status='done',last_error,VALUES(last_error)),
+                      updated_at=IF(status='done',updated_at,UTC_TIMESTAMP(6)),
+                      status=IF(status='done','done','failed')
                     """,
-                    (bucket_id, page_no, error),
+                    (bucket_id, page_no, detail),
                 )
-                cur.execute(
-                    """
-                    UPDATE response_archive a JOIN discovery_pages p ON p.archive_id=a.id
-                    SET a.processing_status='failed',a.error_code=%s
-                    WHERE p.bucket_id=%s AND p.page_no=%s
-                    """,
-                    (error, bucket_id, page_no),
-                )
+                changed = bool(cur.rowcount)
+                # Do not rewrite the processing status of an older archived
+                # response: this failure may be a later HTTP request that
+                # produced no archive at all. Preserve original evidence.
             conn.commit()
         except BaseException:
             conn.rollback()
             raise
-    DISCOVERY_PAGE_RESULTS.labels("failed").inc()
+    if changed:
+        DISCOVERY_PAGE_RESULTS.labels("failed").inc()
 
 
 def page_progress(bucket_id):
@@ -729,51 +858,101 @@ def reset_discovery(refresh=False, bucket_id=None):
     return result
 
 
-def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[dict]:
-    """Read-only shortlist of failed count partitions and capped leaves.
+def _classify_recovery_partition(row: dict) -> str:
+    """Conservative classification from persisted child checkpoints only.
 
-    Each call selects the least recently checked candidates of BOTH kinds.
-    This prevents persistent true-zero children from starving overflow work.
+    A zero-sized leaf is not evidence of a false zero when another child is
+    unfinished. In that case, rerunning an API recount only creates churn.
+    """
+    if int(row["blocked_children"] or 0):
+        return "descendant_incomplete"
+    if int(row["known_children"] or 0) != int(row["children"] or 0):
+        return "count_unavailable"
+    if row["total_items"] is None:
+        return "count_unavailable"
+    if int(row["child_total"] or 0) == int(row["total_items"]):
+        return "ready_to_validate"
+    if int(row["zero_children"] or 0):
+        return "stale_zero"
+    return "count_mismatch"
+
+
+def recovery_candidates(limit: int = 10, parent_id: int | None = None) -> list[dict]:
+    """Read-only recovery diagnosis, including blocked partitions.
+
+    Prioritize actionable work within the operator's limit but report blocked
+    work when room remains. Never silently treat an unresolved partition as
+    complete. This function performs no HTTP request or database update.
     """
     limit = max(1, int(limit))
     with connect() as conn, conn.cursor() as cur:
         cur.execute(
             """
-            SELECT p.id AS bucket_id,p.keyword,'stale_zero' AS reason,
+            SELECT p.id AS bucket_id,p.keyword,p.total_items,p.updated_at AS last_checked,
                    COUNT(c.id) AS children,
-                   SUM(c.status='done' AND c.total_items=0
-                       AND c.pages_total=0 AND c.pages_done=0) AS zero_children,
-                   p.updated_at AS last_checked
+                   COUNT(c.total_items) AS known_children,
+                   COALESCE(SUM(c.total_items),0) AS child_total,
+                   COALESCE(SUM(c.status='done' AND c.total_items=0
+                       AND c.pages_total=0 AND c.pages_done=0),0) AS zero_children,
+                   COALESCE(SUM(
+                       c.status IN ('pending','counted','draining','failed')
+                       OR (c.status='split' AND COALESCE(c.partition_lossless,0)<>1)
+                       OR (c.status='done' AND c.total_items IS NOT NULL
+                           AND (
+                               (c.total_items=0 AND
+                                   (COALESCE(c.pages_total,0)<>0
+                                    OR COALESCE(c.pages_done,0)<>0))
+                               OR (c.total_items>0 AND
+                                   (COALESCE(c.pages_total,0)=0
+                                    OR c.pages_total>1000
+                                    OR c.pages_done<>c.pages_total))
+                           ))
+                   ),0) AS blocked_children
             FROM discovery_buckets p
             JOIN discovery_buckets c ON c.parent_id=p.id
             WHERE p.status='split' AND p.partition_lossless=0
               AND (%s IS NULL OR p.id=%s)
-            GROUP BY p.id,p.keyword,p.updated_at
-            HAVING zero_children>0
-            ORDER BY p.updated_at,p.id LIMIT %s
+            GROUP BY p.id,p.keyword,p.total_items,p.updated_at
             """,
-            (parent_id, parent_id, limit),
+            (parent_id, parent_id),
         )
-        candidates = [dict(row) for row in cur.fetchall()]
+        candidates = []
+        for row in cur.fetchall():
+            item = dict(row)
+            item["reason"] = _classify_recovery_partition(item)
+            candidates.append(item)
         cur.execute(
             """
-            SELECT p.id AS bucket_id,p.keyword,'overflow' AS reason,
-                   0 AS children,0 AS zero_children,
-                   p.updated_at AS last_checked
+            SELECT p.id AS bucket_id,p.keyword,p.total_items,p.updated_at AS last_checked,
+                   p.jp_types,p.pv_codes,p.jp_statuses,p.business_sizes
             FROM discovery_buckets p
             WHERE p.status='failed' AND p.total_items>10000
               AND NOT EXISTS (
                   SELECT 1 FROM discovery_buckets c WHERE c.parent_id=p.id
               )
               AND (%s IS NULL OR p.id=%s)
-            ORDER BY p.updated_at,p.id LIMIT %s
             """,
-            (parent_id, parent_id, limit),
+            (parent_id, parent_id),
         )
-        candidates.extend(dict(row) for row in cur.fetchall())
-        candidates.sort(key=lambda row: (row["last_checked"], int(row["bucket_id"])))
-        return candidates[:limit]
+        for row in cur.fetchall():
+            item = dict(row)
+            item["reason"] = (
+                "partition_exhausted"
+                if all(item.get(field) for field in
+                       ("jp_types","pv_codes","jp_statuses","business_sizes"))
+                else "overflow"
+            )
+            candidates.append(item)
 
+    actionable = {"stale_zero", "overflow"}
+    candidates.sort(
+        key=lambda row: (
+            0 if row["reason"] in actionable else 1,
+            row["last_checked"],
+            int(row["bucket_id"]),
+        )
+    )
+    return candidates[:limit]
 
 def recovery_family(parent_id: int) -> tuple[dict, list[dict]]:
     """Read the exact persisted filters/children for one partition."""

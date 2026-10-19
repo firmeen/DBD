@@ -19,8 +19,13 @@ def _result(*, all_rows=None, first_row=None):
 
 @pytest.mark.asyncio
 async def test_stage_master_sql_is_atomic_and_never_seeds_runtime() -> None:
+    cutoff = "2026-10-15 00:00:00.000000"
     selected = _result(
-        all_rows=[{"jp_type_code": "7", "jp_no": "9000000000001"}]
+        first_row={
+            "jp_type_code": "7",
+            "jp_no": "9000000000001",
+            "batch_cutoff": cutoff,
+        }
     )
     conn = SimpleNamespace(
         execute=AsyncMock(
@@ -44,19 +49,29 @@ async def test_stage_master_sql_is_atomic_and_never_seeds_runtime() -> None:
     calls = conn.execute.call_args_list
     assert len(calls) == 3
     selection, staging, deletion = [str(call.args[0]) for call in calls]
-    assert "FOR UPDATE SKIP LOCKED" in selection
-    assert calls[0].args[1] == {"limit": 1}
+    # Current staging selects one stable primary-key boundary, then performs
+    # one INSERT...SELECT and a range DELETE in the same transaction.
+    assert "FROM dbd_company_master FORCE INDEX (PRIMARY)" in selection
+    assert "ORDER BY jp_type_code, jp_no" in selection
+    assert "LIMIT :offset, 1" in selection
+    assert calls[0].args[1] == {"offset": 0}
+    assert "INSERT INTO dbd_company_deep" in staging
     assert re.search(r"SELECT\s+\*\s+FROM\s*\(", staging)
     assert ") AS new" in staging
+    assert "ON DUPLICATE KEY UPDATE" in staging
     assert not re.search(r"\bVALUES\s*\(", staging, re.IGNORECASE)
     assert "DELETE FROM dbd_company_master" in deletion
+    assert "updated_at <= :batch_cutoff" in staging
+    assert "updated_at <= :batch_cutoff" in deletion
     assert "dbd_deep_runtime" not in "\n".join(
         str(call.args[0]) for call in calls
     )
-    assert all(
-        call.args[1] == {"t0": "7", "n0": "9000000000001"}
-        for call in calls[1:]
-    )
+    expected = {
+        "end_type": "7",
+        "end_no": "9000000000001",
+        "batch_cutoff": cutoff,
+    }
+    assert all(call.args[1] == expected for call in calls[1:])
 
 
 @pytest.mark.asyncio

@@ -3,6 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import os
+import signal
+from contextlib import contextmanager
 
 from .._version import __version__
 from ..contracts.identity import parse_code
@@ -87,6 +89,20 @@ def endpoint_rate_map(value):
         raise argparse.ArgumentTypeError("at least one endpoint=rate is required")
     return result
 
+
+
+
+@contextmanager
+def _discovery_windows_break():
+    """Treat the runner's CTRL_BREAK as a cancellable Discovery interrupt."""
+    if os.name != "nt" or not hasattr(signal, "SIGBREAK"):
+        yield
+        return
+    previous = signal.signal(signal.SIGBREAK, signal.default_int_handler)
+    try:
+        yield
+    finally:
+        signal.signal(signal.SIGBREAK, previous)
 
 def safe_error(exc: BaseException) -> str:
     if isinstance(exc, BaseExceptionGroup):
@@ -565,7 +581,19 @@ def main():
     recovery.add_argument("--parent-id", type=positive)
     recovery.add_argument("--limit", type=positive, default=10)
     recovery.add_argument("--execute", action="store_true")
-    recovery.add_argument("--rate", type=positive_rate, default=1.0)
+    recovery.add_argument("--probe", action="store_true", help="Read-only live API filter diagnostics")
+    recovery.add_argument(
+        "--numeric-plan", action="store_true",
+        help="With --probe and --parent-id: bounded read-only adaptive numeric preview",
+    )
+    recovery.add_argument(
+        "--numeric-split", action="store_true",
+        help="With --execute and --parent-id: requires certified numeric backend coverage",
+    )
+    recovery.add_argument("--probe-keyword", help="Read-only complete identity check for a small search cohort")
+    recovery.add_argument("--cap-max", help="Numeric plan preview: inclusive lower child maximum")
+    recovery.add_argument("--cap-next-min", help="Numeric plan preview: upper child minimum")
+    recovery.add_argument("--rate", type=positive_rate, default=None)
     reset = _add_output_options(
         sub.add_parser("discover-refresh", help="Start another pass over existing discovery buckets")
     )
@@ -722,6 +750,14 @@ def main():
     disc.add_argument("--rate", type=positive_rate)
     disc.add_argument("--max-buckets", type=positive)
     disc.add_argument(
+        "--numeric-split", action="store_true", default=True,
+        help="Use automatic bounded numeric fallback (default)",
+    )
+    disc.add_argument(
+        "--no-numeric-split", action="store_false", dest="numeric_split",
+        help="Collect categorical-only buckets without numeric fallback",
+    )
+    disc.add_argument(
         "--distributed",
         action="store_true",
         help="Claim buckets across processes with Redis-shared Search pacing",
@@ -819,17 +855,60 @@ def main():
             with manager_lock():
                 command_bulk(None, args.run_id, [], args.limit, presenter=presenter)
         elif args.command == "discover-recover":
-            from ..pipelines.discovery import recover_discovery
+            from ..pipelines.discovery import (
+                preview_numeric_discovery_plan,
+                probe_discovery_partition,
+                recover_discovery,
+            )
 
-            if args.execute:
+            if args.probe and args.execute:
+                raise ValueError("--probe and --execute are mutually exclusive")
+            if args.numeric_plan and (not args.probe or args.parent_id is None):
+                raise ValueError("--numeric-plan requires --probe and --parent-id")
+            if args.numeric_plan and (
+                args.probe_keyword is not None or args.cap_max is not None
+                or args.cap_next_min is not None
+            ):
+                raise ValueError("--numeric-plan cannot combine with other probe variants")
+            if args.numeric_split and (not args.execute or args.parent_id is None or args.probe):
+                raise ValueError("--numeric-split requires --execute and --parent-id")
+            if args.probe_keyword is not None and not args.probe:
+                raise ValueError("--probe-keyword requires --probe")
+            if (args.cap_max is not None or args.cap_next_min is not None) and not args.probe:
+                raise ValueError("Numeric plan bounds require --probe")
+            if args.probe and (args.parent_id is None) == (args.probe_keyword is None):
+                raise ValueError("--probe requires exactly one of --parent-id or --probe-keyword")
+            if args.probe:
+                with manager_lock() as conn:
+                    if args.numeric_plan:
+                        result = asyncio.run(
+                            preview_numeric_discovery_plan(
+                                args.parent_id,
+                                rate=args.rate if args.rate is not None else 0.25,
+                                health=lambda: assert_manager_lock(conn),
+                            )
+                        )
+                    else:
+                        result = asyncio.run(
+                            probe_discovery_partition(
+                                parent_id=args.parent_id,
+                                keyword=args.probe_keyword,
+                                cap_max=args.cap_max,
+                                cap_next_min=args.cap_next_min,
+                                rate=args.rate if args.rate is not None else 0.25,
+                                health=lambda: assert_manager_lock(conn),
+                            )
+                        )
+            elif args.execute:
                 with manager_lock() as conn:
                     result = asyncio.run(
                         recover_discovery(
                             parent_id=args.parent_id,
                             limit=args.limit,
                             execute=True,
-                            rate=args.rate,
+                            rate=args.rate if args.rate is not None else 1.0,
                             health=lambda: assert_manager_lock(conn),
+                            numeric_split=args.numeric_split,
                         )
                     )
             else:
@@ -838,7 +917,7 @@ def main():
                         parent_id=args.parent_id,
                         limit=args.limit,
                         execute=False,
-                        rate=args.rate,
+                        rate=args.rate if args.rate is not None else 1.0,
                     )
                 )
             presenter.command_result("DBD · DISCOVERY RECOVERY", result)
@@ -856,22 +935,10 @@ def main():
             if any(len(seed) < 3 for seed in seeds):
                 raise ValueError("Search keywords must contain at least 3 characters")
             configure(args.metrics_port)
-            if args.distributed:
-                if not settings.dbd_redis_url:
-                    raise ValueError("--distributed discovery requires DBD_REDIS_URL")
-                result = asyncio.run(
-                    discovery.run(
-                        seeds,
-                        search_type=args.type,
-                        concurrency=args.concurrency,
-                        rate=args.rate,
-                        max_buckets=args.max_buckets,
-                        verbose=not bool(getattr(args, "json", False)),
-                        distributed=True,
-                    )
-                )
-            else:
-                with manager_lock() as conn:
+            with _discovery_windows_break():
+                if args.distributed:
+                    if not settings.dbd_redis_url:
+                        raise ValueError("--distributed discovery requires DBD_REDIS_URL")
                     result = asyncio.run(
                         discovery.run(
                             seeds,
@@ -880,9 +947,24 @@ def main():
                             rate=args.rate,
                             max_buckets=args.max_buckets,
                             verbose=not bool(getattr(args, "json", False)),
-                            health=lambda: assert_manager_lock(conn),
+                            distributed=True,
+                            numeric_split=args.numeric_split,
                         )
                     )
+                else:
+                    with manager_lock() as conn:
+                        result = asyncio.run(
+                            discovery.run(
+                                seeds,
+                                search_type=args.type,
+                                concurrency=args.concurrency,
+                                rate=args.rate,
+                                max_buckets=args.max_buckets,
+                                verbose=not bool(getattr(args, "json", False)),
+                                health=lambda: assert_manager_lock(conn),
+                                numeric_split=args.numeric_split,
+                            )
+                        )
             presenter.command_result(
                 "DBD · DISCOVERY RESULT",
                 {
@@ -890,6 +972,21 @@ def main():
                     "pages": result.pages_fetched,
                     "companies": result.companies_written,
                     "requests": result.requests_made,
+                    "recovery_attempts": result.recovery_attempts,
+                    "new_splits": result.split_created,
+                    "failed_remaining": result.remaining_failed,
+                    "lossy_remaining": result.remaining_lossy,
+                    "open_remaining": result.remaining_open,
+                    "partial_pages_remaining": result.remaining_partial,
+                    "failed_pages_remaining": result.remaining_failed_pages,
+                    "quarantined_remaining": result.remaining_quarantine,
+                    "status": (
+                        "COMPLETE" if not any((
+                            result.remaining_failed, result.remaining_lossy,
+                            result.remaining_open, result.remaining_partial,
+                            result.remaining_failed_pages, result.remaining_quarantine,
+                        )) else "INCOMPLETE"
+                    ),
                 },
             )
     except KeyboardInterrupt:

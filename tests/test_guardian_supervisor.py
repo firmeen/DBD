@@ -32,8 +32,11 @@ def test_guardian_rate_key_is_forwarded_to_worker_environment(monkeypatch) -> No
     assert worker.process.pid == 4242
     assert captured["env"]["DBD_REDIS_RATE_KEY"] == "dbd:production:global-rate"
     assert captured["env"]["DBD_FLEET_RATE_CEILING"] == "20.0"
-    assert "--run-id" in captured["command"]
-    assert captured["command"][captured["command"].index("--run-id") + 1] == "8"
+    # Windows wraps the worker argv in a PowerShell -Command string.
+    # Unix passes the same worker argv directly to Popen.
+    rendered = " ".join(captured["command"])
+    assert "--run-id 8" in rendered
+    assert "--distributed" in rendered
 
 
 def test_guardian_worker_id_contains_supervisor_generation(monkeypatch) -> None:

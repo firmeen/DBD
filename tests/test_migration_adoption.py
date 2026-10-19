@@ -8,7 +8,7 @@ from dbd.storage.mysql.migrations import migrate
 pytestmark = pytest.mark.integration
 
 
-HEAD = "0012_run9_data_repair"
+HEAD = "0013_discovery_capital_ranges"
 
 
 def test_correctness_migration_adopts_existing_objects():

@@ -81,7 +81,9 @@ async def test_partial_page_quarantines_bad_row_and_retries_only_that_page():
 
 def test_false_zero_recount_reopens_only_proven_positive_child_and_preserves_pages():
     from dbd.storage.mysql.repositories.discovery_repository import (
-        apply_recovery_recount, recovery_family, update_bucket,
+        apply_recovery_recount,
+        recovery_family,
+        update_bucket,
     )
     from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
 
@@ -120,7 +122,9 @@ def test_false_zero_recount_reopens_only_proven_positive_child_and_preserves_pag
 
 def test_recount_does_not_reset_completed_nonzero_child_when_count_drifts():
     from dbd.storage.mysql.repositories.discovery_repository import (
-        apply_recovery_recount, recovery_family, update_bucket,
+        apply_recovery_recount,
+        recovery_family,
+        update_bucket,
     )
     from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
 
@@ -143,7 +147,9 @@ def test_recount_does_not_reset_completed_nonzero_child_when_count_drifts():
 
 def test_recount_cannot_mark_parent_lossless_on_shrinking_search_count():
     from dbd.storage.mysql.repositories.discovery_repository import (
-        apply_recovery_recount, recovery_family, update_bucket,
+        apply_recovery_recount,
+        recovery_family,
+        update_bucket,
     )
     from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
 
@@ -162,3 +168,238 @@ def test_recount_cannot_mark_parent_lossless_on_shrinking_search_count():
     assert result["parent_updated"] is False
     assert old_parent["total_items"] == 100  # never certify a lower live count
     assert family[0]["status"] == "pending"
+
+
+def test_recovery_candidates_distinguish_unfinished_descendant_from_false_zero():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        recovery_candidates,
+        update_bucket,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    filters = SearchFilters("diagnostic-" + uuid4().hex)
+    parent_id = upsert_bucket(filters)
+    first, second = split_bucket(
+        parent_id,
+        [
+            SearchFilters(filters.keyword, jp_types=["2"]),
+            SearchFilters(filters.keyword, jp_types=["5"]),
+        ],
+        1,
+    )
+    update_bucket(parent_id, total_items=100, partition_lossless=0)
+    update_bucket(first, status="done", total_items=0, pages_total=0, pages_done=0)
+    update_bucket(
+        second,
+        status="split",
+        total_items=100,
+        pages_total=10,
+        pages_done=0,
+        partition_lossless=0,
+    )
+
+    def reason():
+        rows = recovery_candidates(limit=10, parent_id=parent_id)
+        assert len(rows) == 1
+        return rows[0]["reason"]
+
+    assert reason() == "descendant_incomplete"
+
+    update_bucket(
+        second, status="done", total_items=99, pages_total=10, pages_done=10
+    )
+    assert reason() == "stale_zero"
+
+    update_bucket(
+        second, status="done", total_items=100, pages_total=10, pages_done=10
+    )
+    assert reason() == "ready_to_validate"
+
+    # A corrupt/incomplete DONE checkpoint must never be certified.
+    update_bucket(second, status="done", pages_total=10, pages_done=9)
+    assert reason() == "descendant_incomplete"
+
+
+def test_failed_leaf_with_all_categorical_filters_is_partition_exhausted():
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        recovery_candidates,
+        update_bucket,
+    )
+
+    filters = SearchFilters(
+        "diagnostic-" + uuid4().hex,
+        jp_types=["5"],
+        pv_codes=["10"],
+        jp_statuses=["1"],
+        business_sizes=["S"],
+    )
+    bucket_id = upsert_bucket(filters)
+    update_bucket(
+        bucket_id, status="failed", total_items=271406, pages_total=27141
+    )
+    rows = recovery_candidates(limit=10, parent_id=bucket_id)
+    assert len(rows) == 1
+    assert rows[0]["reason"] == "partition_exhausted"
+
+
+def test_optional_numeric_split_children_persist_and_resume_without_duplicate_keys():
+    from dbd.pipelines.discovery import _filters_from_row
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        get_bucket,
+        recovery_family,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    keyword = "numeric-resume-" + uuid4().hex
+    parent_filters = SearchFilters(keyword, jp_types=["5"], pv_codes=["10"])
+    parent_id = upsert_bucket(parent_filters)
+    original_key = parent_filters.key()
+    assert "cap=" not in original_key
+    assert get_bucket(parent_id)["bucket_key"] == original_key
+
+    children = [
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["10"], cap_amt_max="0"),
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["10"], cap_amt_min="1"),
+    ]
+    ids = split_bucket(parent_id, children, 1)
+    assert len(ids) == 2
+    assert len(set(ids)) == 2
+    parent, persisted = recovery_family(parent_id)
+    assert parent["status"] == "split"
+    assert len(persisted) == 2
+    assert all(r["status"] == "pending" for r in persisted)
+
+    restored = [_filters_from_row(r) for r in persisted]
+    assert {f.key() for f in restored} == {f.key() for f in children}
+    assert {f.payload()["capAmtMax"] for f in restored} == {None, 0}
+    assert {f.payload()["capAmtMin"] for f in restored} == {None, 1}
+
+    # Fenced split transaction must be idempotent across repeated invocation.
+    assert set(split_bucket(parent_id, children, 1)) == set(ids)
+    _, again = recovery_family(parent_id)
+    assert len(again) == 2
+
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM discovery_pages WHERE bucket_id IN (%s,%s)",
+            tuple(ids),
+        )
+        assert int(cur.fetchone()["n"]) == 0
+
+
+def test_recursive_categorical_split_preserves_existing_siblings_and_resume_state():
+    from dbd.pipelines.discovery import _filters_from_row
+    from dbd.storage.mysql.repositories.discovery_repository import (
+        get_bucket,
+        recovery_family,
+    )
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    keyword = "recursive-categories-" + uuid4().hex
+    root = upsert_bucket(SearchFilters(keyword))
+    jp_children = [
+        SearchFilters(keyword, jp_types=["2"]),
+        SearchFilters(keyword, jp_types=["5"]),
+    ]
+    jp_ids = split_bucket(root, jp_children, 1)
+    assert len(jp_ids) == 2
+
+    sibling_id, large_id = jp_ids
+    sibling_before = get_bucket(sibling_id)
+    large_before = get_bucket(large_id)
+    assert sibling_before["status"] == "pending"
+    assert large_before["status"] == "pending"
+
+    province_children = [
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["10"]),
+        SearchFilters(keyword, jp_types=["5"], pv_codes=["20"]),
+    ]
+    grandchild_ids = split_bucket(large_id, province_children, 2)
+    assert len(grandchild_ids) == 2
+
+    parent, first_level = recovery_family(root)
+    assert parent["status"] == "split"
+    assert {int(row["id"]) for row in first_level} == set(jp_ids)
+    assert get_bucket(sibling_id)["status"] == "pending"
+    assert get_bucket(large_id)["status"] == "split"
+    assert get_bucket(sibling_id)["bucket_key"] == sibling_before["bucket_key"]
+
+    large, second_level = recovery_family(large_id)
+    assert large["status"] == "split"
+    assert {int(row["id"]) for row in second_level} == set(grandchild_ids)
+    assert all(row["status"] == "pending" for row in second_level)
+    assert all(_filters_from_row(row).jp_types == ["5"] for row in second_level)
+    assert set(split_bucket(large_id, province_children, 2)) == set(grandchild_ids)
+    assert len(recovery_family(large_id)[1]) == 2
+
+def test_combined_numeric_range_persists_in_existing_bucket_json_column():
+    """Disposable MySQL only: no refresh, deletion or production writes."""
+    from dbd.pipelines.discovery import _filters_from_row
+    from dbd.storage.mysql.repositories.discovery_split_repository import split_bucket
+
+    keyword = "numeric-four-" + uuid4().hex
+    parent_filters = SearchFilters(keyword, jp_types=["5"], pv_codes=["10"])
+    parent_id = upsert_bucket(parent_filters)
+    children = [
+        SearchFilters(
+            keyword, jp_types=["5"], pv_codes=["10"],
+            cap_amt_max="1000000", total_asset_min="0",
+            total_income_max="2500000.50", net_profit_min="-200",
+        ),
+        SearchFilters(
+            keyword, jp_types=["5"], pv_codes=["10"],
+            cap_amt_min="1000000.01", total_asset_min="0",
+            total_income_max="2500000.50", net_profit_min="-200",
+        ),
+    ]
+    child_ids = split_bucket(parent_id, children, 1)
+    restored = [_filters_from_row(get_bucket(i)) for i in child_ids]
+    assert {item.key() for item in restored} == {item.key() for item in children}
+    assert all(item.payload()["totalAssetMin"] == 0 for item in restored)
+    assert all(item.payload()["totalIncomeMax"] == "2500000.5" for item in restored)
+    assert all(item.payload()["netProfitMin"] == -200 for item in restored)
+    assert set(split_bucket(parent_id, children, 1)) == set(child_ids)
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM discovery_pages WHERE bucket_id IN (%s,%s)",
+            tuple(child_ids),
+        )
+        assert int(cur.fetchone()["n"]) == 0
+
+
+def test_full_discovery_test_database_is_isolated_by_existing_connection_settings():
+    """Uses disposable integration fixture; never opens the production database."""
+    from dbd.core.settings import settings
+
+    assert settings.db_name.startswith("dbd_test_")
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute("SELECT DATABASE() AS actual")
+        assert cur.fetchone()["actual"] == settings.db_name
+        cur.execute("SELECT version_num FROM alembic_version")
+        assert cur.fetchone()["version_num"] == "0013_discovery_capital_ranges"
+        cur.execute(
+            "SELECT COUNT(*) AS n FROM information_schema.columns "
+            "WHERE table_schema=DATABASE() AND table_name='discovery_buckets' "
+            "AND column_name='numeric_filters'"
+        )
+        assert int(cur.fetchone()["n"]) == 1
+
+
+def test_discovery_writes_are_only_visible_in_selected_disposable_schema():
+    """Reuse repository identity/path against the explicitly selected test DB."""
+    from dbd.core.settings import settings
+
+    assert settings.db_name.startswith("dbd_test_")
+    key = "test-" + uuid4().hex
+    identity = SearchFilters(key)
+    bucket_id = upsert_bucket(identity)
+    assert upsert_bucket(identity) == bucket_id  # no duplicate bucket
+    with connect() as conn, conn.cursor() as cur:
+        cur.execute(
+            "SELECT DATABASE() AS actual, COUNT(*) AS n "
+            "FROM discovery_buckets WHERE id=%s AND bucket_key=%s",
+            (bucket_id, identity.key()),
+        )
+        row = cur.fetchone()
+        assert row["actual"] == settings.db_name
+        assert int(row["n"]) == 1

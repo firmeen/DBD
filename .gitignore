@@ -22,3 +22,5 @@ dist/
 pytest-cache-files-*/
 
 canary*
+
+.dbd*

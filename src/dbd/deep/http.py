@@ -286,12 +286,21 @@ class FixedRateDbdClient:
         path: str,
         *,
         params: dict[str, object] | None = None,
+        json_body: object | None = None,
         referer: str | None = None,
+        timeout: float | None = None,
+        rate_key: str | None = None,
     ) -> DeepResponse:
         if self._session is None:
             raise RuntimeError("Use async with FixedRateDbdClient")
 
         referer = referer or WARMUP_PAGE_URL
+        # Discovery passes rate_key="search"; pacing remains one fixed aggregate.
+        _ = rate_key
+        if timeout is not None and (
+            not math.isfinite(float(timeout)) or float(timeout) <= 0
+        ):
+            raise ValueError("request timeout must be finite and positive")
         last_error: BaseException | None = None
 
         for attempt in range(1, self.max_retries + 2):
@@ -304,12 +313,17 @@ class FixedRateDbdClient:
             try:
                 async with self._semaphore:
                     self.requests_made += 1
+                    request_kwargs = {
+                        "params": params,
+                        "headers": self._headers(token, referer),
+                        "timeout": self.timeout if timeout is None else float(timeout),
+                    }
+                    if json_body is not None:
+                        request_kwargs["json"] = json_body
                     response = await self._session.request(
                         method,
                         settings.dbd_base_url.rstrip("/") + path,
-                        params=params,
-                        headers=self._headers(token, referer),
-                        timeout=self.timeout,
+                        **request_kwargs,
                     )
             except (RequestsError, TimeoutError) as exc:
                 last_error = exc
@@ -401,3 +415,11 @@ class FixedRateDbdClient:
         if last_error is not None:
             raise DeepTransientHttpError(str(last_error)) from last_error
         raise DeepTransientHttpError("request retry loop exhausted")
+
+    async def get(self, path: str, params=None, **kwargs):
+        """Return decoded data using the same fixed-rate HTTP transport."""
+        return (await self.fetch("GET", path, params=params, **kwargs)).data
+
+    async def post(self, path: str, json_body, **kwargs):
+        """Send Discovery JSON without a separate retry/rate-control stack."""
+        return (await self.fetch("POST", path, json_body=json_body, **kwargs)).data
