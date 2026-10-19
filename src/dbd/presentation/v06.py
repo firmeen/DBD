@@ -878,6 +878,10 @@ class V06Terminal:
             ("Verified", values.get("verified",0), "branch.verified"),
             ("Branch rows", values.get("branches",0), "branch.branches"),
             ("HTTP requests", values.get("http_requests",0), "branch.requests"),
+            ("Flow NOW (5s)", values.get("flow_now"), "branch.flow_now"),
+            ("Flow 1m", values.get("flow_1m"), "branch.flow_1m"),
+            ("Flow 5m", values.get("flow_5m"), "branch.flow_5m"),
+            ("Flow 1h", values.get("flow_1h"), "branch.flow_1h"),
         ]
         status = (str(values.get("stage") or self.state.status).upper()
                   if self.state.result else "RUNNING")
