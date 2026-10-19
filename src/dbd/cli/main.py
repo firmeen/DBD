@@ -902,19 +902,28 @@ def main():
                 )
                 v06_terminal.finish(result)
         elif args.command == "recover":
-            from ..storage.sqlserver import discovery_repository as discovery_work
-            from ..storage.sqlserver.engine import connection
             from ..storage.production import production_repository
             selected = args.backend or settings.dbd_production_backend
-            if selected != "sqlserver":
-                raise ValueError("Durable Production Discovery recovery requires SQL Server")
             repo = production_repository(selected)
+            if selected == "mysql":
+                from ..storage.mysql import discovery_repository as discovery_work
+            else:
+                from ..storage.sqlserver import discovery_repository as discovery_work
             current = repo.generation_state()
             generation = current.get("active_generation")
-            if generation is None:
-                raise ValueError("No active Production Generation to resume")
-            with connection() as conn:
+            with repo.transaction() as conn:
                 discovery_work.validate_schema(conn)
+                if selected == "mysql":
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT MAX(generation) FROM DBD_DISCOVERY_WORK "
+                            "WHERE scope_key='full'"
+                        )
+                        tree_generation = cur.fetchone()[0]
+                    if tree_generation is not None:
+                        generation = int(tree_generation)
+                if generation is None:
+                    raise ValueError("No durable active Discovery tree/generation to recover")
                 preview = discovery_work.coverage(conn,int(generation),"full")
             if args.check:
                 presenter.command_result("DBD · RECOVERY PREVIEW", {
@@ -926,10 +935,9 @@ def main():
                 )
                 recovered_generation, result = asyncio.run(discover(
                     backend=selected, event=v06_terminal.event,
-                    recovery_limit=args.limit,
-                    recovery_pass=True,
+                    recovery_limit=args.limit, recovery_pass=True,
                 ))
-                with connection() as conn:
+                with repo.transaction() as conn:
                     remaining = discovery_work.coverage(
                         conn, int(recovered_generation), "full"
                     )
