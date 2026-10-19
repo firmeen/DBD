@@ -53,6 +53,31 @@ def parse_printview(html: str, jp_no: str) -> tuple[list[dict], int]:
     summary = soup.select_one("#divbranchsummary")
     if holder is None or summary is None:
         raise BranchError(f"{jp_no}: invalid branch printview")
+    # The response URL alone is not evidence of the company's legal identity.
+    # Validate a printed 13-digit registration number or a same-host canonical
+    # document URL before committing a verified HQ/branch snapshot.
+    identities=set(re.findall(
+        r"(?<!\\d)[0-9]{13}(?!\\d)",soup.get_text(" ",strip=True)
+    ))
+    identity_links=[
+        tag.get("href") for tag in soup.select("link[rel=canonical]")
+    ]+[
+        tag.get("content") for tag in soup.select('meta[property="og:url"]')
+    ]
+    for raw_url in identity_links:
+        if not raw_url:
+            continue
+        parsed=urlparse(urljoin(SITE,str(raw_url)))
+        if parsed.scheme=="https" and parsed.hostname=="www.dataforthai.com":
+            match=re.search(
+                r"/(?:company|company-branch)/([0-9]{13})(?:/|$)",parsed.path
+            )
+            if match:
+                identities.add(match.group(1))
+    if jp_no not in identities or (identities-{jp_no}):
+        raise BranchError(
+            f"{jp_no}: printview lacks matching legal identity or includes another company"
+        )
     expected = None
     for tr in summary.select("tr"):
         cells = tr.find_all("td", recursive=False)
