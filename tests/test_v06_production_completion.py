@@ -17,6 +17,7 @@ from dbd.pipelines.branch import (
     _stage_legacy_journal,
     fingerprint,
     parse_printview,
+    _map_sql_extension_status,
 )
 from dbd.storage.sqlserver.schema import (
     BRANCH_COLUMNS,
@@ -191,3 +192,22 @@ def test_missing_numeric_certification_cannot_be_assumed():
     assert isinstance(PRODUCTION_CERTIFIED_DIMENSIONS,frozenset)
     # Whether any live dimension is certified requires real-source evidence;
     # the presence of a planner alone is never a certificate.
+
+
+def test_sqlserver_extension_import_never_invents_branch_verification():
+    assert _map_sql_extension_status("COMPLETE",current_branches=3,
+                                     reported_total=4)=="OK"
+    assert _map_sql_extension_status("COMPLETE",current_branches=3,
+                                     reported_total=None)=="LEGACY_OK"
+    assert _map_sql_extension_status("NO_BRANCH",current_branches=0,
+                                     reported_total=1)=="NO_BRANCH"
+    assert _map_sql_extension_status("NO_BRANCH",current_branches=0,
+                                     reported_total=None)=="UNAVAILABLE"
+    assert _map_sql_extension_status("RETRY",current_branches=0,
+                                     reported_total=None)=="DEFERRED_NETWORK"
+    assert _map_sql_extension_status(None,current_branches=0,
+                                     reported_total=None)=="DEFERRED_LEGACY"
+    with pytest.raises(BranchError):
+        _map_sql_extension_status("COMPLETE",current_branches=0,reported_total=1)
+    with pytest.raises(BranchError):
+        _map_sql_extension_status("NO_BRANCH",current_branches=2,reported_total=1)
