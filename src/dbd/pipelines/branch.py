@@ -1038,6 +1038,12 @@ def import_sqlserver_extension(*, check: bool = False, limit: int | None = None)
                         f"/company-branch/{jp_no}/show/printview"):
                         stats["conflicted"]+=1
                         continue
+                if (str(old_status or "").upper()=="COMPLETE" and not details
+                    or str(old_status or "").upper()=="NO_BRANCH" and details):
+                    # A contradictory old status must be reviewed, not silently
+                    # rewritten into a new terminal result.
+                    stats["conflicted"]+=1
+                    continue
                 mapping={
                     "COMPLETE":"OK" if details and source_total==len(details)+1
                                else "LEGACY_OK" if details else "UNAVAILABLE",
@@ -1049,7 +1055,7 @@ def import_sqlserver_extension(*, check: bool = False, limit: int | None = None)
                     "NOT_LISTED":"NOT_LISTED",
                 }
                 status=mapping.get(str(old_status or "").upper(),
-                                   "LEGACY_OK" if details else "UNAVAILABLE")
+                                   "LEGACY_OK" if details else "DEFERRED_LEGACY")
                 if status=="LEGACY_OK" and source not in ("DATAFORTHAI","DATAFORTHAI_IMPORT",None):
                     stats["conflicted"]+=1
                     continue
