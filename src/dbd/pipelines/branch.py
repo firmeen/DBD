@@ -57,7 +57,7 @@ def parse_printview(html: str, jp_no: str) -> tuple[list[dict], int]:
     # Validate a printed 13-digit registration number or a same-host canonical
     # document URL before committing a verified HQ/branch snapshot.
     identities=set(re.findall(
-        r"(?<!\\d)[0-9]{13}(?!\\d)",soup.get_text(" ",strip=True)
+        r"(?<!\d)[0-9]{13}(?!\d)",soup.get_text(" ",strip=True)
     ))
     identity_links=[
         tag.get("href") for tag in soup.select("link[rel=canonical]")
