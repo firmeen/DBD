@@ -121,6 +121,74 @@ def phase(conn, *, codes: tuple[str,...], new_phase: bool = False,
     return outcome
 
 
+
+def finish_legacy_import(conn, phase_id: int, scope: tuple[str,...]) -> None:
+    """Append-only cutover marker after all historical identities are durable.
+
+    The .before_production_import.bak copy preserves the original standalone
+    journal (which does not understand production_import_complete events).
+    """
+    import shutil
+    path=_journal()
+    if not path.exists():
+        raise ContractError("Historical Branch Journal disappeared during import")
+    last_phase=0
+    existing_complete=False
+    with path.open("rb") as source:
+        for line in source:
+            if not line.endswith(b"\\n"):
+                raise ContractError("Incomplete Branch Journal before cutover")
+            obj=json.loads(line)
+            if obj.get("event")=="phase_start":
+                last_phase=int(obj["p"])
+            elif obj.get("event")=="production_import_complete" and obj.get("p")==phase_id:
+                existing_complete=True
+    if existing_complete:
+        return
+    if last_phase not in (0,phase_id):
+        raise ContractError("Unexpected legacy phase at import finalization")
+    if last_phase==0 and phase_id!=1:
+        raise ContractError("Cannot recover missing multi-phase journal history")
+    backup=path.with_name(path.name+".before_production_import.bak")
+    if not backup.exists():
+        temp=backup.with_name(backup.name+".incomplete")
+        if temp.exists():
+            raise ContractError(f"Incomplete Journal backup requires review: {temp}")
+        with path.open("rb") as src, temp.open("xb") as dest:
+            shutil.copyfileobj(src,dest,length=1024*1024)
+            dest.flush()
+            os.fsync(dest.fileno())
+        temp.rename(backup)
+    else:
+        # An existing backup must remain untouched. Never overwrite history.
+        if backup.stat().st_size==0 and path.stat().st_size>0:
+            raise ContractError("Existing Branch Journal backup is empty")
+    events=[]
+    if last_phase==0:
+        events.append({
+            "event":"phase_start","p":1,"scope":list(scope),"v":2,
+            "at":datetime.now(timezone.utc).isoformat(),"origin":"legacy",
+        })
+    events.append({
+        "event":"production_import_complete","p":phase_id,"v":2,
+        "at":datetime.now(timezone.utc).isoformat(),
+    })
+    fd=os.open(str(path),os.O_WRONLY|os.O_APPEND)
+    try:
+        for obj in events:
+            payload=(json.dumps(obj,ensure_ascii=False,separators=(",",":"))+"\\n").encode("utf-8")
+            pos=0
+            while pos<len(payload):
+                n=os.write(fd,payload[pos:])
+                if n<=0:
+                    raise ContractError("Failed to append Branch import completion marker")
+                pos+=n
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+
 def candidates(conn, *, after: tuple[str,str] | None = None,
                limit: int = 100, status_codes: tuple[str,...] = ("1","A","B")) -> list[dict]:
     if not 1<=limit<=1000 or not status_codes:
