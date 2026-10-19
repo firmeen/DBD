@@ -163,11 +163,14 @@ class BranchHttp:
         self.stop = threading.Event()
         self.requests = 0
         self._lock = threading.Lock()
+        self._sessions = []
 
     def _session(self):
         if not hasattr(self.local, "session"):
             from curl_cffi.requests import Session
             self.local.session = Session(impersonate="chrome")
+            with self._lock:
+                self._sessions.append(self.local.session)
         return self.local.session
 
     def get(self, url: str, follow_depth: int = 0) -> tuple[str | None, str]:
@@ -224,6 +227,16 @@ class BranchHttp:
                 return None, "UNAVAILABLE"
             return response.text, "OK"
         return None, "RETRY"
+
+    def close(self) -> None:
+        with self._lock:
+            sessions = list(self._sessions)
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception:
+                pass
 
     def collect(self, jp_no: str) -> dict:
         if not re.fullmatch(r"\d{13}",jp_no):
