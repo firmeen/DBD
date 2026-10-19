@@ -1186,7 +1186,7 @@ async def _run_durable_discovery(
                     "WHERE status_code IS NOT NULL AND status_code<>'' "
                     "ORDER BY status_code LIMIT 16"
                 )
-                return tuple(str(row["status_code"]) for row in cur.fetchall())
+                return tuple(str(row[0]) for row in cur.fetchall())
             cur.execute(
                 "SELECT DISTINCT TOP (16) status_code FROM dbo.DBD_COMPANY "
                 "WHERE status_code IS NOT NULL AND status_code<>N'' "
