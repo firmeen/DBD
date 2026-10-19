@@ -136,7 +136,7 @@ def finish_legacy_import(conn, phase_id: int, scope: tuple[str,...]) -> None:
     existing_complete=False
     with path.open("rb") as source:
         for line in source:
-            if not line.endswith(b"\\n"):
+            if not line.endswith(b"\n"):
                 raise ContractError("Incomplete Branch Journal before cutover")
             obj=json.loads(line)
             if obj.get("event")=="phase_start":
@@ -176,7 +176,7 @@ def finish_legacy_import(conn, phase_id: int, scope: tuple[str,...]) -> None:
     fd=os.open(str(path),os.O_WRONLY|os.O_APPEND)
     try:
         for obj in events:
-            payload=(json.dumps(obj,ensure_ascii=False,separators=(",",":"))+"\\n").encode("utf-8")
+            payload=(json.dumps(obj,ensure_ascii=False,separators=(",",":"))+"\n").encode("utf-8")
             pos=0
             while pos<len(payload):
                 n=os.write(fd,payload[pos:])
