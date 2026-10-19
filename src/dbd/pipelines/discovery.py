@@ -38,6 +38,29 @@ JP_TYPES = ("0", "2", "3", "5", "7", "8", "9", "A")
 BUSINESS_SIZES = ("S", "M", "L")
 EXTRA_PREFIX_SEEDS = ("099",)
 
+# The current full-universe root strategy is NOT certified. The repository's
+# own source reference documents that normal search (type="") can match names,
+# registration numbers and other text, so province-like numeric keywords are
+# not proven exhaustive or pairwise disjoint. Never finalize a Generation on
+# the strength of a completed tree until a lossless root strategy is proven.
+PRODUCTION_ROOT_COVERAGE_CERTIFIED = False
+
+
+def require_certified_full_universe_discovery(
+    *, seeds: list[str] | None, search_type: str,
+    max_buckets: int | None, recovery_pass: bool = False,
+) -> None:
+    """Fail closed before monthly state changes when root coverage is unproven."""
+    explicitly_scoped = bool(seeds or search_type or max_buckets is not None)
+    if (not explicitly_scoped and not recovery_pass
+        and not PRODUCTION_ROOT_COVERAGE_CERTIFIED):
+        raise ContractError(
+            "Full-universe Discovery is blocked: the current normal-search numeric "
+            "root seeds are not proven exhaustive and disjoint. Scoped diagnostics "
+            "and recovery remain available, but Production must not claim full "
+            "coverage until an authoritative lossless root strategy is certified."
+        )
+
 
 @dataclass
 class DiscoveryResult:
@@ -852,6 +875,12 @@ async def _direct_page(
         timeout=settings.dbd_count_timeout_seconds if page_no == 1 else None,
     )
     data = response.data
+    meta = data.get("meta") if isinstance(data,dict) else None
+    if (not isinstance(meta,dict) or type(meta.get("itemsPerPage")) is not int
+        or meta["itemsPerPage"] != 10):
+        raise ContractError(
+            f"Search page {page_no} is missing the source's integer itemsPerPage=10 contract"
+        )
     page = parse_search_response(data)
     if page.current_page != page_no:
         raise ContractError(
@@ -861,12 +890,22 @@ async def _direct_page(
         raise ContractError(
             f"Search page {page_no} violated its 10-row pagination contract"
         )
+    if page.total_items > 0 and page_no > page.total_pages:
+        raise ContractError(
+            f"Search page {page_no} is beyond reported totalPages={page.total_pages}"
+        )
     if page.total_items <= MAX_ROWS_PER_QUERY and page.total_pages != (page.total_items+9)//10:
         raise ContractError(
             f"Search page {page_no} pagination total does not reconcile"
         )
-    if not page.rows and page.total_items > 0:
-        raise ContractError(f"Search page {page_no} is empty for a non-empty partition")
+    expected_rows=min(10,max(0,page.total_items-(page_no-1)*10))
+    if len(page.rows) != expected_rows:
+        raise ContractError(
+            f"Search page {page_no} is incomplete: expected {expected_rows} rows, "
+            f"received {len(page.rows)}"
+        )
+    if page.total_items == 0 and page_no != 1:
+        raise ContractError("Empty Search partition cannot have pages after page 1")
     return data, response.requested_at
 
 
@@ -904,6 +943,11 @@ async def run(
 
     repo = repository if repository is not None else production_repository()
     explicitly_scoped = bool(seeds or search_type or max_buckets is not None)
+    if getattr(repo, "backend", None) in ("sqlserver", "mysql"):
+        require_certified_full_universe_discovery(
+            seeds=seeds,search_type=search_type,max_buckets=max_buckets,
+            recovery_pass=recovery_pass,
+        )
     global_rate = settings.dbd_rate_per_second if rate is None else rate
     admission = None
     if getattr(repo, "backend", None) == "sqlserver":
