@@ -158,3 +158,45 @@ def test_search_partition_rejects_rows_outside_requested_categorical_scope():
         validate_search_scope([{**item,"businessSizeCode":None}],filters)
     with pytest.raises(ContractError,match="non-object"):
         validate_search_scope([None],filters)
+
+
+class SequencedCursor:
+    def __init__(self, answers):
+        self.answers=answers
+        self.executed=[]
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self,*args):
+        return False
+
+    def execute(self,sql,params=()):
+        self.executed.append((sql,params))
+
+    def fetchone(self):
+        return self.answers.pop(0)
+
+
+class SequencedConn:
+    def __init__(self,answers):
+        self.cur=SequencedCursor(answers)
+
+    def cursor(self):
+        return self.cur
+
+
+@pytest.mark.parametrize("repository",[ms_branch,my_branch])
+def test_legacy_detail_import_rejects_conflicting_canonical_address(repository):
+    db=SequencedConn([(42,),("CURRENT VERIFIED ADDRESS","https://www.dataforthai.com/current")])
+    with pytest.raises(ContractError,match="conflicts with canonical data"):
+        repository.import_preserved_details(
+            db,company_id=42,source_url=(
+                "https://www.dataforthai.com/company-branch/0105559000001/show/printview"
+            ),
+            branches=[{"branch_no":"00001","address_th":"OLDER SOURCE ADDRESS"}],
+        )
+    # Reads/locking only: a conflict must never start an UPDATE/INSERT or change count.
+    assert len(db.cur.executed)==2
+    assert all(sql.lstrip().upper().startswith("SELECT")
+               for sql,_ in db.cur.executed)
