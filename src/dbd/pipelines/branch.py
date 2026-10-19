@@ -145,13 +145,15 @@ class _RateGate:
         self.next_time = 0.0
         self.lock = threading.Lock()
 
-    def acquire(self):
+    def acquire(self, stop: threading.Event):
+        if stop.is_set():
+            raise SourceAccessDenied("DataForThai collector stopped")
         with self.lock:
             scheduled = max(time.monotonic(), self.next_time)
             self.next_time = scheduled + self.interval
-        delay = scheduled - time.monotonic()
-        if delay > 0:
-            time.sleep(delay)
+        delay = max(0.0, scheduled - time.monotonic())
+        if stop.wait(delay):
+            raise SourceAccessDenied("DataForThai collector stopped")
 
 
 class BranchHttp:
@@ -177,7 +179,7 @@ class BranchHttp:
         if self.stop.is_set():
             raise SourceAccessDenied("External branch source is access restricted")
         for attempt in range(settings.dataforthai_http_attempts):
-            self.rate.acquire()
+            self.rate.acquire(self.stop)
             if self.stop.is_set():
                 raise SourceAccessDenied("External branch source is access restricted")
             with self._lock:
@@ -189,7 +191,8 @@ class BranchHttp:
                 )
             except Exception:
                 if attempt+1 < settings.dataforthai_http_attempts:
-                    time.sleep(min(8, 2**attempt))
+                    if self.stop.wait(min(8, 2**attempt)):
+                        raise SourceAccessDenied("DataForThai collector stopped")
                     continue
                 return None, "RETRY"
             status = int(response.status_code)
@@ -216,7 +219,8 @@ class BranchHttp:
                 return None, "NOT_FOUND"
             if status in (500,502,503,504):
                 if attempt+1 < settings.dataforthai_http_attempts:
-                    time.sleep(min(8, 2**attempt))
+                    if self.stop.wait(min(8, 2**attempt)):
+                        raise SourceAccessDenied("DataForThai collector stopped")
                     continue
                 return None, "RETRY"
             if status != 200 or "html" not in response.headers.get("content-type","").lower():
