@@ -152,6 +152,32 @@ def _direct_categorical_plans(
     return candidates
 
 
+
+def validate_search_scope(rows: list[dict], filters: SearchFilters) -> None:
+    """Reject company rows outside their requested disjoint categorical filters.
+
+    Count parity alone cannot prove non-overlap if a source silently ignores a
+    filter. Verify every returned identity has each constrained attribute.
+    This also detects requests whose search filters changed semantics upstream.
+    """
+    categorical = (
+        (filters.jp_types, "jpTypeCode"),
+        (filters.pv_codes, "pvCode"),
+        (filters.jp_statuses, "jpStatCode"),
+        (filters.business_sizes, "businessSizeCode"),
+    )
+    for row in rows:
+        if not isinstance(row,dict):
+            raise ContractError("Search returned a non-object company row")
+        for expected,field in categorical:
+            if expected and str(row.get(field) or "") not in {str(v) for v in expected}:
+                raise ContractError(
+                    f"Search response ignored or violated scoped filter {field}"
+                )
+
+
+
+
 async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
     data = await client.get("/api/v1/commons/provinces")
     if not isinstance(data, list):
@@ -1291,6 +1317,7 @@ async def _run_durable_discovery(
                         candidate_counts.append(
                             (observed.total_items, observed.total_pages)
                         )
+                        validate_search_scope(observed.rows,child)
                         for row in observed.rows:
                             identity = (row.get("jpTypeCode"),row.get("jpNo"))
                             if all(identity):
@@ -1397,6 +1424,7 @@ async def _run_durable_discovery(
                             obj.total_pages != parent.total_pages or
                             len(obj.rows) == 0):
                             raise ContractError("Discovery pagination drift or empty page")
+                        validate_search_scope(obj.rows, filters)
                         rows, rejected = _normalize_direct_rows(
                             obj.rows, published_at=_now())
                         invalid += rejected
