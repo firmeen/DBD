@@ -7,7 +7,6 @@ No Redis, scheduler, or out-of-band cursor is involved.
 from __future__ import annotations
 
 from hashlib import sha256
-from typing import Any
 
 from ...core.exceptions import ContractError
 from ..sqlserver.discovery_repository import _filters_json, filters_for
