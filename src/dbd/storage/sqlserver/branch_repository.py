@@ -215,7 +215,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
         if current is None:
             raise ContractError("Unknown or changed company legal identity")
         cur.execute(
-            f"SELECT checked_phase,collection_status,verified_phase FROM {TABLE} "
+            f"SELECT checked_phase,collection_status,verified_phase,source_fingerprint FROM {TABLE} "
             "WITH (UPDLOCK,HOLDLOCK) WHERE company_id=%s AND branch_no=N'00000'",
             (company_id,),
         )
@@ -226,7 +226,8 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
         ):
             raise ContractError("A newer Branch Phase result already exists")
         if (old_hq is not None and old_hq[0] == phase_id
-            and old_hq[1] in TERMINAL | REVIEW):
+            and old_hq[1] in TERMINAL | REVIEW
+            and old_hq[3] == fingerprint):
             return "SKIPPED"
     previous = _branch_numbers(conn, company_id)
     if (source_kind=="DATAFORTHAI_IMPORT" and verified and previous and old_hq is None):
