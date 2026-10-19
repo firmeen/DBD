@@ -377,6 +377,26 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                 stats.update(store.summary(conn,phase_id))
             return {"read_only":True,**stats}
 
+        from collections import deque
+        samples=deque([(time.monotonic(),0)],maxlen=3700)
+        def record_flow() -> None:
+            """Only committed results contribute to rolling throughput."""
+            now=time.monotonic()
+            if now-samples[-1][0]>=1.0:
+                samples.append((now,int(stats["checked"])))
+            else:
+                samples[-1]=(now,int(stats["checked"]))
+            for label,seconds in (("now",5),("1m",60),("5m",300),("1h",3600)):
+                baseline=samples[0]
+                for point in reversed(samples):
+                    if point[0]<=now-seconds:
+                        baseline=point
+                        break
+                elapsed=now-baseline[0]
+                stats["flow_"+label]=round(
+                    (int(stats["checked"])-baseline[1])/elapsed,3
+                ) if elapsed>0.01 else 0.0
+
         client=BranchHttp()
         if stop is not None:
             client.stop=stop
@@ -466,6 +486,7 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                                     else:
                                         stats["skipped"]+=1
                                     stats["http_requests"]=client.requests
+                                    record_flow()
                                     if event:
                                         event("branch_progress",dict(stats))
                             except BaseException:
@@ -484,6 +505,7 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
             with repo.transaction() as conn:
                 snapshot=store.summary(conn,phase_id)
             stats.update(snapshot)
+            record_flow()
             stats["http_requests"]=client.requests
             stats["stage"]=("LIMIT REACHED" if stats["limit_reached"] else
                             "NEEDS_REVIEW" if stats["review"] else
