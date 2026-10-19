@@ -689,6 +689,59 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
                         "Historical Journal is missing while branch/checkpoint data exist; "
                         "recover original Journal before import"
                     )
+                # Reconcile positive rows that the standalone collector adopted
+                # before writing a current-phase terminal Journal record. A
+                # coherent positive snapshot is valid historical evidence, not
+                # evidence of a live DataForThai verification.
+                import hashlib
+                positives_adopted=0
+                positives_invalid=0
+                if source_data:
+                    with legacy.cursor() as cur:
+                        cur.execute(
+                            "SELECT jp_type_code,jp_no FROM dbd_company_branch "
+                            "GROUP BY jp_type_code,jp_no ORDER BY jp_type_code,jp_no"
+                        )
+                        while True:
+                            identities=cur.fetchmany(500)
+                            if not identities:
+                                break
+                            for item in identities:
+                                jp_type=str(item["jp_type_code"])
+                                jp_no=str(item["jp_no"])
+                                if staging.execute(
+                                    "SELECT 1 FROM results WHERE t=? AND j=?",
+                                    (jp_type,jp_no),
+                                ).fetchone() is not None:
+                                    continue
+                                source_rows=_legacy_source_rows(legacy,jp_type,jp_no)
+                                try:
+                                    _validate_legacy_details(
+                                        source_rows,jp_no,expected=len(source_rows)
+                                    )
+                                except (BranchError,ValueError,TypeError):
+                                    positives_invalid+=1
+                                    continue
+                                fp=hashlib.sha256(
+                                    ("legacy-positive:"+jp_type+":"+jp_no).encode("utf-8")
+                                ).hexdigest()
+                                staging.execute(
+                                    "INSERT INTO results(t,j,fp,status,n,method) "
+                                    "VALUES (?,?,?,?,?,?)",
+                                    (jp_type,jp_no,fp,"LEGACY_OK",len(source_rows),"legacy"),
+                                )
+                                positives_adopted+=1
+                    staging.commit()
+                if positives_invalid:
+                    raise BranchError(
+                        f"{positives_invalid} unjournaled legacy branch snapshots "
+                        "are inconsistent; import refused until reviewed"
+                    )
+                state["records"]=int(staging.execute(
+                    "SELECT COUNT(*) FROM results"
+                ).fetchone()[0])
+                stats["historical_records"]=state["records"]
+                stats["positive_only_adopted"]=positives_adopted
                 if check:
                     # No Production writes, no HTTP, no journal changes.
                     return {**stats,"read_only":True,"source_has_rows":source_data,
