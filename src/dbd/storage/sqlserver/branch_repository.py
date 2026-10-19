@@ -217,6 +217,15 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
             "historical import must not replace a potentially newer snapshot"
         )
 
+    # A verified count from an earlier source must never be reduced when
+    # the newly observed data cannot account for all prior establishments.
+    if verified and total is not None and int(current[0] or 1)>total:
+        status="STALE_BRANCHES"
+        verified=False
+        reason=(
+            f"Incoming total {total} is below preserved count {current[0]}; "
+            "manual reconciliation required"
+        )
     if verified and previous - set(numbers):
         status="STALE_BRANCHES"
         verified=False
