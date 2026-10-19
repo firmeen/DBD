@@ -296,3 +296,19 @@ def test_direct_discovery_rejects_paginated_overrun_and_inconsistent_counts():
         asyncio.run(attempt(sample(11,1,[one])))
     with pytest.raises(ContractError,match="10-row"):
         asyncio.run(attempt(sample(1,1,[one],per_page=20)))
+
+
+def test_sqlserver_phase_checks_legacy_company_summary_even_without_branch_rows(
+    monkeypatch
+):
+    monkeypatch.setattr(
+        ms_branch.ControlRepository,"_read",
+        staticmethod(lambda *args,**kwargs:None),
+    )
+    # 1: no canonical HQ, 2: extension table absent,
+    # 3: PR100 branch_status column present, 4: summary result exists.
+    conn=SequencedConn([None,(None,),(1,),(9,)])
+    with pytest.raises(ContractError,match="Historical branch rows"):
+        ms_branch.phase(conn,codes=("1","A","B"),read_only=True)
+    assert any("branch_status IS NOT NULL" in sql
+               for sql,_ in conn.cur.executed)
