@@ -37,6 +37,8 @@ def phase(conn, *, codes: tuple[str,...], new_phase: bool = False,
         raise ContractError("Branch phase scope must be normalized")
     path=_journal()
     current=None
+    historical=False
+    import_complete=False
     if path.exists():
         with path.open("rb") as f:
             while True:
@@ -51,7 +53,12 @@ def phase(conn, *, codes: tuple[str,...], new_phase: bool = False,
                     raise ContractError("Malformed branch phase Journal") from exc
                 if not isinstance(obj,dict):
                     raise ContractError("Malformed branch Journal object")
-                if obj.get("event")=="phase_start":
+                if obj.get("event")=="production_import_complete":
+                    if (obj.get("v")!=2 or current is None
+                        or obj.get("p")!=current["phase"]):
+                        raise ContractError("Invalid Production Branch import marker")
+                    import_complete=True
+                elif obj.get("event")=="phase_start":
                     if obj.get("v")!=2 or type(obj.get("p")) is not int or obj["p"]<1:
                         raise ContractError("Unexpected Branch Phase event")
                     if current and obj["p"]!=current["phase"]+1:
@@ -59,15 +66,19 @@ def phase(conn, *, codes: tuple[str,...], new_phase: bool = False,
                     if not current and obj["p"]!=1:
                         raise ContractError("Missing earlier Branch Phase marker")
                     current={"phase":obj["p"],"scope":obj["scope"],"origin":obj["origin"]}
+                    # Once imported, later explicit phases use database-only results.
                 elif "event" in obj:
                     raise ContractError("Unknown Branch Journal event")
                 elif "s" in obj:
-                    # Historical per-company results require explicit migration;
-                    # never treat them as current Production MySQL result rows.
-                    if current is None:
-                        raise ContractError("Historical branch Journal must be migrated first")
+                    # Legacy historical outcomes are retained append-only but
+                    # must be copied to DBD_BRANCH before live HTTP can begin.
+                    historical=True
+                    if current is None and obj.get("p",1)!=1:
+                        raise ContractError("Legacy Journal result lacks a phase boundary")
                 else:
                     raise ContractError("Unrecognized Branch Journal record")
+    if historical and not import_complete:
+        raise ContractError("Legacy company-level Branch results require completed Production import")
     if current is None:
         with conn.cursor() as cur:
             cur.execute(f"SELECT 1 FROM {TABLE} WHERE collection_status IS NOT NULL LIMIT 1")
