@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
