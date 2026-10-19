@@ -140,10 +140,12 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
         raise ContractError("Duplicate, malformed or reserved branch number")
     if any(not str(b.get("address_th") or "").strip() for b in branches):
         raise ContractError("Branch address required")
-    verified = status in {"OK","NO_BRANCH"}
+    verified = status in {"OK","NO_BRANCH","LEGACY_OK"}
     if verified and (total != len(branches)+1 or not source_url or
-                     (status=="OK") != bool(branches)):
+                     (status in ("OK","LEGACY_OK")) != bool(branches)):
         raise ContractError("Verified branch snapshot requires HQ and exact total")
+    if status=="LEGACY_OK" and source_kind!="DATAFORTHAI_IMPORT":
+        raise ContractError("Imported legacy result requires explicit legacy source kind")
     if not verified and branches and status not in REVIEW:
         raise ContractError("Non-verified result cannot replace branch data")
     company_id = int(company["company_id"])
