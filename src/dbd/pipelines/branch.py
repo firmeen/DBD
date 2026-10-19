@@ -15,8 +15,6 @@ from urllib.parse import urljoin, urlparse
 from bs4 import BeautifulSoup
 
 from ..core.settings import settings
-from ..storage.sqlserver import branch_repository as store
-from ..storage.sqlserver.repository import ProductionSqlServerRepository
 
 SITE = "https://www.dataforthai.com"
 
@@ -335,7 +333,6 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                           settings.dataforthai_status_codes.split(",") if s.strip()}))
     if not codes or any(not re.fullmatch(r"[A-Z0-9]{1,4}",s) for s in codes):
         raise BranchError("Invalid DataForThai company status scope")
-    import contextlib
 
     # Use the existing SQL branch manager lock or the MySQL production manager.
     manager = (repo.manager_lock(resource="TIPDI:DBD:v0.6:branch")
