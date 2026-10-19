@@ -80,7 +80,7 @@ def phase(conn, *, codes: tuple[str,...], new_phase: bool = False,
         raise ContractError("Legacy company-level Branch results require completed Production import")
     if current is None:
         with conn.cursor() as cur:
-            cur.execute(f"SELECT 1 FROM {TABLE} WHERE collection_status IS NOT NULL LIMIT 1")
+            cur.execute(f"SELECT 1 FROM {TABLE} LIMIT 1")
             existing=cur.fetchone() is not None
         if existing or Path(".dbd_branch_checkpoint.json").exists():
             raise ContractError(
