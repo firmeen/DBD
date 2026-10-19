@@ -242,6 +242,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if any(not str(b.get("address_th") or "").strip() for b in branches):
         raise ContractError("Missing branch address")
     verified=status in {"OK","NO_BRANCH","LEGACY_OK"}
+    directly_verified = status in {"OK","NO_BRANCH"}
     if verified and (total!=len(branches)+1 or not source_url or
                      (status in ("OK","LEGACY_OK")) != bool(branches)):
         raise ContractError("Verified branch total/HQ mismatch")
@@ -270,6 +271,11 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
             "WHERE company_id=%s AND branch_no='00000' FOR UPDATE",(company_id,)
         )
         old_hq=cur.fetchone()
+    if old_hq and (
+        (old_hq[0] is not None and old_hq[0]>phase_id) or
+        (old_hq[2] is not None and old_hq[2]>phase_id)
+    ):
+        raise ContractError("A newer Branch Phase result already exists")
     if old_hq and old_hq[0]==phase_id and (
         old_hq[1] in TERMINAL | REVIEW
     ):
@@ -312,8 +318,8 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                 "collection_status,checked_phase,verified_phase,source_fingerprint,"
                 "reported_total,last_error) VALUES (%s,'00000',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (company_id,company.get("company_name_th"),company.get("address_th"),
-                 source_url,source_kind,now,now,now if verified else None,
-                 status,phase_id,phase_id if verified else None,fingerprint,
+                 source_url,source_kind,now,now,now if directly_verified else None,
+                 status,phase_id,phase_id if directly_verified else None,fingerprint,
                  total if verified else None,(reason or "")[:1024] or None),
             )
         elif verified:
@@ -322,8 +328,9 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                 "verified_phase=%s,source_fingerprint=%s,reported_total=%s,"
                 "source_url=%s,source_kind=%s,last_checked_at=%s,last_verified_at=%s,"
                 "last_error=NULL WHERE company_id=%s AND branch_no='00000'",
-                (status,phase_id,phase_id,fingerprint,total,source_url,source_kind,
-                 now,now,company_id),
+                (status,phase_id,phase_id if directly_verified else None,
+                 fingerprint,total,source_url,source_kind,now,
+                 now if directly_verified else None,company_id),
             )
         else:
             cur.execute(
