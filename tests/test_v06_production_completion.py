@@ -210,6 +210,8 @@ def test_sqlserver_extension_import_never_invents_branch_verification():
                                      reported_total=None)=="DEFERRED_LEGACY"
     with pytest.raises(BranchError):
         _map_sql_extension_status("COMPLETE",current_branches=0,reported_total=1)
+    with pytest.raises(BranchError,match="contradicts"):
+        _map_sql_extension_status("COMPLETE",current_branches=3,reported_total=99)
     with pytest.raises(BranchError):
         _map_sql_extension_status("NO_BRANCH",current_branches=2,reported_total=1)
 
