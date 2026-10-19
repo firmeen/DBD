@@ -452,3 +452,33 @@ set remains empty pending real upstream coverage evidence; a nonpartitionable
 overflow remains durable BLOCKED, never DONE. A future explicitly authorized
 recovery may recheck safely blocked zero-page oversize work after numeric
 certification, without resetting committed pages or core Business data.
+
+## Canonical Branch and Production MySQL durability — PR #102
+
+`DBD_BRANCH` is the sixth canonical business table, with `branch_id` as the
+surrogate PK and a unique `(company_id,branch_no)`. The internal `00000` row
+holds the per-company Branch Phase outcome; real branches carry source address
+details. `DBD_COMPANY.branch_count` is HQ-inclusive and is owned **only** by
+the Branch transaction writer, not Core-7 company upserts. A default of 1 is
+not itself verified HQ-only evidence.
+
+The legal identity `(juristic_type_code, registration_no)` is the Branch work
+selection key. Every invocation starts from the beginning, and the keyset
+cursor is scoped to the current scan pass. Per-company HQ phase results
+prevent duplicate same-phase HTTP requests. Source business-field fingerprints
+are audit evidence, not time-based selectors. Branch Phase advances only with
+an explicit `--new-phase`, independently from the monthly Core Generation.
+
+SQL Server preserves existing `DBD_CONTROL` and `DBD_DISCOVERY_WORK`. MySQL
+uses a minimal `DBD_DISCOVERY_WORK` table for atomic company/page checkpoint
+writes and the existing JSONL path for append-only global Branch Phase events.
+Company-level Branch results belong in `DBD_BRANCH`, not in another queue
+or result table.
+
+A stale external printview that omits a previously known branch becomes
+`STALE_BRANCHES` rather than deactivating/deleting its old row or reducing the
+previous verified count. Legacy imports preserve the source and its outcome,
+and are never counted as a fresh live HTTP verification.
+
+The canonical schema migration does **not** automatically erase the PR100
+`DBD_COMPANY_BRANCH` extension or its old `DBD_COMPANY` metadata.
