@@ -166,13 +166,18 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     if verified and (total != len(branches)+1 or not source_url or
                      (status in ("OK","LEGACY_OK")) != bool(branches)):
         raise ContractError("Verified branch snapshot requires HQ and exact total")
-    seed_stale = status=="STALE_BRANCHES" and source_kind=="DATAFORTHAI_IMPORT"
+    seed_stale = (status=="STALE_BRANCHES"
+                  and source_kind=="DATAFORTHAI_IMPORT" and bool(branches))
     if seed_stale and total != len(branches)+1:
         raise ContractError("Historical stale branch count must include HQ")
     if status=="LEGACY_OK" and source_kind!="DATAFORTHAI_IMPORT":
         raise ContractError("Imported legacy result requires explicit legacy source kind")
     if not verified and branches and status not in REVIEW:
         raise ContractError("Non-verified result cannot replace branch data")
+
+    marker=ControlRepository._read(conn,"AUDIT",PHASE_RECORD_KEY,lock=True)
+    if marker is None or marker.get("phase")!=phase_id:
+        raise ContractError("Branch Phase changed before result commit")
     company_id = int(company["company_id"])
     now = datetime.now(timezone.utc).replace(tzinfo=None)
     with conn.cursor() as cur:
