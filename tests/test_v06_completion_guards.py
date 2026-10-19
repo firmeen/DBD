@@ -264,3 +264,35 @@ def test_prior_hq_inclusive_count_is_never_reduced_by_incoming_no_branch(
         "UPDATE dbo.DBD_COMPANY SET branch_count" in sql
         for sql,_ in conn.queries
     )
+
+
+def test_direct_discovery_rejects_paginated_overrun_and_inconsistent_counts():
+    import asyncio
+    from types import SimpleNamespace
+    from dbd.client.endpoints.search import SearchFilters
+    from dbd.pipelines.discovery import _direct_page
+
+    class FakeHttp:
+        def __init__(self,page):
+            self.page=page
+
+        async def fetch(self,*args,**kwargs):
+            return SimpleNamespace(data=self.page,requested_at=None)
+
+    async def attempt(page):
+        return await _direct_page(FakeHttp(page),SearchFilters(keyword="010"),1)
+
+    def sample(total,pages,contents,per_page=10):
+        return {"meta":{
+            "totalItems":total,"totalPages":pages,"currentPage":1,
+            "itemsPerPage":per_page,
+        },"contents":contents}
+
+    one={"jpTypeCode":"5","jpNo":"0105559000001"}
+    asyncio.run(attempt(sample(1,1,[one])))
+    with pytest.raises(ContractError,match="10-row"):
+        asyncio.run(attempt(sample(11,2,[one]*11)))
+    with pytest.raises(ContractError,match="pagination total"):
+        asyncio.run(attempt(sample(11,1,[one])))
+    with pytest.raises(ContractError,match="10-row"):
+        asyncio.run(attempt(sample(1,1,[one],per_page=20)))
