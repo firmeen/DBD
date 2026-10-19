@@ -393,9 +393,10 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                         baseline=point
                         break
                 elapsed=now-baseline[0]
-                stats["flow_"+label]=round(
-                    (int(stats["checked"])-baseline[1])/elapsed,3
-                ) if elapsed>0.01 else 0.0
+                stats["flow_"+label]=(
+                    round((int(stats["checked"])-baseline[1])/elapsed,3)
+                    if elapsed>=seconds and elapsed>0.01 else None
+                )
 
         client=BranchHttp()
         if stop is not None:
