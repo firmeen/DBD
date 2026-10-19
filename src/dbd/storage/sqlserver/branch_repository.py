@@ -270,6 +270,42 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
     return status
 
 
+
+def import_preserved_details(conn, *, company_id: int, branches: list[dict],
+                             source_url: str) -> None:
+    """Copy historical detail rows without inventing a verified Phase result."""
+    numbers=[str(b["branch_no"]) for b in branches]
+    if len(set(numbers))!=len(numbers) or any(
+        not re.fullmatch(r"[0-9]{5}",n) or n=="00000" for n in numbers
+    ) or any(not str(b.get("address_th") or "").strip() for b in branches):
+        raise ContractError("Invalid historical branch details")
+    now=datetime.now(timezone.utc).replace(tzinfo=None)
+    with conn.cursor() as cur:
+        cur.execute("SELECT company_id FROM dbo.DBD_COMPANY WITH (UPDLOCK,HOLDLOCK) WHERE company_id=%s",(company_id,))
+        if cur.fetchone() is None:
+            raise ContractError("Legacy branch company missing")
+        for b in branches:
+            cur.execute(
+                f"UPDATE {TABLE} SET branch_name=%s,address_th=%s,source_url=%s,"
+                "source_kind='DATAFORTHAI_IMPORT' WHERE company_id=%s AND branch_no=%s",
+                (b.get("branch_name"),b["address_th"],source_url,company_id,str(b["branch_no"])),
+            )
+            if cur.rowcount==0:
+                cur.execute(
+                    f"INSERT INTO {TABLE} (company_id,branch_no,branch_name,address_th,"
+                    "province_name,district_name,subdistrict_name,postal_code,source_url,"
+                    "source_kind,is_current,first_seen_at,last_checked_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'DATAFORTHAI_IMPORT',1,%s,%s)",
+                    (company_id,str(b["branch_no"]),b.get("branch_name"),b["address_th"],
+                     b.get("province_name"),b.get("district_name"),
+                     b.get("subdistrict_name"),b.get("postal_code"),source_url,now,now),
+                )
+        cur.execute(
+            "UPDATE dbo.DBD_COMPANY SET branch_count=CASE WHEN branch_count<%s THEN %s ELSE branch_count END "
+            "WHERE company_id=%s",(len(branches)+1,len(branches)+1,company_id),
+        )
+
+
 def summary(conn, phase_id: int) -> dict:
     with conn.cursor() as cur:
         cur.execute(
