@@ -166,11 +166,15 @@ def validate_search_scope(rows: list[dict], filters: SearchFilters) -> None:
         (filters.jp_statuses, "jpStatCode"),
         (filters.business_sizes, "businessSizeCode"),
     )
+    constraints = [
+        ({str(value) for value in expected},field)
+        for expected,field in categorical if expected
+    ]
     for row in rows:
         if not isinstance(row,dict):
             raise ContractError("Search returned a non-object company row")
-        for expected,field in categorical:
-            if expected and str(row.get(field) or "") not in {str(v) for v in expected}:
+        for allowed,field in constraints:
+            if str(row.get(field) or "") not in allowed:
                 raise ContractError(
                     f"Search response ignored or violated scoped filter {field}"
                 )
