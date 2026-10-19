@@ -312,3 +312,16 @@ def test_sqlserver_phase_checks_legacy_company_summary_even_without_branch_rows(
         ms_branch.phase(conn,codes=("1","A","B"),read_only=True)
     assert any("branch_status IS NOT NULL" in sql
                for sql,_ in conn.cur.executed)
+
+
+def test_sqlserver_phase_blocks_detail_only_rows_without_durable_marker(
+    monkeypatch
+):
+    monkeypatch.setattr(
+        ms_branch.ControlRepository,"_read",
+        staticmethod(lambda *args,**kwargs:None),
+    )
+    conn=SequencedConn([(42,),(None,),None])
+    with pytest.raises(ContractError,match="Historical branch rows"):
+        ms_branch.phase(conn,codes=("1","A","B"),read_only=True)
+    assert "WHERE collection_status" not in conn.cur.executed[0][0]
