@@ -342,7 +342,7 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
                 "source_url,source_kind,first_seen_at,last_checked_at,last_verified_at,"
                 "collection_status,checked_phase,verified_phase,source_fingerprint,"
                 "reported_total,last_error) VALUES (%s,'00000',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
-                (company_id,company.get("company_name_th"),company.get("address_th"),
+                (company_id,company.get("company_name_th"),None,
                  source_url,source_kind,now,now,observed_at if has_verified_time else None,
                  status,phase_id,phase_id if directly_verified else None,fingerprint,
                  total if verified else None,(reason or "")[:1024] or None),
