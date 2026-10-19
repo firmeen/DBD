@@ -317,8 +317,6 @@ INDEXES = {
             ),
         ),
     ),
-}
-
     "dbo.DBD_BRANCH": (
         ("UQ_DBD_BRANCH_COMPANY_NO", True, ("company_id", "branch_no")),
         ("IX_DBD_BRANCH_PROVINCE", False, ("province_name", "company_id")),
