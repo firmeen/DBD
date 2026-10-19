@@ -495,6 +495,29 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
 
 
 
+
+def status(*, backend: str | None = None, repository=None) -> dict:
+    """Read-only durable Branch Phase/coverage, including when another run owns the lock."""
+    from ..storage.production import production_repository
+
+    repo=repository or production_repository(backend)
+    selected=getattr(repo,"backend",None)
+    if selected=="sqlserver":
+        from ..storage.sqlserver import branch_repository as store
+    elif selected=="mysql":
+        from ..storage.mysql import branch_repository as store
+    else:
+        raise BranchError("Unsupported Production Branch status backend")
+    codes=tuple(sorted({x.strip().upper() for x in
+                        settings.dataforthai_status_codes.split(",") if x.strip()}))
+    with repo.transaction() as conn:
+        store.validate_schema(conn)
+        active=store.phase(conn,codes=codes,read_only=True)
+        state=store.summary(conn,int(active["phase"]))
+    return {**active,**state,"scope":",".join(codes),"read_only":True}
+
+
+
 def _stage_legacy_journal(path, stage) -> dict:
     """Replay historical JSONL into a bounded on-disk temporary SQLite index.
 
