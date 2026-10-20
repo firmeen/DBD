@@ -485,11 +485,10 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                                         stats["source_changed"]+=1
                                     else:
                                         stats["skipped"]+=1
-                                # A terminal result is reusable only for the same
-                                # source identity snapshot. Recheck changed/missing
-                                # fingerprints instead of reporting stale data caught up.
-                                if not fingerprint_changed:
-                                    continue
+                                # A fingerprint is audit evidence, not consent
+                                # to repeat an already terminal HTTP collection.
+                                # Explicit new-phase work remains independent.
+                                continue
                             if ident in attempted:
                                 continue
                             if pass_no==1 and not active_result:
