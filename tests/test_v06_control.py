@@ -228,7 +228,7 @@ def test_recovery_reconciles_crash_after_business_finalize(monkeypatch) -> None:
     monkeypatch.setattr(control_sql, "transaction", fake_transaction)
     from dbd.storage.sqlserver import discovery_repository
     monkeypatch.setattr(discovery_repository, "coverage",
-                        lambda _conn, _generation, _scope: {"ok": True})
+                        lambda _conn, _generation, _scope: {"ok": True, "certified": True})
     monkeypatch.setattr(repo, "require_admin", lambda _node: None)
     monkeypatch.setattr(
         repo, "_read",
