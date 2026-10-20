@@ -784,6 +784,108 @@ async def fetch_company(
     )
 
 
+def _certified_full_coverage(repository: Any, generation: int) -> dict[str, Any]:
+    """One backend-specific durable tree query plus independent root evidence."""
+    if getattr(repository, "backend", None) == "mysql":
+        from .storage.mysql import discovery_repository as work
+    else:
+        from .storage.sqlserver import discovery_repository as work
+    with repository.transaction() as conn:
+        evidence = work.coverage(conn, generation, "full")
+    if not evidence.get("certified"):
+        raise RuntimeError(
+            "Production full-universe Discovery is not certified; cannot "
+            "PREPARE or FINALIZE: " + str(evidence)
+        )
+    return evidence
+
+
+def _refresh_extended_tx(repository: Any, generation: int) -> int:
+    """Bounded, explicitly requested Extended-only refresh."""
+    total = 0
+    after = 0
+    batch_size = max(1, int(settings.dbd_write_batch_size))
+    while True:
+        with repository.transaction() as conn:
+            changed, last = repository.refresh_phase_outcomes(
+                conn, generation=generation, phase_mask=EXTENDED_ENDPOINT_MASK,
+                limit=batch_size, after_company_id=after,
+            )
+        total += int(changed)
+        if not changed:
+            break
+        if last is None or last <= after:
+            raise RuntimeError("Extended refresh keyset did not advance")
+        after = int(last)
+    return total
+
+
+async def _cycle_run_extended(
+    *, refresh: bool, concurrency: int | None, rate: float | None,
+    http_retries: int | None, repository: Any | None, backend: str | None,
+    event: EventCallback | None,
+) -> CycleResult:
+    """Admin-only collection on an existing, certified, finalized Core scope.
+
+    No new Control generation, no new Discovery and no second finalization.
+    A previous Core result and its generation remain untouched.
+    """
+    repo = _repo(repository, backend)
+    _require_sql_admin(repo)
+    with repo.manager_lock() as lock_conn:
+        _emit(event, "phase_started", phase="PRECHECK")
+        await asyncio.to_thread(repo.check_database)
+        repo.assert_manager_lock(lock_conn)
+        state = repo.generation_state()
+        generation = state.get("finalized_generation")
+        if generation is None or state.get("active_generation") is not None:
+            raise RuntimeError("Extended requires a finalized Core Generation with no active Core cycle")
+        generation = int(generation)
+        if getattr(repo, "backend", None) == "sqlserver":
+            from .storage.sqlserver.control_repository import ControlRepository
+            if ControlRepository().active_generation() is not None:
+                raise RuntimeError("Extended cannot race an active SQL Server monthly Core Generation")
+        await asyncio.to_thread(_certified_full_coverage, repo, generation)
+        core_summary = repo.status_summary(
+            phase_mask=CORE_ENDPOINT_MASK, generation=generation,
+        )
+        if int(core_summary.get("unresolved") or 0) or int(core_summary.get("active_leases") or 0):
+            raise RuntimeError("Extended requires settled Core work and no active company leases")
+        _emit(event, "phase_completed", phase="PRECHECK", generation=generation)
+        _emit(event, "phase_started", phase="PREPARE", generation=generation)
+        prepare_result = await asyncio.to_thread(
+            _prepare_tx, repo, generation=generation, phase="extended",
+        )
+        if refresh:
+            await asyncio.to_thread(_refresh_extended_tx, repo, generation)
+        repo.assert_manager_lock(lock_conn)
+        _emit(event, "phase_completed", phase="PREPARE", generation=generation,
+              rows_prepared=prepare_result.rows_prepared)
+        _emit(event, "phase_started", phase="COLLECT", generation=generation)
+        with _keep_system_awake():
+            collection = await _guard_application_lock(
+                repo, lock_conn, collect(
+                    generation=generation, phase="extended",
+                    concurrency=concurrency, rate=rate,
+                    http_retries=http_retries, repository=repo, event=event,
+                ),
+            )
+        _emit(event, "phase_completed", phase="COLLECT", generation=generation)
+        repo.assert_manager_lock(lock_conn)
+        await asyncio.to_thread(_recover_expired, repo)
+        _emit(event, "phase_started", phase="VERIFY", generation=generation)
+        checked = await verify(generation=generation, phase="extended", repository=repo)
+        _emit(event, "phase_completed", phase="VERIFY", generation=generation,
+              status=checked.status)
+        return CycleResult(
+            status=checked.status if checked.details["ok"] else "FAILED",
+            generation=generation, phase="extended", resumed=True,
+            discovery={}, prepare=asdict(prepare_result),
+            collection=collection, verification=checked.details,
+            finalized_rows=0,
+        )
+
+
 async def _cycle_run_core(
     *,
     phase: str = "core",
@@ -807,11 +909,11 @@ async def _cycle_run_core(
         raise ValueError(
             "cycle run requires full-universe discovery; use dbd-data discover for scoped Search"
         )
-    # This guard must precede monthly-control transitions, PRECHECK events and
-    # any durable generation mutation; an uncertified root strategy is a hard stop.
-    if repository is None or getattr(repository,"backend",None) in ("sqlserver","mysql"):
-        discovery.require_certified_full_universe_discovery(
-            seeds=None,search_type="",max_buckets=None,
+    if phase == "extended":
+        return await _cycle_run_extended(
+            refresh=refresh, concurrency=concurrency, rate=rate,
+            http_retries=http_retries, repository=repository,
+            backend=backend, event=event,
         )
     repo = _repo(repository, backend)
     with repo.manager_lock() as lock_conn:
@@ -819,24 +921,45 @@ async def _cycle_run_core(
         await asyncio.to_thread(repo.check_database)
         repo.assert_manager_lock(lock_conn)
 
-        generation, resumed = _cycle_generation(repo, phase=phase)
+        generation, resumed = _cycle_generation(repo, phase="core")
         control = None
         control_node = None
         cycle_month = None
-        if phase == "core" and getattr(repo, "backend", None) == "sqlserver":
-            from .control import EarlyStartConfirmationRequired
+        restart_state = "SCHEDULED"
+
+        if getattr(repo, "backend", None) == "sqlserver":
+            from .control import EarlyStartConfirmationRequired, choose_monthly_generation, month_key
             from .presentation.setup import local_node_id
             from .storage.sqlserver.control_repository import ControlRepository
+
             control_node = local_node_id()
             if control_node is None:
                 raise RuntimeError("Run dbd-data setup before the monthly cycle")
             control = ControlRepository()
+            control.require_admin(control_node)
+            now = datetime.now(timezone.utc)
+
+            # This read-only decision must precede select_cycle(), which can
+            # create a GENERATION row or adopt unfinished business rows.
+            state = repo.generation_state()
+            scheduled = control.schedule()
+            if scheduled is None:
+                raise RuntimeError("Monthly schedule not configured")
+            active_record = control.active_generation()
+            month_record = control.generation(month_key(now))
+            preview = choose_monthly_generation(
+                now=now, generation_state=state, schedule=scheduled,
+                current_month_record=month_record, active_record=active_record,
+            )
+            if preview.action == "START" or (
+                preview.action == "NOT_DUE" and not auto and manual_confirmed
+            ):
+                discovery.require_certified_full_universe_discovery(
+                    seeds=None, search_type="", max_buckets=None,
+                )
             action, record = control.select_cycle(
-                control_node,
-                repo.generation_state(),
-                auto=auto,
-                manual_confirmed=manual_confirmed,
-                now=datetime.now(timezone.utc),
+                control_node, state, auto=auto,
+                manual_confirmed=manual_confirmed, now=now,
             )
             if action == "NOT_DUE" and not auto:
                 raise EarlyStartConfirmationRequired(
@@ -852,186 +975,145 @@ async def _cycle_run_core(
                 )
                 _emit(event, "cycle_completed", **asdict(result))
                 return result
-            assert record is not None
+            if record is None or action not in ("START", "RESUME"):
+                raise RuntimeError("Monthly Core Control did not select an executable generation")
             generation = int(record["generation"])
             cycle_month = str(record["cycle_month"])
             resumed = action == "RESUME"
+            restart_state = str(record.get("state") or "SCHEDULED")
+            if restart_state not in (
+                "SCHEDULED", "DISCOVERING", "PREPARING", "COLLECTING",
+                "DRAINING", "VERIFYING", "FINALIZING",
+            ):
+                raise RuntimeError("Cannot resume invalid monthly Core state: " + restart_state)
             if record.get("start_warning"):
                 _emit(event, "warning", message=str(record["start_warning"]))
-            control.transition(control_node, cycle_month, "DISCOVERING")
         elif auto:
             raise ValueError("--auto requires the SQL Server production backend")
-        _emit(
-            event,
-            "phase_completed",
-            phase="PRECHECK",
-            generation=generation,
-            resumed=resumed,
-        )
-
-        discover_work = discovery.run(
-            list(seeds or []),
-            search_type=search_type,
-            concurrency=concurrency,
-            rate=rate,
-            max_buckets=max_buckets,
-            verbose=verbose,
-            distributed=False,
-            generation=generation,
-            refresh_mask=phase_mask(phase) if refresh else 0,
-            repository=repo,
-            event=event,
-        )
-        _emit(event, "phase_started", phase="DISCOVER", generation=generation)
-        with _keep_system_awake():
-            discovery_result = await _guard_application_lock(
-                repo,
-                lock_conn,
-                discover_work,
+        elif repository is None or getattr(repository, "backend", None) in ("sqlserver", "mysql"):
+            # Production MySQL has no SQL Server monthly Control Plane.
+            discovery.require_certified_full_universe_discovery(
+                seeds=None, search_type="", max_buckets=None,
             )
-        _emit(
-            event,
-            "phase_completed",
-            phase="DISCOVER",
-            generation=generation,
-            companies=discovery_result.companies_written,
-            partitions=discovery_result.buckets_processed,
-            pages=discovery_result.pages_fetched,
-            requests=discovery_result.requests_made,
-            invalid_rows=discovery_result.invalid_rows,
-        )
 
+        positions = (
+            "SCHEDULED", "DISCOVERING", "PREPARING", "COLLECTING",
+            "DRAINING", "VERIFYING", "FINALIZING",
+        )
+        resume_at = positions.index(restart_state)
+        _emit(event, "phase_completed", phase="PRECHECK",
+              generation=generation, resumed=resumed)
+        discovery_result = None
+        prepare_result = None
+        collection_result = {}
+
+        if resume_at <= positions.index("DISCOVERING"):
+            discovery.require_certified_full_universe_discovery(
+                seeds=None, search_type="", max_buckets=None,
+            ) if (repository is None or getattr(repository, "backend", None) in (
+                "sqlserver", "mysql"
+            )) else None
+            if control is not None:
+                control.transition(control_node, cycle_month, "DISCOVERING")
+            _emit(event, "phase_started", phase="DISCOVER", generation=generation)
+            work = discovery.run(
+                [], search_type="", concurrency=concurrency, rate=rate,
+                max_buckets=None, verbose=verbose, distributed=False,
+                generation=generation,
+                refresh_mask=CORE_ENDPOINT_MASK if refresh else 0,
+                repository=repo, event=event,
+            )
+            with _keep_system_awake():
+                discovery_result = await _guard_application_lock(repo, lock_conn, work)
+            _emit(event, "phase_completed", phase="DISCOVER", generation=generation,
+                  companies=discovery_result.companies_written,
+                  partitions=discovery_result.buckets_processed,
+                  pages=discovery_result.pages_fetched,
+                  requests=discovery_result.requests_made,
+                  invalid_rows=discovery_result.invalid_rows)
         if control is not None or getattr(repo, "backend", None) == "mysql":
-            # Both production backends require durable full-universe certification
-            # before preparing Core-7 claims. A drained queue is insufficient.
-            if getattr(repo, "backend", None) == "mysql":
-                from .storage.mysql import discovery_repository as discovery_work
-            else:
-                from .storage.sqlserver import discovery_repository as discovery_work
-            with repo.transaction() as conn:
-                evidence = discovery_work.coverage(conn, generation, "full")
-            if not evidence["ok"]:
-                raise RuntimeError(
-                    "Monthly Core Discovery is incomplete; cannot PREPARE: "
-                    + str(evidence)
-                )
+            await asyncio.to_thread(_certified_full_coverage, repo, generation)
+        if resume_at <= positions.index("PREPARING"):
             if control is not None:
                 control.transition(control_node, cycle_month, "PREPARING")
-        _emit(event, "phase_started", phase="PREPARE", generation=generation)
-        repo.assert_manager_lock(lock_conn)
-        prepare_result = await asyncio.to_thread(
-            _prepare_tx,
-            repo,
-            generation=generation,
-            phase=phase,
-        )
-        repo.assert_manager_lock(lock_conn)
-        _emit(
-            event,
-            "phase_completed",
-            phase="PREPARE",
-            generation=generation,
-            rows_prepared=prepare_result.rows_prepared,
-        )
-
-        if control is not None:
-            control.transition(control_node, cycle_month, "COLLECTING")
-        _emit(event, "phase_started", phase="COLLECT", generation=generation)
-        collection_work = collect(
-            generation=generation,
-            phase=phase,
-            concurrency=concurrency,
-            rate=rate,
-            http_retries=http_retries,
-            continuous=False,
-            repository=repo,
-            event=event,
-        )
-        with _keep_system_awake():
-            collection_result = await _guard_application_lock(
-                repo,
-                lock_conn,
-                collection_work,
+            _emit(event, "phase_started", phase="PREPARE", generation=generation)
+            repo.assert_manager_lock(lock_conn)
+            prepare_result = await asyncio.to_thread(
+                _prepare_tx, repo, generation=generation, phase="core",
             )
-        _emit(event, "phase_completed", phase="COLLECT", generation=generation)
-
-        if control is not None:
-            control.transition(control_node, cycle_month, "DRAINING")
-            await _wait_for_remote_claims(repo, generation=generation)
-        repo.assert_manager_lock(lock_conn)
-        await asyncio.to_thread(_recover_expired, repo)
-        repo.assert_manager_lock(lock_conn)
-        if control is not None:
-            control.transition(control_node, cycle_month, "VERIFYING")
+            repo.assert_manager_lock(lock_conn)
+            _emit(event, "phase_completed", phase="PREPARE",
+                  generation=generation, rows_prepared=prepare_result.rows_prepared)
+        if resume_at <= positions.index("COLLECTING"):
+            if control is not None:
+                control.transition(control_node, cycle_month, "COLLECTING")
+            _emit(event, "phase_started", phase="COLLECT", generation=generation)
+            with _keep_system_awake():
+                collection_result = await _guard_application_lock(
+                    repo, lock_conn,
+                    collect(generation=generation, phase="core",
+                            concurrency=concurrency, rate=rate,
+                            http_retries=http_retries, continuous=False,
+                            repository=repo, event=event),
+                )
+            _emit(event, "phase_completed", phase="COLLECT", generation=generation)
+        if resume_at <= positions.index("DRAINING"):
+            if control is not None:
+                control.transition(control_node, cycle_month, "DRAINING")
+                await _wait_for_remote_claims(repo, generation=generation)
+            repo.assert_manager_lock(lock_conn)
+            await asyncio.to_thread(_recover_expired, repo)
+            repo.assert_manager_lock(lock_conn)
+            if control is not None:
+                control.transition(control_node, cycle_month, "VERIFYING")
 
         _emit(event, "phase_started", phase="VERIFY", generation=generation)
-        verification = await verify(
-            generation=generation,
-            phase=phase,
-            repository=repo,
-        )
-        _emit(
-            event,
-            "phase_completed",
-            phase="VERIFY",
-            generation=generation,
-            status=verification.status,
-        )
-
+        verification = await verify(generation=generation, phase="core", repository=repo)
+        _emit(event, "phase_completed", phase="VERIFY",
+              generation=generation, status=verification.status)
         if not bool(verification.details["ok"]):
             result = CycleResult(
-                status="FAILED",
-                generation=generation,
-                phase=phase,
-                resumed=resumed,
-                discovery=asdict(discovery_result),
-                prepare=asdict(prepare_result),
-                collection=collection_result,
-                verification=verification.details,
+                status="FAILED", generation=generation, phase=phase, resumed=resumed,
+                discovery=asdict(discovery_result) if discovery_result else {},
+                prepare=asdict(prepare_result) if prepare_result else {},
+                collection=collection_result, verification=verification.details,
                 finalized_rows=0,
             )
             _emit(event, "cycle_completed", **asdict(result))
             return result
 
-        if control is not None:
+        if control is not None and resume_at <= positions.index("VERIFYING"):
             control.transition(control_node, cycle_month, "FINALIZING")
         _emit(event, "phase_started", phase="FINALIZE", generation=generation)
         finalized_rows = await _finalize_all(
-            repo,
-            lock_conn,
-            generation=generation,
+            repo, lock_conn, generation=generation,
         )
         repo.assert_manager_lock(lock_conn)
         final_verification = await verify(
-            generation=generation,
-            phase=phase,
-            repository=repo,
+            generation=generation, phase="core", repository=repo,
         )
         final_ok = bool(final_verification.details["ok"]) and not int(
             final_verification.details.get("unfinished_rows") or 0
         )
         status_value = (
-            "FAILED"
-            if not final_ok
-            else "COMPLETE_WITH_FAILURES"
-            if int(final_verification.details.get("global_terminal_failures") or 0)
-            else "COMPLETE"
+            "FAILED" if not final_ok else
+            "COMPLETE_WITH_FAILURES" if int(
+                final_verification.details.get("global_terminal_failures") or 0
+            ) else "COMPLETE"
         )
         result = CycleResult(
-            status=status_value,
-            generation=generation,
-            phase=phase,
+            status=status_value, generation=generation, phase=phase,
             resumed=resumed,
-            discovery=asdict(discovery_result),
-            prepare=asdict(prepare_result),
-            collection=collection_result,
-            verification=final_verification.details,
+            discovery=asdict(discovery_result) if discovery_result else {},
+            prepare=asdict(prepare_result) if prepare_result else {},
+            collection=collection_result, verification=final_verification.details,
             finalized_rows=finalized_rows,
         )
         if control is not None and final_ok:
             control.transition(
                 control_node, cycle_month,
-                "COMPLETE_WITH_FAILURES" if status_value == "COMPLETE_WITH_FAILURES" else "COMPLETED",
+                "COMPLETE_WITH_FAILURES" if status_value == "COMPLETE_WITH_FAILURES"
+                else "COMPLETED",
             )
         _emit(event, "phase_completed", phase="FINALIZE", generation=generation)
         _emit(event, "cycle_completed", **asdict(result))
