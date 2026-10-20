@@ -233,8 +233,6 @@ def split(conn, parent: dict, children: list, dimension: str,
           counts: list[tuple[int,int]] | None = None) -> None:
     if parent["status"]!="COUNTED" or len(children)<2:
         raise ContractError("Only counted parent may be split")
-    from ...pipelines.discovery import validate_certified_split_shape
-    validate_certified_split_shape(parent, children, dimension)
     if len({f.key() for f in children}) != len(children):
         raise ContractError("Duplicate child discovery filters")
     if counts is None or len(counts)!=len(children):
@@ -245,6 +243,8 @@ def split(conn, parent: dict, children: list, dimension: str,
            or (total<=10000 and pages!=(total+9)//10)
            for total,pages in counts):
         raise ContractError("Invalid child page count evidence")
+    from ...pipelines.discovery import validate_certified_split_shape
+    validate_certified_split_shape(parent, children, dimension)
     for child,(total,pages) in zip(children,counts,strict=True):
         child_id=_add(conn,int(parent["generation"]),parent["scope_key"],
                       child,int(parent["work_id"]))
