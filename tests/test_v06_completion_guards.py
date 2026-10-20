@@ -288,7 +288,7 @@ class ChangedFingerprintConn(ReplayConn):
 
 
 @pytest.mark.parametrize("repository",[ms_branch,my_branch])
-def test_terminal_branch_result_is_not_skipped_when_company_fingerprint_changes(
+def test_terminal_branch_result_is_reused_when_company_fingerprint_changes(
     repository,monkeypatch
 ):
     if repository is ms_branch:
@@ -306,9 +306,9 @@ def test_terminal_branch_result_is_not_skipped_when_company_fingerprint_changes(
         total=1,
         source_url="https://www.dataforthai.com/company-branch/0105559000001/show/printview",
     )
-    assert result=="NO_BRANCH"
-    assert any("SET collection_status=%s,checked_phase=%s" in sql
-               for sql,_ in conn.queries)
+    assert result=="SKIPPED"
+    assert not any("SET collection_status=%s,checked_phase=%s" in sql
+                   for sql,_ in conn.queries)
 
 
 def test_direct_discovery_rejects_paginated_overrun_and_inconsistent_counts():
