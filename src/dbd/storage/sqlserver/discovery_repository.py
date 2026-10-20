@@ -218,7 +218,8 @@ def reopen_blocked_keyword(conn, generation: int, scope: str, *,
 
     A caller cannot reopen merely because a candidate generator now exists.
     """
-    if not semantics_certified:
+    from ...pipelines.discovery import root_coverage_contract
+    if not semantics_certified or not root_coverage_contract()["search_semantics_certified"]:
         return 0
     if not 1 <= limit <= 1000:
         raise ValueError("Keyword recovery limit must be 1..1000")
