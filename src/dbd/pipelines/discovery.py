@@ -227,6 +227,17 @@ def validate_certified_split_shape(parent: dict, children: list[SearchFilters],
     additionally refuse a malformed parent/child filter relationship.
     Keyword candidates are deliberately NOT certifiable with current evidence.
     """
+    if dimension == "keyword":
+        if not root_coverage_contract()["search_semantics_certified"]:
+            raise ContractError("Keyword split has no certified search semantics")
+        raw = parent.get("filters_json")
+        if not raw:
+            raise ContractError("Certified split requires persisted parent filters")
+        original = SearchFilters(**json.loads(raw))
+        expected = _keyword_expansion_candidates(original)
+        if len(expected) != 10 or {c.key() for c in children} != {c.key() for c in expected}:
+            raise ContractError("Keyword child identities do not preserve a complete parent partition")
+        return
     if dimension not in ("juristic_type", "province", "status", "business_size"):
         raise ContractError("Split dimension has no certified search semantics")
     raw = parent.get("filters_json")
@@ -1444,9 +1455,9 @@ async def _run_durable_discovery(
                         try:
                             child_data, _ = await _direct_page(client,child,1)
                         except DeepPermanentHttpError as exc:
-                            if exc.status == 400 and dimension == "status":
+                            if exc.status == 400:
                                 candidate_ok = False
-                                reasons.append("status_filter_not_supported")
+                                reasons.append(dimension + ":filter_not_supported")
                                 break
                             raise
                         observed = parse_search_response(child_data)
@@ -1490,16 +1501,65 @@ async def _run_durable_discovery(
                     break
 
                 if children is None:
-                    # Categorical splitting was exhausted. Decimal keyword
-                    # extension is a bounded candidate, NOT a verified prefix
-                    # partition for DBD normal-search semantics. Probe only
-                    # sample membership/count and always retain a blocked
-                    # certificate until an authoritative search contract exists.
+                    # Probe a bounded decimal-prefix candidate, never assume
+                    # that numeric-looking keywords mean registration prefixes.
                     keyword_children = _keyword_expansion_candidates(filters)
-                    if keyword_children:
-                        reasons.append("keyword_prefix_semantics_not_certified")
-                    else:
+                    if not keyword_children:
                         reasons.append("keyword_expansion_not_applicable")
+                    elif not all(
+                        str(row.get("jpNo") or "").startswith(filters.keyword)
+                        for row in parent.rows if isinstance(row, dict)
+                    ):
+                        reasons.append("keyword_parent_matches_non_prefix_company")
+                    else:
+                        keyword_counts = []
+                        keyword_seen = set()
+                        keyword_valid = True
+                        for child in keyword_children:
+                            from ..deep.http import DeepPermanentHttpError
+                            try:
+                                data, _ = await _direct_page(client, child, 1)
+                            except DeepPermanentHttpError as exc:
+                                if exc.status == 400:
+                                    reasons.append("keyword_child_filter_unsupported")
+                                    keyword_valid = False
+                                    break
+                                raise
+                            observed = parse_search_response(data)
+                            pages_fetched += 1
+                            validate_search_scope(observed.rows, child)
+                            for row in observed.rows:
+                                identity = (str(row.get("jpTypeCode") or ""),
+                                            str(row.get("jpNo") or ""))
+                                if (not identity[1].startswith(child.keyword)
+                                    or identity in keyword_seen):
+                                    keyword_valid = False
+                                    reasons.append("keyword_non_prefix_or_sample_overlap")
+                                    break
+                                keyword_seen.add(identity)
+                            if not keyword_valid:
+                                break
+                            keyword_counts.append((observed.total_items, observed.total_pages))
+                        if keyword_valid and len(keyword_counts) == 10:
+                            child_totals = [total for total, _ in keyword_counts]
+                            if (sum(child_totals) != parent.total_items
+                                or max(child_totals) >= parent.total_items):
+                                reasons.append("keyword_count_mismatch_or_no_progress")
+                            else:
+                                latest_data, _ = await _direct_page(client, filters, 1)
+                                pages_fetched += 1
+                                latest = parse_search_response(latest_data)
+                                if (latest.total_items != parent.total_items
+                                    or latest.total_pages != parent.total_pages):
+                                    reasons.append("keyword_parent_count_drift")
+                                elif not root_coverage_contract()["search_semantics_certified"]:
+                                    reasons.append("keyword_prefix_semantics_not_certified")
+                                else:
+                                    children = keyword_children
+                                    counts = keyword_counts
+                                    split_dimension = "keyword"
+                        elif not reasons:
+                            reasons.append("keyword_candidate_invalid")
 
                 if children is None:
                     reason = "no_certified_lossless_split:" + ",".join(reasons)[:900]
