@@ -1492,6 +1492,40 @@ class ProductionSqlServerRepository:
         finally:
             cur.close()
 
+    def refresh_phase_outcomes(
+        self, conn, *, generation: int, phase_mask: int,
+        limit: int, after_company_id: int = 0,
+    ) -> tuple[int, int | None]:
+        """Explicit bounded phase refresh; leave all other mask bits unchanged."""
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                DECLARE @changed TABLE (company_id BIGINT NOT NULL);
+                ;WITH target AS (
+                    SELECT TOP (%s) * FROM dbo.DBD_COMPANY WITH (UPDLOCK,ROWLOCK)
+                    WHERE last_seen_generation=%s AND company_id>%s
+                      AND (done_mask | not_available_mask | failed_mask) & %s <> 0
+                      AND (lease_owner IS NULL OR lease_expires_at<=SYSUTCDATETIME())
+                    ORDER BY company_id
+                )
+                UPDATE target SET
+                    done_mask=done_mask & ~%s,
+                    not_available_mask=not_available_mask & ~%s,
+                    failed_mask=failed_mask & ~%s,
+                    retry_at=NULL,collect_status=N'PENDING',
+                    collection_completed_at=NULL
+                OUTPUT inserted.company_id INTO @changed(company_id);
+                SELECT COUNT(*),MAX(company_id) FROM @changed;
+                """,
+                (int(limit),int(generation),int(after_company_id),int(phase_mask),
+                 int(phase_mask),int(phase_mask),int(phase_mask)),
+            )
+            row=cur.fetchone()
+            return int(row[0] or 0), (int(row[1]) if row[1] is not None else None)
+        finally:
+            cur.close()
+
     def claim_company(
         self,
         conn,
