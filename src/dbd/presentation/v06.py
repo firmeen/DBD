@@ -1192,6 +1192,12 @@ class V06Terminal:
                 ("Endpoint failed", collection.get("endpoints_failed"), "cycle.endpoints_failed"),
                 ("Finalized rows", result.get("finalized_rows"), "cycle.finalized_rows"),
             ]
+            branch = dict(result.get("branch") or {})
+            if branch:
+                result_items.extend([
+                    ("Core outcome", branch.get("core_status"), "cycle.core_status"),
+                    ("Branch outcome", branch.get("branch_status"), "cycle.branch_status"),
+                ])
             blocks = [
                 cycle_panel,
                 self._panel(
@@ -1829,9 +1835,15 @@ class V06Terminal:
                 f"company_id={payload.get('company_id')}"
             )
         if command in {"cycle-run", "cycle-loop"}:
+            branch = dict(payload.get("branch") or {})
+            detail = (
+                f" core={branch.get('core_status')} branch={branch.get('branch_status')}"
+                f" branch_stage={branch.get('stage')}"
+                if branch else ""
+            )
             return (
                 f"Result: status={payload.get('status')} generation={payload.get('generation')} "
-                f"finalized_rows={payload.get('finalized_rows')}"
+                f"finalized_rows={payload.get('finalized_rows')}" + detail
             )
         if command == "prepare":
             return (
