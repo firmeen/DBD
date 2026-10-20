@@ -419,8 +419,25 @@ def _mysql_plan(conn: Any, *, owning_manager_lock: bool = False) -> dict[str, An
                     p["data_conflicts"] += positives
                     p["blockers"].append(
                         f"{positives} historical nullable counts; cannot infer HQ semantics")
+                elif "legacy_branch_count_pre_v06" in actual:
+                    p["blockers"].append(
+                        "Legacy backup column already exists; cannot rename branch_count safely")
                 else:
-                    p["reconciliation"].append("Set unverified NULL/zero count to HQ default 1")
+                    p["reconciliation"].append(
+                        "Preserve nullable branch_count as legacy_branch_count_pre_v06 "
+                        "before adding unverified canonical HQ default 1")
+        if table == "DBD_COMPANY" and "branch_count" not in actual and (
+            "legacy_branch_count_pre_v06" in actual
+        ):
+            legacy_values = int(_one(conn,
+                "SELECT COUNT(*) FROM DBD_COMPANY "
+                "WHERE legacy_branch_count_pre_v06 IS NOT NULL "
+                "AND legacy_branch_count_pre_v06<>0") or 0)
+            if legacy_values:
+                p["data_conflicts"] += legacy_values
+                p["blockers"].append(
+                    f"{legacy_values} preserved legacy count(s) need manual evidence reconciliation"
+                )
         if "DBD_COMPANY" == table and {"lease_owner", "lease_expires_at"} <= actual.keys():
             leases = int(_one(conn, "SELECT COUNT(*) FROM DBD_COMPANY "
                 "WHERE lease_owner IS NOT NULL AND lease_expires_at>UTC_TIMESTAMP(6)") or 0)
@@ -515,14 +532,14 @@ def apply_migration(backend: str | None = None, *, expected: dict[str, Any]) -> 
             from .mysql.production_engine import connection
             with connection() as conn:
                 if "RECONCILE nullable DBD_COMPANY.branch_count" in current["actions"]:
+                    # MySQL DDL auto-commits: preserve the complete historical
+                    # column instead of committing an ambiguous UPDATE first.
+                    # After a crash, the new invocation sees the renamed column
+                    # and a missing canonical column and can add it idempotently.
                     with conn.cursor() as cur:
                         cur.execute(
-                            "UPDATE DBD_COMPANY SET branch_count=1 "
-                            "WHERE branch_count IS NULL OR branch_count=0"
-                        )
-                        conn.commit()
-                        cur.execute(
-                            "ALTER TABLE DBD_COMPANY MODIFY branch_count INT NOT NULL DEFAULT 1"
+                            "ALTER TABLE DBD_COMPANY RENAME COLUMN branch_count "
+                            "TO legacy_branch_count_pre_v06"
                         )
                 result = ensure_schema(conn)
                 ensure_work(conn)
