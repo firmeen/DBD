@@ -9,7 +9,7 @@ import re
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
@@ -18,7 +18,8 @@ from ..core.settings import settings
 
 SITE = "https://www.dataforthai.com"
 
-# Phase-based branch collection; timestamps are audit only, never work selectors.
+# Durable Branch Phase remains authoritative. Deferred results also respect a
+# bounded retry cooldown, so loop restarts do not immediately repeat HTTP.
 
 class BranchError(RuntimeError):
     pass
@@ -26,6 +27,35 @@ class BranchError(RuntimeError):
 
 class SourceAccessDenied(BranchError):
     pass
+
+
+_RECHECK_HOURS = {
+    "RETRY": 1, "INVALID": 24, "UNAVAILABLE": 24, "NOT_LISTED": 24,
+    "DEFERRED_NETWORK": 1, "DEFERRED_PARSE": 24, "DEFERRED_BRANCH": 24,
+}
+
+
+def _deferred_retry_ready(company: dict, now: datetime | None = None) -> bool:
+    """Only retry a deferred HQ result when its recorded cooldown expired."""
+    status = str(company.get("collection_status") or "")
+    if not status.startswith("DEFERRED_"):
+        return True
+    checked_at = company.get("last_checked_at")
+    if checked_at is None:
+        return True
+    if isinstance(checked_at, str):
+        try:
+            checked_at = datetime.fromisoformat(checked_at)
+        except ValueError as exc:
+            raise BranchError("Invalid durable Branch retry timestamp") from exc
+    if not isinstance(checked_at, datetime):
+        raise BranchError("Unsupported durable Branch retry timestamp")
+    if checked_at.tzinfo is None:
+        checked_at = checked_at.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    return current >= checked_at + timedelta(
+        hours=_RECHECK_HOURS.get(status, 24)
+    )
 
 
 def _clean(value) -> str:
@@ -488,6 +518,10 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                                 # A fingerprint is audit evidence, not consent
                                 # to repeat an already terminal HTTP collection.
                                 # Explicit new-phase work remains independent.
+                                continue
+                            if not _deferred_retry_ready(company):
+                                if pass_no==1:
+                                    stats["skipped"]+=1
                                 continue
                             if ident in attempted:
                                 continue
