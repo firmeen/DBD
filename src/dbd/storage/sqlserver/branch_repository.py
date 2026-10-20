@@ -131,7 +131,7 @@ def candidates(conn, *, after: tuple[str,str] | None = None,
             "c.status_code,c.address_th,c.province_code,c.district_code,"
             "c.subdistrict_code,c.postal_code,c.branch_count,"
             "b.collection_status,b.checked_phase,b.verified_phase,"
-            "b.source_fingerprint,b.reported_total "
+            "b.source_fingerprint,b.reported_total,b.last_checked_at "
             "FROM dbo.DBD_COMPANY c "
             f"LEFT JOIN {TABLE} b ON b.company_id=c.company_id AND b.branch_no=N'00000' "
             f"WHERE c.status_code IN ({marks}) {cursor_sql} "
@@ -143,7 +143,7 @@ def candidates(conn, *, after: tuple[str,str] | None = None,
                  "address_th","province_code","district_code",
                  "subdistrict_code","postal_code","branch_count",
                  "collection_status","checked_phase","verified_phase",
-                 "source_fingerprint","reported_total")
+                 "source_fingerprint","reported_total","last_checked_at")
         return [dict(zip(names,row,strict=True)) for row in cur.fetchall()]
 
 
