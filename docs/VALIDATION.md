@@ -342,3 +342,12 @@ must remain unverified without upstream consistency evidence.
 `dbd-data branch import --source sqlserver-extension -c -d sqlserver`
 performs read-only source preflight before approved canonical schema DDL and
 reports blockers without creating a Phase or issuing HTTP requests.
+
+
+### Nullable Production MySQL branch_count — restart-safe preservation
+
+When inspection proves a nullable historical `branch_count` contains **only NULL/zero and no positive historical count**, the approved MySQL Apply first renames the original column to `legacy_branch_count_pre_v06` without rewriting its values. It then adds the canonical `branch_count INT NOT NULL DEFAULT 1`. This is intentional preservation of legacy evidence. If MySQL stops after the rename, the next `--check` identifies the missing canonical column and allows the safe additive step. Positive or ambiguous historical values block the operation.
+
+For SQL Server, the corresponding narrow null/zero normalization and NOT NULL conversion occur within the SQL Server transaction, which rolls back on failure. SQL Server Apply acquires both existing cycle and Branch writer coordination resources before any DDL. The standalone PR #100 extension must still be separately reconciled and is *not* automatically imported by `migrate`.
+
+**Verification limitation:** CLI/unit tests are committed but have not been run successfully in an isolated test environment. The GitHub Actions checks remain failed without retrievable job logs. Do not migrate Production until SQL Server/MySQL isolated integration, PR #100 evidence reconciliation and Windows Ctrl+C tests pass.
