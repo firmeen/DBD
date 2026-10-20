@@ -290,7 +290,8 @@ def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
         raise ContractError("A newer Branch Phase result already exists")
     if old_hq and old_hq[0]==phase_id and (
         old_hq[1] in TERMINAL | REVIEW
-    ) and old_hq[3] == fingerprint:
+    ):
+        # Fingerprint is audit metadata, not an HTTP replay key.
         return "SKIPPED"
     old_numbers=_branch_numbers(conn,company_id)
     if source_kind=="DATAFORTHAI_IMPORT" and verified and old_numbers and old_hq is None:
