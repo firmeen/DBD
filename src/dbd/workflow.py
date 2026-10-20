@@ -951,9 +951,12 @@ async def _cycle_run_core(
                 now=now, generation_state=state, schedule=scheduled,
                 current_month_record=month_record, active_record=active_record,
             )
-            if preview.action == "START" or (
-                preview.action == "NOT_DUE" and not auto and manual_confirmed
-            ):
+            if (preview.action == "START"
+                or (preview.action == "NOT_DUE" and not auto and manual_confirmed)
+                or (state.get("active_generation") is not None
+                    and active_record is None)):
+                # Also fence the adoption of pre-Control unfinished business
+                # rows before select_cycle() can create any Control record.
                 discovery.require_certified_full_universe_discovery(
                     seeds=None, search_type="", max_buckets=None,
                 )
