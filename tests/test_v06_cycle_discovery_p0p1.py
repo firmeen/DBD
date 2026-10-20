@@ -125,6 +125,10 @@ def test_keyword_blocked_recovery_requires_certified_semantics(backend):
     assert backend.reopen_blocked_keyword(
         None, 2, "full", semantics_certified=False
     ) == 0
+    # An untrusted caller boolean cannot override the source-policy evidence.
+    assert backend.reopen_blocked_keyword(
+        None, 2, "full", semantics_certified=True
+    ) == 0
 
 
 @pytest.mark.parametrize("backend", [sql_work, mysql_work])
