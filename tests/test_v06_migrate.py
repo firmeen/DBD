@@ -78,7 +78,7 @@ def test_mysql_preview_uses_select_only(monkeypatch):
 
     class Cursor:
         def execute(self, sql, params=()):
-            if not sql.lstrip().upper().startswith("SELECT"):
+            if not sql.lstrip().upper().startswith(("SELECT", "SHOW GRANTS")):
                 raise AssertionError("Preview attempted a write: " + sql)
             sql_seen.append(sql)
             self.sql = sql
@@ -94,6 +94,8 @@ def test_mysql_preview_uses_select_only(monkeypatch):
             return (None,)
 
         def fetchall(self):
+            if self.sql.strip().upper() == "SHOW GRANTS":
+                return [("GRANT ALL PRIVILEGES ON *.* TO 'test_user'@'localhost'",)]
             return []
 
         def close(self):
@@ -109,7 +111,7 @@ def test_mysql_preview_uses_select_only(monkeypatch):
     assert len(result["missing_tables"]) == 6
     assert any("DISCOVERY_WORK" in op for op in result["actions"])
     assert sql_seen
-    assert all(s.lstrip().upper().startswith("SELECT") for s in sql_seen)
+    assert all(s.lstrip().upper().startswith(("SELECT", "SHOW GRANTS")) for s in sql_seen)
 
 
 def test_apply_denies_blocked_plan_before_acquiring_lock(monkeypatch):
