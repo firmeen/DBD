@@ -204,6 +204,8 @@ def split(conn, parent: dict, children: list, dimension: str,
           counts: list[tuple[int,int]] | None = None) -> None:
     if parent["status"]!="COUNTED" or len(children)<2:
         raise ContractError("Only counted parent may be split")
+    from ...pipelines.discovery import validate_certified_split_shape
+    validate_certified_split_shape(parent, children, dimension)
     if len({f.key() for f in children}) != len(children):
         raise ContractError("Duplicate child discovery filters")
     if counts is None or len(counts)!=len(children):
@@ -281,5 +283,15 @@ def coverage(conn, generation: int, scope: str) -> dict[str,int | bool]:
         invalid=int(cur.fetchone()[0] or 0)
     incomplete=sum(values.get(s,0) for s in
                    ("pending","counted","fetching","failed","blocked"))
-    return {**values,"roots":roots,"invalid_tree":invalid,
-            "ok":bool(roots and not incomplete and not invalid)}
+    from ...pipelines.discovery import root_coverage_contract
+    tree_ok = bool(roots and not incomplete and not invalid)
+    root_evidence = root_coverage_contract()
+    certified = bool(scope == "full" and tree_ok and root_evidence["certified"])
+    return {
+        **values, "roots": roots, "invalid_tree": invalid,
+        "ok": tree_ok, "tree_ok": tree_ok,
+        "root_scope_certified": bool(scope == "full" and root_evidence["certified"]),
+        "certified": certified,
+        "coverage_claim": ("VERIFIED" if certified else
+                           "UNVERIFIED_ROOT_SCOPE" if tree_ok else "INCOMPLETE"),
+    }
