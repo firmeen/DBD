@@ -324,8 +324,6 @@ def split(conn, parent: dict, children: list[SearchFilters],
           dimension: str, counts: list[tuple[int, int]] | None = None) -> None:
     if parent["status"] != "COUNTED" or len(children) < 2:
         raise ContractError("Only counted parents may be split into distinct children")
-    from ...pipelines.discovery import validate_certified_split_shape
-    validate_certified_split_shape(parent, children, dimension)
     if len({f.key() for f in children}) != len(children):
         raise ContractError("Duplicate Discovery child key")
     # A durable SPLIT with uncounted children can never certify coverage.
@@ -343,6 +341,8 @@ def split(conn, parent: dict, children: list[SearchFilters],
         for total, pages in counts
     ):
         raise ContractError("Invalid Discovery child pagination snapshot")
+    from ...pipelines.discovery import validate_certified_split_shape
+    validate_certified_split_shape(parent, children, dimension)
     for index, child in enumerate(children):
         child_id = _add(conn, int(parent["generation"]), parent["scope_key"],
                         child, int(parent["work_id"]))
