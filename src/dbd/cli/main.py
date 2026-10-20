@@ -1291,7 +1291,9 @@ def main():
                     )
                 payload = asdict(result)
                 v06_terminal.finish(payload)
-                if result.status == "FAILED":
+                # Incomplete Branch enrichment is not a clean cycle success.
+                branch = result.branch or {}
+                if result.status == "FAILED" or branch.get("branch_status") == "PARTIAL":
                     raise SystemExit(1)
     except KeyboardInterrupt:
         if v06_terminal is not None:
