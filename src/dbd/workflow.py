@@ -990,8 +990,31 @@ async def _cycle_run_core(
                 _emit(event, "warning", message=str(record["start_warning"]))
         elif auto:
             raise ValueError("--auto requires the SQL Server production backend")
-        elif repository is None or getattr(repository, "backend", None) in ("sqlserver", "mysql"):
-            # Production MySQL has no SQL Server monthly Control Plane.
+        elif getattr(repo, "backend", None) == "mysql":
+            # MySQL has no monthly SQL Server Control record. Under an
+            # uncertified new-universe policy we may still safely finish the
+            # independent Branch phase of an existing finalized Core G2+.
+            state = repo.generation_state()
+            finalized = int(state.get("finalized_generation") or 0)
+            if (not discovery.root_coverage_contract()["certified"]
+                and finalized >= 2
+                and state.get("active_generation") is None
+                and int(state.get("last_seen_generation") or 0) == finalized):
+                summary = repo.status_summary(
+                    phase_mask=None, generation=finalized,
+                )
+                if int(summary.get("unresolved") or 0) == 0:
+                    result = CycleResult(
+                        status="ALREADY_COMPLETED", generation=finalized,
+                        phase=phase, resumed=True, discovery={}, prepare={},
+                        collection={}, verification={}, finalized_rows=0,
+                    )
+                    _emit(event, "cycle_completed", **asdict(result))
+                    return result
+            discovery.require_certified_full_universe_discovery(
+                seeds=None, search_type="", max_buckets=None,
+            )
+        elif repository is None:
             discovery.require_certified_full_universe_discovery(
                 seeds=None, search_type="", max_buckets=None,
             )
