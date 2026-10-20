@@ -503,9 +503,10 @@ class ControlRepository:
                 evidence = discovery_work.coverage(
                     conn, int(active["generation"]), "full"
                 )
-                if not evidence["ok"]:
+                if not evidence.get("certified"):
                     raise ControlError(
-                        "Cannot reconcile completed business Generation while "
+                        "Cannot reconcile completed business Generation without "
+                        "certified full-universe Discovery; "
                         "durable Discovery coverage remains incomplete: "
                         + str(evidence)
                     )
