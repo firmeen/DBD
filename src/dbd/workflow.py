@@ -1089,6 +1089,15 @@ async def _cycle_run_core(
             repo.assert_manager_lock(lock_conn)
             if control is not None:
                 control.transition(control_node, cycle_month, "VERIFYING")
+        else:
+            # VERIFYING/FINALIZING resume cannot rewind the monthly state.
+            # Drain existing claims and reclaim expired leases in place before
+            # verification; otherwise every restart can fail on stale leases.
+            if control is not None:
+                await _wait_for_remote_claims(repo, generation=generation)
+            repo.assert_manager_lock(lock_conn)
+            await asyncio.to_thread(_recover_expired, repo)
+            repo.assert_manager_lock(lock_conn)
 
         _emit(event, "phase_started", phase="VERIFY", generation=generation)
         verification = await verify(generation=generation, phase="core", repository=repo)
