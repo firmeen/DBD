@@ -1358,16 +1358,20 @@ async def _run_durable_discovery(
     status_candidates = await atomic(observed_statuses)
 
     if recovery_pass:
-        from .discovery_numeric import PRODUCTION_CERTIFIED_DIMENSIONS
-        if PRODUCTION_CERTIFIED_DIMENSIONS:
+        evidence = root_coverage_contract(
+            seeds=seeds if explicitly_scoped else None, search_type=search_type,
+            max_buckets=max_buckets,
+        )
+        if evidence["search_semantics_certified"]:
             reopened = await atomic(
-                work.reopen_blocked_numeric, generation, scope,
+                work.reopen_blocked_keyword, generation, scope,
+                semantics_certified=True,
                 limit=min(int(recovery_limit or 100), 1000),
             )
-            notify(
-                "discovery_progress", stage="RECONCILING",
-                reopened_buckets=reopened,
-            )
+            notify("discovery_progress", stage="RECONCILING",
+                   reopened_buckets=reopened)
+        # No new certification means no automatic BLOCKED retry. Previously
+        # stored pages and other failure reasons must remain untouched.
 
     async def pulse() -> None:
         nonlocal durable_snapshot, last_summary_at
