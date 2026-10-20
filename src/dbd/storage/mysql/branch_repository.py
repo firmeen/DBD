@@ -206,13 +206,13 @@ def candidates(conn, *, after: tuple[str,str] | None = None,
             "c.company_name_th,c.company_name_en,c.status_code,c.address_th,"
             "c.province_code,c.district_code,c.subdistrict_code,c.postal_code,"
             "c.branch_count,b.collection_status,b.checked_phase,b.verified_phase,"
-            "b.source_fingerprint,b.reported_total FROM DBD_COMPANY c "
+            "b.source_fingerprint,b.reported_total,b.last_checked_at FROM DBD_COMPANY c "
             f"LEFT JOIN {TABLE} b ON b.company_id=c.company_id AND b.branch_no='00000' "
             f"WHERE c.status_code IN ({marks}) {condition}"
             "ORDER BY c.juristic_type_code,c.registration_no LIMIT %s",
             tuple(args),
         )
-        return [dict(zip(("company_id","juristic_type_code","registration_no","company_name_th","company_name_en","status_code","address_th","province_code","district_code","subdistrict_code","postal_code","branch_count","collection_status","checked_phase","verified_phase","source_fingerprint","reported_total"),row,strict=True)) for row in cur.fetchall()]
+        return [dict(zip(("company_id","juristic_type_code","registration_no","company_name_th","company_name_en","status_code","address_th","province_code","district_code","subdistrict_code","postal_code","branch_count","collection_status","checked_phase","verified_phase","source_fingerprint","reported_total","last_checked_at"),row,strict=True)) for row in cur.fetchall()]
 
 
 def _branch_numbers(conn, company_id: int) -> set[str]:
