@@ -219,6 +219,40 @@ def _keyword_expansion_candidates(filters: SearchFilters) -> list[SearchFilters]
     return children
 
 
+def validate_certified_split_shape(parent: dict, children: list[SearchFilters],
+                                   dimension: str) -> None:
+    """Repository-side structural fence for a proposed certified partition.
+
+    Source-semantic certification belongs to the planner; a repository must
+    additionally refuse a malformed parent/child filter relationship.
+    Keyword candidates are deliberately NOT certifiable with current evidence.
+    """
+    if dimension not in ("juristic_type", "province", "status", "business_size"):
+        raise ContractError("Split dimension has no certified search semantics")
+    raw = parent.get("filters_json")
+    if not raw:
+        raise ContractError("Certified split requires persisted parent filters")
+    parent_filters = SearchFilters(**json.loads(raw))
+    fields = {
+        "juristic_type": "jp_types", "province": "pv_codes",
+        "status": "jp_statuses", "business_size": "business_sizes",
+    }
+    selected = fields[dimension]
+    if getattr(parent_filters, selected):
+        raise ContractError("Cannot split an already constrained categorical dimension")
+    if len(children) < 2 or len({c.key() for c in children}) != len(children):
+        raise ContractError("Certified split children must have unique identities")
+    values = []
+    from dataclasses import replace
+    for child in children:
+        candidate = getattr(child, selected)
+        if len(candidate) != 1 or replace(child, **{selected: []}).key() != parent_filters.key():
+            raise ContractError("Split child does not preserve its parent's search filters")
+        values.append(str(candidate[0]))
+    if len(values) != len(set(values)):
+        raise ContractError("Overlapping categorical split constraints")
+
+
 def validate_search_scope(rows: list[dict], filters: SearchFilters) -> None:
     """Reject company rows outside their requested disjoint categorical filters.
 
