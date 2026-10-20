@@ -46,19 +46,42 @@ EXTRA_PREFIX_SEEDS = ("099",)
 PRODUCTION_ROOT_COVERAGE_CERTIFIED = False
 
 
+def root_coverage_contract(*, seeds: list[str] | None = None,
+                           search_type: str = "", max_buckets: int | None = None) -> dict:
+    """Separate a complete registered tree from an authoritative universe proof.
+
+    The normal DBD keyword Search is not documented as an exhaustive/disjoint
+    registration-prefix search. No observed page count can certify that fact.
+    """
+    scoped = bool(seeds or search_type or max_buckets is not None)
+    return {
+        "scope": "diagnostic" if scoped else "full",
+        "root_strategy_known": True,
+        "search_semantics_certified": False,
+        "exhaustive": False,
+        "disjoint": False,
+        "certified": False,
+        "reason": (
+            "Scoped Search is not a complete company universe"
+            if scoped else
+            "DBD normal keyword Search has no authoritative exhaustive, "
+            "disjoint registration-prefix semantics proof"
+        ),
+    }
+
+
 def require_certified_full_universe_discovery(
     *, seeds: list[str] | None, search_type: str,
     max_buckets: int | None, recovery_pass: bool = False,
 ) -> None:
     """Fail closed before monthly state changes when root coverage is unproven."""
-    explicitly_scoped = bool(seeds or search_type or max_buckets is not None)
-    if (not explicitly_scoped and not recovery_pass
-        and not PRODUCTION_ROOT_COVERAGE_CERTIFIED):
+    evidence = root_coverage_contract(
+        seeds=seeds, search_type=search_type, max_buckets=max_buckets,
+    )
+    if evidence["scope"] == "full" and not recovery_pass and not evidence["certified"]:
         raise ContractError(
-            "Full-universe Discovery is blocked: the current normal-search numeric "
-            "root seeds are not proven exhaustive and disjoint. Scoped diagnostics "
-            "and recovery remain available, but Production must not claim full "
-            "coverage until an authoritative lossless root strategy is certified."
+            "Full-universe Discovery is blocked: roots are not proven exhaustive "
+            "and disjoint; " + str(evidence["reason"])
         )
 
 
@@ -174,6 +197,26 @@ def _direct_categorical_plans(
                 candidates.append((dimension,children))
     return candidates
 
+
+
+def _keyword_expansion_candidates(filters: SearchFilters) -> list[SearchFilters]:
+    """Bounded, syntactic registration-prefix *candidates*, never a certificate.
+
+    DBD normal Search can also match names and substrings. Advancing a keyword
+    is unsafe without independently established prefix/exhaustiveness semantics.
+    Preserve all other filters and advance at most to a 13-digit identity.
+    """
+    from dataclasses import replace
+
+    keyword = filters.keyword
+    if (not keyword.isascii() or not keyword.isdecimal()
+        or not 3 <= len(keyword) < 13 or filters.search_type):
+        return []
+    children = [replace(filters, keyword=keyword + str(n)) for n in range(10)]
+    keys = [child.key() for child in children]
+    if len(set(keys)) != 10 or filters.key() in keys:
+        return []
+    return children
 
 
 def validate_search_scope(rows: list[dict], filters: SearchFilters) -> None:
@@ -1373,7 +1416,15 @@ async def _run_durable_discovery(
                         candidate_counts.append(
                             (observed.total_items, observed.total_pages)
                         )
-                        validate_search_scope(observed.rows,child)
+                        try:
+                            validate_search_scope(observed.rows, child)
+                        except ContractError as exc:
+                            # Only an incompatible *candidate* filter is safe
+                            # to skip. Invalid pagination, HTTP, auth and
+                            # persistence errors remain fatal.
+                            candidate_ok = False
+                            reasons.append(dimension + ":filter_not_respected:" + str(exc)[:120])
+                            break
                         for row in observed.rows:
                             identity = (row.get("jpTypeCode"),row.get("jpNo"))
                             if all(identity):
@@ -1401,51 +1452,16 @@ async def _run_durable_discovery(
                     break
 
                 if children is None:
-                    from .discovery_numeric import (
-                        PRODUCTION_CERTIFIED_DIMENSIONS,
-                        NumericObservation,
-                        numeric_partition_structure,
-                        plan_numeric_split,
-                    )
-                    if PRODUCTION_CERTIFIED_DIMENSIONS:
-                        async def numeric_count(candidate: SearchFilters):
-                            nonlocal pages_fetched
-                            child_data, _ = await _direct_page(client,candidate,1)
-                            child_page = parse_search_response(child_data)
-                            pages_fetched += 1
-                            return NumericObservation(
-                                child_page.total_items,child_page.rows,
-                            )
-
-                        plan = await plan_numeric_split(
-                            filters, parent.total_items, numeric_count,
-                            parent.rows,
-                            dimensions=tuple(PRODUCTION_CERTIFIED_DIMENSIONS),
-                        )
-                        if (
-                            plan.candidate
-                            and plan.dimension in PRODUCTION_CERTIFIED_DIMENSIONS
-                            and numeric_partition_structure(
-                                filters.key(),
-                                [child.key() for child in plan.children],
-                                certified=PRODUCTION_CERTIFIED_DIMENSIONS,
-                            )
-                        ):
-                            fresh, _ = await _direct_page(client,filters,1)
-                            pages_fetched += 1
-                            checked = parse_search_response(fresh)
-                            if (checked.total_items == parent.total_items
-                                and checked.total_pages == parent.total_pages):
-                                children = plan.children
-                                counts = [
-                                    (obs.count,(obs.count+9)//10)
-                                    for obs in plan.child_observations
-                                ]
-                                split_dimension = str(plan.dimension)
-                            else:
-                                reasons.append("numeric_parent_count_drift")
-                        else:
-                            reasons.append(plan.reason)
+                    # Categorical splitting was exhausted. Decimal keyword
+                    # extension is a bounded candidate, NOT a verified prefix
+                    # partition for DBD normal-search semantics. Probe only
+                    # sample membership/count and always retain a blocked
+                    # certificate until an authoritative search contract exists.
+                    keyword_children = _keyword_expansion_candidates(filters)
+                    if keyword_children:
+                        reasons.append("keyword_prefix_semantics_not_certified")
+                    else:
+                        reasons.append("keyword_expansion_not_applicable")
 
                 if children is None:
                     reason = "no_certified_lossless_split:" + ",".join(reasons)[:900]
