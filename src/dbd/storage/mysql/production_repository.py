@@ -597,6 +597,32 @@ class ProductionMySqlRepository:
                 )
         return len(rows), (int(rows[-1][0]) if rows else None)
 
+    def refresh_phase_outcomes(
+        self, conn, *, generation, phase_mask, limit, after_company_id=0,
+    ):
+        """Explicit bounded phase refresh; keep all unselected outcomes."""
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT company_id FROM DBD_COMPANY WHERE "
+                "last_seen_generation=%s AND company_id>%s "
+                "AND ((done_mask | not_available_mask | failed_mask) & %s)<>0 "
+                "AND (lease_owner IS NULL OR lease_expires_at<=UTC_TIMESTAMP(6)) "
+                "ORDER BY company_id LIMIT %s FOR UPDATE",
+                (int(generation),int(after_company_id),int(phase_mask),int(limit)),
+            )
+            ids=[int(row[0]) for row in cur.fetchall()]
+            for company_id in ids:
+                cur.execute(
+                    "UPDATE DBD_COMPANY SET "
+                    "done_mask=done_mask & ~%s, "
+                    "not_available_mask=not_available_mask & ~%s, "
+                    "failed_mask=failed_mask & ~%s, retry_at=NULL, "
+                    "collect_status='PENDING',collection_completed_at=NULL "
+                    "WHERE company_id=%s",
+                    (int(phase_mask),int(phase_mask),int(phase_mask),company_id),
+                )
+        return len(ids), (ids[-1] if ids else None)
+
     def claim_company(
         self, conn, *, generation, phase_mask, lease_seconds, worker_prefix, company_id=None,
     ):
