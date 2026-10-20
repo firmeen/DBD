@@ -1,185 +1,69 @@
-# C:\Users\afimeenu\project\DBD\mysql_to_sql.py
+
+"""
+mysql_to_sql.py
+DBD Company Export — Unicode-Safe MySQL -> SQL Server Rebuild
+
+Dependencies:
+    python -m pip install mysql-connector-python python-tds python-dotenv
+
+Commands:
+    python mysql_to_sql.py --mode status
+    python mysql_to_sql.py --mode build
+    python mysql_to_sql.py --mode verify
+    python mysql_to_sql.py --mode cutover --confirm-cutover
+
+Behavior:
+    - Uses the existing .env
+    - Never modifies the MySQL source
+    - Never drops the existing SQL Server target
+    - Creates or resumes DBD_COMPANY_EXPORT_BUILD
+    - Uses Unicode-aware TDS bulk transfer
+    - Verifies all 17 columns against MySQL
+    - Preserves committed batches after interruption
+    - Performs cutover only with explicit confirmation
+    - Retains the original target as DBD_COMPANY_EXPORT_BACKUP
+
+Important:
+    Keep the MySQL source unchanged during rebuild and verification.
+    Stop consumers and writers before cutover.
+    The script has not been validated against the live databases.
+"""
 
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 import time
+
 from contextlib import contextmanager
+from dataclasses import dataclass
 from decimal import Decimal
+from pathlib import Path
 
 import mysql.connector
-import pymssql
+import pytds
+
+from pytds import tds_types
 from dotenv import load_dotenv
 
 
 # ============================================================
-# ENV
+# 01. CONFIGURATION
 # ============================================================
 
-PROJECT_ROOT = r"C:\Users\afimeenu\project\DBD"
+PROJECT_ROOT = Path(__file__).resolve().parent
 
-load_dotenv(
-    dotenv_path=os.path.join(
-        PROJECT_ROOT,
-        ".env",
-    )
-)
+load_dotenv(PROJECT_ROOT / ".env")
 
-
-# ============================================================
-# SOURCE / TARGET
-# ============================================================
-
-MYSQL_DATABASE = "dbd"
 MYSQL_TABLE = "dbd_company_export"
 
-MSSQL_DATABASE = "TIPDataIntelligence"
-MSSQL_SCHEMA = "dbo"
-MSSQL_TABLE = "DBD_COMPANY_EXPORT"
+SQL_SCHEMA = "dbo"
+SQL_TARGET = "DBD_COMPANY_EXPORT"
+SQL_BUILD = f"{SQL_TARGET}_BUILD"
+SQL_BACKUP = f"{SQL_TARGET}_BACKUP"
 
-MSSQL_FULL_TABLE = (
-    f"[{MSSQL_SCHEMA}].[{MSSQL_TABLE}]"
-)
-
-BULK_TARGET_TABLE = (
-    f"{MSSQL_SCHEMA}.{MSSQL_TABLE}"
-)
-
-
-# ============================================================
-# PERFORMANCE
-#
-# MySQL:
-#   50,000 rows per page
-#
-# SQL Server:
-#   25,000 rows per BCP batch
-#
-# SQL connection:
-#   persistent during transfer
-#
-# Safety:
-#   PK + UNIQUE always retained
-#   no DELETE
-#   no TRUNCATE
-#   no DROP TABLE
-#
-# Ctrl+C:
-#   already committed batches remain
-#   rerun validates exact committed prefix
-#   resumes after MAX(row_no)
-# ============================================================
-
-MYSQL_PAGE_SIZE = 50_000
-
-BULK_COMMIT_SIZE = 25_000
-
-USE_TABLOCK = True
-
-MYSQL_PAGE_RETRIES = 5
-
-MSSQL_BULK_RETRIES = 5
-
-RETRY_DELAYS = (
-    2,
-    5,
-    10,
-    20,
-    30,
-)
-
-
-# ============================================================
-# MYSQL CONFIG
-# ============================================================
-
-MYSQL_CONFIG = {
-    "host": os.getenv(
-        "DB_HOST",
-        "127.0.0.1",
-    ),
-
-    "port": int(
-        os.getenv(
-            "DB_PORT",
-            "3307",
-        )
-    ),
-
-    "database": os.getenv(
-        "DB_NAME",
-        MYSQL_DATABASE,
-    ),
-
-    "user": os.getenv(
-        "DB_USER",
-        "dbd-data",
-    ),
-
-    "password": os.getenv(
-        "DB_PASSWORD",
-        "",
-    ),
-
-    "charset": "utf8mb4",
-
-    "use_unicode": True,
-
-    "connection_timeout": 30,
-}
-
-
-# ============================================================
-# SQL SERVER CONFIG
-#
-# Uses pymssql directly.
-# ODBC driver is NOT required by this script.
-# ============================================================
-
-MSSQL_CONFIG = {
-    "server": os.getenv(
-        "MSSQL_HOST",
-        "128.191.100.234",
-    ),
-
-    "port": int(
-        os.getenv(
-            "MSSQL_PORT",
-            "1433",
-        )
-    ),
-
-    "user": os.getenv(
-        "MSSQL_USER",
-        "",
-    ),
-
-    "password": os.getenv(
-        "MSSQL_PASSWORD",
-        "",
-    ),
-
-    "database": os.getenv(
-        "MSSQL_DATABASE",
-        MSSQL_DATABASE,
-    ).strip(),
-
-    "login_timeout": 15,
-
-    "timeout": 600,
-
-    "charset": "UTF-8",
-
-    "autocommit": False,
-}
-
-
-# ============================================================
-# COLUMN CONTRACT
-# ============================================================
-
-COLUMNS = [
+COLUMNS = (
     "row_no",
     "registration_no",
     "juristic_type_code",
@@ -197,2707 +81,2340 @@ COLUMNS = [
     "net_profit",
     "total_assets",
     "total_equity",
-]
-
-BULK_COLUMN_IDS = list(
-    range(
-        1,
-        len(COLUMNS) + 1,
-    )
 )
 
+UNICODE_COLS = {
+    "company_name_th",
+    "juristic_type",
+    "status",
+    "business_type",
+    "province",
+}
 
-# ============================================================
-# CREATE SQL SERVER TARGET
-#
-# IMPORTANT:
-#
-# This script ONLY writes to:
-#
-#   dbo.DBD_COMPANY_EXPORT
-#
-# It does NOT modify:
-#
-#   dbo.DBD_COMPANY
-#
-# ============================================================
+DECIMAL_COLS = {
+    "registered_capital",
+    "total_income",
+    "net_profit",
+    "total_assets",
+    "total_equity",
+}
 
-CREATE_TABLE_SQL = f"""
-CREATE TABLE {MSSQL_FULL_TABLE}
-(
-    [row_no]
-        BIGINT
-        NOT NULL,
+REQUIRED_COLS = {
+    "row_no",
+    "registration_no",
+    "juristic_type_code",
+}
 
-    [registration_no]
-        VARCHAR(20)
-        NOT NULL,
-
-    [juristic_type_code]
-        VARCHAR(4)
-        NOT NULL,
-
-    [company_name_th]
-        NVARCHAR(500)
-        NULL,
-
-    [juristic_type]
-        NVARCHAR(255)
-        NULL,
-
-    [status_code]
-        VARCHAR(4)
-        NULL,
-
-    [status]
-        NVARCHAR(255)
-        NULL,
-
-    [business_type_code]
-        VARCHAR(20)
-        NULL,
-
-    [business_type]
-        NVARCHAR(500)
-        NULL,
-
-    [business_size_code]
-        VARCHAR(4)
-        NULL,
-
-    [province]
-        NVARCHAR(255)
-        NULL,
-
-    [registered_capital]
-        DECIMAL(20,2)
-        NULL,
-
-    [latest_fiscal_year]
-        VARCHAR(50)
-        NULL,
-
-    [total_income]
-        DECIMAL(20,2)
-        NULL,
-
-    [net_profit]
-        DECIMAL(20,2)
-        NULL,
-
-    [total_assets]
-        DECIMAL(20,2)
-        NULL,
-
-    [total_equity]
-        DECIMAL(20,2)
-        NULL,
-
-    CONSTRAINT [PK_DBD_COMPANY_EXPORT]
-        PRIMARY KEY CLUSTERED
-        (
-            [row_no]
-        ),
-
-    CONSTRAINT [UQ_DBD_COMPANY_EXPORT_IDENTITY]
-        UNIQUE
-        (
-            [juristic_type_code],
-            [registration_no]
-        )
-);
-"""
-
-
-# ============================================================
-# SECONDARY INDEXES
-#
-# Created only AFTER complete transfer + verification.
-#
-# Existing indexes are never dropped by this script.
-# ============================================================
-
-SECONDARY_INDEXES = {
-    "IX_DBD_COMPANY_EXPORT_REGISTRATION":
-        f"""
-        CREATE INDEX
-            [IX_DBD_COMPANY_EXPORT_REGISTRATION]
-        ON {MSSQL_FULL_TABLE}
-        (
-            [registration_no]
-        )
-        """,
-
-    "IX_DBD_COMPANY_EXPORT_STATUS":
-        f"""
-        CREATE INDEX
-            [IX_DBD_COMPANY_EXPORT_STATUS]
-        ON {MSSQL_FULL_TABLE}
-        (
-            [status_code]
-        )
-        """,
-
-    "IX_DBD_COMPANY_EXPORT_BUSINESS_TYPE":
-        f"""
-        CREATE INDEX
-            [IX_DBD_COMPANY_EXPORT_BUSINESS_TYPE]
-        ON {MSSQL_FULL_TABLE}
-        (
-            [business_type_code]
-        )
-        """,
-
-    "IX_DBD_COMPANY_EXPORT_BUSINESS_SIZE":
-        f"""
-        CREATE INDEX
-            [IX_DBD_COMPANY_EXPORT_BUSINESS_SIZE]
-        ON {MSSQL_FULL_TABLE}
-        (
-            [business_size_code]
-        )
-        """,
-
-    "IX_DBD_COMPANY_EXPORT_PROVINCE":
-        f"""
-        CREATE INDEX
-            [IX_DBD_COMPANY_EXPORT_PROVINCE]
-        ON {MSSQL_FULL_TABLE}
-        (
-            [province]
-        )
-        """,
-
-    "IX_DBD_COMPANY_EXPORT_FISCAL_YEAR":
-        f"""
-        CREATE INDEX
-            [IX_DBD_COMPANY_EXPORT_FISCAL_YEAR]
-        ON {MSSQL_FULL_TABLE}
-        (
-            [latest_fiscal_year]
-        )
-        """,
+TEXT_MIN = {
+    "registration_no": 20,
+    "juristic_type_code": 4,
+    "company_name_th": 500,
+    "juristic_type": 255,
+    "status_code": 4,
+    "status": 255,
+    "business_type_code": 20,
+    "business_type": 500,
+    "business_size_code": 4,
+    "province": 255,
+    "latest_fiscal_year": 50,
 }
 
 
-# ============================================================
-# HELPERS
-# ============================================================
+def env_required(name: str) -> str:
+    value = os.getenv(name, "").strip()
 
-def retry_delay(attempt: int) -> int:
-    return RETRY_DELAYS[
-        min(
-            attempt - 1,
-            len(RETRY_DELAYS) - 1,
+    if not value:
+        raise RuntimeError(
+            f"Missing .env setting: {name}"
         )
-    ]
-
-
-def format_duration(
-    seconds: float | None,
-) -> str:
-
-    if seconds is None:
-        return "-"
-
-    seconds = max(
-        0,
-        int(seconds),
-    )
-
-    hours, remainder = divmod(
-        seconds,
-        3600,
-    )
-
-    minutes, seconds = divmod(
-        remainder,
-        60,
-    )
-
-    if hours:
-        return (
-            f"{hours}h "
-            f"{minutes:02d}m "
-            f"{seconds:02d}s"
-        )
-
-    if minutes:
-        return (
-            f"{minutes}m "
-            f"{seconds:02d}s"
-        )
-
-    return f"{seconds}s"
-
-
-def sanitize_value(value):
-
-    if isinstance(value, str):
-
-        if "\x00" in value:
-            return value.replace(
-                "\x00",
-                "",
-            )
-
-        return value
-
-    if isinstance(value, Decimal):
-        return value
 
     return value
 
 
-def sanitize_row(row):
+def env_int(
+    name: str,
+    default: int,
+    minimum: int = 1,
+    maximum: int = 1_000_000,
+) -> int:
+    value = int(os.getenv(name, str(default)))
 
-    return tuple(
-        sanitize_value(value)
-        for value in row
+    if not minimum <= value <= maximum:
+        raise ValueError(
+            f"{name} must be between "
+            f"{minimum} and {maximum}"
+        )
+
+    return value
+
+
+PAGE_SIZE = env_int(
+    "DBD_SYNC_PAGE_SIZE",
+    10_000,
+    1,
+    100_000,
+)
+
+VERIFY_PAGE_SIZE = env_int(
+    "DBD_SYNC_VERIFY_PAGE_SIZE",
+    5_000,
+    1,
+    50_000,
+)
+
+MAX_RETRIES = env_int(
+    "DBD_SYNC_RETRIES",
+    4,
+    1,
+    20,
+)
+
+
+# ============================================================
+# 02. SQL IDENTIFIERS
+# ============================================================
+
+def quote(name: str) -> str:
+    return "[" + name.replace("]", "]]") + "]"
+
+
+def sql_table(name: str) -> str:
+    return (
+        f"{quote(SQL_SCHEMA)}."
+        f"{quote(name)}"
+    )
+
+
+def mysql_table() -> str:
+    return f"`{MYSQL_TABLE}`"
+
+
+def selected_columns() -> str:
+    return ", ".join(
+        quote(column)
+        for column in COLUMNS
     )
 
 
 # ============================================================
-# CONNECTIONS
+# 03. DATABASE CONNECTIONS
 # ============================================================
 
 @contextmanager
 def mysql_connection():
 
-    conn = mysql.connector.connect(
-        **MYSQL_CONFIG
+    connection = mysql.connector.connect(
+        host=env_required("DB_HOST"),
+        port=env_int(
+            "DB_PORT",
+            3307,
+            1,
+            65535,
+        ),
+        user=env_required("DB_USER"),
+        password=os.getenv(
+            "DB_PASSWORD",
+            "",
+        ),
+        database=env_required("DB_NAME"),
+        charset="utf8mb4",
+        use_unicode=True,
+        autocommit=True,
+        connection_timeout=30,
     )
 
     try:
-        yield conn
+        yield connection
 
     finally:
-        try:
-            if conn.is_connected():
-                conn.close()
-
-        except Exception:
-            pass
-
-
-def open_mssql_connection():
-
-    return pymssql.connect(
-        **MSSQL_CONFIG
-    )
+        connection.close()
 
 
 @contextmanager
-def mssql_connection():
+def sql_connection():
 
-    conn = open_mssql_connection()
+    connection = pytds.connect(
+        dsn=env_required("MSSQL_HOST"),
+        port=env_int(
+            "MSSQL_PORT",
+            1433,
+            1,
+            65535,
+        ),
+        database=env_required(
+            "MSSQL_DATABASE"
+        ),
+        user=env_required("MSSQL_USER"),
+        password=env_required(
+            "MSSQL_PASSWORD"
+        ),
+        login_timeout=20,
+        timeout=600,
+        autocommit=False,
+        bytes_to_unicode=True,
+        appname="DBD-Unicode-Safe-Rebuild",
+    )
 
     try:
-        yield conn
+        yield connection
 
     finally:
-        try:
-            conn.close()
+        connection.close()
 
-        except Exception:
-            pass
 
-
-def close_mssql_safely(conn):
-
-    if conn is None:
-        return
-
-    try:
-        conn.close()
-
-    except Exception:
-        pass
-
-
-# ============================================================
-# CONFIG VALIDATION
-# ============================================================
-
-def validate_config():
-
-    if (
-        MYSQL_CONFIG["database"]
-        != MYSQL_DATABASE
-    ):
-        raise RuntimeError(
-            "DB_NAME must be "
-            f"{MYSQL_DATABASE!r}; got "
-            f"{MYSQL_CONFIG['database']!r}"
-        )
-
-    if (
-        MSSQL_CONFIG["database"]
-        != MSSQL_DATABASE
-    ):
-        raise RuntimeError(
-            "MSSQL_DATABASE must be "
-            f"{MSSQL_DATABASE!r}; got "
-            f"{MSSQL_CONFIG['database']!r}"
-        )
-
-    if not MYSQL_CONFIG["user"]:
-        raise RuntimeError(
-            "DB_USER missing."
-        )
-
-    if not MSSQL_CONFIG["server"]:
-        raise RuntimeError(
-            "MSSQL_HOST missing."
-        )
-
-    if not MSSQL_CONFIG["user"]:
-        raise RuntimeError(
-            "MSSQL_USER missing."
-        )
-
-    if not MSSQL_CONFIG["password"]:
-        raise RuntimeError(
-            "MSSQL_PASSWORD missing."
-        )
-
-
-# ============================================================
-# BULK COPY PREFLIGHT
-# ============================================================
-
-def validate_bulk_copy_support():
-
-    with mssql_connection() as conn:
-
-        if not hasattr(
-            conn,
-            "bulk_copy",
-        ):
-            version = getattr(
-                pymssql,
-                "__version__",
-                "unknown",
-            )
-
-            raise RuntimeError(
-                "Installed pymssql "
-                f"({version}) does not provide "
-                "Connection.bulk_copy()."
-            )
-
-
-# ============================================================
-# MYSQL SOURCE
-# ============================================================
-
-def inspect_mysql_source() -> dict:
-
-    with mysql_connection() as conn:
-
-        cursor = conn.cursor(
-            buffered=True
-        )
-
-        try:
-
-            # ------------------------------------------------
-            # TABLE
-            # ------------------------------------------------
-
-            cursor.execute(
-                """
-                SELECT COUNT(*)
-
-                FROM information_schema.tables
-
-                WHERE table_schema = %s
-                  AND table_name = %s
-                """,
-                (
-                    MYSQL_DATABASE,
-                    MYSQL_TABLE,
-                ),
-            )
-
-            if (
-                cursor.fetchone()[0]
-                != 1
-            ):
-                raise RuntimeError(
-                    "Source table missing: "
-                    f"{MYSQL_DATABASE}."
-                    f"{MYSQL_TABLE}"
-                )
-
-            # ------------------------------------------------
-            # COLUMNS
-            # ------------------------------------------------
-
-            cursor.execute(
-                """
-                SELECT COLUMN_NAME
-
-                FROM information_schema.columns
-
-                WHERE table_schema = %s
-                  AND table_name = %s
-
-                ORDER BY ORDINAL_POSITION
-                """,
-                (
-                    MYSQL_DATABASE,
-                    MYSQL_TABLE,
-                ),
-            )
-
-            actual_columns = [
-                row[0]
-                for row
-                in cursor.fetchall()
-            ]
-
-            if actual_columns != COLUMNS:
-                raise RuntimeError(
-                    "MySQL source schema mismatch.\n"
-                    f"Expected: {COLUMNS}\n"
-                    f"Actual  : {actual_columns}"
-                )
-
-            # ------------------------------------------------
-            # SOURCE FINGERPRINT
-            # ------------------------------------------------
-
-            cursor.execute(
-                f"""
-                SELECT
-                    COUNT(*),
-
-                    COUNT(
-                        DISTINCT
-                        CONCAT(
-                            juristic_type_code,
-                            ':',
-                            registration_no
-                        )
-                    ),
-
-                    MIN(row_no),
-
-                    MAX(row_no),
-
-                    COALESCE(
-                        SUM(
-                            CAST(
-                                row_no
-                                AS DECIMAL(38,0)
-                            )
-                        ),
-                        0
-                    ),
-
-                    COALESCE(
-                        SUM(
-                            CAST(
-                                row_no
-                                AS DECIMAL(38,0)
-                            )
-                            *
-                            CAST(
-                                row_no
-                                AS DECIMAL(38,0)
-                            )
-                        ),
-                        0
-                    ),
-
-                    SUM(
-                        registration_no IS NULL
-                    ),
-
-                    SUM(
-                        juristic_type_code IS NULL
-                    )
-
-                FROM `{MYSQL_TABLE}`
-                """
-            )
-
-            (
-                rows,
-                unique_identities,
-                min_row_no,
-                max_row_no,
-                sum_row_no,
-                sum_sq_row_no,
-                null_registration,
-                null_type,
-            ) = cursor.fetchone()
-
-            rows = int(
-                rows or 0
-            )
-
-            unique_identities = int(
-                unique_identities or 0
-            )
-
-            if rows == 0:
-                raise RuntimeError(
-                    "MySQL source is empty."
-                )
-
-            if (
-                rows
-                != unique_identities
-            ):
-                raise RuntimeError(
-                    "MySQL source contains "
-                    "duplicate company identities."
-                )
-
-            if int(
-                null_registration or 0
-            ):
-                raise RuntimeError(
-                    "NULL registration_no "
-                    "found in source."
-                )
-
-            if int(
-                null_type or 0
-            ):
-                raise RuntimeError(
-                    "NULL juristic_type_code "
-                    "found in source."
-                )
-
-            return {
-                "rows":
-                    rows,
-
-                "unique_identities":
-                    unique_identities,
-
-                "min_row_no":
-                    int(min_row_no),
-
-                "max_row_no":
-                    int(max_row_no),
-
-                "sum_row_no":
-                    int(sum_row_no),
-
-                "sum_sq_row_no":
-                    int(sum_sq_row_no),
-            }
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# SQL SERVER PREFLIGHT
-# ============================================================
-
-def inspect_mssql() -> dict:
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            cursor.execute(
-                """
-                SELECT
-                    @@SERVERNAME,
-                    DB_NAME(),
-                    SUSER_SNAME(),
-                    USER_NAME(),
-
-                    HAS_PERMS_BY_NAME(
-                        DB_NAME(),
-                        'DATABASE',
-                        'CREATE TABLE'
-                    ),
-
-                    HAS_PERMS_BY_NAME(
-                        'dbo',
-                        'SCHEMA',
-                        'ALTER'
-                    )
-                """
-            )
-
-            (
-                server_name,
-                database_name,
-                login_name,
-                database_user,
-                can_create_table,
-                can_alter_dbo,
-            ) = cursor.fetchone()
-
-            if (
-                database_name
-                != MSSQL_DATABASE
-            ):
-                raise RuntimeError(
-                    "Connected to wrong "
-                    "SQL Server database: "
-                    f"{database_name!r}"
-                )
-
-            cursor.execute(
-                """
-                SELECT COUNT(*)
-
-                FROM sys.tables AS t
-
-                INNER JOIN sys.schemas AS s
-                    ON s.schema_id =
-                       t.schema_id
-
-                WHERE s.name = %s
-                  AND t.name = %s
-                """,
-                (
-                    MSSQL_SCHEMA,
-                    MSSQL_TABLE,
-                ),
-            )
-
-            exists = (
-                cursor.fetchone()[0]
-                == 1
-            )
-
-            return {
-                "server":
-                    server_name,
-
-                "database":
-                    database_name,
-
-                "login":
-                    login_name,
-
-                "database_user":
-                    database_user,
-
-                "can_create_table":
-                    bool(
-                        can_create_table
-                    ),
-
-                "can_alter_dbo":
-                    bool(
-                        can_alter_dbo
-                    ),
-
-                "table_exists":
-                    exists,
-            }
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# CREATE TARGET
-# ============================================================
-
-def create_mssql_table():
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            cursor.execute(
-                CREATE_TABLE_SQL
-            )
-
-            conn.commit()
-
-        except Exception:
-
-            conn.rollback()
-
-            raise
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# VALIDATE TARGET
-# ============================================================
-
-def validate_mssql_table():
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            # ------------------------------------------------
-            # COLUMNS
-            # ------------------------------------------------
-
-            cursor.execute(
-                """
-                SELECT COLUMN_NAME
-
-                FROM INFORMATION_SCHEMA.COLUMNS
-
-                WHERE TABLE_SCHEMA = %s
-                  AND TABLE_NAME = %s
-
-                ORDER BY ORDINAL_POSITION
-                """,
-                (
-                    MSSQL_SCHEMA,
-                    MSSQL_TABLE,
-                ),
-            )
-
-            actual_columns = [
-                row[0]
-                for row
-                in cursor.fetchall()
-            ]
-
-            if (
-                actual_columns
-                != COLUMNS
-            ):
-                raise RuntimeError(
-                    "SQL Server target schema "
-                    "does not match.\n"
-                    f"Expected: {COLUMNS}\n"
-                    f"Actual  : {actual_columns}"
-                )
-
-            # ------------------------------------------------
-            # PK
-            # ------------------------------------------------
-
-            cursor.execute(
-                f"""
-                SELECT COUNT(*)
-
-                FROM sys.key_constraints
-
-                WHERE parent_object_id =
-                    OBJECT_ID(
-                        N'{MSSQL_SCHEMA}.{MSSQL_TABLE}'
-                    )
-
-                  AND type = 'PK'
-
-                  AND name =
-                    'PK_DBD_COMPANY_EXPORT'
-                """
-            )
-
-            if (
-                cursor.fetchone()[0]
-                != 1
-            ):
-                raise RuntimeError(
-                    "PK_DBD_COMPANY_EXPORT "
-                    "missing."
-                )
-
-            # ------------------------------------------------
-            # UNIQUE IDENTITY
-            # ------------------------------------------------
-
-            cursor.execute(
-                f"""
-                SELECT COUNT(*)
-
-                FROM sys.indexes
-
-                WHERE object_id =
-                    OBJECT_ID(
-                        N'{MSSQL_SCHEMA}.{MSSQL_TABLE}'
-                    )
-
-                  AND name =
-                    'UQ_DBD_COMPANY_EXPORT_IDENTITY'
-
-                  AND is_unique = 1
-                """
-            )
-
-            if (
-                cursor.fetchone()[0]
-                != 1
-            ):
-                raise RuntimeError(
-                    "UQ_DBD_COMPANY_EXPORT_IDENTITY "
-                    "missing."
-                )
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# EXISTING SECONDARY INDEXES
-# ============================================================
-
-def get_existing_secondary_indexes():
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            cursor.execute(
-                f"""
-                SELECT name
-
-                FROM sys.indexes
-
-                WHERE object_id =
-                    OBJECT_ID(
-                        N'{MSSQL_SCHEMA}.{MSSQL_TABLE}'
-                    )
-
-                  AND name IS NOT NULL
-                """
-            )
-
-            existing = {
-                row[0]
-                for row
-                in cursor.fetchall()
-            }
-
-            return {
-                name
-                for name
-                in SECONDARY_INDEXES
-                if name in existing
-            }
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# TARGET STATS
-# ============================================================
-
-def get_target_stats() -> dict:
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            cursor.execute(
-                f"""
-                SELECT
-                    COUNT_BIG(*),
-
-                    COUNT_BIG(
-                        DISTINCT row_no
-                    ),
-
-                    MIN(row_no),
-
-                    MAX(row_no),
-
-                    COALESCE(
-                        SUM(
-                            CONVERT(
-                                DECIMAL(38,0),
-                                row_no
-                            )
-                        ),
-                        0
-                    ),
-
-                    COALESCE(
-                        SUM(
-                            CONVERT(
-                                DECIMAL(38,0),
-                                row_no
-                            )
-                            *
-                            CONVERT(
-                                DECIMAL(38,0),
-                                row_no
-                            )
-                        ),
-                        0
-                    )
-
-                FROM {MSSQL_FULL_TABLE}
-                """
-            )
-
-            (
-                rows,
-                distinct_rows,
-                min_row_no,
-                max_row_no,
-                sum_row_no,
-                sum_sq_row_no,
-            ) = cursor.fetchone()
-
-            return {
-                "rows":
-                    int(rows or 0),
-
-                "distinct_rows":
-                    int(
-                        distinct_rows or 0
-                    ),
-
-                "min_row_no":
-                    (
-                        int(min_row_no)
-                        if min_row_no
-                        is not None
-                        else None
-                    ),
-
-                "max_row_no":
-                    (
-                        int(max_row_no)
-                        if max_row_no
-                        is not None
-                        else None
-                    ),
-
-                "sum_row_no":
-                    int(
-                        sum_row_no or 0
-                    ),
-
-                "sum_sq_row_no":
-                    int(
-                        sum_sq_row_no or 0
-                    ),
-            }
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# MYSQL PREFIX STATS
-# ============================================================
-
-def get_mysql_prefix_stats(
-    max_row_no: int,
-) -> dict:
-
-    with mysql_connection() as conn:
-
-        cursor = conn.cursor(
-            buffered=True
-        )
-
-        try:
-
-            cursor.execute(
-                f"""
-                SELECT
-                    COUNT(*),
-
-                    MIN(row_no),
-
-                    MAX(row_no),
-
-                    COALESCE(
-                        SUM(
-                            CAST(
-                                row_no
-                                AS DECIMAL(38,0)
-                            )
-                        ),
-                        0
-                    ),
-
-                    COALESCE(
-                        SUM(
-                            CAST(
-                                row_no
-                                AS DECIMAL(38,0)
-                            )
-                            *
-                            CAST(
-                                row_no
-                                AS DECIMAL(38,0)
-                            )
-                        ),
-                        0
-                    )
-
-                FROM `{MYSQL_TABLE}`
-
-                WHERE row_no <= %s
-                """,
-                (
-                    max_row_no,
-                ),
-            )
-
-            (
-                rows,
-                min_row_no,
-                max_source_row_no,
-                sum_row_no,
-                sum_sq_row_no,
-            ) = cursor.fetchone()
-
-            return {
-                "rows":
-                    int(rows or 0),
-
-                "min_row_no":
-                    (
-                        int(min_row_no)
-                        if min_row_no
-                        is not None
-                        else None
-                    ),
-
-                "max_row_no":
-                    (
-                        int(max_source_row_no)
-                        if max_source_row_no
-                        is not None
-                        else None
-                    ),
-
-                "sum_row_no":
-                    int(
-                        sum_row_no or 0
-                    ),
-
-                "sum_sq_row_no":
-                    int(
-                        sum_sq_row_no or 0
-                    ),
-            }
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# BOUNDARY IDENTITY
-# ============================================================
-
-def get_mysql_boundary(
-    row_no: int,
+def scalar(
+    connection,
+    query: str,
+    params=(),
 ):
+    with connection.cursor() as cursor:
+        cursor.execute(query, params)
+        return cursor.fetchone()[0]
 
-    with mysql_connection() as conn:
 
-        cursor = conn.cursor(
-            buffered=True
+def table_exists(
+    connection,
+    table: str,
+) -> bool:
+
+    return bool(
+        scalar(
+            connection,
+            """
+            SELECT COUNT(*)
+            FROM sys.tables AS t
+            JOIN sys.schemas AS s
+              ON t.schema_id = s.schema_id
+            WHERE s.name = %s
+              AND t.name = %s
+            """,
+            (
+                SQL_SCHEMA,
+                table,
+            ),
         )
-
-        try:
-
-            cursor.execute(
-                f"""
-                SELECT
-                    row_no,
-                    registration_no,
-                    juristic_type_code
-
-                FROM `{MYSQL_TABLE}`
-
-                WHERE row_no = %s
-                """,
-                (
-                    row_no,
-                ),
-            )
-
-            row = cursor.fetchone()
-
-            if row is None:
-                return None
-
-            return tuple(
-                row
-            )
-
-        finally:
-            cursor.close()
+    )
 
 
-def get_mssql_boundary(
-    row_no: int,
-):
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            cursor.execute(
-                f"""
-                SELECT
-                    row_no,
-                    registration_no,
-                    juristic_type_code
-
-                FROM {MSSQL_FULL_TABLE}
-
-                WHERE row_no = %s
-                """,
-                (
-                    row_no,
-                ),
-            )
-
-            row = cursor.fetchone()
-
-            if row is None:
-                return None
-
-            return tuple(
-                row
-            )
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# SAFE RESUME VALIDATION
-# ============================================================
-
-def validate_resume_state(
-    source: dict,
+def row_count(
+    connection,
+    table: str,
 ) -> int:
 
-    target = (
-        get_target_stats()
-    )
-
-    if (
-        target["rows"]
-        == 0
-    ):
-        return 0
-
-    if (
-        target["rows"]
-        != target["distinct_rows"]
-    ):
-        raise RuntimeError(
-            "SQL Server target contains "
-            "duplicate row_no values."
-        )
-
-    if (
-        target["rows"]
-        > source["rows"]
-    ):
-        raise RuntimeError(
-            "SQL Server target contains "
-            "more rows than MySQL source."
-        )
-
-    target_max = (
-        target["max_row_no"]
-    )
-
-    if target_max is None:
-        raise RuntimeError(
-            "Target MAX(row_no) missing."
-        )
-
-    prefix = (
-        get_mysql_prefix_stats(
-            target_max
-        )
-    )
-
-    if (
-        prefix["rows"]
-        != target["rows"]
-    ):
-        raise RuntimeError(
-            "SQL Server target is not "
-            "a complete ordered MySQL prefix."
-        )
-
-    if (
-        prefix["min_row_no"]
-        != target["min_row_no"]
-    ):
-        raise RuntimeError(
-            "Resume MIN(row_no) mismatch."
-        )
-
-    if (
-        prefix["max_row_no"]
-        != target["max_row_no"]
-    ):
-        raise RuntimeError(
-            "Resume MAX(row_no) mismatch."
-        )
-
-    if (
-        prefix["sum_row_no"]
-        != target["sum_row_no"]
-    ):
-        raise RuntimeError(
-            "Resume SUM(row_no) mismatch."
-        )
-
-    if (
-        prefix["sum_sq_row_no"]
-        != target["sum_sq_row_no"]
-    ):
-        raise RuntimeError(
-            "Resume row_no fingerprint "
-            "mismatch."
-        )
-
-    mysql_boundary = (
-        get_mysql_boundary(
-            target_max
-        )
-    )
-
-    mssql_boundary = (
-        get_mssql_boundary(
-            target_max
-        )
-    )
-
-    if (
-        mysql_boundary
-        != mssql_boundary
-    ):
-        raise RuntimeError(
-            "Resume boundary identity "
-            "does not match."
-        )
-
     return int(
-        target_max
-    )
-
-
-# ============================================================
-# MYSQL PAGE READ
-# ============================================================
-
-def fetch_mysql_page(
-    after_row_no: int,
-    source_max_row_no: int,
-):
-
-    last_error = None
-
-    for attempt in range(
-        1,
-        MYSQL_PAGE_RETRIES + 1,
-    ):
-
-        conn = None
-        cursor = None
-
-        try:
-
-            conn = (
-                mysql.connector.connect(
-                    **MYSQL_CONFIG
-                )
-            )
-
-            cursor = conn.cursor(
-                buffered=True
-            )
-
-            cursor.execute(
-                f"""
-                SELECT
-                    row_no,
-                    registration_no,
-                    juristic_type_code,
-                    company_name_th,
-                    juristic_type,
-                    status_code,
-                    status,
-                    business_type_code,
-                    business_type,
-                    business_size_code,
-                    province,
-                    registered_capital,
-                    latest_fiscal_year,
-                    total_income,
-                    net_profit,
-                    total_assets,
-                    total_equity
-
-                FROM `{MYSQL_TABLE}`
-
-                WHERE row_no > %s
-                  AND row_no <= %s
-
-                ORDER BY row_no
-
-                LIMIT %s
-                """,
-                (
-                    after_row_no,
-                    source_max_row_no,
-                    MYSQL_PAGE_SIZE,
-                ),
-            )
-
-            return cursor.fetchall()
-
-        except mysql.connector.Error as exc:
-
-            last_error = exc
-
-            if (
-                attempt
-                >= MYSQL_PAGE_RETRIES
-            ):
-                raise
-
-            delay = retry_delay(
-                attempt
-            )
-
-            print(
-                f"MySQL retry "
-                f"{attempt}/"
-                f"{MYSQL_PAGE_RETRIES} "
-                f"in {delay}s: "
-                f"{exc}"
-            )
-
-            time.sleep(
-                delay
-            )
-
-        finally:
-
-            if cursor is not None:
-                try:
-                    cursor.close()
-
-                except Exception:
-                    pass
-
-            if conn is not None:
-                try:
-                    if conn.is_connected():
-                        conn.close()
-
-                except Exception:
-                    pass
-
-    if last_error is not None:
-        raise last_error
-
-    raise RuntimeError(
-        "MySQL page read failed."
-    )
-
-
-# ============================================================
-# TARGET RANGE IDENTITY
-# ============================================================
-
-def get_target_range_identity(
-    first_row_no: int,
-    last_row_no: int,
-):
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            cursor.execute(
-                f"""
-                SELECT
-                    row_no,
-                    registration_no,
-                    juristic_type_code
-
-                FROM {MSSQL_FULL_TABLE}
-
-                WHERE row_no >= %s
-                  AND row_no <= %s
-
-                ORDER BY row_no
-                """,
-                (
-                    first_row_no,
-                    last_row_no,
-                ),
-            )
-
-            return [
-                tuple(row)
-                for row
-                in cursor.fetchall()
-            ]
-
-        finally:
-            cursor.close()
-
-
-# ============================================================
-# BULK RECONCILIATION
-# ============================================================
-
-def reconcile_bulk_chunk(
-    original_batch,
-) -> dict:
-
-    expected = [
-        (
-            int(row[0]),
-            row[1],
-            row[2],
-        )
-        for row
-        in original_batch
-    ]
-
-    first_id = int(
-        original_batch[0][0]
-    )
-
-    last_id = int(
-        original_batch[-1][0]
-    )
-
-    actual = (
-        get_target_range_identity(
-            first_id,
-            last_id,
+        scalar(
+            connection,
+            f"""
+            SELECT COUNT_BIG(*)
+            FROM {sql_table(table)}
+            """,
         )
     )
 
-    if not actual:
-
-        return {
-            "state":
-                "missing",
-
-            "committed_count":
-                0,
-
-            "last_row_no":
-                None,
-        }
-
-    if (
-        actual
-        == expected
-    ):
-
-        return {
-            "state":
-                "committed",
-
-            "committed_count":
-                len(actual),
-
-            "last_row_no":
-                actual[-1][0],
-        }
-
-    actual_count = len(
-        actual
-    )
-
-    if (
-        actual_count
-        < len(expected)
-
-        and
-
-        actual
-        == expected[
-            :actual_count
-        ]
-    ):
-
-        return {
-            "state":
-                "partial_prefix",
-
-            "committed_count":
-                actual_count,
-
-            "last_row_no":
-                actual[-1][0],
-        }
-
-    return {
-        "state":
-            "conflict",
-
-        "committed_count":
-            actual_count,
-
-        "last_row_no":
-            (
-                actual[-1][0]
-                if actual
-                else None
-            ),
-    }
-
 
 # ============================================================
-# SQL SERVER BULK COPY
+# 04. COLUMN CONTRACT
 # ============================================================
 
-def bulk_copy_chunk(
-    original_batch,
-    persistent_conn,
-):
+@dataclass(frozen=True)
+class ColumnSpec:
 
-    conn = persistent_conn
+    name: str
+    sql_type: str
+    nullable: bool
 
-    pending = list(
-        original_batch
-    )
+    size: int | None = None
+    precision: int | None = None
+    scale: int | None = None
 
-    for attempt in range(
-        1,
-        MSSQL_BULK_RETRIES + 1,
-    ):
+    def tds_column(self):
 
-        if not pending:
-            return conn
+        if self.name == "row_no":
 
-        try:
+            data_type = (
+                tds_types.BigIntType()
+            )
 
-            if conn is None:
-                conn = (
-                    open_mssql_connection()
+        elif self.name in DECIMAL_COLS:
+
+            data_type = tds_types.DecimalType(
+                precision=self.precision,
+                scale=self.scale,
+            )
+
+        elif self.name in UNICODE_COLS:
+
+            if self.size == -1:
+                data_type = (
+                    tds_types.NVarCharMaxType()
                 )
-
-            # ------------------------------------------------
-            # REAL BCP / BULK COPY
-            # ------------------------------------------------
-
-            conn.bulk_copy(
-                BULK_TARGET_TABLE,
-
-                pending,
-
-                column_ids=
-                    BULK_COLUMN_IDS,
-
-                batch_size=
-                    len(pending),
-
-                tablock=
-                    USE_TABLOCK,
-
-                check_constraints=
-                    False,
-
-                fire_triggers=
-                    False,
-            )
-
-            # Safe if bulk_copy already committed internally.
-            conn.commit()
-
-            return conn
-
-        except KeyboardInterrupt:
-
-            if conn is not None:
-                try:
-                    conn.rollback()
-
-                except Exception:
-                    pass
-
-            close_mssql_safely(
-                conn
-            )
-
-            raise
-
-        except Exception as exc:
-
-            if conn is not None:
-                try:
-                    conn.rollback()
-
-                except Exception:
-                    pass
-
-            close_mssql_safely(
-                conn
-            )
-
-            conn = None
-
-            # ------------------------------------------------
-            # DETERMINE REAL SQL SERVER STATE
-            # ------------------------------------------------
-
-            try:
-
-                state = (
-                    reconcile_bulk_chunk(
-                        original_batch
+            else:
+                data_type = (
+                    tds_types.NVarCharType(
+                        self.size
                     )
                 )
 
-            except Exception as reconcile_exc:
+        else:
 
+            if self.size == -1:
+                data_type = (
+                    tds_types.VarCharMaxType()
+                )
+            else:
+                data_type = (
+                    tds_types.VarCharType(
+                        self.size
+                    )
+                )
+
+        flags = (
+            pytds.Column.fNullable
+            if self.nullable
+            else 0
+        )
+
+        return pytds.Column(
+            name=self.name,
+            type=data_type,
+            flags=flags,
+        )
+
+
+def get_source_spec(
+    connection,
+) -> list[ColumnSpec]:
+
+    with connection.cursor() as cursor:
+
+        cursor.execute(
+            """
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                IS_NULLABLE,
+                CHARACTER_MAXIMUM_LENGTH,
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE
+            FROM information_schema.COLUMNS
+            WHERE TABLE_SCHEMA = DATABASE()
+              AND TABLE_NAME = %s
+            ORDER BY ORDINAL_POSITION
+            """,
+            (MYSQL_TABLE,),
+        )
+
+        rows = cursor.fetchall()
+
+    actual_names = [
+        row[0]
+        for row in rows
+    ]
+
+    if actual_names != list(COLUMNS):
+        raise RuntimeError(
+            "MySQL column contract mismatch. "
+            f"Actual={actual_names!r}"
+        )
+
+    specs = []
+
+    for (
+        name,
+        data_type,
+        nullable,
+        length,
+        precision,
+        scale,
+    ) in rows:
+
+        if name == "row_no":
+
+            if data_type not in {
+                "int",
+                "bigint",
+                "mediumint",
+                "smallint",
+            }:
                 raise RuntimeError(
-                    "Cannot determine SQL Server "
-                    "bulk commit state. "
-                    "Stop here and rerun the script. "
-                    "Safe-resume will inspect the "
-                    "committed SQL Server prefix."
-                ) from reconcile_exc
+                    "Unexpected row_no type: "
+                    f"{data_type}"
+                )
 
-            # ------------------------------------------------
-            # FULLY COMMITTED
-            # ------------------------------------------------
+            specs.append(
+                ColumnSpec(
+                    name=name,
+                    sql_type="BIGINT",
+                    nullable=False,
+                )
+            )
+
+        elif name in DECIMAL_COLS:
+
+            if data_type not in {
+                "decimal",
+                "numeric",
+            }:
+                raise RuntimeError(
+                    f"{name} requires exact "
+                    f"MySQL DECIMAL, got "
+                    f"{data_type}"
+                )
+
+            source_precision = int(precision)
+            source_scale = int(scale)
+
+            target_scale = max(
+                source_scale,
+                2,
+            )
+
+            target_precision = max(
+                20,
+                source_precision
+                - source_scale
+                + target_scale,
+            )
+
+            if target_precision > 38:
+                raise RuntimeError(
+                    f"{name} cannot fit "
+                    "SQL Server DECIMAL(38,s)"
+                )
+
+            specs.append(
+                ColumnSpec(
+                    name=name,
+                    sql_type=(
+                        f"DECIMAL("
+                        f"{target_precision},"
+                        f"{target_scale})"
+                    ),
+                    nullable=True,
+                    precision=target_precision,
+                    scale=target_scale,
+                )
+            )
+
+        elif name in TEXT_MIN:
+
+            if data_type not in {
+                "char",
+                "varchar",
+                "tinytext",
+                "text",
+                "mediumtext",
+                "longtext",
+            }:
+                raise RuntimeError(
+                    f"Unexpected text type "
+                    f"{name}: {data_type}"
+                )
 
             if (
-                state["state"]
-                == "committed"
+                length is None
+                or int(length) > 4000
             ):
+                size = -1
 
-                print(
-                    "Bulk batch was already "
-                    "fully committed."
+            else:
+                size = max(
+                    TEXT_MIN[name],
+                    int(length),
                 )
-
-                return None
-
-            # ------------------------------------------------
-            # PARTIAL PREFIX
-            # ------------------------------------------------
 
             if (
-                state["state"]
-                == "partial_prefix"
+                name not in UNICODE_COLS
+                and size > 8000
             ):
+                size = -1
 
-                committed_count = int(
-                    state[
-                        "committed_count"
-                    ]
+            sql_type = (
+                "NVARCHAR"
+                if name in UNICODE_COLS
+                else "VARCHAR"
+            )
+
+            declaration = (
+                f"{sql_type}(MAX)"
+                if size == -1
+                else f"{sql_type}({size})"
+            )
+
+            specs.append(
+                ColumnSpec(
+                    name=name,
+                    sql_type=declaration,
+                    nullable=(
+                        name not in REQUIRED_COLS
+                    ),
+                    size=size,
+                )
+            )
+
+        else:
+            raise RuntimeError(
+                f"Unmapped column: {name}"
+            )
+
+    return specs
+
+
+# ============================================================
+# 05. MYSQL SOURCE PREFLIGHT
+# ============================================================
+
+def source_stats(
+    connection,
+) -> tuple[int, int, int]:
+
+    with connection.cursor() as cursor:
+
+        cursor.execute(
+            f"""
+            SELECT
+                COUNT(*),
+                MIN(row_no),
+                MAX(row_no)
+            FROM {mysql_table()}
+            """
+        )
+
+        count, minimum, maximum = (
+            cursor.fetchone()
+        )
+
+    return (
+        int(count),
+        int(minimum),
+        int(maximum),
+    )
+
+
+def validate_source(
+    connection,
+):
+
+    specs = get_source_spec(
+        connection
+    )
+
+    snapshot = source_stats(
+        connection
+    )
+
+    if snapshot[0] == 0:
+        raise RuntimeError(
+            "MySQL source is empty"
+        )
+
+    if snapshot[1] <= 0:
+        raise RuntimeError(
+            "row_no must be positive "
+            "for keyset pagination"
+        )
+
+    with connection.cursor() as cursor:
+
+        cursor.execute(
+            f"""
+            SELECT row_no
+            FROM {mysql_table()}
+            WHERE
+                row_no IS NULL
+                OR registration_no IS NULL
+                OR juristic_type_code IS NULL
+            LIMIT 1
+            """
+        )
+
+        if cursor.fetchone():
+            raise RuntimeError(
+                "NULL required identity "
+                "found in MySQL"
+            )
+
+        cursor.execute(
+            f"""
+            SELECT row_no
+            FROM {mysql_table()}
+            GROUP BY row_no
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        )
+
+        if cursor.fetchone():
+            raise RuntimeError(
+                "Duplicate row_no "
+                "found in MySQL"
+            )
+
+        cursor.execute(
+            f"""
+            SELECT
+                juristic_type_code,
+                registration_no
+            FROM {mysql_table()}
+            GROUP BY
+                juristic_type_code,
+                registration_no
+            HAVING COUNT(*) > 1
+            LIMIT 1
+            """
+        )
+
+        if cursor.fetchone():
+            raise RuntimeError(
+                "Duplicate composite identity "
+                "found in MySQL"
+            )
+
+    return specs, snapshot
+
+
+# ============================================================
+# 06. CREATE BUILD TABLE
+# ============================================================
+
+def build_ddl(
+    specs: list[ColumnSpec],
+) -> str:
+
+    definitions = []
+
+    for column in specs:
+
+        nullability = (
+            "NULL"
+            if column.nullable
+            else "NOT NULL"
+        )
+
+        definitions.append(
+            f"{quote(column.name)} "
+            f"{column.sql_type} "
+            f"{nullability}"
+        )
+
+    definitions.extend(
+        [
+            (
+                f"CONSTRAINT "
+                f"{quote('PK_' + SQL_BUILD)} "
+                "PRIMARY KEY CLUSTERED "
+                "([row_no])"
+            ),
+            (
+                f"CONSTRAINT "
+                f"{quote('UQ_' + SQL_BUILD)} "
+                "UNIQUE "
+                "([juristic_type_code], "
+                "[registration_no])"
+            ),
+        ]
+    )
+
+    columns_sql = ",\n    ".join(
+        definitions
+    )
+
+    return (
+        f"CREATE TABLE "
+        f"{sql_table(SQL_BUILD)} "
+        f"(\n    {columns_sql}\n)"
+    )
+
+
+def validate_sql_schema(
+    connection,
+    table: str,
+    specs: list[ColumnSpec],
+):
+
+    with connection.cursor() as cursor:
+
+        cursor.execute(
+            """
+            SELECT
+                COLUMN_NAME,
+                DATA_TYPE,
+                CHARACTER_MAXIMUM_LENGTH,
+                NUMERIC_PRECISION,
+                NUMERIC_SCALE,
+                IS_NULLABLE
+            FROM INFORMATION_SCHEMA.COLUMNS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME = %s
+            ORDER BY ORDINAL_POSITION
+            """,
+            (
+                SQL_SCHEMA,
+                table,
+            ),
+        )
+
+        rows = cursor.fetchall()
+
+    if len(rows) != len(specs):
+        raise RuntimeError(
+            f"{table}: column count mismatch"
+        )
+
+    for actual, expected in zip(
+        rows,
+        specs,
+    ):
+
+        (
+            name,
+            data_type,
+            length,
+            precision,
+            scale,
+            nullable,
+        ) = actual
+
+        wanted_type = (
+            expected.sql_type
+            .split("(")[0]
+            .lower()
+        )
+
+        if (
+            name != expected.name
+            or data_type.lower() != wanted_type
+        ):
+            raise RuntimeError(
+                f"{table}.{expected.name}: "
+                f"SQL type mismatch: {actual}"
+            )
+
+        if wanted_type in {
+            "varchar",
+            "nvarchar",
+        }:
+
+            if int(length) != expected.size:
+                raise RuntimeError(
+                    f"{table}.{name}: "
+                    "SQL length mismatch"
                 )
 
-                print(
-                    "Detected committed "
-                    "partial prefix: "
-                    f"{committed_count:,} rows."
-                )
+        if wanted_type == "decimal":
 
-                pending = (
-                    original_batch[
-                        committed_count:
-                    ]
-                )
-
-                if not pending:
-                    return None
-
-            # ------------------------------------------------
-            # NOTHING COMMITTED
-            # ------------------------------------------------
-
-            elif (
-                state["state"]
-                == "missing"
+            if (
+                int(precision)
+                != expected.precision
+                or int(scale)
+                != expected.scale
             ):
-
-                pending = list(
-                    original_batch
+                raise RuntimeError(
+                    f"{table}.{name}: "
+                    "SQL decimal mismatch"
                 )
 
-            # ------------------------------------------------
-            # CONFLICT
-            # ------------------------------------------------
+        if (
+            (nullable == "YES")
+            != expected.nullable
+        ):
+            raise RuntimeError(
+                f"{table}.{name}: "
+                "SQL nullability mismatch"
+            )
+
+    primary_key_count = scalar(
+        connection,
+        """
+        SELECT COUNT(*)
+        FROM sys.key_constraints
+        WHERE parent_object_id = OBJECT_ID(%s)
+          AND type = 'PK'
+        """,
+        (f"{SQL_SCHEMA}.{table}",),
+    )
+
+    if not primary_key_count:
+        raise RuntimeError(
+            f"{table}: primary key missing"
+        )
+
+    unique_count = scalar(
+        connection,
+        """
+        SELECT COUNT(*)
+        FROM sys.key_constraints
+        WHERE parent_object_id = OBJECT_ID(%s)
+          AND type = 'UQ'
+        """,
+        (f"{SQL_SCHEMA}.{table}",),
+    )
+
+    if not unique_count:
+        raise RuntimeError(
+            f"{table}: unique constraint missing"
+        )
+
+
+def create_build(
+    connection,
+    specs,
+):
+
+    if table_exists(
+        connection,
+        SQL_BUILD,
+    ):
+
+        validate_sql_schema(
+            connection,
+            SQL_BUILD,
+            specs,
+        )
+
+        return False
+
+    with connection.cursor() as cursor:
+        cursor.execute(
+            build_ddl(specs)
+        )
+
+    connection.commit()
+
+    print(
+        f"[CREATE] {sql_table(SQL_BUILD)}"
+    )
+
+    return True
+
+
+# ============================================================
+# 07. SOURCE ROW VALIDATION
+# ============================================================
+
+def normalize_source_row(
+    row,
+    specs: list[ColumnSpec],
+):
+
+    if len(row) != len(specs):
+        raise RuntimeError(
+            "Source row length mismatch"
+        )
+
+    normalized = []
+
+    for value, column in zip(
+        row,
+        specs,
+    ):
+
+        if value is None:
+
+            if not column.nullable:
+                raise ValueError(
+                    f"NULL in {column.name} "
+                    f"row_no={row[0]}"
+                )
+
+        elif column.name == "row_no":
+
+            value = int(value)
+
+        elif column.name in DECIMAL_COLS:
+
+            if not isinstance(
+                value,
+                Decimal,
+            ):
+                raise TypeError(
+                    f"{column.name}: expected "
+                    f"Decimal, got "
+                    f"{type(value).__name__}"
+                )
+
+            if not value.is_finite():
+                raise ValueError(
+                    f"{column.name}: "
+                    "non-finite decimal"
+                )
+
+            if (
+                value.as_tuple().exponent
+                < -column.scale
+            ):
+                raise ValueError(
+                    f"{column.name}: "
+                    "value exceeds SQL scale"
+                )
+
+        elif isinstance(value, str):
+
+            if "\x00" in value:
+                raise ValueError(
+                    f"NUL character in "
+                    f"{column.name}, "
+                    f"row_no={row[0]}"
+                )
+
+            if any(
+                0xD800 <= ord(char) <= 0xDFFF
+                for char in value
+            ):
+                raise ValueError(
+                    f"Invalid Unicode surrogate "
+                    f"in {column.name}, "
+                    f"row_no={row[0]}"
+                )
+
+            if column.name in UNICODE_COLS:
+
+                utf16_units = (
+                    len(
+                        value.encode("utf-16-le")
+                    ) // 2
+                )
+
+                if (
+                    column.size != -1
+                    and utf16_units > column.size
+                ):
+                    raise ValueError(
+                        f"{column.name}: "
+                        "NVARCHAR length exceeded"
+                    )
 
             else:
 
-                raise RuntimeError(
-                    "SQL Server contains "
-                    "a conflicting non-prefix "
-                    "bulk range. "
-                    "No DELETE, TRUNCATE or "
-                    "DROP was performed."
-                ) from exc
+                try:
+                    value.encode("ascii")
+
+                except UnicodeEncodeError as exc:
+                    raise ValueError(
+                        f"Non-ASCII in VARCHAR "
+                        f"{column.name}, "
+                        f"row_no={row[0]}"
+                    ) from exc
+
+                if (
+                    column.size != -1
+                    and len(value) > column.size
+                ):
+                    raise ValueError(
+                        f"{column.name}: "
+                        "VARCHAR length exceeded"
+                    )
+
+        else:
+            raise TypeError(
+                f"Unexpected type for "
+                f"{column.name}: "
+                f"{type(value).__name__}"
+            )
+
+        normalized.append(value)
+
+    return tuple(normalized)
+
+
+# ============================================================
+# 08. MYSQL KEYSET PAGINATION
+# ============================================================
+
+def fetch_mysql_page(
+    connection,
+    after: int,
+    maximum: int,
+    limit: int,
+    specs,
+):
+
+    column_sql = ", ".join(
+        f"`{column}`"
+        for column in COLUMNS
+    )
+
+    with connection.cursor() as cursor:
+
+        cursor.execute(
+            f"""
+            SELECT {column_sql}
+            FROM {mysql_table()}
+            WHERE row_no > %s
+              AND row_no <= %s
+            ORDER BY row_no
+            LIMIT %s
+            """,
+            (
+                after,
+                maximum,
+                limit,
+            ),
+        )
+
+        rows = cursor.fetchall()
+
+    return [
+        normalize_source_row(
+            row,
+            specs,
+        )
+        for row in rows
+    ]
+
+
+# ============================================================
+# 09. SQL SERVER READBACK
+# ============================================================
+
+def fetch_sql_page(
+    connection,
+    table: str,
+    after: int,
+    maximum: int,
+    limit: int,
+):
+
+    with connection.cursor() as cursor:
+
+        cursor.execute(
+            f"""
+            SELECT TOP {int(limit)}
+                {selected_columns()}
+            FROM {sql_table(table)}
+            WHERE row_no > %s
+              AND row_no <= %s
+            ORDER BY row_no
+            """,
+            (
+                after,
+                maximum,
+            ),
+        )
+
+        return [
+            tuple(row)
+            for row in cursor.fetchall()
+        ]
+
+
+def fetch_sql_range(
+    connection,
+    table: str,
+    first: int,
+    last: int,
+):
+
+    with connection.cursor() as cursor:
+
+        cursor.execute(
+            f"""
+            SELECT
+                {selected_columns()}
+            FROM {sql_table(table)}
+            WHERE row_no >= %s
+              AND row_no <= %s
+            ORDER BY row_no
+            """,
+            (
+                first,
+                last,
+            ),
+        )
+
+        return [
+            tuple(row)
+            for row in cursor.fetchall()
+        ]
+
+
+# ============================================================
+# 10. CONTENT COMPARISON
+# ============================================================
+
+def same_row(
+    expected,
+    actual,
+) -> bool:
+
+    if len(expected) != len(actual):
+        return False
+
+    for source_value, target_value in zip(
+        expected,
+        actual,
+    ):
+
+        if (
+            source_value is None
+            or target_value is None
+        ):
 
             if (
-                attempt
-                >= MSSQL_BULK_RETRIES
+                source_value is not None
+                or target_value is not None
             ):
-                raise
+                return False
 
-            delay = retry_delay(
-                attempt
+        elif isinstance(
+            source_value,
+            Decimal,
+        ):
+
+            if (
+                not isinstance(
+                    target_value,
+                    Decimal,
+                )
+                or source_value != target_value
+            ):
+                return False
+
+        elif (
+            type(source_value)
+            is type(target_value)
+        ):
+
+            if source_value != target_value:
+                return False
+
+        elif source_value != target_value:
+            return False
+
+    return True
+
+
+def assert_rows_match(
+    expected,
+    actual,
+    context: str,
+):
+
+    if len(expected) != len(actual):
+        raise RuntimeError(
+            f"{context}: row count mismatch "
+            f"source={len(expected)} "
+            f"target={len(actual)}"
+        )
+
+    for source_row, target_row in zip(
+        expected,
+        actual,
+    ):
+
+        if same_row(
+            source_row,
+            target_row,
+        ):
+            continue
+
+        for index, (
+            source_value,
+            target_value,
+        ) in enumerate(
+            zip(
+                source_row,
+                target_row,
             )
+        ):
 
-            print(
-                f"SQL Server bulk retry "
-                f"{attempt}/"
-                f"{MSSQL_BULK_RETRIES} "
-                f"in {delay}s | "
-                f"{type(exc).__name__}: "
-                f"{exc}"
-            )
+            if not same_row(
+                (source_value,),
+                (target_value,),
+            ):
+                raise RuntimeError(
+                    f"{context}: "
+                    f"row_no={source_row[0]} "
+                    f"column={COLUMNS[index]} "
+                    "CONTENT MISMATCH"
+                )
 
-            time.sleep(
-                delay
-            )
-
-    raise RuntimeError(
-        "SQL Server bulk retries exhausted."
-    )
+        raise RuntimeError(
+            f"{context}: "
+            f"row_no={source_row[0]} "
+            "CONTENT MISMATCH"
+        )
 
 
 # ============================================================
-# TRANSFER
+# 11. UNICODE-SAFE BULK COPY
 # ============================================================
 
-def transfer(
-    source: dict,
-    existing_rows: int,
-    resume_after: int,
-) -> dict:
+def bulk_insert(
+    connection,
+    table: str,
+    rows,
+    specs,
+):
 
-    expected_rows = int(
-        source["rows"]
-    )
+    if not rows:
+        return
 
-    source_max = int(
-        source["max_row_no"]
-    )
+    columns = [
+        spec.tds_column()
+        for spec in specs
+    ]
 
-    total = int(
-        existing_rows
-    )
+    with connection.cursor() as cursor:
 
-    inserted_this_run = 0
+        cursor.copy_to(
+            table_or_view=table,
+            schema=SQL_SCHEMA,
+            data=rows,
+            columns=columns,
+            keep_nulls=True,
+            check_constraints=True,
+            rows_per_batch=len(rows),
+            tablock=False,
+        )
 
-    last_row_no = int(
-        resume_after
-    )
+    connection.commit()
 
-    started = (
-        time.perf_counter()
-    )
 
-    page_no = 0
+# ============================================================
+# 12. REAL UNICODE BULK CANARY
+# ============================================================
 
-    bulk_no = 0
+def unicode_canary(
+    connection,
+):
 
-    mssql_conn = None
+    cases = [
+        (
+            1,
+            "บริษัท ทดสอบ จำกัด",
+            Decimal("12345.67"),
+        ),
+        (
+            2,
+            "ภาษาไทย English 日本語 中文 한글 😀",
+            Decimal("-0.03"),
+        ),
+        (
+            3,
+            "",
+            Decimal("0.00"),
+        ),
+        (
+            4,
+            None,
+            None,
+        ),
+        (
+            5,
+            "อักษรพิเศษ: \t\n\r\u200b\u0e33",
+            Decimal("999999.99"),
+        ),
+    ]
+
+    columns = [
+        pytds.Column(
+            "id",
+            type=tds_types.IntType(),
+            flags=0,
+        ),
+        pytds.Column(
+            "txt",
+            type=tds_types.NVarCharType(200),
+            flags=pytds.Column.fNullable,
+        ),
+        pytds.Column(
+            "amount",
+            type=tds_types.DecimalType(
+                20,
+                2,
+            ),
+            flags=pytds.Column.fNullable,
+        ),
+    ]
 
     try:
 
-        # Persistent SQL Server connection
-        mssql_conn = (
-            open_mssql_connection()
-        )
+        with connection.cursor() as cursor:
 
-        while True:
-
-            # ------------------------------------------------
-            # MYSQL PAGE
-            # ------------------------------------------------
-
-            page_no += 1
-
-            page_started = (
-                time.perf_counter()
+            cursor.execute(
+                """
+                CREATE TABLE #DBD_UNICODE_PROBE
+                (
+                    id INT NOT NULL PRIMARY KEY,
+                    txt NVARCHAR(200) NULL,
+                    amount DECIMAL(20,2) NULL
+                )
+                """
             )
 
-            rows = fetch_mysql_page(
-                last_row_no,
-                source_max,
+            cursor.copy_to(
+                table_or_view=(
+                    "#DBD_UNICODE_PROBE"
+                ),
+                data=cases,
+                columns=columns,
+                keep_nulls=True,
+                check_constraints=True,
             )
 
-            if not rows:
-                break
+            cursor.execute(
+                """
+                SELECT
+                    id,
+                    txt,
+                    amount
+                FROM #DBD_UNICODE_PROBE
+                ORDER BY id
+                """
+            )
 
-            if (
-                int(rows[0][0])
-                <= last_row_no
-            ):
-                raise RuntimeError(
-                    "MySQL pagination "
-                    "did not advance."
-                )
-
-            if (
-                int(rows[-1][0])
-                > source_max
-            ):
-                raise RuntimeError(
-                    "MySQL page exceeded "
-                    "source snapshot MAX."
-                )
-
-            # ------------------------------------------------
-            # SANITIZE PAGE ONCE
-            # ------------------------------------------------
-
-            clean_page = [
-                sanitize_row(row)
-                for row
-                in rows
+            actual = [
+                tuple(row)
+                for row in cursor.fetchall()
             ]
 
-            # ------------------------------------------------
-            # BCP 25K CHUNKS
-            # ------------------------------------------------
+        assert_rows_match(
+            cases,
+            actual,
+            "Unicode bulk canary",
+        )
 
-            for start in range(
-                0,
-                len(clean_page),
-                BULK_COMMIT_SIZE,
-            ):
+    finally:
+        connection.rollback()
 
-                chunk = clean_page[
-                    start:
-                    start
-                    + BULK_COMMIT_SIZE
-                ]
+    print(
+        "[PASS] Unicode bulk protocol canary"
+    )
 
-                if not chunk:
-                    continue
 
-                bulk_no += 1
+# ============================================================
+# 13. FULL CONTENT VERIFICATION
+# ============================================================
 
-                first_id = int(
-                    chunk[0][0]
+def verify_prefix(
+    source_connection,
+    target_connection,
+    specs,
+    maximum: int,
+    table: str = SQL_BUILD,
+):
+
+    print(
+        "[VERIFY] Comparing all 17 columns"
+    )
+
+    source_after = 0
+    target_after = 0
+
+    verified = 0
+
+    while True:
+
+        source_rows = fetch_mysql_page(
+            source_connection,
+            source_after,
+            maximum,
+            VERIFY_PAGE_SIZE,
+            specs,
+        )
+
+        target_rows = fetch_sql_page(
+            target_connection,
+            table,
+            target_after,
+            maximum,
+            VERIFY_PAGE_SIZE,
+        )
+
+        if (
+            not source_rows
+            and not target_rows
+        ):
+            break
+
+        assert_rows_match(
+            source_rows,
+            target_rows,
+            "Full content verification",
+        )
+
+        verified += len(source_rows)
+
+        if not source_rows:
+            break
+
+        source_after = source_rows[-1][0]
+        target_after = target_rows[-1][0]
+
+        if (
+            verified % 100_000
+            < VERIFY_PAGE_SIZE
+        ):
+            print(
+                f"[VERIFY] "
+                f"rows={verified:,} "
+                f"last_row_no={source_after:,}"
+            )
+
+    return verified
+
+
+def verify_entire(
+    source_connection,
+    target_connection,
+    specs,
+    snapshot,
+):
+
+    verified = verify_prefix(
+        source_connection,
+        target_connection,
+        specs,
+        snapshot[2],
+    )
+
+    target_rows = row_count(
+        target_connection,
+        SQL_BUILD,
+    )
+
+    if (
+        verified != snapshot[0]
+        or target_rows != snapshot[0]
+    ):
+        raise RuntimeError(
+            "Full verification row count "
+            f"mismatch: "
+            f"verified={verified:,} "
+            f"source={snapshot[0]:,} "
+            f"target={target_rows:,}"
+        )
+
+    current_source = source_stats(
+        source_connection
+    )
+
+    if current_source != snapshot:
+        raise RuntimeError(
+            "MySQL source row count or range "
+            "changed during transfer"
+        )
+
+    print(
+        "[PASS] FULL CONTENT VERIFY "
+        f"| rows={verified:,} "
+        "| columns=17 "
+        "| mismatch=0"
+    )
+
+
+# ============================================================
+# 14. INDEXES
+# ============================================================
+
+def create_indexes(
+    connection,
+    specs,
+):
+
+    index_definitions = {
+        f"IX_{SQL_BUILD}_REG": (
+            "registration_no",
+        ),
+        f"IX_{SQL_BUILD}_STATUS": (
+            "status_code",
+        ),
+        f"IX_{SQL_BUILD}_BIZ": (
+            "business_type_code",
+        ),
+        f"IX_{SQL_BUILD}_SIZE": (
+            "business_size_code",
+        ),
+        f"IX_{SQL_BUILD}_PROV": (
+            "province",
+        ),
+        f"IX_{SQL_BUILD}_YEAR": (
+            "latest_fiscal_year",
+        ),
+    }
+
+    by_name = {
+        spec.name: spec
+        for spec in specs
+    }
+
+    for name, columns in (
+        index_definitions.items()
+    ):
+
+        too_wide = any(
+            (
+                by_name[column].size == -1
+                or (
+                    column in UNICODE_COLS
+                    and by_name[column].size > 450
                 )
+            )
+            for column in columns
+        )
 
-                chunk_last_id = int(
-                    chunk[-1][0]
-                )
+        if too_wide:
+            print(
+                f"[INDEX] SKIP {name}: "
+                "wide text needs a "
+                "different index strategy"
+            )
+            continue
 
-                chunk_started = (
-                    time.perf_counter()
-                )
+        existing = scalar(
+            connection,
+            """
+            SELECT COUNT(*)
+            FROM sys.indexes
+            WHERE object_id = OBJECT_ID(%s)
+              AND name = %s
+            """,
+            (
+                f"{SQL_SCHEMA}.{SQL_BUILD}",
+                name,
+            ),
+        )
 
-                mssql_conn = (
-                    bulk_copy_chunk(
-                        chunk,
-                        mssql_conn,
+        if existing:
+            continue
+
+        column_sql = ", ".join(
+            quote(column)
+            for column in columns
+        )
+
+        with connection.cursor() as cursor:
+
+            cursor.execute(
+                f"""
+                CREATE INDEX {quote(name)}
+                ON {sql_table(SQL_BUILD)}
+                ({column_sql})
+                """
+            )
+
+        connection.commit()
+
+        print(
+            f"[INDEX] CREATED {name}"
+        )
+
+
+# ============================================================
+# 15. COMMITTED BULK RECONCILIATION
+# ============================================================
+
+def compare_chunk_committed(
+    connection,
+    source_rows,
+):
+
+    if not source_rows:
+        return 0
+
+    first = source_rows[0][0]
+    last = source_rows[-1][0]
+
+    target_rows = fetch_sql_range(
+        connection,
+        SQL_BUILD,
+        first,
+        last,
+    )
+
+    if len(target_rows) > len(source_rows):
+        raise RuntimeError(
+            "Unexpected rows in "
+            "target chunk range"
+        )
+
+    assert_rows_match(
+        source_rows[:len(target_rows)],
+        target_rows,
+        "Bulk reconciliation prefix",
+    )
+
+    return len(target_rows)
+
+
+# ============================================================
+# 16. TRANSFER ENGINE
+# ============================================================
+
+def transfer(
+    source_connection,
+    target_connection,
+    specs,
+    snapshot,
+    resume_after: int,
+):
+
+    source_total = snapshot[0]
+    source_maximum = snapshot[2]
+
+    starting_count = row_count(
+        target_connection,
+        SQL_BUILD,
+    )
+
+    inserted = 0
+    after = resume_after
+
+    started = time.perf_counter()
+
+    while True:
+
+        rows = fetch_mysql_page(
+            source_connection,
+            after,
+            source_maximum,
+            PAGE_SIZE,
+            specs,
+        )
+
+        if not rows:
+            break
+
+        committed = 0
+
+        for attempt in range(
+            1,
+            MAX_RETRIES + 1,
+        ):
+
+            try:
+
+                with sql_connection() as writer:
+
+                    bulk_insert(
+                        writer,
+                        SQL_BUILD,
+                        rows[committed:],
+                        specs,
                     )
-                )
 
-                # --------------------------------------------
-                # CHECKPOINT ADVANCES ONLY AFTER BULK RETURNS
-                # --------------------------------------------
+            except KeyboardInterrupt:
+                raise
 
-                last_row_no = (
-                    chunk_last_id
-                )
+            except Exception as error:
 
-                chunk_size = len(
-                    chunk
-                )
+                # The connection may fail after
+                # SQL Server has committed the data.
+                # Inspect the actual committed state.
 
-                total += chunk_size
+                try:
 
-                inserted_this_run += (
-                    chunk_size
-                )
+                    with sql_connection() as inspector:
 
-                if (
-                    total
-                    > expected_rows
-                ):
+                        committed = (
+                            compare_chunk_committed(
+                                inspector,
+                                rows,
+                            )
+                        )
+
+                except Exception as reconcile_error:
+
                     raise RuntimeError(
-                        "Transferred row count "
-                        "exceeded source."
-                    )
+                        "Cannot reconcile committed "
+                        "bulk state. STOP safely."
+                    ) from reconcile_error
 
-                now = (
-                    time.perf_counter()
-                )
+                if committed == len(rows):
+                    break
 
-                chunk_elapsed = (
-                    now
-                    - chunk_started
-                )
+                if attempt >= MAX_RETRIES:
 
-                overall_elapsed = (
-                    now
-                    - started
-                )
+                    raise RuntimeError(
+                        "Bulk transfer failed after "
+                        f"{attempt} attempts"
+                    ) from error
 
-                chunk_rate = (
-                    chunk_size
-                    / chunk_elapsed
-                    if chunk_elapsed > 0
-                    else 0.0
-                )
-
-                average_rate = (
-                    inserted_this_run
-                    / overall_elapsed
-                    if overall_elapsed > 0
-                    else 0.0
-                )
-
-                remaining = max(
-                    expected_rows
-                    - total,
-                    0,
-                )
-
-                eta = (
-                    remaining
-                    / average_rate
-                    if average_rate > 0
-                    else None
-                )
-
-                percent = (
-                    total
-                    / expected_rows
-                    * 100
-                    if expected_rows
-                    else 100.0
+                delay = min(
+                    2 ** attempt,
+                    30,
                 )
 
                 print(
-                    f"[BULK {bulk_no:04d}] "
-                    f"{total:,}/"
-                    f"{expected_rows:,} "
-                    f"({percent:6.2f}%) "
-                    f"| row_no "
-                    f"{first_id}"
-                    f" -> "
-                    f"{chunk_last_id} "
-                    f"| batch "
-                    f"{chunk_rate:,.0f} rows/s "
-                    f"| avg "
-                    f"{average_rate:,.0f} rows/s "
-                    f"| ETA "
-                    f"{format_duration(eta)}"
+                    f"[RETRY] "
+                    f"row_no={rows[0][0]} "
+                    f"attempt={attempt} "
+                    f"delay={delay}s "
+                    f"error={type(error).__name__}"
                 )
 
-                # If reconciliation closed the connection,
-                # restore persistent connection for next chunk.
-                if mssql_conn is None:
-                    mssql_conn = (
-                        open_mssql_connection()
-                    )
+                time.sleep(delay)
 
-            page_elapsed = (
-                time.perf_counter()
-                - page_started
+            else:
+                break
+
+        # Verification is performed through
+        # a fresh connection after commit.
+
+        with sql_connection() as verifier:
+
+            actual_rows = fetch_sql_range(
+                verifier,
+                SQL_BUILD,
+                rows[0][0],
+                rows[-1][0],
             )
 
-            print(
-                f"          MySQL page "
-                f"{page_no}: "
-                f"{len(rows):,} rows "
-                f"| {page_elapsed:.2f}s total"
+            assert_rows_match(
+                rows,
+                actual_rows,
+                "Post-commit batch verification",
             )
 
-        elapsed = (
-            time.perf_counter()
-            - started
+        after = rows[-1][0]
+        inserted += len(rows)
+
+        elapsed = max(
+            time.perf_counter() - started,
+            0.001,
+        )
+
+        done_total = (
+            starting_count + inserted
         )
 
         average_rate = (
-            inserted_this_run
-            / elapsed
-            if (
-                inserted_this_run
-                and elapsed > 0
-            )
-            else 0.0
+            inserted / elapsed
         )
 
-        return {
-            "total_rows":
-                total,
-
-            "inserted_this_run":
-                inserted_this_run,
-
-            "last_row_no":
-                last_row_no,
-
-            "elapsed":
-                elapsed,
-
-            "average_rate":
-                average_rate,
-        }
-
-    finally:
-
-        close_mssql_safely(
-            mssql_conn
+        remaining = max(
+            source_total - done_total,
+            0,
         )
+
+        eta_seconds = (
+            remaining / average_rate
+            if average_rate > 0
+            else 0
+        )
+
+        percentage = (
+            100 * done_total / source_total
+        )
+
+        print(
+            f"[BULK] "
+            f"{done_total:,}/{source_total:,} "
+            f"({percentage:.2f}%) "
+            f"| row_no={after:,} "
+            f"| avg={average_rate:,.0f} rows/s "
+            f"| ETA={eta_seconds / 60:.1f}m"
+        )
+
+    return inserted
 
 
 # ============================================================
-# SOURCE STABILITY
+# 17. CUTOVER DEPENDENCY VALIDATION
 # ============================================================
 
-def verify_source_unchanged(
-    original: dict,
+def validate_cutover_dependencies(
+    connection,
+    target: str,
 ):
 
-    current = (
-        inspect_mysql_source()
+    full_name = (
+        f"{SQL_SCHEMA}.{target}"
     )
 
-    fields = (
-        "rows",
-        "unique_identities",
-        "min_row_no",
-        "max_row_no",
-        "sum_row_no",
-        "sum_sq_row_no",
-    )
+    checks = {
+        "incoming_or_outgoing_foreign_keys": (
+            """
+            SELECT COUNT(*)
+            FROM sys.foreign_keys
+            WHERE
+                referenced_object_id = OBJECT_ID(%s)
+                OR parent_object_id = OBJECT_ID(%s)
+            """,
+            (
+                full_name,
+                full_name,
+            ),
+        ),
+        "referencing_sql_objects": (
+            """
+            SELECT COUNT(*)
+            FROM sys.sql_expression_dependencies
+            WHERE referenced_id = OBJECT_ID(%s)
+            """,
+            (full_name,),
+        ),
+        "table_triggers": (
+            """
+            SELECT COUNT(*)
+            FROM sys.triggers
+            WHERE parent_id = OBJECT_ID(%s)
+            """,
+            (full_name,),
+        ),
+        "explicit_object_permissions": (
+            """
+            SELECT COUNT(*)
+            FROM sys.database_permissions
+            WHERE class = 1
+              AND major_id = OBJECT_ID(%s)
+            """,
+            (full_name,),
+        ),
+    }
 
-    for field in fields:
+    blocked = {}
 
-        if (
-            current[field]
-            != original[field]
+    for label, (
+        query,
+        params,
+    ) in checks.items():
+
+        count = int(
+            scalar(
+                connection,
+                query,
+                params,
+            )
+        )
+
+        if count:
+            blocked[label] = count
+
+    if blocked:
+        raise RuntimeError(
+            f"Unsafe cutover dependencies "
+            f"on {full_name}: {blocked}"
+        )
+
+
+# ============================================================
+# 18. CONTROLLED CUTOVER
+# ============================================================
+
+def cutover(
+    specs,
+    snapshot,
+    confirmed: bool,
+):
+
+    if not confirmed:
+        raise RuntimeError(
+            "Explicit confirmation required. "
+            "Use --confirm-cutover only after "
+            "consumer downtime and dependency "
+            "validation."
+        )
+
+    with sql_connection() as connection:
+
+        if not table_exists(
+            connection,
+            SQL_BUILD,
         ):
             raise RuntimeError(
-                "MySQL source changed "
-                "during transfer: "
-                f"{field}"
+                "BUILD table does not exist"
             )
 
+        if table_exists(
+            connection,
+            SQL_BACKUP,
+        ):
+            raise RuntimeError(
+                "BACKUP table already exists. "
+                "Refusing to overwrite."
+            )
 
-# ============================================================
-# FINAL VERIFY
-# ============================================================
-
-def final_verify(
-    source: dict,
-) -> dict:
-
-    verify_source_unchanged(
-        source
-    )
-
-    target = (
-        get_target_stats()
-    )
-
-    if (
-        target["rows"]
-        != source["rows"]
-    ):
-        raise RuntimeError(
-            "Final row count mismatch: "
-            f"MySQL={source['rows']:,}, "
-            f"SQL Server="
-            f"{target['rows']:,}"
+        validate_sql_schema(
+            connection,
+            SQL_BUILD,
+            specs,
         )
 
-    if (
-        target["distinct_rows"]
-        != target["rows"]
-    ):
-        raise RuntimeError(
-            "SQL Server row_no "
-            "uniqueness failed."
+        unicode_canary(
+            connection
         )
 
-    if (
-        target["min_row_no"]
-        != source["min_row_no"]
-    ):
-        raise RuntimeError(
-            "Final MIN(row_no) "
-            "mismatch."
+        # Verify the new table against
+        # MySQL immediately before cutover.
+
+        with mysql_connection() as source_connection:
+
+            verify_entire(
+                source_connection,
+                connection,
+                specs,
+                snapshot,
+            )
+
+        if table_exists(
+            connection,
+            SQL_TARGET,
+        ):
+
+            validate_cutover_dependencies(
+                connection,
+                SQL_TARGET,
+            )
+
+        create_indexes(
+            connection,
+            specs,
         )
-
-    if (
-        target["max_row_no"]
-        != source["max_row_no"]
-    ):
-        raise RuntimeError(
-            "Final MAX(row_no) "
-            "mismatch."
-        )
-
-    if (
-        target["sum_row_no"]
-        != source["sum_row_no"]
-    ):
-        raise RuntimeError(
-            "Final SUM(row_no) "
-            "mismatch."
-        )
-
-    if (
-        target["sum_sq_row_no"]
-        != source["sum_sq_row_no"]
-    ):
-        raise RuntimeError(
-            "Final row_no fingerprint "
-            "mismatch."
-        )
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
 
         try:
 
-            # ------------------------------------------------
-            # COMPOSITE IDENTITY
-            # ------------------------------------------------
+            with connection.cursor() as cursor:
 
-            cursor.execute(
-                f"""
-                SELECT COUNT_BIG(*)
+                # Rename the old table to BACKUP.
+                # No old table is dropped.
 
-                FROM
-                (
-                    SELECT
-                        juristic_type_code,
-                        registration_no
+                if table_exists(
+                    connection,
+                    SQL_TARGET,
+                ):
 
-                    FROM {MSSQL_FULL_TABLE}
-
-                    GROUP BY
-                        juristic_type_code,
-                        registration_no
-
-                    HAVING COUNT_BIG(*) > 1
-                ) AS d
-                """
-            )
-
-            if (
-                cursor.fetchone()[0]
-                != 0
-            ):
-                raise RuntimeError(
-                    "Duplicate company "
-                    "identity found "
-                    "in SQL Server."
-                )
-
-            # ------------------------------------------------
-            # REQUIRED NULLS
-            # ------------------------------------------------
-
-            cursor.execute(
-                f"""
-                SELECT COUNT_BIG(*)
-
-                FROM {MSSQL_FULL_TABLE}
-
-                WHERE registration_no
-                      IS NULL
-
-                   OR juristic_type_code
-                      IS NULL
-                """
-            )
-
-            if (
-                cursor.fetchone()[0]
-                != 0
-            ):
-                raise RuntimeError(
-                    "Required NULL "
-                    "check failed."
-                )
-
-        finally:
-            cursor.close()
-
-    return target
-
-
-# ============================================================
-# SECONDARY INDEXES
-# ============================================================
-
-def create_secondary_indexes():
-
-    with mssql_connection() as conn:
-
-        cursor = conn.cursor()
-
-        try:
-
-            cursor.execute(
-                f"""
-                SELECT name
-
-                FROM sys.indexes
-
-                WHERE object_id =
-                    OBJECT_ID(
-                        N'{MSSQL_SCHEMA}.{MSSQL_TABLE}'
+                    cursor.execute(
+                        """
+                        EXEC sp_rename
+                            %s,
+                            %s,
+                            %s
+                        """,
+                        (
+                            f"{SQL_SCHEMA}.{SQL_TARGET}",
+                            SQL_BACKUP,
+                            "OBJECT",
+                        ),
                     )
 
-                  AND name IS NOT NULL
-                """
-            )
-
-            existing = {
-                row[0]
-                for row
-                in cursor.fetchall()
-            }
-
-            for (
-                index_name,
-                sql,
-            ) in SECONDARY_INDEXES.items():
-
-                if (
-                    index_name
-                    in existing
-                ):
-                    continue
-
-                print(
-                    f"Creating index "
-                    f"{index_name}..."
-                )
+                # Promote verified BUILD to TARGET.
 
                 cursor.execute(
-                    sql
+                    """
+                    EXEC sp_rename
+                        %s,
+                        %s,
+                        %s
+                    """,
+                    (
+                        f"{SQL_SCHEMA}.{SQL_BUILD}",
+                        SQL_TARGET,
+                        "OBJECT",
+                    ),
                 )
 
-                conn.commit()
+            connection.commit()
 
         except Exception:
 
-            conn.rollback()
-
+            connection.rollback()
             raise
 
-        finally:
-            cursor.close()
+        # Verify the target name and row count
+        # after the naming transaction.
+
+        if not table_exists(
+            connection,
+            SQL_TARGET,
+        ):
+            raise RuntimeError(
+                "Cutover postcheck failed: "
+                "target table missing"
+            )
+
+        final_rows = row_count(
+            connection,
+            SQL_TARGET,
+        )
+
+        if final_rows != snapshot[0]:
+            raise RuntimeError(
+                "Cutover postcheck failed: "
+                f"target={final_rows:,} "
+                f"source={snapshot[0]:,}"
+            )
+
+    print()
+    print("=" * 78)
+    print("CUTOVER COMPLETE")
+    print("=" * 78)
+    print(
+        f"Active : {sql_table(SQL_TARGET)}"
+    )
+    print(
+        f"Backup : {sql_table(SQL_BACKUP)}"
+    )
+    print("Old table was not dropped.")
+    print()
 
 
 # ============================================================
-# MAIN
+# 19. STATUS
+# ============================================================
+
+def show_status(
+    connection,
+):
+
+    print()
+    print("=" * 78)
+    print("SQL SERVER TABLE STATUS")
+    print("=" * 78)
+
+    for table in (
+        SQL_TARGET,
+        SQL_BUILD,
+        SQL_BACKUP,
+    ):
+
+        if table_exists(
+            connection,
+            table,
+        ):
+
+            count = row_count(
+                connection,
+                table,
+            )
+
+            print(
+                f"{sql_table(table):50} "
+                f"{count:>15,} rows"
+            )
+
+        else:
+
+            print(
+                f"{sql_table(table):50} "
+                "MISSING"
+            )
+
+    print()
+
+
+# ============================================================
+# 20. MAIN WORKFLOW
 # ============================================================
 
 def main():
+
+    parser = argparse.ArgumentParser(
+        description=__doc__,
+    )
+
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "status",
+            "build",
+            "verify",
+            "cutover",
+        ),
+        default="build",
+    )
+
+    parser.add_argument(
+        "--confirm-cutover",
+        action="store_true",
+    )
+
+    args = parser.parse_args()
+
+    if (
+        args.confirm_cutover
+        and args.mode != "cutover"
+    ):
+        parser.error(
+            "--confirm-cutover is only valid "
+            "with --mode cutover"
+        )
 
     print()
     print("=" * 78)
     print("DBD COMPANY EXPORT")
     print("MYSQL -> SQL SERVER")
-    print("HIGH SPEED BCP / SAFE RESUME")
+    print("UNICODE-SAFE REBUILD")
     print("=" * 78)
     print()
 
-    try:
+    with mysql_connection() as source_connection:
 
-        # ----------------------------------------------------
-        # CONFIG
-        # ----------------------------------------------------
-
-        validate_config()
-
-        # ----------------------------------------------------
-        # MYSQL SOURCE
-        # ----------------------------------------------------
-
-        print("[1/7] MYSQL SOURCE")
-
-        source = (
-            inspect_mysql_source()
+        specs, snapshot = validate_source(
+            source_connection
         )
 
         print(
-            f"Database : "
-            f"{MYSQL_DATABASE}"
+            f"[SOURCE] Rows  : {snapshot[0]:,}"
         )
-
         print(
-            f"Table    : "
+            f"[SOURCE] Range : "
+            f"{snapshot[1]:,} -> {snapshot[2]:,}"
+        )
+        print(
+            f"[SOURCE] Table : "
             f"{MYSQL_TABLE}"
         )
-
-        print(
-            f"Rows     : "
-            f"{source['rows']:,}"
-        )
-
-        print(
-            f"Unique   : "
-            f"{source['unique_identities']:,}"
-        )
-
-        print(
-            f"Range    : "
-            f"{source['min_row_no']}"
-            f" -> "
-            f"{source['max_row_no']}"
-        )
-
         print()
 
-        # ----------------------------------------------------
-        # BCP SUPPORT
-        # ----------------------------------------------------
+        with sql_connection() as target_connection:
 
-        print("[2/7] BULK COPY PREFLIGHT")
+            # ------------------------------------------------
+            # STATUS
+            # ------------------------------------------------
 
-        validate_bulk_copy_support()
+            if args.mode == "status":
 
-        print(
-            "pymssql.bulk_copy : READY"
-        )
-
-        print(
-            f"MySQL page         : "
-            f"{MYSQL_PAGE_SIZE:,}"
-        )
-
-        print(
-            f"Bulk commit        : "
-            f"{BULK_COMMIT_SIZE:,}"
-        )
-
-        print(
-            f"TABLOCK            : "
-            f"{'YES' if USE_TABLOCK else 'NO'}"
-        )
-
-        print()
-
-        # ----------------------------------------------------
-        # SQL SERVER
-        # ----------------------------------------------------
-
-        print("[3/7] SQL SERVER")
-
-        server = (
-            inspect_mssql()
-        )
-
-        print(
-            f"Host     : "
-            f"{MSSQL_CONFIG['server']}:"
-            f"{MSSQL_CONFIG['port']}"
-        )
-
-        print(
-            f"Server   : "
-            f"{server['server']}"
-        )
-
-        print(
-            f"Database : "
-            f"{server['database']}"
-        )
-
-        print(
-            f"Login    : "
-            f"{server['login']}"
-        )
-
-        print(
-            f"Target   : "
-            f"{MSSQL_SCHEMA}."
-            f"{MSSQL_TABLE}"
-        )
-
-        print()
-
-        # ----------------------------------------------------
-        # TARGET
-        # ----------------------------------------------------
-
-        print("[4/7] TARGET TABLE")
-
-        if not server[
-            "table_exists"
-        ]:
-
-            if not server[
-                "can_create_table"
-            ]:
-                raise PermissionError(
-                    "CREATE TABLE "
-                    "permission missing."
+                show_status(
+                    target_connection
                 )
 
-            if not server[
-                "can_alter_dbo"
-            ]:
-                raise PermissionError(
-                    "ALTER dbo "
-                    "permission missing."
-                )
+                return
 
-            print(
-                "Creating "
-                "dbo.DBD_COMPANY_EXPORT..."
-            )
+            # ------------------------------------------------
+            # CUTOVER
+            # ------------------------------------------------
 
-            create_mssql_table()
+            if args.mode == "cutover":
 
-            print(
-                "Created."
-            )
+                # Continue after connections close.
+                pass
 
-        validate_mssql_table()
+            else:
 
-        print(
-            "Schema   : VALID"
-        )
+                # --------------------------------------------
+                # UNICODE CANARY
+                # --------------------------------------------
 
-        existing_secondary = (
-            get_existing_secondary_indexes()
-        )
-
-        if existing_secondary:
-
-            print(
-                "Warning  : secondary indexes "
-                "already exist; bulk speed may "
-                "be lower."
-            )
-
-            for index_name in sorted(
-                existing_secondary
-            ):
                 print(
-                    f"           {index_name}"
+                    "[1/5] UNICODE BULK PREFLIGHT"
                 )
 
-            print(
-                "           No index was dropped."
-            )
+                unicode_canary(
+                    target_connection
+                )
 
-        print()
+                # --------------------------------------------
+                # BUILD TABLE
+                # --------------------------------------------
 
-        # ----------------------------------------------------
-        # SAFE RESUME
-        # ----------------------------------------------------
+                print()
+                print(
+                    "[2/5] BUILD TABLE"
+                )
 
-        print("[5/7] SAFE RESUME")
+                if args.mode == "build":
 
-        resume_after = (
-            validate_resume_state(
-                source
-            )
+                    create_build(
+                        target_connection,
+                        specs,
+                    )
+
+                elif not table_exists(
+                    target_connection,
+                    SQL_BUILD,
+                ):
+
+                    raise RuntimeError(
+                        "BUILD table missing. "
+                        "Run --mode build first."
+                    )
+
+                validate_sql_schema(
+                    target_connection,
+                    SQL_BUILD,
+                    specs,
+                )
+
+                target_count = row_count(
+                    target_connection,
+                    SQL_BUILD,
+                )
+
+                if target_count > snapshot[0]:
+                    raise RuntimeError(
+                        "BUILD contains more rows "
+                        "than MySQL source"
+                    )
+
+                target_last = int(
+                    scalar(
+                        target_connection,
+                        f"""
+                        SELECT
+                            COALESCE(MAX(row_no), 0)
+                        FROM {sql_table(SQL_BUILD)}
+                        """,
+                    )
+                )
+
+                # --------------------------------------------
+                # SAFE RESUME VALIDATION
+                # --------------------------------------------
+
+                print()
+                print(
+                    "[3/5] SAFE RESUME VALIDATION"
+                )
+
+                if target_count:
+
+                    if not (
+                        snapshot[1]
+                        <= target_last
+                        <= snapshot[2]
+                    ):
+                        raise RuntimeError(
+                            "Invalid BUILD MAX(row_no)"
+                        )
+
+                    verified_prefix = verify_prefix(
+                        source_connection,
+                        target_connection,
+                        specs,
+                        target_last,
+                    )
+
+                    if (
+                        verified_prefix
+                        != target_count
+                    ):
+                        raise RuntimeError(
+                            "BUILD is not a complete "
+                            "verified source prefix"
+                        )
+
+                print(
+                    f"[RESUME] Existing rows : "
+                    f"{target_count:,}"
+                )
+
+                print(
+                    f"[RESUME] After row_no  : "
+                    f"{target_last:,}"
+                )
+
+                # --------------------------------------------
+                # VERIFY ONLY
+                # --------------------------------------------
+
+                if args.mode == "verify":
+
+                    verify_entire(
+                        source_connection,
+                        target_connection,
+                        specs,
+                        snapshot,
+                    )
+
+                    return
+
+                # --------------------------------------------
+                # TRANSFER
+                # --------------------------------------------
+
+                print()
+                print(
+                    "[4/5] HIGH-SPEED BULK TRANSFER"
+                )
+
+                if target_count < snapshot[0]:
+
+                    inserted = transfer(
+                        source_connection,
+                        target_connection,
+                        specs,
+                        snapshot,
+                        target_last,
+                    )
+
+                    print(
+                        f"[TRANSFER] Inserted : "
+                        f"{inserted:,}"
+                    )
+
+                else:
+
+                    print(
+                        "[TRANSFER] All source rows "
+                        "already exist in BUILD"
+                    )
+
+                # --------------------------------------------
+                # FULL VERIFICATION
+                # --------------------------------------------
+
+                print()
+                print(
+                    "[5/5] FINAL CONTENT VERIFICATION"
+                )
+
+                verify_entire(
+                    source_connection,
+                    target_connection,
+                    specs,
+                    snapshot,
+                )
+
+                # --------------------------------------------
+                # INDEXES
+                # --------------------------------------------
+
+                create_indexes(
+                    target_connection,
+                    specs,
+                )
+
+                print()
+                print("=" * 78)
+                print("BUILD VERIFIED")
+                print("=" * 78)
+                print(
+                    f"Source rows : {snapshot[0]:,}"
+                )
+                print(
+                    f"Target rows : "
+                    f"{row_count(target_connection, SQL_BUILD):,}"
+                )
+                print("Columns     : 17")
+                print("Mismatch    : 0")
+                print("Unicode     : PASS")
+                print("Cutover     : PENDING")
+                print()
+                print(
+                    "To activate the new table:"
+                )
+                print(
+                    "python mysql_to_sql.py "
+                    "--mode cutover "
+                    "--confirm-cutover"
+                )
+                print()
+
+                return
+
+    # --------------------------------------------------------
+    # CUTOVER: FRESH CONNECTION
+    # --------------------------------------------------------
+
+    if args.mode == "cutover":
+
+        cutover(
+            specs,
+            snapshot,
+            args.confirm_cutover,
         )
 
-        target_before = (
-            get_target_stats()
-        )
 
-        existing_rows = int(
-            target_before["rows"]
-        )
+# ============================================================
+# 21. ENTRY POINT
+# ============================================================
 
-        remaining = max(
-            source["rows"]
-            - existing_rows,
-            0,
-        )
+if __name__ == "__main__":
 
-        print(
-            f"Existing rows : "
-            f"{existing_rows:,}"
-        )
-
-        print(
-            f"Remaining     : "
-            f"{remaining:,}"
-        )
-
-        print(
-            f"Resume after  : "
-            f"{resume_after}"
-        )
-
-        print(
-            "Prefix check  : PASS"
-        )
-
-        print()
-
-        # ----------------------------------------------------
-        # TRANSFER
-        # ----------------------------------------------------
-
-        print("[6/7] BULK TRANSFER")
-
-        if (
-            existing_rows
-            == source["rows"]
-        ):
-
-            print(
-                "Target already contains "
-                "all source rows."
-            )
-
-            result = {
-                "total_rows":
-                    existing_rows,
-
-                "inserted_this_run":
-                    0,
-
-                "last_row_no":
-                    resume_after,
-
-                "elapsed":
-                    0.0,
-
-                "average_rate":
-                    0.0,
-            }
-
-        else:
-
-            result = transfer(
-                source=source,
-
-                existing_rows=
-                    existing_rows,
-
-                resume_after=
-                    resume_after,
-            )
-
-        print()
-
-        print(
-            f"Inserted this run : "
-            f"{result['inserted_this_run']:,}"
-        )
-
-        print(
-            f"Average speed     : "
-            f"{result['average_rate']:,.0f} "
-            f"rows/s"
-        )
-
-        print(
-            f"Runtime           : "
-            f"{format_duration(result['elapsed'])}"
-        )
-
-        print()
-
-        # ----------------------------------------------------
-        # VERIFY
-        # ----------------------------------------------------
-
-        print("[7/7] FINAL VERIFY")
-
-        final = (
-            final_verify(
-                source
-            )
-        )
-
-        print(
-            "Data verification : PASS"
-        )
-
-        print()
-
-        # ----------------------------------------------------
-        # INDEXES
-        # ----------------------------------------------------
-
-        create_secondary_indexes()
-
-        # ----------------------------------------------------
-        # COMPLETE
-        # ----------------------------------------------------
-
-        print()
-        print("=" * 78)
-        print("COMPLETE")
-        print("=" * 78)
-
-        print(
-            f"MySQL rows        : "
-            f"{source['rows']:,}"
-        )
-
-        print(
-            f"SQL Server rows   : "
-            f"{final['rows']:,}"
-        )
-
-        print(
-            f"MIN row_no        : "
-            f"{final['min_row_no']}"
-        )
-
-        print(
-            f"MAX row_no        : "
-            f"{final['max_row_no']}"
-        )
-
-        print(
-            "Identity unique   : YES"
-        )
-
-        print(
-            "Fingerprint       : MATCH"
-        )
-
-        print(
-            "DELETE            : NONE"
-        )
-
-        print(
-            "TRUNCATE          : NONE"
-        )
-
-        print(
-            "DROP TABLE        : NONE"
-        )
-
-        print()
-        print("STATUS: COMPLETE")
-        print()
+    try:
+        main()
 
     except KeyboardInterrupt:
 
@@ -2905,86 +2422,22 @@ def main():
         print("=" * 78)
         print("INTERRUPTED")
         print("=" * 78)
+        print(
+            "Committed BUILD batches remain."
+        )
+        print(
+            "Rerun to verify and resume."
+        )
         print()
 
-        print(
-            "Ctrl+C received."
-        )
-
-        print(
-            "Committed SQL Server "
-            "bulk batches remain."
-        )
-
-        print(
-            "No committed rows "
-            "were deleted."
-        )
-
-        print(
-            "No DELETE, TRUNCATE "
-            "or DROP was performed."
-        )
-
-        print()
-
-        print(
-            "Run again:"
-        )
-
-        print(
-            r"python .\mysql_to_sql.py"
-        )
-
-        print()
-
-        print(
-            "The script will inspect "
-            "the actual SQL Server prefix "
-            "and continue after the last "
-            "committed row_no."
-        )
-
-        print()
-
-        sys.exit(
-            130
-        )
+        sys.exit(130)
 
     except Exception as exc:
 
-        print()
-        print("=" * 78)
-        print("FAILED")
-        print("=" * 78)
-        print()
-
         print(
-            f"Type    : "
-            f"{type(exc).__name__}"
+            f"[FAILED] "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
         )
 
-        print(
-            f"Message : "
-            f"{exc}"
-        )
-
-        print()
-
-        print(
-            "Committed batches remain."
-        )
-
-        print(
-            "No automatic DELETE, "
-            "TRUNCATE or DROP "
-            "was performed."
-        )
-
-        print()
-
-        raise
-
-
-if __name__ == "__main__":
-    main()
+        sys.exit(1)

@@ -1,88 +1,87 @@
-
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 """
-DBD BRANCH COLLECTOR v5.0
-=========================
+DBD BRANCH COLLECTOR
 
-One Python file. MySQL only.
+Run this same command for initial collection and resume within the active
+Phase, including newly discovered companies and deferred retries:
 
-SOURCE:
-    dbd_company_deep
+    python .\\dbd_branch_collector.py --status-codes 1,A,B
 
-TARGET:
-    dbd_company_branch
+MySQL:
+    SOURCE: dbd_company_deep
+    TARGET: dbd_company_branch
 
-INSTALL:
-    python -m pip install PyMySQL python-dotenv requests beautifulsoup4 rich
+REQUIREMENTS:
+    - Use existing MySQL tables only.
+    - No new MySQL tables.
+    - No deletion of existing branch records.
+    - No timestamp-based work selection.
+    - Identify companies by (jp_type_code, jp_no).
+    - Discover companies inserted before or after previous cursors.
+    - Detect changes in relevant source business information.
+    - Find and process previously unchecked identities.
+    - Retry unresolved identities on the next invocation.
+    - Preserve previous .dbd_branch_checkpoint.json.
+    - Preserve existing branch data.
+    - Concurrent HTTP workers with one global rate limiter.
+    - One MySQL writer.
+    - Transactional branch UPSERT.
+    - Safe Ctrl+C, crash recovery, and resume.
+    - No Redis or additional MySQL tables.
+    - One command for normal execution and subsequent resume.
 
-COMMANDS:
-    python dbd_branch_collector.py --jp-no 0107538000533 --dry-run
-    python dbd_branch_collector.py --jp-no 0107538000533
-    python dbd_branch_collector.py --limit 20
-    python dbd_branch_collector.py
-    python dbd_branch_collector.py --refresh
-    python dbd_branch_collector.py --retry-deferred
-    python dbd_branch_collector.py --status-codes 1,A,B --limit 20
+STATE:
+    .dbd_branch_results.jsonl
 
-EXISTING .env:
-    DB_HOST=127.0.0.1
-    DB_PORT=3307
-    DB_NAME=dbd
-    DB_USER=dbd-data
-    DB_PASSWORD=your_password
+The result journal is necessary because dbd_company_branch contains branch
+records, not a complete history of every company checked.
 
-DATA FOR THAI .env:
-    DATAFORTHAI_STATUS_CODES=1
-    DATAFORTHAI_CONCURRENCY=4
-    DATAFORTHAI_RATE_PER_SECOND=2
-    DATAFORTHAI_REQUEST_TIMEOUT=30
-    DATAFORTHAI_HTTP_ATTEMPTS=3
+Companies with no branches also need durable company-level results.
 
-FEATURES:
-    - Concurrent HTTP requests
-    - Shared global HTTP rate limiter
-    - One MySQL writer
-    - Ordered checkpoint commits
-    - Safe resume after Ctrl+C
-    - Automatic target table creation
-    - Additive schema updates
-    - Idempotent UPSERT
-    - Custom company-status filters
-    - Handle unavailable companies
-    - Handle companies without listed branches
-    - Retry transient failures
-    - Live Terminal UI
-    - No COUNT(*) or OFFSET pagination
-    - No Redis, SQL Server or extra database tables
-    - No latitude/longitude
+The previous checkpoint contains aggregate counters and deferred identities.
+It cannot reconstruct missing zero-branch or unavailable results. Never
+silently treat a lost result Journal as a fresh installation.
 
-IMPORTANT:
-    The configured request rate must be permitted by the source website.
-    Authentication restrictions, HTTP 401/403 and HTTP 429 are not bypassed.
+Once a company has a terminal result for the active Phase, its source
+fingerprint is an audit value, not a reason to fetch the website again.
+Use --new-phase explicitly to refresh even those terminal companies.
+
+If newly retrieved branch data omits previously stored branch numbers,
+existing rows are preserved and the result is marked STALE_BRANCHES.
+
+The journal must be backed up together with MySQL.
+
+HTTP 401, 403, and 429 stop collection safely.
+Access restrictions are not bypassed.
 """
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import random
 import re
+import shutil
+import sys
 import threading
 import time
-import uuid
 
-from collections import deque
+from collections import Counter, deque
+
 from concurrent.futures import (
+    FIRST_COMPLETED,
     ThreadPoolExecutor,
-    TimeoutError as FutureTimeout,
+    wait,
 )
-from contextlib import nullcontext
+
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urljoin, urlparse
+
 
 try:
     import pymysql
@@ -94,13 +93,15 @@ try:
     from rich.console import Console, Group
     from rich.live import Live
     from rich.panel import Panel
+
     from rich.progress import (
-        BarColumn,
         Progress,
         SpinnerColumn,
+        BarColumn,
         TextColumn,
         TimeElapsedColumn,
     )
+
     from rich.table import Table
 
 except ImportError as exc:
@@ -123,85 +124,93 @@ load_dotenv(
 )
 
 SOURCE = "dbd_company_deep"
+
 TARGET = "dbd_company_branch"
 
 SITE = "https://www.dataforthai.com"
 
-CHECKPOINT = ROOT / ".dbd_branch_checkpoint.json"
+CHECKPOINT = (
+    ROOT / ".dbd_branch_checkpoint.json"
+)
 
-RECONNECT_CODES = {
+JOURNAL = (
+    ROOT / ".dbd_branch_results.jsonl"
+)
+
+LOCK = "dbd:branch:collector:exclusive"
+
+RECONNECT = {
     2006,
     2013,
     2014,
     2055,
 }
 
+PHASE_TERMINAL_STATUSES = frozenset({
+    "OK", "NO_BRANCH", "LEGACY_OK", "NO_BRANCH_LISTED",
+    "UNAVAILABLE", "NOT_LISTED",
+})
+PHASE_REVIEW_STATUSES = frozenset({"STALE_BRANCHES"})
+PHASE_FORMAT_VERSION = 2
 
-# ============================================================
-# MYSQL TABLE
-# ============================================================
 
-CREATE_TABLE = f"""
-CREATE TABLE IF NOT EXISTS `{TARGET}` (
+def result_class(status):
+    if status in PHASE_TERMINAL_STATUSES:
+        return "TERMINAL"
+    if status in PHASE_REVIEW_STATUSES:
+        return "REVIEW"
+    if status.startswith("DEFERRED_") and re.fullmatch(r"DEFERRED_[A-Z0-9_]+", status):
+        return "DEFERRED"
+    raise CollectorError(f"Unknown Journal status: {status!r}")
 
-    jp_type_code VARCHAR(4) NOT NULL,
-    jp_no VARCHAR(20) NOT NULL,
+# Relevant source business fields are recorded for audit purposes only.
+# A fingerprint change must NOT invalidate a current-Phase terminal result.
+# Runtime timestamps, financial endpoints, and worker controls are excluded.
 
-    jp_name VARCHAR(500) NULL,
-    jp_name_e VARCHAR(500) NULL,
-
-    branch_no VARCHAR(5) NOT NULL,
-    branch_count INT UNSIGNED NOT NULL,
-    branch_name VARCHAR(500) NULL,
-    branch_address TEXT NOT NULL,
-
-    province_name VARCHAR(191) NULL,
-    district_name VARCHAR(191) NULL,
-    subdistrict_name VARCHAR(191) NULL,
-    postal_code VARCHAR(10) NULL,
-
-    source_url VARCHAR(255) NOT NULL,
-
-    first_seen_at DATETIME(6)
-        NOT NULL DEFAULT CURRENT_TIMESTAMP(6),
-
-    fetched_at DATETIME(6) NOT NULL,
-
-    PRIMARY KEY (
-        jp_type_code,
-        jp_no,
-        branch_no
-    ),
-
-    KEY idx_branch_jp_no (jp_no),
-    KEY idx_branch_province (province_name)
-
+FINGERPRINT_FIELDS = (
+    "jp_type_code",
+    "jp_no",
+    "jp_name",
+    "jp_name_e",
+    "jp_stat_code",
+    "address",
+    "pv_code",
+    "ampur_code",
+    "tumbon_code",
+    "zip_code",
 )
-ENGINE=InnoDB
-DEFAULT CHARSET=utf8mb4
-COLLATE=utf8mb4_0900_ai_ci
-"""
 
+REQUIRED_SOURCE = {
+    "jp_type_code",
+    "jp_no",
+    "jp_name",
+    "jp_name_e",
+    "jp_stat_code",
+}
 
-ADDITIVE_COLUMNS = {
-    "jp_name": "VARCHAR(500) NULL",
-    "jp_name_e": "VARCHAR(500) NULL",
-    "branch_count": "INT UNSIGNED NULL",
-    "branch_name": "VARCHAR(500) NULL",
-    "branch_address": "TEXT NULL",
-    "province_name": "VARCHAR(191) NULL",
-    "district_name": "VARCHAR(191) NULL",
-    "subdistrict_name": "VARCHAR(191) NULL",
-    "postal_code": "VARCHAR(10) NULL",
-    "source_url": "VARCHAR(255) NULL",
-    "first_seen_at": (
-        "DATETIME(6) NULL DEFAULT CURRENT_TIMESTAMP(6)"
-    ),
-    "fetched_at": "DATETIME(6) NULL",
+REQUIRED_TARGET = {
+    "jp_type_code",
+    "jp_no",
+    "jp_name",
+    "jp_name_e",
+    "branch_no",
+    "branch_count",
+    "branch_name",
+    "branch_address",
+    "province_name",
+    "district_name",
+    "subdistrict_name",
+    "postal_code",
+    "source_url",
+    "fetched_at",
 }
 
 
-UPSERT_SQL = f"""
+# ============================================================
+# EXISTING TARGET TABLE UPSERT
+# ============================================================
+
+UPSERT = f"""
 INSERT INTO `{TARGET}` (
 
     jp_type_code,
@@ -250,7 +259,7 @@ ON DUPLICATE KEY UPDATE
 
 
 # ============================================================
-# HELPERS
+# EXCEPTIONS
 # ============================================================
 
 class CollectorError(RuntimeError):
@@ -261,9 +270,13 @@ class AccessDenied(CollectorError):
     pass
 
 
+# ============================================================
+# HELPERS
+# ============================================================
+
 def positive(
-    name: str,
-    default: str,
+    name,
+    default,
     kind=float,
 ):
     try:
@@ -276,15 +289,44 @@ def positive(
 
         return value
 
-    except ValueError as exc:
+    except (
+        TypeError,
+        ValueError,
+    ) as exc:
         raise CollectorError(
-            f"Invalid positive .env setting: {name}"
+            f"Invalid positive setting: {name}"
         ) from exc
 
 
-def parse_status_codes(
-    raw: str,
-) -> tuple[str, ...]:
+def clean(value):
+    return (
+        " ".join(str(value or "").split())
+        or None
+    )
+
+
+def key(row):
+    return (
+        str(row["jp_type_code"]),
+        str(row["jp_no"]),
+    )
+
+
+def key_text(row):
+    jp_type, jp_no = key(row)
+
+    return (
+        jp_type + ":" + jp_no
+    )
+
+
+def now_utc():
+    return datetime.now(
+        timezone.utc
+    ).replace(tzinfo=None)
+
+
+def status_codes(raw):
 
     codes = [
         value.strip().upper()
@@ -299,7 +341,7 @@ def parse_status_codes(
         for value in codes
     ):
         raise CollectorError(
-            "Invalid status codes; example: 1,A,B"
+            "Invalid status codes; expected 1,A,B"
         )
 
     return tuple(
@@ -307,45 +349,41 @@ def parse_status_codes(
     )
 
 
-def clean(value):
-    return (
-        " ".join(str(value or "").split())
-        or None
-    )
+# ============================================================
+# CONTENT FINGERPRINT
+#
+# Identity and relevant business values only.
+#
+# Does not depend on dates, timestamps, runtime states,
+# request counters, or worker statuses.
+# ============================================================
 
+def fingerprint(
+    row,
+    columns,
+):
 
-def utc_now():
-    return datetime.now(
-        timezone.utc
-    ).isoformat()
+    payload = json.dumps(
+        [
+            row.get(name)
+            for name in columns
+        ],
 
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
 
-def duration(seconds):
-
-    n = max(
-        0,
-        int(seconds),
-    )
-
-    if n >= 3600:
-        return (
-            f"{n // 3600}h "
-            f"{(n % 3600) // 60}m"
-        )
-
-    return (
-        f"{n // 60}m "
-        f"{n % 60}s"
-    )
+    return hashlib.sha256(
+        payload
+    ).hexdigest()
 
 
 # ============================================================
 # ADDRESS PARSER
 # ============================================================
 
-def parse_address(
-    address: str,
-):
+def parse_address(address):
 
     province = (
         "กรุงเทพมหานคร"
@@ -376,7 +414,7 @@ def parse_address(
         address,
     )
 
-    postcodes = re.findall(
+    zipcodes = re.findall(
         r"(?<!\d)\d{5}(?!\d)",
         address,
     )
@@ -392,19 +430,19 @@ def parse_address(
         if subdistrict
         else None,
 
-        postcodes[-1]
-        if postcodes
+        zipcodes[-1]
+        if zipcodes
         else None,
     )
 
 
 # ============================================================
-# BRANCH HTML PARSER
+# BRANCH PRINTVIEW PARSER
 # ============================================================
 
 def parse_printview(
-    html: str,
-    jp_no: str,
+    html,
+    jp_no,
 ):
 
     soup = BeautifulSoup(
@@ -437,17 +475,15 @@ def parse_printview(
         if len(cells) < 2:
             continue
 
-        label = clean(
+        if clean(
             cells[0].get_text(
                 " ",
                 strip=True,
             )
-        )
-
-        if label != "รวม":
+        ) != "รวม":
             continue
 
-        value = (
+        raw = (
             clean(
                 cells[1].get_text(
                     " ",
@@ -457,14 +493,15 @@ def parse_printview(
             or ""
         ).replace(",", "")
 
-        if value.isdecimal():
-            expected = int(value)
+        if raw.isdecimal():
+            expected = int(raw)
 
         break
 
     if expected is None:
         raise CollectorError(
-            f"{jp_no}: cannot validate branch count"
+            f"{jp_no}: missing or invalid "
+            "establishment total"
         )
 
     cards = holder.select(
@@ -474,7 +511,7 @@ def parse_printview(
     if len(cards) != expected:
         raise CollectorError(
             f"{jp_no}: incomplete printview "
-            f"({len(cards)}/{expected})"
+            f"{len(cards)}/{expected}"
         )
 
     branches = []
@@ -485,7 +522,7 @@ def parse_printview(
 
     for card in cards:
 
-        code_element = card.select_one(
+        code = card.select_one(
             ".branch-code"
         )
 
@@ -493,17 +530,14 @@ def parse_printview(
             ".branch-info"
         )
 
-        if (
-            code_element is None
-            or info is None
-        ):
+        if code is None or info is None:
             raise CollectorError(
-                f"{jp_no}: unexpected branch card"
+                f"{jp_no}: incomplete branch card"
             )
 
         label = (
             clean(
-                code_element.get_text(
+                code.get_text(
                     " ",
                     strip=True,
                 )
@@ -520,17 +554,16 @@ def parse_printview(
             label,
         )
 
-        if len(matches) != 1:
+        if (
+            len(matches) != 1
+            or matches[0] in seen
+        ):
             raise CollectorError(
-                f"{jp_no}: invalid branch code {label!r}"
+                f"{jp_no}: invalid or duplicate "
+                f"branch number {label!r}"
             )
 
         branch_no = matches[0]
-
-        if branch_no in seen:
-            raise CollectorError(
-                f"{jp_no}: duplicate branch {branch_no}"
-            )
 
         seen.add(branch_no)
 
@@ -541,7 +574,8 @@ def parse_printview(
 
         if len(parts) < 2:
             raise CollectorError(
-                f"{jp_no}: incomplete branch details"
+                f"{jp_no}/{branch_no}: "
+                "missing detail elements"
             )
 
         branch_name = clean(
@@ -551,36 +585,25 @@ def parse_printview(
             )
         )
 
-        branch_address = clean(
+        address = clean(
             parts[1].get_text(
                 " ",
                 strip=True,
             )
         )
 
-        if not branch_address:
+        if not address:
             raise CollectorError(
-                f"{jp_no}/{branch_no}: missing address"
+                f"{jp_no}/{branch_no}: "
+                "empty branch address"
             )
-
-        (
-            province,
-            district,
-            subdistrict,
-            postal_code,
-        ) = parse_address(
-            branch_address
-        )
 
         branches.append(
             (
                 branch_no,
                 branch_name,
-                branch_address,
-                province,
-                district,
-                subdistrict,
-                postal_code,
+                address,
+                *parse_address(address),
             )
         )
 
@@ -589,7 +612,7 @@ def parse_printview(
         or len(branches) + headquarters != expected
     ):
         raise CollectorError(
-            f"{jp_no}: establishment count mismatch"
+            f"{jp_no}: inconsistent establishment count"
         )
 
     return branches, expected
@@ -600,26 +623,26 @@ def parse_printview(
 # ============================================================
 
 def parse_company_page(
-    html: str,
-    jp_no: str,
-) -> str:
+    html,
+    jp_no,
+):
 
     soup = BeautifulSoup(
         html,
         "html.parser",
     )
 
-    for element in soup.select(
-        "script, style, noscript"
+    for node in soup.select(
+        "script,style,noscript"
     ):
-        element.decompose()
+        node.decompose()
 
-    page_text = soup.get_text(
+    visible = soup.get_text(
         " ",
         strip=True,
     )
 
-    explicit_not_found = (
+    not_found_phrases = (
         "ไม่พบข้อมูลนิติบุคคล",
         "ไม่พบข้อมูลผู้ประกอบการ",
         "ไม่พบข้อมูลบริษัท",
@@ -627,14 +650,10 @@ def parse_company_page(
     )
 
     if any(
-        phrase in page_text
-        for phrase in explicit_not_found
+        phrase in visible
+        for phrase in not_found_phrases
     ):
         return "NOT_LISTED"
-
-    # Verify the requested legal ID.
-    # Do not classify a generic homepage as a company
-    # without branches.
 
     identity_urls = []
 
@@ -648,56 +667,51 @@ def parse_company_page(
             canonical["href"]
         )
 
-    og_url = soup.find(
+    og = soup.find(
         "meta",
         attrs={
             "property": "og:url"
         },
     )
 
-    if og_url and og_url.get("content"):
+    if og and og.get("content"):
         identity_urls.append(
-            og_url["content"]
+            og["content"]
         )
 
-    verified_identity = False
+    verified = any(
+        (
+            path := urlparse(
+                urljoin(SITE, url)
+            ).path
+        ).rstrip("/") == f"/company/{jp_no}"
 
-    for value in identity_urls:
+        or path.startswith(
+            f"/company/{jp_no}/"
+        )
 
-        path = urlparse(
-            urljoin(SITE, value)
-        ).path
+        for url in identity_urls
+    )
 
-        if (
-            path == f"/company/{jp_no}"
-            or path.startswith(
-                f"/company/{jp_no}/"
-            )
-        ):
-            verified_identity = True
-            break
-
-    if not verified_identity:
+    if not verified:
         return "UNAVAILABLE"
 
-    # Detect visible branch links/buttons.
-
-    for element in soup.select(
-        "a, button, [role=button]"
+    for node in soup.select(
+        "a,button,[role=button]"
     ):
 
-        label = element.get_text(
+        label = node.get_text(
             " ",
             strip=True,
         )
 
         href = (
-            element.get("href")
+            node.get("href")
             or ""
         )
 
         onclick = (
-            element.get("onclick")
+            node.get("onclick")
             or ""
         )
 
@@ -709,339 +723,25 @@ def parse_company_page(
             else ""
         )
 
-        direct_branch_link = path.startswith(
-            f"/company-branch/{jp_no}/"
-        )
+        if (
+            path.startswith(
+                f"/company-branch/{jp_no}/"
+            )
 
-        visible_branch_button = (
-            "ตำแหน่งที่ตั้งของสาขา" in label
+            or "ตำแหน่งที่ตั้งของสาขา" in label
+
             or "ข้อมูลตำแหน่งที่ตั้งสาขา" in label
+
             or "ข้อมูลสาขา" in label
+
             or (
                 "open_branch(" in onclick
                 and bool(label)
             )
-        )
-
-        if (
-            direct_branch_link
-            or visible_branch_button
         ):
             return "HAS_BRANCH_LINK"
 
     return "NO_BRANCH_LISTED"
-
-
-# ============================================================
-# CHECKPOINT
-# ============================================================
-
-def new_scan():
-
-    return {
-        "last_type": "",
-        "last_no": "",
-
-        "checked": 0,
-        "branches": 0,
-
-        "no_branch": 0,
-        "not_found": 0,
-        "unavailable": 0,
-    }
-
-
-def load_checkpoint(
-    path: Path,
-):
-
-    if not path.exists():
-
-        return {
-            "version": 5,
-            "scans": {},
-            "deferred": [],
-        }
-
-    try:
-
-        raw = json.loads(
-            path.read_text(
-                encoding="utf-8",
-            )
-        )
-
-    except (
-        OSError,
-        ValueError,
-    ) as exc:
-
-        raise CollectorError(
-            f"Cannot read checkpoint safely: {exc}"
-        ) from exc
-
-    if not isinstance(raw, dict):
-        raise CollectorError(
-            "Invalid checkpoint format"
-        )
-
-    # Preserve checkpoints created by older versions.
-    # Never reuse an unfiltered cursor for status=1.
-
-    if "scans" not in raw:
-
-        required = (
-            "last_type",
-            "last_no",
-            "checked",
-            "branches",
-            "no_branch",
-            "not_found",
-        )
-
-        if not all(
-            key in raw
-            for key in required
-        ):
-            raise CollectorError(
-                "Invalid legacy checkpoint"
-            )
-
-        result = {
-            "version": 5,
-            "scans": {},
-            "deferred": raw.get(
-                "deferred",
-                [],
-            ),
-            "legacy_unfiltered": {
-                key: raw[key]
-                for key in required
-            },
-        }
-
-    else:
-        result = raw
-
-    if not isinstance(
-        result.get("scans"),
-        dict,
-    ):
-        raise CollectorError(
-            "Invalid checkpoint scan profiles"
-        )
-
-    if not isinstance(
-        result.get("deferred"),
-        list,
-    ):
-        raise CollectorError(
-            "Invalid checkpoint deferred queue"
-        )
-
-    for key, profile in result["scans"].items():
-
-        if (
-            not isinstance(key, str)
-            or not isinstance(profile, dict)
-        ):
-            raise CollectorError(
-                "Invalid checkpoint scan profile"
-            )
-
-        if not isinstance(
-            profile.get("last_type"),
-            str,
-        ):
-            raise CollectorError(
-                "Invalid checkpoint type cursor"
-            )
-
-        if not isinstance(
-            profile.get("last_no"),
-            str,
-        ):
-            raise CollectorError(
-                "Invalid checkpoint company cursor"
-            )
-
-        for field in (
-            "checked",
-            "branches",
-            "no_branch",
-            "not_found",
-            "unavailable",
-        ):
-
-            value = profile.get(
-                field,
-                0,
-            )
-
-            if (
-                type(value) is not int
-                or value < 0
-            ):
-                raise CollectorError(
-                    f"Invalid checkpoint counter: {field}"
-                )
-
-    for item in result["deferred"]:
-
-        if not isinstance(item, dict):
-            raise CollectorError(
-                "Invalid deferred queue entry"
-            )
-
-        for field in (
-            "jp_type_code",
-            "jp_no",
-            "reason",
-        ):
-
-            if not isinstance(
-                item.get(field),
-                str,
-            ):
-                raise CollectorError(
-                    f"Invalid deferred field: {field}"
-                )
-
-    return result
-
-
-def save_checkpoint(path: Path, state: dict):
-
-    path.parent.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # Unique temporary filename prevents collisions.
-    temporary = path.with_name(
-        f"{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-    )
-
-    try:
-        with temporary.open(
-            "w",
-            encoding="utf-8",
-        ) as file:
-
-            json.dump(
-                state,
-                file,
-                ensure_ascii=False,
-                indent=2,
-            )
-
-            file.flush()
-            os.fsync(file.fileno())
-
-        # Windows may temporarily lock the destination.
-        # Retry only sharing/access errors.
-        # Never overwrite the checkpoint non-atomically.
-
-        for attempt in range(10):
-
-            try:
-                os.replace(temporary, path)
-                return
-
-            except PermissionError as exc:
-
-                if (
-                    getattr(exc, "winerror", None)
-                    not in (5, 32)
-                    or attempt == 9
-                ):
-                    raise
-
-                time.sleep(
-                    min(0.2 * (attempt + 1), 1.0)
-                )
-
-    finally:
-        try:
-            temporary.unlink(missing_ok=True)
-        except OSError:
-            pass
-
-
-def mark_deferred(
-    items: list,
-    company: dict,
-    reason: str,
-    maximum: int,
-):
-
-    jp_type = str(
-        company["jp_type_code"]
-    )
-
-    jp_no = str(
-        company["jp_no"]
-    )
-
-    for item in items:
-
-        if (
-            item["jp_type_code"] == jp_type
-            and item["jp_no"] == jp_no
-        ):
-
-            item.update(
-                reason=reason,
-
-                attempts=(
-                    int(
-                        item.get(
-                            "attempts",
-                            1,
-                        )
-                    )
-                    + 1
-                ),
-
-                last_seen_utc=utc_now(),
-            )
-
-            return
-
-    if len(items) >= maximum:
-        raise CollectorError(
-            f"Deferred queue reached {maximum} items"
-        )
-
-    items.append(
-        {
-            "jp_type_code": jp_type,
-            "jp_no": jp_no,
-            "reason": reason,
-            "attempts": 1,
-            "last_seen_utc": utc_now(),
-        }
-    )
-
-
-def clear_deferred(
-    items: list,
-    company: dict,
-):
-
-    key = (
-        str(company["jp_type_code"]),
-        str(company["jp_no"]),
-    )
-
-    items[:] = [
-        item
-        for item in items
-        if (
-            item["jp_type_code"],
-            item["jp_no"],
-        ) != key
-    ]
 
 
 # ============================================================
@@ -1061,14 +761,14 @@ class MySQL:
         )
 
         missing = [
-            key
-            for key in required
-            if os.getenv(key) is None
+            name
+            for name in required
+            if os.getenv(name) is None
         ]
 
         if missing:
             raise CollectorError(
-                "Missing MySQL .env values: "
+                "Missing .env: "
                 + ", ".join(missing)
             )
 
@@ -1078,33 +778,39 @@ class MySQL:
             int,
         )
 
-        self.settings = {
+        self.config = {
             "host": os.environ["DB_HOST"],
             "port": int(
                 os.environ["DB_PORT"]
             ),
+            "database": os.environ["DB_NAME"],
             "user": os.environ["DB_USER"],
             "password": os.environ["DB_PASSWORD"],
-            "database": os.environ["DB_NAME"],
 
             "charset": "utf8mb4",
-
-            "connect_timeout": timeout,
-            "read_timeout": timeout,
-            "write_timeout": timeout,
-
-            "autocommit": True,
 
             "cursorclass": (
                 pymysql.cursors.DictCursor
             ),
+
+            "autocommit": True,
+
+            "connect_timeout": timeout,
+            "read_timeout": timeout,
+            "write_timeout": timeout,
         }
 
         self.conn = None
 
-        self.reconnect()
+        self.fields = ()
 
-    def reconnect(self):
+        self.connect()
+
+    # --------------------------------------------------------
+    # CONNECTION AND EXCLUSIVE LOCK
+    # --------------------------------------------------------
+
+    def connect(self):
 
         if self.conn is not None:
 
@@ -1115,76 +821,77 @@ class MySQL:
                 pass
 
         self.conn = pymysql.connect(
-            **self.settings
+            **self.config
         )
+
+        try:
+
+            with self.conn.cursor() as cursor:
+
+                cursor.execute(
+                    "SELECT GET_LOCK(%s,0) AS acquired",
+                    (LOCK,),
+                )
+
+                result = cursor.fetchone()
+
+                if result["acquired"] != 1:
+                    raise CollectorError(
+                        "Another collector already "
+                        "holds the MySQL lock"
+                    )
+
+        except BaseException:
+
+            self.conn.close()
+
+            self.conn = None
+
+            raise
 
     def close(self):
 
         if self.conn is not None:
 
             self.conn.close()
+
             self.conn = None
+
+    # --------------------------------------------------------
+    # QUERY WITH RECONNECTION
+    # --------------------------------------------------------
 
     def query(
         self,
         sql,
-        params=None,
-        *,
-        fetch=None,
-        many=False,
-        transaction=False,
+        args=None,
+        mode=None,
     ):
 
         for attempt in range(3):
 
             try:
 
-                if transaction:
-                    self.conn.begin()
-
                 with self.conn.cursor() as cursor:
 
-                    if many:
+                    cursor.execute(
+                        sql,
+                        args,
+                    )
 
-                        cursor.executemany(
-                            sql,
-                            params,
-                        )
+                    if mode == "all":
+                        return cursor.fetchall()
 
-                    else:
+                    if mode == "one":
+                        return cursor.fetchone()
 
-                        cursor.execute(
-                            sql,
-                            params,
-                        )
-
-                    if fetch == "all":
-                        result = cursor.fetchall()
-
-                    elif fetch == "one":
-                        result = cursor.fetchone()
-
-                    else:
-                        result = None
-
-                if transaction:
-                    self.conn.commit()
-
-                return result
+                    return None
 
             except (
                 pymysql.err.InterfaceError,
                 pymysql.err.OperationalError,
                 OSError,
             ) as exc:
-
-                if transaction:
-
-                    try:
-                        self.conn.rollback()
-
-                    except Exception:
-                        pass
 
                 code = (
                     exc.args[0]
@@ -1200,7 +907,8 @@ class MySQL:
                             OSError,
                         ),
                     )
-                    or code in RECONNECT_CODES
+
+                    or code in RECONNECT
                 )
 
                 if (
@@ -1213,325 +921,806 @@ class MySQL:
                     0.5 * (attempt + 1)
                 )
 
-                self.reconnect()
-
-            except BaseException:
-
-                if transaction:
-
-                    try:
-                        self.conn.rollback()
-
-                    except Exception:
-                        pass
-
-                raise
+                self.connect()
 
     # --------------------------------------------------------
     # SCHEMA PREFLIGHT
+    #
+    # Read existing table structures.
+    # Do not create or alter database tables.
     # --------------------------------------------------------
 
-    def preflight(
-        self,
-        write: bool,
-    ):
+    def preflight(self):
 
-        columns = {
-            column["Field"]
-            for column in self.query(
-                f"SHOW COLUMNS FROM `{SOURCE}`",
-                fetch="all",
-            )
+        source = self.query(
+            f"SHOW COLUMNS FROM `{SOURCE}`",
+            mode="all",
+        )
+
+        names = {
+            row["Field"]
+            for row in source
         }
 
-        required = {
-            "jp_type_code",
-            "jp_no",
-            "jp_name",
-            "jp_name_e",
-            "jp_stat_code",
-        }
-
-        missing = required - columns
-
-        if missing:
+        if not REQUIRED_SOURCE <= names:
             raise CollectorError(
-                f"Source missing columns: "
-                f"{sorted(missing)}"
+                "Source missing columns: "
+                f"{sorted(REQUIRED_SOURCE - names)}"
             )
 
-        if not write:
-            return []
-
-        changes = []
-
-        exists = self.query(
+        target_exists = self.query(
             "SHOW TABLES LIKE %s",
             (TARGET,),
-            fetch="one",
+            "one",
         )
 
-        if not exists:
-
-            self.query(
-                CREATE_TABLE
+        if not target_exists:
+            raise CollectorError(
+                f"Target table {TARGET} "
+                "does not exist; nothing was changed"
             )
 
-            changes.append(
-                "TABLE CREATED"
-            )
+        target = {
+            row["Field"]
 
-        existing = {
-            column["Field"]
-            for column in self.query(
+            for row in self.query(
                 f"SHOW COLUMNS FROM `{TARGET}`",
-                fetch="all",
+                mode="all",
             )
         }
 
-        identity = (
-            "jp_type_code",
-            "jp_no",
-            "branch_no",
-        )
-
-        if not set(identity).issubset(
-            existing
-        ):
+        if not REQUIRED_TARGET <= target:
             raise CollectorError(
-                "Target identity columns missing; "
-                "manual review required"
+                "Target missing columns: "
+                f"{sorted(REQUIRED_TARGET - target)}"
             )
 
-        indexes = self.query(
-            f"SHOW INDEX FROM `{TARGET}`",
-            fetch="all",
+        expected_keys = (
+            (
+                SOURCE,
+                [
+                    "jp_type_code",
+                    "jp_no",
+                ],
+            ),
+
+            (
+                TARGET,
+                [
+                    "jp_type_code",
+                    "jp_no",
+                    "branch_no",
+                ],
+            ),
         )
 
-        primary_key = [
-            item["Column_name"]
-            for item in sorted(
-                (
-                    item
-                    for item in indexes
-                    if item["Key_name"] == "PRIMARY"
-                ),
-                key=lambda item: item["Seq_in_index"],
-            )
-        ]
+        for table, expected in expected_keys:
 
-        if primary_key != list(identity):
+            indexes = self.query(
+                f"SHOW INDEX FROM `{table}`",
+                mode="all",
+            )
+
+            primary_key = [
+                row["Column_name"]
+
+                for row in sorted(
+                    (
+                        item
+                        for item in indexes
+                        if item["Key_name"] == "PRIMARY"
+                    ),
+
+                    key=lambda item: item["Seq_in_index"],
+                )
+            ]
+
+            if primary_key != expected:
+                raise CollectorError(
+                    f"Unexpected PRIMARY in {table}: "
+                    f"{primary_key}; expected {expected}"
+                )
+
+        self.fields = tuple(
+            name
+            for name in FINGERPRINT_FIELDS
+            if name in names
+        )
+
+        if len(self.fields) < 5:
             raise CollectorError(
-                f"Unexpected target primary key: "
-                f"{primary_key}"
+                "Insufficient source fields "
+                "for content fingerprint"
             )
 
-        for name, definition in (
-            ADDITIVE_COLUMNS.items()
-        ):
-
-            if name in existing:
-                continue
-
-            self.query(
-                f"ALTER TABLE `{TARGET}` "
-                f"ADD COLUMN `{name}` {definition}"
-            )
-
-            changes.append(
-                "COLUMN ADDED: " + name
-            )
-
-        # Backfill existing branch rows without HTTP requests.
-        # Fill only missing branch_count values.
-        # Each company is counted separately by its composite key.
-
-        missing_counts = self.query(
-            f"SELECT 1 "
-            f"FROM `{TARGET}` "
-            f"WHERE branch_count IS NULL "
-            f"LIMIT 1",
-            fetch="one",
-        )
-
-        if missing_counts:
-
-            self.query(
-                f"""
-                UPDATE `{TARGET}` AS b
-                JOIN (
-                    SELECT
-                        jp_type_code,
-                        jp_no,
-                        COUNT(*) AS total_branches
-                    FROM `{TARGET}`
-                    GROUP BY
-                        jp_type_code,
-                        jp_no
-                ) AS counts
-                    ON b.jp_type_code = counts.jp_type_code
-                   AND b.jp_no = counts.jp_no
-                SET b.branch_count = counts.total_branches
-                WHERE b.branch_count IS NULL
-                """
-            )
-
-            changes.append(
-                "BACKFILL: existing branch_count completed"
-            )
-
-        return changes
+    def has_existing_branch_data(self):
+        """Distinguish a fresh install from a lost Journal."""
+        return bool(self.query(f"SELECT 1 AS present FROM `{TARGET}` LIMIT 1", mode="one"))
 
     # --------------------------------------------------------
     # KEYSET PAGINATION
     #
-    # No COUNT(*)
-    # No OFFSET
-    # No complete-table preload
+    # Uses legal identity, not timestamps.
+    #
+    # Each reconciliation pass starts from the beginning.
+    # Previously verified results are skipped before HTTP.
     # --------------------------------------------------------
 
     def select_page(
         self,
-        scan: dict,
-        codes: tuple[str, ...],
-        limit: int,
+        codes,
+        after,
+        size,
     ):
 
         placeholders = ",".join(
-            ["%s"] * len(codes)
+            "%s"
+            for _ in codes
         )
 
-        sql = (
-            "SELECT "
-            "jp_type_code, "
-            "jp_no, "
-            "jp_name, "
-            "jp_name_e, "
-            "jp_stat_code "
-            f"FROM `{SOURCE}` FORCE INDEX (PRIMARY) "
-            f"WHERE jp_stat_code IN ({placeholders})"
-        )
+        args = list(codes)
 
-        params = list(codes)
+        condition = ""
 
-        if scan["last_type"]:
+        if after is not None:
 
-            sql += (
-                " AND ("
-                "jp_type_code > %s "
-                "OR ("
-                "jp_type_code = %s "
-                "AND jp_no > %s"
-                ")"
-                ")"
-            )
+            condition = """
+                AND (
+                    jp_type_code > %s
 
-            params.extend(
+                    OR (
+                        jp_type_code = %s
+                        AND jp_no > %s
+                    )
+                )
+            """
+
+            args.extend(
                 (
-                    scan["last_type"],
-                    scan["last_type"],
-                    scan["last_no"],
+                    after[0],
+                    after[0],
+                    after[1],
                 )
             )
 
-        sql += (
-            " ORDER BY "
-            "jp_type_code, jp_no "
-            "LIMIT %s"
+        args.append(size)
+
+        fields = ",".join(
+            "`" + column + "`"
+            for column in self.fields
         )
 
-        params.append(limit)
+        sql = f"""
+            SELECT
+                {fields}
+
+            FROM `{SOURCE}`
+                FORCE INDEX (PRIMARY)
+
+            WHERE
+                jp_stat_code IN ({placeholders})
+
+                {condition}
+
+            ORDER BY
+                jp_type_code,
+                jp_no
+
+            LIMIT %s
+        """
 
         return self.query(
             sql,
-            tuple(params),
-            fetch="all",
+            tuple(args),
+            "all",
         )
 
-    def select_single(
+    # --------------------------------------------------------
+    # EXISTING BRANCH DATA VALIDATION
+    #
+    # Read existing MySQL branch rows.
+    #
+    # A positive historical result can be reused only
+    # when its recorded branch count matches the number
+    # of rows actually present for the company.
+    # --------------------------------------------------------
+
+    def existing_positive(
         self,
-        jp_no: str,
+        companies,
     ):
 
-        return self.query(
-            "SELECT "
-            "jp_type_code, "
-            "jp_no, "
-            "jp_name, "
-            "jp_name_e, "
-            "jp_stat_code "
-            f"FROM `{SOURCE}` "
-            "WHERE jp_no = %s "
-            "ORDER BY jp_type_code, jp_no",
-            (jp_no,),
-            fetch="all",
+        if not companies:
+            return {}
+
+        placeholders = ",".join(
+            "(%s,%s)"
+            for _ in companies
         )
 
-    def select_deferred(
-        self,
-        jp_type_code: str,
-        jp_no: str,
-    ):
+        params = tuple(
+            value
 
-        return self.query(
-            "SELECT "
-            "jp_type_code, "
-            "jp_no, "
-            "jp_name, "
-            "jp_name_e, "
-            "jp_stat_code "
-            f"FROM `{SOURCE}` "
-            "WHERE jp_type_code = %s "
-            "AND jp_no = %s",
-            (
+            for company in companies
+
+            for value in key(company)
+        )
+
+        rows = self.query(
+            f"""
+            SELECT
                 jp_type_code,
                 jp_no,
-            ),
-            fetch="one",
+
+                COUNT(*) AS actual,
+
+                MIN(branch_count) AS min_count,
+                MAX(branch_count) AS max_count,
+
+                MIN(jp_name) AS jp_name,
+                MIN(jp_name_e) AS jp_name_e,
+
+                SUM(
+                    CASE
+                        WHEN branch_address IS NULL
+                          OR TRIM(branch_address) = ''
+                        THEN 1
+                        ELSE 0
+                    END
+                ) AS bad_address
+
+            FROM `{TARGET}`
+
+            WHERE
+                (jp_type_code, jp_no)
+                IN ({placeholders})
+
+            GROUP BY
+                jp_type_code,
+                jp_no
+            """,
+
+            params,
+            "all",
         )
 
+        results = {}
+
+        for row in rows:
+
+            identity = (
+                str(row["jp_type_code"]),
+                str(row["jp_no"]),
+            )
+
+            results[identity] = row
+
+        return results
+
     # --------------------------------------------------------
-    # IDEMPOTENT UPSERT
+    # EXISTING BRANCH NUMBERS
     #
-    # MySQL writes always run in the main thread.
+    # Used to detect previously stored branches that
+    # disappear from newly retrieved source data.
     # --------------------------------------------------------
 
-    def upsert(
+    def current_branch_numbers(
         self,
-        company: dict,
-        branches: list[tuple],
-        url: str,
+        company,
+    ):
+
+        rows = self.query(
+            f"""
+            SELECT branch_no
+
+            FROM `{TARGET}`
+
+            WHERE
+                jp_type_code = %s
+                AND jp_no = %s
+            """,
+
+            key(company),
+            "all",
+        )
+
+        return {
+            str(row["branch_no"])
+            for row in rows
+        }
+
+    # --------------------------------------------------------
+    # TRANSACTIONAL BRANCH UPSERT
+    #
+    # No DELETE, REPLACE, TRUNCATE, or DROP.
+    #
+    # Idempotent UPSERT supports safe retry when the
+    # MySQL connection is interrupted.
+    # --------------------------------------------------------
+
+    def commit_branches(
+        self,
+        company,
+        branches,
+        source_url,
     ):
 
         if not branches:
             return
 
-        stamp = datetime.now(
-            timezone.utc
-        ).replace(tzinfo=None)
-
-        branch_count = len(branches)
+        fetched_at = now_utc()
 
         rows = [
             (
                 company["jp_type_code"],
                 company["jp_no"],
+
                 company["jp_name"],
                 company["jp_name_e"],
+
                 *branch,
-                url,
-                stamp,
-                branch_count,
+
+                source_url,
+                fetched_at,
+                len(branches),
             )
+
             for branch in branches
         ]
 
-        self.query(
-            UPSERT_SQL,
-            rows,
-            many=True,
-            transaction=True,
+        for attempt in range(3):
+
+            try:
+
+                self.conn.begin()
+
+                with self.conn.cursor() as cursor:
+
+                    cursor.executemany(
+                        UPSERT,
+                        rows,
+                    )
+
+                self.conn.commit()
+
+                return
+
+            except (
+                pymysql.err.InterfaceError,
+                pymysql.err.OperationalError,
+                OSError,
+            ) as exc:
+
+                try:
+                    self.conn.rollback()
+
+                except Exception:
+                    pass
+
+                code = (
+                    exc.args[0]
+                    if exc.args
+                    else None
+                )
+
+                retryable = (
+                    isinstance(
+                        exc,
+                        (
+                            pymysql.err.InterfaceError,
+                            OSError,
+                        ),
+                    )
+
+                    or code in RECONNECT
+                )
+
+                if (
+                    not retryable
+                    or attempt == 2
+                ):
+                    raise
+
+                time.sleep(
+                    0.5 * (attempt + 1)
+                )
+
+                self.connect()
+
+            except BaseException:
+
+                try:
+                    self.conn.rollback()
+
+                except Exception:
+                    pass
+
+                raise
+
+
+# ============================================================
+# DURABLE RESULT JOURNAL
+#
+# No additional MySQL table is created.
+#
+# Journal records are written only after the associated
+# MySQL transaction has committed.
+#
+# A crash between MySQL commit and journal append can
+# cause an HTTP request to be repeated, but it cannot
+# duplicate the committed branch primary keys.
+# ============================================================
+
+class Journal:
+    """Append-only journal; only the active phase is indexed in RAM.
+
+    Legacy records without 'p' always belong to phase 1. Phase-start events
+    form a monotonic boundary; earlier phases stay on disk rather than being
+    multiplied into per-phase in-memory indexes. A writer must already hold
+    the MySQL advisory lock before calling prepare_for_writes().
+    """
+
+    def __init__(self, path, read_only=False):
+        self.path = Path(path)
+        self.read_only = read_only
+        self.exists = self.path.exists()
+        self.records = {}              # "type:number" -> (fp, status, count, method)
+        self.counts = Counter()        # Latest company status, active phase only
+        self.phases = {}               # small: id -> metadata event
+        self.active_phase = None
+        self.fd = None
+        self.tail_bytes = 0
+        self.safe_offset = 0
+        self.total_records = 0
+        self.legacy_records = 0
+        self._load()
+
+    @staticmethod
+    def _identity(jp_type, jp_no):
+        # The colon is a separator, not an integer conversion.
+        return jp_type + ":" + jp_no
+
+    def _set_record(self, identity, value):
+        old = self.records.get(identity)
+        if old is not None:
+            self.counts[old[1]] -= 1
+            if not self.counts[old[1]]:
+                del self.counts[old[1]]
+        self.records[identity] = value
+        self.counts[value[1]] += 1
+
+    def _load(self):
+        if not self.exists:
+            return
+        with self.path.open("rb") as source:
+            while True:
+                raw = source.readline()
+                if not raw:
+                    break
+                if not raw.endswith(b"\n"):
+                    self.tail_bytes = self.path.stat().st_size - self.safe_offset
+                    break
+                try:
+                    obj = json.loads(raw)
+                    if not isinstance(obj, dict):
+                        raise ValueError("Expected object")
+                    if "event" in obj:
+                        self._load_event(obj)
+                    else:
+                        self._load_result(obj)
+                except (ValueError, KeyError, TypeError, CollectorError) as exc:
+                    raise CollectorError(
+                        f"Malformed complete Journal record at byte "
+                        f"{self.safe_offset}: {exc}"
+                    ) from exc
+                self.safe_offset = source.tell()
+
+    def _load_event(self, obj):
+        if set(obj) != {"event", "p", "scope", "v", "at", "origin"}:
+            raise ValueError("Unexpected Phase event fields")
+        if obj["event"] != "phase_start" or obj["v"] != PHASE_FORMAT_VERSION:
+            raise ValueError("Unknown Phase event/version")
+        phase = obj["p"]
+        if type(phase) is not int or phase < 1:
+            raise ValueError("Invalid phase id")
+        scope = obj["scope"]
+        if (not isinstance(scope, list) or not scope or
+            any(not isinstance(c, str) for c in scope) or
+            list(status_codes(",".join(scope))) != scope):
+            raise ValueError("Invalid or unnormalized phase scope")
+        if not isinstance(obj["at"], str) or not obj["at"]:
+            raise ValueError("Invalid phase audit timestamp")
+        if obj["origin"] not in ("initial", "legacy", "refresh"):
+            raise ValueError("Invalid phase origin")
+        try:
+            if datetime.fromisoformat(obj["at"]).tzinfo is None:
+                raise ValueError("Phase audit timestamp must include timezone")
+        except (ValueError, TypeError) as exc:
+            raise ValueError("Invalid Phase audit timestamp") from exc
+        if phase == 1 and bool(self.legacy_records) != (obj["origin"] == "legacy"):
+            raise ValueError("Legacy Phase origin is inconsistent with recorded history")
+        if phase in self.phases:
+            raise ValueError("Duplicate phase start event")
+        if phase != len(self.phases) + 1:
+            raise ValueError("Phase IDs must be contiguous")
+        if phase == 1 and obj["origin"] == "refresh":
+            raise ValueError("Phase 1 cannot be a refresh")
+        if phase > 1 and obj["origin"] != "refresh":
+            raise ValueError("Later phases must be explicit refreshes")
+        if phase == 1 and self.active_phase not in (None, 1):
+            raise ValueError("Invalid Phase 1 migration order")
+        if phase > 1 and self.active_phase != phase - 1:
+            raise ValueError("Phase event boundary mismatch")
+        self.phases[phase] = obj
+        self.active_phase = phase
+        if phase > 1:
+            self.records.clear()
+            self.counts.clear()
+
+    def _load_result(self, obj):
+        required = {"t", "j", "f", "s", "n", "m"}
+        if not required <= set(obj) or set(obj) - required - {"p"}:
+            raise ValueError("Unexpected result fields")
+        jp_type, jp_no = obj["t"], obj["j"]
+        fp, status = obj["f"], obj["s"]
+        count, method = obj["n"], obj["m"]
+        if (not isinstance(jp_type, str) or not jp_type or 
+            not isinstance(jp_no, str) or not jp_no or
+            not isinstance(fp, str) or not re.fullmatch(r"[0-9a-f]{64}", fp) or
+            not isinstance(status, str) or
+            type(count) is not int or count < 0 or
+            method not in ("http", "legacy")):
+            raise ValueError("Invalid result fields")
+        result_class(status)
+        if (status in ("OK", "LEGACY_OK") and count < 1):
+            raise ValueError("Positive result requires a positive branch count")
+        if (status in ("NO_BRANCH", "NO_BRANCH_LISTED", "UNAVAILABLE", "NOT_LISTED")
+            and count != 0):
+            raise ValueError("Non-branch result cannot carry branch rows")
+        if (method == "legacy") != (status == "LEGACY_OK"):
+            raise ValueError("Legacy method/status mismatch")
+        phase = obj.get("p", 1)
+        if type(phase) is not int or phase < 1:
+            raise ValueError("Invalid result phase")
+        if "p" in obj and phase not in self.phases:
+            raise ValueError("Phase-aware result missing phase_start")
+        if phase == 1 and not self.phases:
+            self.active_phase = 1
+        if phase != self.active_phase:
+            raise ValueError("Out-of-order result across phase boundary")
+        if "p" not in obj:
+            if phase != 1:
+                raise ValueError("Legacy result outside Phase 1")
+            self.legacy_records += 1
+        self._set_record(self._identity(jp_type, jp_no),
+                         (fp, status, count, method))
+        self.total_records += 1
+
+    def snapshot(self):
+        terminal = sum(self.counts.get(s, 0) for s in PHASE_TERMINAL_STATUSES)
+        deferred = sum(n for s, n in self.counts.items() if s.startswith("DEFERRED_"))
+        review = sum(self.counts.get(s, 0) for s in PHASE_REVIEW_STATUSES)
+        return {"terminal": terminal, "deferred": deferred, "review": review,
+                "recorded": len(self.records)}
+
+    def get(self, company):
+        return self.records.get(key_text(company))
+
+    @staticmethod
+    def _backup_file(path, suffix):
+        """Durable, non-destructive backup; never overwrite an existing backup."""
+        target = path.with_name(path.name + suffix)
+        if target.exists():
+            if target.stat().st_size == 0 and path.stat().st_size:
+                raise CollectorError(f"Incomplete backup needs review: {target}")
+            return target
+        temp = target.with_name(target.name + ".incomplete")
+        if temp.exists():
+            raise CollectorError(f"Incomplete backup needs manual review: {temp}")
+        try:
+            with path.open("rb") as src, temp.open("xb") as dst:
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                os.fsync(dst.fileno())
+            if target.exists():
+                raise CollectorError(f"Backup unexpectedly exists: {target}")
+            temp.rename(target)
+        except BaseException:
+            # Leave an interrupted copy as evidence; never touch source.
+            raise
+        return target
+
+    def prepare_for_writes(self, legacy_migration=False):
+        if self.read_only:
+            raise CollectorError("Read-only Journal cannot write")
+        if self.fd is not None:
+            return
+        if self.exists and legacy_migration:
+            self._backup_file(self.path, ".before_phase_v2.bak")
+        if self.tail_bytes:
+            # Backup original including incomplete bytes BEFORE truncating.
+            import hashlib as _hashlib
+            with self.path.open("rb") as file:
+                file.seek(self.safe_offset)
+                digest = _hashlib.sha256(file.read()).hexdigest()[:16]
+            self._backup_file(self.path,
+                f".tail_{self.path.stat().st_size}_{digest}.bak")
+            with self.path.open("r+b") as file:
+                file.truncate(self.safe_offset)
+                file.flush()
+                os.fsync(file.fileno())
+            self.tail_bytes = 0
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.fd = os.open(str(self.path), os.O_CREAT | os.O_WRONLY | os.O_APPEND, 0o600)
+        self.exists = True
+
+    def _write(self, obj):
+        if self.fd is None:
+            raise CollectorError("Journal not opened for writes")
+        payload = (json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+                   + "\n").encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            count = os.write(self.fd, payload[offset:])
+            if count <= 0:
+                raise CollectorError("Journal append did not advance")
+            offset += count
+        os.fsync(self.fd)
+
+    def begin_phase(self, phase, scope, origin):
+        if type(phase) is not int or phase != len(self.phases) + 1:
+            raise CollectorError("Invalid new Phase id")
+        if origin == "legacy" and (phase != 1 or not self.records):
+            raise CollectorError("Invalid legacy migration")
+        event = {"event": "phase_start", "p": phase, "scope": list(scope),
+                 "v": PHASE_FORMAT_VERSION,
+                 "at": datetime.now(timezone.utc).isoformat(), "origin": origin}
+        # Validate before writing so a malformed event cannot corrupt the log.
+        if (list(status_codes(",".join(scope))) != list(scope) or
+            (phase > 1 and origin != "refresh") or
+            (phase == 1 and origin not in ("initial", "legacy"))):
+            raise CollectorError("Invalid new Phase event")
+        self._write(event)
+        self.phases[phase] = event
+        self.active_phase = phase
+        if phase > 1:
+            self.records.clear()
+            self.counts.clear()
+
+    def append(self, company, fp, result, count, method):
+        if self.active_phase not in self.phases:
+            raise CollectorError("Phase not established")
+        record = {"p": self.active_phase, "t": key(company)[0],
+                  "j": key(company)[1], "f": fp, "s": result,
+                  "n": count, "m": method}
+        # same strict checks as journal replay
+        if (not isinstance(fp, str) or not re.fullmatch(r"[0-9a-f]{64}", fp)
+            or type(count) is not int or count < 0 or method not in ("http", "legacy")):
+            raise CollectorError("Invalid company result")
+        result_class(result)
+        if (result in ("OK", "LEGACY_OK") and count < 1):
+            raise CollectorError("Positive result needs branch count")
+        if (result in ("NO_BRANCH", "NO_BRANCH_LISTED", "UNAVAILABLE", "NOT_LISTED")
+            and count != 0):
+            raise CollectorError("Non-branch result needs zero branch count")
+        if (method == "legacy") != (result == "LEGACY_OK"):
+            raise CollectorError("Invalid legacy method/status")
+        self._write(record)
+        self._set_record(key_text(company), (fp, result, count, method))
+        self.total_records += 1
+
+    def close(self):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.fd = None
+
+
+def establish_phase(journal, codes, explicit_continue=False, new_phase=False):
+    """Must run only after exclusive lock and Journal validation."""
+    scope = list(codes)
+    if journal.phases:
+        existing = journal.phases[journal.active_phase]["scope"]
+        if not new_phase and existing != scope:
+            raise CollectorError(
+                f"Phase {journal.active_phase} scope mismatch: "
+                f"expected {','.join(existing)}, supplied {','.join(scope)}; "
+                "use the original --status-codes or explicitly --new-phase"
+            )
+        if new_phase:
+            journal.begin_phase(journal.active_phase + 1, scope, "refresh")
+            return "NEW_PHASE"
+        return "RESUME"
+    if journal.records:
+        # Legacy results have no reliable historical scope. Record adoption.
+        journal.begin_phase(1, scope, "legacy")
+        if new_phase:
+            journal.begin_phase(2, scope, "refresh")
+            return "NEW_PHASE"
+        return "RESUME (LEGACY MIGRATION)"
+    if explicit_continue:
+        raise CollectorError("--continue requires existing Phase/Journal state")
+    if new_phase:
+        raise CollectorError("--new-phase requires an existing collection Phase")
+    journal.begin_phase(1, scope, "initial")
+    return "INITIAL"
+
+
+# ============================================================
+# HISTORICAL CHECKPOINT
+#
+# Read-only.
+#
+# Preserve the existing checkpoint, counters and cursor.
+# The old cursor is not used to exclude company identities.
+#
+# Import pending deferred identities into the selection
+# policy without deleting or rewriting the checkpoint.
+# ============================================================
+
+def read_previous_checkpoint(path):
+
+    if not path.exists():
+        return set()
+
+    try:
+
+        with path.open(
+            "r",
+            encoding="utf-8",
+        ) as file:
+
+            checkpoint = json.load(file)
+
+        if not isinstance(
+            checkpoint,
+            dict,
+        ):
+            raise ValueError(
+                "Expected JSON object"
+            )
+
+        deferred = checkpoint.get(
+            "deferred",
+            [],
         )
+
+        if not isinstance(
+            deferred,
+            list,
+        ):
+            raise ValueError(
+                "Invalid deferred list"
+            )
+
+        pending = set()
+
+        for row in deferred:
+
+            if not isinstance(row, dict):
+                raise ValueError(
+                    "Invalid deferred entry"
+                )
+
+            pending.add(
+                (
+                    str(row["jp_type_code"]),
+                    str(row["jp_no"]),
+                )
+            )
+
+        return pending
+
+    except (
+        OSError,
+        ValueError,
+        KeyError,
+        TypeError,
+    ) as exc:
+
+        raise CollectorError(
+            "Cannot safely read historical checkpoint: "
+            f"{exc}"
+        ) from exc
 
 
 # ============================================================
@@ -1547,6 +1736,12 @@ class Website:
             "2",
         )
 
+        self.concurrency = positive(
+            "DATAFORTHAI_CONCURRENCY",
+            "4",
+            int,
+        )
+
         self.timeout = positive(
             "DATAFORTHAI_REQUEST_TIMEOUT",
             "30",
@@ -1558,134 +1753,109 @@ class Website:
             int,
         )
 
-        self.concurrency = positive(
-            "DATAFORTHAI_CONCURRENCY",
-            "4",
-            int,
-        )
-
         if self.concurrency > 32:
             raise CollectorError(
-                "DATAFORTHAI_CONCURRENCY must be <= 32"
+                "DATAFORTHAI_CONCURRENCY "
+                "must be <= 32"
             )
-
-        # One rate limiter for all HTTP workers.
 
         self.lock = threading.Lock()
 
         self.next_request_at = 0.0
 
-        self.request_count = 0
+        self.count = 0
+        self.active = 0
 
-        self.active_requests = 0
-
-        self.stop_event = threading.Event()
-
-        # Each thread has its own requests.Session.
-        # requests.Session is not shared between threads.
+        self.stop = threading.Event()
 
         self.local = threading.local()
 
         self.sessions = []
 
     # --------------------------------------------------------
-    # THREAD-LOCAL SESSION
+    # THREAD-LOCAL HTTP SESSION
     # --------------------------------------------------------
 
     def session(self):
 
-        value = getattr(
+        session = getattr(
             self.local,
             "session",
             None,
         )
 
-        if value is not None:
-            return value
+        if session is not None:
+            return session
 
-        value = requests.Session()
+        session = requests.Session()
 
-        value.headers.update(
+        session.headers.update(
             {
                 "User-Agent": os.getenv(
                     "DATAFORTHAI_USER_AGENT",
-                    "DBD-BranchCollector/5.0",
+                    "DBD-BranchCollector",
                 ),
+
                 "Accept": (
                     "text/html,"
                     "application/xhtml+xml;q=0.9,"
                     "*/*;q=0.8"
                 ),
+
                 "Accept-Language": (
                     "th-TH,th;q=0.9"
                 ),
             }
         )
 
-        self.local.session = value
+        self.local.session = session
 
         with self.lock:
-            self.sessions.append(value)
+            self.sessions.append(session)
 
-        return value
-
-    def close(self):
-
-        for session in self.sessions:
-            session.close()
+        return session
 
     # --------------------------------------------------------
-    # INTERRUPTIBLE WAIT
+    # INTERRUPTIBLE SLEEP
     # --------------------------------------------------------
 
-    def sleep(
-        self,
-        seconds: float,
-    ):
+    def sleep(self, seconds):
 
-        if self.stop_event.wait(
-            max(0.0, seconds)
+        if self.stop.wait(
+            max(0, seconds)
         ):
             raise CollectorError(
-                "HTTP workers stopped"
+                "HTTP worker stopped"
             )
 
     # --------------------------------------------------------
     # GLOBAL RATE LIMITER
-    #
-    # Example:
-    #
-    #   concurrency = 4
-    #   rate = 2
-    #
-    # Total rate = 2 requests/second,
-    # NOT 2 requests/second per worker.
     # --------------------------------------------------------
 
     def acquire(self):
 
-        if self.stop_event.is_set():
+        if self.stop.is_set():
             raise CollectorError(
-                "HTTP workers stopped"
+                "HTTP worker stopped"
             )
 
         with self.lock:
 
-            scheduled = max(
+            due = max(
                 time.monotonic(),
                 self.next_request_at,
             )
 
             self.next_request_at = (
-                scheduled + 1.0 / self.rate
+                due + 1 / self.rate
             )
 
         self.sleep(
-            scheduled - time.monotonic()
+            due - time.monotonic()
         )
 
         with self.lock:
-            self.request_count += 1
+            self.count += 1
 
     # --------------------------------------------------------
     # HTTP GET
@@ -1693,11 +1863,11 @@ class Website:
 
     def get(
         self,
-        url: str,
-        follow_depth: int = 0,
+        url,
+        depth=0,
     ):
 
-        if follow_depth > 2:
+        if depth > 2:
             return (
                 None,
                 "REDIRECT_OTHER",
@@ -1710,12 +1880,13 @@ class Website:
             self.acquire()
 
             with self.lock:
-                self.active_requests += 1
+                self.active += 1
 
             try:
 
                 response = self.session().get(
                     url,
+
                     timeout=(
                         min(
                             15.0,
@@ -1723,6 +1894,7 @@ class Website:
                         ),
                         self.timeout,
                     ),
+
                     allow_redirects=False,
                 )
 
@@ -1737,6 +1909,7 @@ class Website:
                 self.sleep(
                     min(
                         30.0,
+
                         2 ** attempt
                         + random.random(),
                     )
@@ -1747,13 +1920,13 @@ class Website:
             finally:
 
                 with self.lock:
-                    self.active_requests -= 1
+                    self.active -= 1
 
             status = response.status_code
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # ACCESS RESTRICTIONS
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             if status in (
                 401,
@@ -1761,20 +1934,17 @@ class Website:
                 429,
             ):
 
-                self.stop_event.set()
+                self.stop.set()
 
                 raise AccessDenied(
-                    f"HTTP {status}: access restricted; "
+                    f"HTTP {status}: "
+                    "access restricted; "
                     "collection stopped safely"
                 )
 
-            # -----------------------------------------------
-            # REDIRECT
-            #
-            # Follow only canonical destinations belonging
-            # to the same company. Do not follow login or
-            # security redirects.
-            # -----------------------------------------------
+            # ------------------------------------------------
+            # SAFE REDIRECT
+            # ------------------------------------------------
 
             if status in (
                 301,
@@ -1802,34 +1972,37 @@ class Website:
                 )
 
                 if (
-                    parsed.scheme != "https"
+                    not destination
+
+                    or parsed.scheme != "https"
+
                     or parsed.hostname
                     != "www.dataforthai.com"
                 ):
 
-                    self.stop_event.set()
+                    self.stop.set()
 
                     raise AccessDenied(
-                        "Unexpected redirect destination; "
-                        "collection stopped safely"
+                        "Unexpected redirect destination"
                     )
-
-                source_path = urlparse(
-                    url
-                ).path
 
                 match = re.search(
                     r"/(?:company|company-branch)/"
                     r"(\d{13})(?:/|$)",
-                    source_path,
+
+                    urlparse(url).path,
                 )
 
                 allowed = bool(
                     match
                     and (
-                        parsed.path.startswith(
+                        parsed.path.rstrip("/")
+                        == f"/company/{match.group(1)}"
+
+                        or parsed.path.startswith(
                             f"/company/{match.group(1)}/"
                         )
+
                         or parsed.path.startswith(
                             f"/company-branch/"
                             f"{match.group(1)}/"
@@ -1841,29 +2014,22 @@ class Website:
                     allowed
                     and destination != url
                 ):
-
                     return self.get(
                         destination,
-                        follow_depth=follow_depth + 1,
-                    )
-
-                if parsed.path in (
-                    "",
-                    "/",
-                ):
-                    return (
-                        None,
-                        "REDIRECT_HOME",
+                        depth + 1,
                     )
 
                 return (
                     None,
-                    "REDIRECT_OTHER",
+
+                    "REDIRECT_HOME"
+                    if parsed.path in ("", "/")
+                    else "REDIRECT_OTHER",
                 )
 
-            # -----------------------------------------------
+            # ------------------------------------------------
             # TRANSIENT HTTP ERRORS
-            # -----------------------------------------------
+            # ------------------------------------------------
 
             if status in (
                 500,
@@ -1873,7 +2039,6 @@ class Website:
             ):
 
                 if attempt + 1 == self.attempts:
-
                     return (
                         None,
                         f"DEFERRED_HTTP_{status}",
@@ -1886,48 +2051,32 @@ class Website:
                     )
                 )
 
-                if retry_after.isdecimal():
-
-                    pause = int(
-                        retry_after
-                    )
-
-                else:
-
-                    pause = (
-                        2 ** attempt
-                        + 1
-                    )
+                pause = (
+                    int(retry_after)
+                    if retry_after.isdecimal()
+                    else 2 ** attempt + 1
+                )
 
                 self.sleep(
                     min(
-                        120,
-                        max(
-                            2,
-                            pause,
-                        ),
+                        120.0,
+                        max(2.0, pause),
                     )
                 )
 
                 continue
 
-            # -----------------------------------------------
-            # HTTP 404
-            # -----------------------------------------------
+            # ------------------------------------------------
+            # HTTP RESPONSE
+            # ------------------------------------------------
 
             if status == 404:
-
                 return (
                     None,
                     "NOT_FOUND",
                 )
 
-            # -----------------------------------------------
-            # OTHER HTTP ERRORS
-            # -----------------------------------------------
-
             if status != 200:
-
                 return (
                     None,
                     f"DEFERRED_HTTP_{status}",
@@ -1941,7 +2090,6 @@ class Website:
             )
 
             if "html" not in content_type:
-
                 return (
                     None,
                     "DEFERRED_CONTENT",
@@ -1960,32 +2108,25 @@ class Website:
     # --------------------------------------------------------
     # COLLECT ONE COMPANY
     #
-    # This function executes inside an HTTP worker.
-    #
-    # It never writes to MySQL or checkpoints.
+    # HTTP only. No MySQL or checkpoint writes.
     # --------------------------------------------------------
 
-    def collect(
-        self,
-        jp_no: str,
-    ):
-
-        started = time.monotonic()
+    def collect(self, jp_no):
 
         branch_url = (
             f"{SITE}/company-branch/"
             f"{jp_no}/show/printview"
         )
 
-        html, outcome = self.get(
+        html, result = self.get(
             branch_url
         )
 
-        # -----------------------------------------------
-        # VALID BRANCH PAGE
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # VALID BRANCH PRINTVIEW
+        # ----------------------------------------------------
 
-        if outcome == "OK":
+        if result == "OK":
 
             try:
 
@@ -2001,66 +2142,58 @@ class Website:
                     None,
                     "DEFERRED_PARSE",
                     branch_url,
-                    time.monotonic() - started,
                 )
 
             return (
                 branches,
                 total,
 
-                (
-                    "OK"
-                    if branches
-                    else "NO_BRANCH"
-                ),
+                "OK"
+                if branches
+                else "NO_BRANCH",
 
                 branch_url,
-                time.monotonic() - started,
             )
 
-        # -----------------------------------------------
-        # TRANSIENT ERROR
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # TRANSIENT FAILURE
+        # ----------------------------------------------------
 
-        if outcome.startswith(
+        if result.startswith(
             "DEFERRED"
         ):
 
             return (
                 [],
                 None,
-                outcome,
+                result,
                 branch_url,
-                time.monotonic() - started,
             )
 
-        # -----------------------------------------------
-        # COMPANY PAGE FALLBACK
-        #
-        # Execute only when branch printview is absent
-        # or redirects.
-        # -----------------------------------------------
+        # ----------------------------------------------------
+        # FALLBACK COMPANY PAGE
+        # ----------------------------------------------------
 
         company_url = (
             f"{SITE}/company/{jp_no}/"
         )
 
-        company_html, fallback = self.get(
+        fallback_html, fallback = self.get(
             company_url
         )
 
         if fallback == "NOT_FOUND":
 
-            result = "NOT_LISTED"
+            status = "NOT_LISTED"
 
         elif fallback == "OK":
 
             classification = parse_company_page(
-                company_html,
+                fallback_html,
                 jp_no,
             )
 
-            result = (
+            status = (
                 "DEFERRED_BRANCH"
                 if classification == "HAS_BRANCH_LINK"
                 else classification
@@ -2070,475 +2203,488 @@ class Website:
             "DEFERRED"
         ):
 
-            result = fallback
+            status = fallback
 
         else:
 
-            result = "UNAVAILABLE"
+            status = "UNAVAILABLE"
 
         return (
             [],
             None,
-            result,
+            status,
             branch_url,
-            time.monotonic() - started,
         )
 
+    def close(self):
+
+        for session in self.sessions:
+            session.close()
+
 
 # ============================================================
-# LIVE TERMINAL UI
+# TERMINAL UI
 # ============================================================
 
-class TerminalUI:
-
-    def __init__(
-        self,
-        console: Console,
-        scan: dict,
-        mode: str,
-        status: str,
-        limit: int,
-        website: Website,
-        plain: bool,
-    ):
-
-        self.console = console
-
-        self.scan = scan
-
-        self.mode = mode
-
-        self.status_codes = status
-
-        self.limit = limit
-
+class UI:
+    def __init__(self, website, codes, journal, mode):
+        self.console = Console()
         self.website = website
-
-        self.plain = (
-            plain
-            or not console.is_terminal
-        )
-
+        self.codes = ",".join(codes)
+        self.journal = journal
+        self.mode = mode
+        self.run_id = (datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+                       + f"-pid{os.getpid()}")
         self.started = time.monotonic()
-
-        self.stage = "STARTING"
-
+        self.pass_no = 0
+        self.stage = "READY"
         self.current = "-"
-
-        self.companies = 0
-
-        self.branches = 0
-
-        self.no_branch = 0
-        self.not_listed = 0
-        self.unavailable = 0
-        self.deferred = 0
-        self.skipped = 0
-
-        self.retry_pending = 0
-
-        self.recent = deque(
-            maxlen=6
-        )
-
-        self.progress = Progress(
-            SpinnerColumn(),
-
-            BarColumn(
-                bar_width=None,
-            ),
-
-            TextColumn(
-                "{task.completed:,.0f} / {task.total:,.0f}"
-                if limit
-                else (
-                    "{task.completed:,.0f} scanned "
-                    "(total unknown)"
-                )
-            ),
-
-            TimeElapsedColumn(),
-
-            expand=True,
-        )
-
-        self.task = self.progress.add_task(
-            "companies",
-
-            total=(
-                limit
-                if limit
-                else None
-            ),
-        )
-
+        self.examined = 0          # This pass only; not cumulative unique coverage
+        self.scanned_total = 0     # Source rows scanned across all passes
+        self.checked = 0           # HTTP companies committed this run
+        self.branches = 0          # Branch rows returned this run
+        self.legacy = 0
+        self.skipped = 0           # Skip observations during first pass only
+        self.unknown = 0           # First-pass identities missing current result
+        self.source_changed = 0    # Fingerprint change is audit-only
+        self.integrity_issues = set()
+        self.outcomes = Counter()
+        self.recent = deque(maxlen=6)
         self.live = None
-
-    # --------------------------------------------------------
-    # STATUS
-    # --------------------------------------------------------
-
-    def stage_change(
-        self,
-        stage,
-        jp_no=None,
-    ):
-
-        self.stage = stage
-
-        if jp_no is not None:
-            self.current = jp_no
-
-        if self.plain:
-
-            self.console.print(
-                f"[cyan]{stage}[/] "
-                f"{self.current}"
-            )
-
-        self.refresh()
-
-    def refresh(self):
-
-        if self.live is not None:
-
-            self.live.update(
-                self.render(),
-                refresh=True,
-            )
-
-    # --------------------------------------------------------
-    # RECORD RESULT
-    # --------------------------------------------------------
-
-    def record(
-        self,
-        jp_no,
-        result,
-        branch_count,
-        page_total,
-        seconds,
-    ):
-
-        self.companies += 1
-
-        self.branches += branch_count
-
-        self.no_branch += int(
-            result in (
-                "NO_BRANCH",
-                "NO_BRANCH_LISTED",
-            )
-        )
-
-        self.not_listed += int(
-            result == "NOT_LISTED"
-        )
-
-        self.unavailable += int(
-            result == "UNAVAILABLE"
-        )
-
-        self.deferred += int(
-            result.startswith(
-                "DEFERRED"
-            )
-        )
-
-        self.skipped += int(
-            result == "SKIPPED_STATUS"
-        )
-
-        self.recent.append(
-            (
-                self.companies,
-                jp_no,
-                result,
-                branch_count,
-                page_total,
-                seconds,
-            )
-        )
-
-        self.progress.update(
-            self.task,
-            completed=self.companies,
-        )
-
-        self.stage_change(
-            result,
-            jp_no,
-        )
-
-        if self.plain:
-
-            self.console.print(
-                f"[{self.companies:>5}] "
-                f"{jp_no} "
-                f"{result:<19} "
-                f"branches={branch_count:>3} "
-                f"page="
-                f"{page_total if page_total is not None else '-'} "
-                f"{seconds:.1f}s"
-            )
-
-    # --------------------------------------------------------
-    # DASHBOARD
-    # --------------------------------------------------------
+        self.progress = Progress(SpinnerColumn(), BarColumn(bar_width=None),
+                                 TextColumn("{task.completed:,.0f} source rows this pass"),
+                                 TimeElapsedColumn(), expand=True)
+        self.task = self.progress.add_task("scan", total=None)
 
     def render(self):
-
-        elapsed = max(
-            0.001,
-            time.monotonic()
-            - self.started,
-        )
-
-        speed = (
-            self.companies / elapsed
-        )
-
-        if (
-            self.limit
-            and speed > 0
-        ):
-
-            remaining = max(
-                0,
-                self.limit
-                - self.companies,
-            )
-
-            eta = duration(
-                remaining / speed
-            )
-
-        else:
-
-            eta = "—"
-
-        # ----------------------------------------------------
-        # MAIN METRICS
-        # ----------------------------------------------------
-
-        metrics = Table.grid(
-            expand=True,
-            padding=(0, 2),
-        )
-
+        elapsed = max(0.001, time.monotonic() - self.started)
+        coverage = self.journal.snapshot()
+        metrics = Table.grid(expand=True, padding=(0, 2))
         for _ in range(4):
+            metrics.add_column(ratio=1)
+        metrics.add_row(f"Phase {self.journal.active_phase}",
+                        f"Run {self.run_id}", f"Pass {self.pass_no}",
+                        f"Mode {self.mode}")
+        metrics.add_row(f"Terminal {coverage['terminal']:,}",
+                        f"Deferred {coverage['deferred']:,}",
+                        f"Stale review {coverage['review']:,}",
+                        f"Integrity issues {len(self.integrity_issues):,}")
+        metrics.add_row(f"Source rows/pass {self.examined:,}",
+                        f"Skipped (pass 1) {self.skipped:,}",
+                        f"Unexamined (pass 1) {self.unknown:,}",
+                        f"HTTP companies/run {self.checked:,}")
+        metrics.add_row(f"Branches/run {self.branches:,}",
+                        f"Legacy adopted/run {self.legacy:,}",
+                        f"HTTP requests/run {self.website.count:,}",
+                        f"Avg {self.checked / elapsed:.2f} company/s")
+        metrics.add_row(f"Branches OK {self.journal.counts['OK']:,}",
+                        f"No branches {self.journal.counts['NO_BRANCH']:,}",
+                        f"Legacy OK {self.journal.counts['LEGACY_OK']:,}",
+                        f"Unlisted/unavailable {sum(self.journal.counts[s] for s in ('NOT_LISTED','NO_BRANCH_LISTED','UNAVAILABLE')):,}")
+        outcomes = Table.grid(expand=True)
+        outcomes.add_column()
+        outcomes.add_row(
+            "Results this run: " + ", ".join(f"{k}={v:,}" for k,v in sorted(self.outcomes.items()))
+            if self.outcomes else "Results this run: no HTTP results yet")
+        recent = Table(expand=True, box=None)
+        recent.add_column("Company")
+        recent.add_column("Result")
+        recent.add_column("Branches", justify="right")
+        for jp_no, result, count in reversed(self.recent):
+            recent.add_row(jp_no, result, str(count))
+        footer = (f"Stage {self.stage} | Current {self.current} | Status {self.codes} "
+                  f"| Source changes (no refetch) {self.source_changed:,}\n"
+                  f"Workers {self.website.active}/{self.website.concurrency} "
+                  f"| Global {self.website.rate:g} HTTP req/s "
+                  f"| Source reads total {self.scanned_total:,} (passes may overlap)\n"
+                  "Terminal = examined per Phase, not necessarily branch-data success. "
+                  "CAUGHT_UP = observed source, not permanent completeness.\n"
+                  "Ctrl+C = safe stop | Same command = same Phase")
+        return Group(Panel(metrics, title="DBD BRANCH COLLECTOR · PHASE AWARE"),
+                     self.progress, outcomes,
+                     Panel(recent, title="Recent Results"),
+                     Panel(footer, border_style="dim"))
 
-            metrics.add_column(
-                ratio=1
+    def refresh(self):
+        if self.live is not None:
+            self.live.update(self.render(), refresh=True)
+
+    def result(self, company, status, count):
+        self.checked += 1
+        self.branches += count
+        self.outcomes[status] += 1
+        self.current = key_text(company)
+        self.recent.append((str(company["jp_no"]), status, count))
+        self.refresh()
+
+
+def _validate_positive(previous, db_row):
+    if not db_row or previous[2] <= 0:
+        return False
+    expected = previous[2]
+    return (int(db_row["actual"]) == expected
+            and int(db_row["min_count"]) == expected
+            and int(db_row["max_count"]) == expected
+            and not int(db_row["bad_address"]))
+
+
+def _write_http_result(db, journal, ui, company, payload):
+    """Single writer: compare, transaction commit, fsync Journal, then UI."""
+    branches, total, result, url = payload
+    if result in ("OK", "NO_BRANCH"):
+        old_numbers = db.current_branch_numbers(company)
+        incoming = {str(branch[0]) for branch in branches}
+        if old_numbers - incoming:
+            result = "STALE_BRANCHES"
+    if branches:
+        db.commit_branches(company, branches, url)
+    journal.append(company, company["_fingerprint"], result, len(branches), "http")
+    ui.result(company, result, len(branches))
+
+
+def collect_batch(candidates, pool, website, db, journal, ui, attempted):
+    """Bounded and completion-driven; all writes run in the caller's thread.
+
+    On interruption, stop admitting tasks, preserve already finished futures,
+    and re-raise after draining. No HTTP worker ever writes MySQL/Journal.
+    """
+    limit = max(1, website.concurrency * 2)
+    work = iter(candidates)
+    pending = {}
+    interrupted = None
+
+    def fill():
+        while not website.stop.is_set() and len(pending) < limit:
+            try:
+                company = next(work)
+            except StopIteration:
+                break
+            identity = key(company)
+            if identity in attempted:
+                continue
+            attempted.add(identity)  # once in this Run, independent of fp
+            future = pool.submit(website.collect, str(company["jp_no"]))
+            pending[future] = company
+
+    fill()
+    try:
+        while pending:
+            done, _ = wait(tuple(pending), timeout=0.25, return_when=FIRST_COMPLETED)
+            if not done:
+                ui.refresh()
+                continue
+            for future in done:
+                company = pending.pop(future)
+                if future.cancelled():
+                    continue
+                try:
+                    result = future.result()
+                except AccessDenied as exc:
+                    interrupted = exc
+                    website.stop.set()
+                    continue
+                except CollectorError as exc:
+                    if website.stop.is_set():
+                        interrupted = interrupted or exc
+                        continue
+                    raise
+                _write_http_result(db, journal, ui, company, result)
+            if interrupted is None:
+                fill()
+            else:
+                break
+    except KeyboardInterrupt as exc:
+        interrupted = exc
+        website.stop.set()
+    finally:
+        if interrupted is not None:
+            website.stop.set()
+            for future in pending:
+                future.cancel()
+            # Preserve results already completed and usable; do not wait for
+            # unfinished HTTP tasks before releasing the single writer.
+            for future, company in list(pending.items()):
+                if future.done() and not future.cancelled():
+                    try:
+                        result = future.result()
+                    except (CollectorError, requests.RequestException):
+                        continue
+                    _write_http_result(db, journal, ui, company, result)
+    if interrupted is not None:
+        raise interrupted
+
+
+def _check_preflight_state(journal, checkpoint_exists, has_target_data):
+    if (not journal.phases and not journal.records and
+        (has_target_data or checkpoint_exists)):
+        raise CollectorError(
+            "Journal has no recoverable company results/Phase metadata, but "
+            "historical checkpoint or MySQL branch rows exist. Cannot infer "
+            "zero-branch/UNAVAILABLE results; recover the original Journal "
+            "from backup or use a separately authorized recovery procedure."
+        )
+
+
+def _check_requested_phase(journal, codes, args):
+    if journal.phases and not args.new_phase:
+        expected = journal.phases[journal.active_phase]["scope"]
+        if expected != list(codes):
+            raise CollectorError(
+                f"Phase {journal.active_phase} scope mismatch; "
+                f"expected {','.join(expected)}, supplied {','.join(codes)}"
             )
+    if not journal.phases and not journal.records:
+        if args.continue_phase:
+            raise CollectorError("--continue requires a recognized previous Phase")
+        if args.new_phase:
+            raise CollectorError("--new-phase requires an existing Phase")
 
-        metrics.add_row(
-            (
-                f"Companies "
-                f"[cyan]{self.companies:,}[/]"
-            ),
 
-            (
-                f"Branches "
-                f"[green]{self.branches:,}[/]"
-            ),
+def checkpoint_conflict_count(journal, old_deferred):
+    """Older checkpoint DEFERRED does not override terminal Journal truth."""
+    if journal.active_phase not in (None, 1):
+        return 0
+    return sum(1 for t, j in old_deferred
+               if (record := journal.records.get(t + ":" + j)) is not None
+               and record[1] in PHASE_TERMINAL_STATUSES)
 
-            (
-                f"HTTP "
-                f"{self.website.request_count:,}"
-            ),
 
-            (
-                f"Speed "
-                f"{speed:.2f} comp/s"
-            ),
+def _preflight_report(journal, codes, checkpoint, db, old_deferred):
+    _check_preflight_state(journal, CHECKPOINT.exists(), db.has_existing_branch_data())
+    snapshots = journal.snapshot()
+    conflicts = checkpoint_conflict_count(journal, old_deferred)
+    label = (f"Phase {journal.active_phase}"
+             if journal.phases else
+             "Legacy Phase 1 (migration eligible)" if journal.records else
+             "New installation (initialize Phase 1)")
+    Console().print(
+        f"PREFLIGHT READ-ONLY | {label} | scope={','.join(codes)}\n"
+        f"Current Journal: {journal.path} (exists={journal.exists})\n"
+        f"Journal records={journal.total_records:,} "
+        f"| legacy records={journal.legacy_records:,} "
+        f"| latest current-Phase results={snapshots['recorded']:,}\n"
+        f"Terminal={snapshots['terminal']:,} "
+        f"| Deferred={snapshots['deferred']:,} "
+        f"| Review={snapshots['review']:,}\n"
+        f"Tail repair needed={journal.tail_bytes:,} bytes "
+        f"| Historical checkpoint present={checkpoint}\n"
+        f"Checkpoint deferred vs terminal Journal conflicts={conflicts:,} "
+        "(Journal wins)\n"
+        "Legacy scope, if any, is adopted from supplied --status-codes; "
+        "not historically verified.\n"
+        "Coverage counts are Journal-only; not exact live source coverage.\n"
+        "No Phase metadata written. No HTTP. No Journal repair. No MySQL data writes."
+    )
+
+
+def run(args):
+    codes = status_codes(args.status_codes)
+    old_deferred = read_previous_checkpoint(CHECKPOINT)
+    db = journal = website = pool = None
+    try:
+        # GET_LOCK is acquired before any writable state operation. Reconnects
+        # reacquire this same lock or fail closed.
+        db = MySQL()
+        db.preflight()
+        journal = Journal(JOURNAL, read_only=args.preflight)
+        _check_preflight_state(journal, CHECKPOINT.exists(), db.has_existing_branch_data())
+        _check_requested_phase(journal, codes, args)
+        if args.preflight:
+            _preflight_report(journal, codes, CHECKPOINT.exists(), db, old_deferred)
+            return 0
+
+        is_migration = bool(journal.records and not journal.phases)
+        # Snapshot original Journal BEFORE any recoverable-tail truncation.
+        journal.prepare_for_writes(legacy_migration=is_migration)
+        mode = establish_phase(journal, codes, args.continue_phase, args.new_phase)
+        Console().print(
+            f"PHASE {journal.active_phase} | {mode} | "
+            f"scope={','.join(codes)} | recorded={journal.snapshot()['recorded']:,}"
         )
+        if args.new_phase:
+            Console().print("NEW PHASE persisted: future ordinary invocations resume "
+                            "this Phase; do not repeat --new-phase to resume.")
+        if is_migration:
+            Console().print("Legacy records adopted as Phase 1, historical scope "
+                            "bound to supplied --status-codes (not independently verified).")
+        if journal.active_phase == 1:
+            conflicts = checkpoint_conflict_count(journal, old_deferred)
+            if conflicts:
+                Console().print(
+                    f"CHECKPOINT WARNING: {conflicts:,} old deferred identities "
+                    "have terminal Journal results; latest Journal terminal wins."
+                )
 
-        # ----------------------------------------------------
-        # SECONDARY METRICS
-        # ----------------------------------------------------
+        website = Website()
+        ui = UI(website, codes, journal, mode)
+        pool = ThreadPoolExecutor(max_workers=website.concurrency,
+                                  thread_name_prefix="branch-http")
+        attempted = set()          # HTTP identities (once per Run)
+        validated_positive = set() # Verified without extra HTTP this Run
+        review_once = set()
+        quiet = 0
+        limit_hit = False
+        with Live(ui.render(), console=ui.console, refresh_per_second=3,
+                  transient=False) as live:
+            ui.live = live
+            while True:
+                ui.pass_no += 1
+                ui.examined = 0
+                ui.progress.reset(ui.task)
+                position = None
+                activity = 0
+                while True:
+                    ui.stage = "READ SOURCE IDENTITIES"
+                    rows = db.select_page(codes, position, args.batch_size)
+                    if not rows:
+                        break
+                    position = key(rows[-1])
+                    ui.examined += len(rows)
+                    ui.scanned_total += len(rows)
+                    ui.progress.update(ui.task, advance=len(rows))
+                    unknown, candidates, verify_positive = [], [], []
+                    for company in rows:
+                        company["_fingerprint"] = fingerprint(company, db.fields)
+                        previous = journal.get(company)
+                        identity = key(company)
+                        if previous is None:
+                            if ui.pass_no == 1:
+                                ui.unknown += 1
+                            # Only Phase 1 can adopt legacy MySQL data.
+                            if journal.active_phase == 1:
+                                unknown.append(company)
+                            else:
+                                candidates.append(company)
+                            continue
+                        kind = result_class(previous[1])
+                        if previous[0] != company["_fingerprint"] and ui.pass_no == 1:
+                            ui.source_changed += 1
+                        if kind == "TERMINAL":
+                            if identity in review_once:
+                                continue
+                            if previous[1] in ("OK", "LEGACY_OK") and identity not in validated_positive:
+                                verify_positive.append((company, previous))
+                            else:
+                                if ui.pass_no == 1:
+                                    ui.skipped += 1
+                            continue
+                        if kind == "REVIEW":
+                            review_once.add(identity)
+                            continue
+                        # A Deferred result retries once in the next Run;
+                        # its current source fingerprint cannot reset that cap.
+                        if identity not in attempted:
+                            candidates.append(company)
 
-        secondary = Table.grid(
-            expand=True
+                    if verify_positive:
+                        checks = db.existing_positive([c for c, _ in verify_positive])
+                        for company, previous in verify_positive:
+                            identity = key(company)
+                            if _validate_positive(previous, checks.get(identity)):
+                                validated_positive.add(identity)
+                                if ui.pass_no == 1:
+                                    ui.skipped += 1
+                            else:
+                                ui.integrity_issues.add(identity)
+                                review_once.add(identity)
+                                if ui.pass_no == 1:
+                                    ui.skipped += 1
+                    if unknown:
+                        positives = db.existing_positive(unknown)
+                        for company in unknown:
+                            identity = key(company)
+                            existing = positives.get(identity)
+                            valid = bool(
+                                existing and identity not in old_deferred and
+                                int(existing["actual"]) > 0 and
+                                int(existing["actual"]) == int(existing["min_count"])
+                                == int(existing["max_count"]) and
+                                not int(existing["bad_address"]) and
+                                (existing["jp_name"] or "") == (company["jp_name"] or "") and
+                                (existing["jp_name_e"] or "") == (company["jp_name_e"] or "")
+                            )
+                            if valid:
+                                journal.append(company, company["_fingerprint"],
+                                               "LEGACY_OK", int(existing["actual"]), "legacy")
+                                validated_positive.add(identity)
+                                ui.legacy += 1
+                                activity += 1
+                            else:
+                                candidates.append(company)
+                    if candidates:
+                        remaining = (args.limit - len(attempted)) if args.limit else len(candidates)
+                        if remaining <= 0:
+                            limit_hit = True
+                            break
+                        if len(candidates) > remaining:
+                            candidates = candidates[:remaining]
+                            limit_hit = True
+                        ui.stage = "COLLECT HTTP / COMMIT AS COMPLETED"
+                        before = ui.checked
+                        collect_batch(candidates, pool, website, db, journal, ui, attempted)
+                        activity += ui.checked - before
+                        if args.limit and len(attempted) >= args.limit:
+                            limit_hit = True
+                            break
+                    ui.refresh()
+                if limit_hit:
+                    ui.stage = "LIMIT REACHED"
+                    ui.refresh()
+                    break
+                quiet = 0 if activity else quiet + 1
+                ui.stage = "RECONCILE" if quiet < 2 else "FINALIZE"
+                ui.refresh()
+                if quiet >= 2:
+                    break
+        coverage = journal.snapshot()
+        review = coverage["review"] + len(ui.integrity_issues)
+        if review:
+            ui.stage = "NEEDS_REVIEW"
+            exit_code = 3
+        elif coverage["deferred"]:
+            ui.stage = "PARTIAL - DEFERRED"
+            exit_code = 2
+        elif limit_hit:
+            ui.stage = "LIMIT REACHED"
+            exit_code = 0  # Historical --limit behavior (explicit stop)
+        else:
+            ui.stage = "CAUGHT_UP"
+            exit_code = 0
+        ui.console.print(
+            f"FINISHED | phase={journal.active_phase} | run={ui.run_id} "
+            f"| stage={ui.stage} | terminal={coverage['terminal']:,} "
+            f"| deferred={coverage['deferred']:,} | stale={coverage['review']:,} "
+            f"| integrity={len(ui.integrity_issues):,} "
+            f"| HTTP companies={ui.checked:,} | HTTP requests={website.count:,} "
+            f"| branches={ui.branches:,} | existing adopted={ui.legacy:,} "
+            f"| outcomes={dict(ui.outcomes)}"
         )
-
-        secondary.add_column(
-            ratio=1
-        )
-
-        secondary.add_column(
-            ratio=1
-        )
-
-        secondary.add_row(
-            (
-                f"No branches: {self.no_branch} "
-                f"| Not listed: {self.not_listed} "
-                f"| Unavailable: {self.unavailable} "
-                f"| Deferred: {self.deferred}"
-            ),
-
-            (
-                f" | Workers: "
-                f"{self.website.active_requests}/"
-                f"{self.website.concurrency} "
-                f"| Cap: {self.website.rate:g} req/s "
-                f"| ETA: {eta}"
-            ),
-        )
-
-        # ----------------------------------------------------
-        # RECENT COMPANIES
-        # ----------------------------------------------------
-
-        recent = Table(
-            expand=True,
-            show_header=True,
-            box=None,
-            padding=(0, 1),
-        )
-
-        recent.add_column(
-            "#",
-            justify="right",
-            width=5,
-        )
-
-        recent.add_column(
-            "Company",
-            min_width=13,
-        )
-
-        recent.add_column(
-            "Result",
-            min_width=16,
-        )
-
-        recent.add_column(
-            "Branches",
-            justify="right",
-        )
-
-        recent.add_column(
-            "Total",
-            justify="right",
-        )
-
-        recent.add_column(
-            "Time",
-            justify="right",
-        )
-
-        for (
-            number,
-            jp_no,
-            result,
-            count,
-            total,
-            seconds,
-        ) in reversed(self.recent):
-
-            style = (
-                "green"
-                if result == "OK"
-                else "yellow"
-            )
-
-            recent.add_row(
-                str(number),
-                jp_no,
-                f"[{style}]{result}[/]",
-                str(count),
-
-                (
-                    str(total)
-                    if total is not None
-                    else "—"
-                ),
-
-                f"{seconds:.1f}s",
-            )
-
-        # ----------------------------------------------------
-        # FOOTER
-        # ----------------------------------------------------
-
-        footer = (
-            f"Mode: {self.mode} "
-            f"| Stage: {self.stage} "
-            f"| Current: {self.current}\n"
-
-            f"MySQL: {os.getenv('DB_NAME', '?')} "
-            f"| {SOURCE} -> {TARGET} "
-            f"| Status: {self.status_codes}\n"
-
-            f"Cursor: "
-            f"{self.scan['last_type']}:"
-            f"{self.scan['last_no']} "
-
-            f"| Pending retry: "
-            f"{self.retry_pending} "
-
-            "| Ctrl+C = safe stop"
-        )
-
-        return Group(
-            Panel(
-                metrics,
-
-                title=(
-                    "DBD BRANCH COLLECTOR · MySQL"
-                ),
-
-                border_style="cyan",
-            ),
-
-            secondary,
-
-            self.progress,
-
-            Panel(
-                recent,
-                title="Recent Companies",
-                border_style="blue",
-            ),
-
-            Panel(
-                footer,
-                border_style="dim",
-            ),
-        )
+        return exit_code
+    finally:
+        if website is not None:
+            website.stop.set()
+        if pool is not None:
+            pool.shutdown(wait=True, cancel_futures=True)
+        if website is not None:
+            website.close()
+        if journal is not None:
+            journal.close()
+        if db is not None:
+            db.close()
 
 
 # ============================================================
-# MAIN
+# CLI
 # ============================================================
 
 def main():
 
     parser = argparse.ArgumentParser(
         description=(
-            "DBD Concurrent Branch Collector — "
-            "MySQL Terminal UI"
+            "DBD Branch Collector "
+            "with identity-based reconciliation "
+            "and one-command safe resume"
         )
-    )
-
-    parser.add_argument(
-        "--jp-no",
-        help=(
-            "Single 13-digit legal ID; "
-            "does not move global checkpoint"
-        ),
-    )
-
-    parser.add_argument(
-        "--limit",
-        type=int,
-        default=0,
-        help=(
-            "Number of eligible companies; "
-            "0 means all"
-        ),
     )
 
     parser.add_argument(
@@ -2550,788 +2696,62 @@ def main():
         ),
 
         help=(
-            "Comma-separated jp_stat_code values; "
-            "default: 1"
+            "Comma-separated company status codes. "
+            "Example: 1,A,B"
         ),
-    )
-
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        help=(
-            "No MySQL writes and "
-            "no checkpoint writes"
-        ),
-    )
-
-    parser.add_argument(
-        "--refresh",
-        action="store_true",
-        help=(
-            "Rescan selected statuses "
-            "from beginning and UPSERT"
-        ),
-    )
-
-    parser.add_argument(
-        "--retry-deferred",
-        action="store_true",
-        help=(
-            "Retry previously deferred companies"
-        ),
-    )
-
-    parser.add_argument(
-        "--checkpoint",
-        type=Path,
-        default=CHECKPOINT,
     )
 
     parser.add_argument(
         "--batch-size",
+
         type=int,
-        default=20,
-    )
 
-    parser.add_argument(
-        "--max-deferred",
-        type=int,
-        default=10000,
-    )
+        default=100,
 
-    parser.add_argument(
-        "--plain",
-        action="store_true",
-    )
-
-    parser.add_argument(
-        "--parse-file",
-        type=Path,
         help=(
-            "Offline HTML parser test "
-            "without MySQL or HTTP"
+            "Number of source identities read "
+            "per keyset page"
         ),
     )
 
-    args = parser.parse_args()
+    parser.add_argument(
+        "--limit",
 
-    # --------------------------------------------------------
-    # ARGUMENT VALIDATION
-    # --------------------------------------------------------
+        type=int,
+
+        default=0,
+
+        help=(
+            "Maximum HTTP-checked companies "
+            "during this invocation; 0 = unlimited"
+        ),
+    )
+
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--continue", dest="continue_phase", action="store_true",
+                       help="Require and resume an existing Phase")
+    group.add_argument("--new-phase", action="store_true",
+                       help="Explicitly start a fresh Phase; never for ordinary resume")
+    parser.add_argument("--preflight", action="store_true",
+                        help="Read-only validation of database, checkpoint, Journal and Phase")
+
+    args = parser.parse_args()
+    if args.preflight and args.new_phase:
+        parser.error("--preflight and --new-phase cannot be combined")
+
+    if not (
+        1 <= args.batch_size <= 500
+    ):
+        parser.error(
+            "--batch-size must be between 1 and 500"
+        )
 
     if args.limit < 0:
         parser.error(
             "--limit must be >= 0"
         )
 
-    if args.batch_size < 1:
-        parser.error(
-            "--batch-size must be >= 1"
-        )
-
-    if args.max_deferred < 1:
-        parser.error(
-            "--max-deferred must be >= 1"
-        )
-
-    if (
-        args.jp_no
-        and not re.fullmatch(
-            r"\d{13}",
-            args.jp_no,
-        )
-    ):
-        parser.error(
-            "--jp-no must contain exactly 13 digits"
-        )
-
-    exclusive = sum(
-        map(
-            bool,
-            (
-                args.jp_no,
-                args.refresh,
-                args.retry_deferred,
-            ),
-        )
-    )
-
-    if exclusive > 1:
-        parser.error(
-            "--jp-no, --refresh and "
-            "--retry-deferred cannot be combined"
-        )
-
-    # --------------------------------------------------------
-    # STATUS FILTER
-    # --------------------------------------------------------
-
-    codes = parse_status_codes(
-        args.status_codes
-    )
-
-    status_key = ",".join(
-        codes
-    )
-
-    console = Console()
-
-    # --------------------------------------------------------
-    # OFFLINE PARSER TEST
-    # --------------------------------------------------------
-
-    if args.parse_file:
-
-        html = args.parse_file.read_text(
-            encoding="utf-8-sig"
-        )
-
-        branches, total = parse_printview(
-            html,
-            args.jp_no or "SAMPLE",
-        )
-
-        console.print(
-            "[green]PARSE PASS[/] "
-            f"establishments={total} "
-            f"branches={len(branches)}"
-        )
-
-        return 0
-
-    # --------------------------------------------------------
-    # CHECKPOINT
-    #
-    # Different status filters use different cursors.
-    # --------------------------------------------------------
-
-    checkpoint = load_checkpoint(
-        args.checkpoint
-    )
-
-    scan = (
-        new_scan()
-        if args.refresh
-        else {
-            **new_scan(),
-
-            **checkpoint["scans"].get(
-                status_key,
-                {},
-            ),
-        }
-    )
-
-    # --------------------------------------------------------
-    # MODE
-    # --------------------------------------------------------
-
-    if args.dry_run:
-        mode = "DRY RUN"
-
-    elif args.jp_no:
-        mode = "SINGLE"
-
-    elif args.retry_deferred:
-        mode = "RETRY DEFERRED"
-
-    elif args.refresh:
-        mode = "REFRESH"
-
-    else:
-        mode = "COLLECT"
-
-    # --------------------------------------------------------
-    # HTTP
-    # --------------------------------------------------------
-
-    website = Website()
-
-    # --------------------------------------------------------
-    # TERMINAL UI
-    # --------------------------------------------------------
-
-    ui_limit = (
-        1
-        if args.jp_no
-        else args.limit
-    )
-
-    if (
-        args.retry_deferred
-        and not ui_limit
-    ):
-
-        ui_limit = len(
-            checkpoint["deferred"]
-        )
-
-    ui = TerminalUI(
-        console=console,
-        scan=scan,
-        mode=mode,
-        status=status_key,
-        limit=ui_limit,
-        website=website,
-        plain=args.plain,
-    )
-
-    ui.retry_pending = len(
-        checkpoint["deferred"]
-    )
-
-    db = None
-
-    pool = None
-
-    try:
-
-        context = (
-            Live(
-                ui.render(),
-                console=console,
-                refresh_per_second=4,
-                transient=False,
-            )
-            if not ui.plain
-            else nullcontext()
-        )
-
-        with context as live:
-
-            ui.live = live
-
-            # ------------------------------------------------
-            # MYSQL CONNECTION
-            # ------------------------------------------------
-
-            ui.stage_change(
-                "MYSQL CONNECT"
-            )
-
-            db = MySQL()
-
-            # ------------------------------------------------
-            # SCHEMA
-            # ------------------------------------------------
-
-            ui.stage_change(
-                "MYSQL SCHEMA CHECK"
-            )
-
-            changes = db.preflight(
-                write=not args.dry_run
-            )
-
-            for change in changes:
-
-                ui.stage_change(
-                    "SCHEMA: " + change
-                )
-
-            # ------------------------------------------------
-            # CONCURRENT HTTP WORKERS
-            # ------------------------------------------------
-
-            pool = ThreadPoolExecutor(
-                max_workers=website.concurrency,
-                thread_name_prefix="branch-http",
-            )
-
-            # ------------------------------------------------
-            # DEFERRED QUEUE SNAPSHOT
-            # ------------------------------------------------
-
-            jobs = (
-                list(
-                    checkpoint["deferred"]
-                )
-                if args.retry_deferred
-                else []
-            )
-
-            job_index = 0
-
-            # ------------------------------------------------
-            # SINGLE COMPANY
-            # ------------------------------------------------
-
-            if args.jp_no:
-
-                ui.stage_change(
-                    "MYSQL SELECT SINGLE",
-                    args.jp_no,
-                )
-
-                single_records = db.select_single(
-                    args.jp_no
-                )
-
-                if not single_records:
-                    raise CollectorError(
-                        f"{args.jp_no}: "
-                        f"not found in {SOURCE}"
-                    )
-
-            else:
-
-                single_records = None
-
-            # ------------------------------------------------
-            # MAIN COLLECTION LOOP
-            # ------------------------------------------------
-
-            while True:
-
-                # --------------------------------------------
-                # SINGLE COMPANY
-                # --------------------------------------------
-
-                if args.jp_no:
-
-                    records = single_records
-
-                # --------------------------------------------
-                # RETRY DEFERRED
-                # --------------------------------------------
-
-                elif args.retry_deferred:
-
-                    records = []
-
-                    remaining = (
-                        args.limit - ui.companies
-                        if args.limit
-                        else args.batch_size
-                    )
-
-                    if remaining <= 0:
-                        break
-
-                    while (
-                        job_index < len(jobs)
-                        and len(records)
-                        < min(
-                            args.batch_size,
-                            remaining,
-                        )
-                    ):
-
-                        job = jobs[job_index]
-
-                        job_index += 1
-
-                        company = db.select_deferred(
-                            job["jp_type_code"],
-                            job["jp_no"],
-                        )
-
-                        if company is None:
-                            continue
-
-                        current_status = str(
-                            company["jp_stat_code"]
-                            or ""
-                        ).upper()
-
-                        if current_status not in codes:
-                            continue
-
-                        records.append(
-                            company
-                        )
-
-                    if not records:
-                        break
-
-                # --------------------------------------------
-                # NORMAL KEYSET PAGE
-                # --------------------------------------------
-
-                else:
-
-                    remaining = (
-                        args.limit - ui.companies
-                        if args.limit
-                        else args.batch_size
-                    )
-
-                    if remaining <= 0:
-                        break
-
-                    page_size = min(
-                        args.batch_size,
-                        remaining,
-                    )
-
-                    ui.stage_change(
-                        "MYSQL SELECT PAGE"
-                    )
-
-                    records = db.select_page(
-                        scan,
-                        codes,
-                        page_size,
-                    )
-
-                if not records:
-                    break
-
-                # --------------------------------------------
-                # FILTER ELIGIBLE COMPANIES
-                # --------------------------------------------
-
-                eligible = []
-
-                for company in records:
-
-                    current_status = str(
-                        company["jp_stat_code"]
-                        or ""
-                    ).upper()
-
-                    if current_status in codes:
-
-                        eligible.append(
-                            company
-                        )
-
-                    elif args.jp_no:
-
-                        ui.record(
-                            str(company["jp_no"]),
-                            "SKIPPED_STATUS",
-                            0,
-                            None,
-                            0.0,
-                        )
-
-                # --------------------------------------------
-                # CONCURRENT HTTP SUBMISSION
-                #
-                # Only the HTTP stage runs concurrently.
-                #
-                # No worker accesses MySQL or checkpoints.
-                # --------------------------------------------
-
-                futures = [
-                    pool.submit(
-                        website.collect,
-                        str(company["jp_no"]),
-                    )
-                    for company in eligible
-                ]
-
-                # --------------------------------------------
-                # ORDERED MYSQL WRITE
-                #
-                # Results are consumed in source order.
-                #
-                # Even if company #4 finishes before #2,
-                # the checkpoint cannot skip #2.
-                # --------------------------------------------
-
-                for company, future in zip(
-                    eligible,
-                    futures,
-                ):
-
-                    jp_no = str(
-                        company["jp_no"]
-                    )
-
-                    ui.stage_change(
-                        "HTTP CONCURRENT",
-                        jp_no,
-                    )
-
-                    # ----------------------------------------
-                    # WAIT FOR NEXT ORDERED RESULT
-                    #
-                    # Refresh the terminal while waiting.
-                    # ----------------------------------------
-
-                    while True:
-
-                        try:
-
-                            (
-                                branches,
-                                page_total,
-                                result,
-                                source_url,
-                                seconds,
-                            ) = future.result(
-                                timeout=0.25
-                            )
-
-                            break
-
-                        except FutureTimeout:
-
-                            ui.refresh()
-
-                    # ----------------------------------------
-                    # MYSQL UPSERT
-                    #
-                    # One writer, executed on main thread.
-                    # ----------------------------------------
-
-                    if (
-                        not args.dry_run
-                        and branches
-                    ):
-
-                        ui.stage_change(
-                            "MYSQL UPSERT",
-                            jp_no,
-                        )
-
-                        db.upsert(
-                            company,
-                            branches,
-                            source_url,
-                        )
-
-                    # ----------------------------------------
-                    # CHECKPOINT
-                    #
-                    # Advance only after successful database
-                    # commit, never on task submission.
-                    # ----------------------------------------
-
-                    if not args.jp_no:
-
-                        next_scan = dict(
-                            scan
-                        )
-
-                        next_queue = [
-                            dict(item)
-                            for item in checkpoint["deferred"]
-                        ]
-
-                        if result.startswith(
-                            "DEFERRED"
-                        ):
-
-                            mark_deferred(
-                                next_queue,
-                                company,
-                                result,
-                                args.max_deferred,
-                            )
-
-                        else:
-
-                            clear_deferred(
-                                next_queue,
-                                company,
-                            )
-
-                        # ------------------------------------
-                        # NORMAL SCAN CURSOR
-                        # ------------------------------------
-
-                        if not args.retry_deferred:
-
-                            next_scan.update(
-                                {
-                                    "last_type": str(
-                                        company["jp_type_code"]
-                                    ),
-
-                                    "last_no": jp_no,
-
-                                    "checked": (
-                                        scan["checked"]
-                                        + 1
-                                    ),
-
-                                    "branches": (
-                                        scan["branches"]
-                                        + len(branches)
-                                    ),
-
-                                    "no_branch": (
-                                        scan["no_branch"]
-                                        + int(
-                                            result in (
-                                                "NO_BRANCH",
-                                                "NO_BRANCH_LISTED",
-                                            )
-                                        )
-                                    ),
-
-                                    "not_found": (
-                                        scan["not_found"]
-                                        + int(
-                                            result == "NOT_LISTED"
-                                        )
-                                    ),
-
-                                    "unavailable": (
-                                        scan["unavailable"]
-                                        + int(
-                                            result == "UNAVAILABLE"
-                                        )
-                                    ),
-
-                                    "updated_utc": utc_now(),
-                                }
-                            )
-
-                        # ------------------------------------
-                        # NEXT STATE
-                        # ------------------------------------
-
-                        next_state = dict(
-                            checkpoint
-                        )
-
-                        next_state["scans"] = dict(
-                            checkpoint["scans"]
-                        )
-
-                        next_state["scans"][
-                            status_key
-                        ] = next_scan
-
-                        next_state["deferred"] = (
-                            next_queue
-                        )
-
-                        # ------------------------------------
-                        # ATOMIC CHECKPOINT
-                        # ------------------------------------
-
-                        if not args.dry_run:
-
-                            ui.stage_change(
-                                "CHECKPOINT SAVE",
-                                jp_no,
-                            )
-
-                            save_checkpoint(
-                                args.checkpoint,
-                                next_state,
-                            )
-
-                        # Keep in-memory scan progress even
-                        # in dry-run, without writing a file.
-
-                        checkpoint = next_state
-
-                        scan.update(
-                            next_scan
-                        )
-
-                        ui.retry_pending = len(
-                            next_queue
-                        )
-
-                    # ----------------------------------------
-                    # TERMINAL RESULT
-                    # ----------------------------------------
-
-                    ui.record(
-                        jp_no=jp_no,
-                        result=result,
-                        branch_count=len(branches),
-                        page_total=page_total,
-                        seconds=seconds,
-                    )
-
-                    # ----------------------------------------
-                    # LIMIT
-                    # ----------------------------------------
-
-                    if (
-                        args.limit
-                        and ui.companies >= args.limit
-                    ):
-                        break
-
-                # --------------------------------------------
-                # EXIT CONDITIONS
-                # --------------------------------------------
-
-                if args.jp_no:
-                    break
-
-                if (
-                    args.limit
-                    and ui.companies >= args.limit
-                ):
-                    break
-
-            # ------------------------------------------------
-            # FINISH TERMINAL UI
-            # ------------------------------------------------
-
-            ui.stage_change(
-                "FINISHED"
-            )
-
-            ui.refresh()
-
-        # ----------------------------------------------------
-        # FINAL SUMMARY
-        # ----------------------------------------------------
-
-        elapsed_total = (
-            time.monotonic()
-            - ui.started
-        )
-
-        console.print(
-            "[green]FINISHED[/] "
-
-            f"companies={ui.companies} "
-
-            f"branches={ui.branches} "
-
-            f"HTTP={website.request_count} "
-
-            f"no_branches={ui.no_branch} "
-
-            f"not_listed={ui.not_listed} "
-
-            f"unavailable={ui.unavailable} "
-
-            f"deferred={ui.deferred} "
-
-            f"retry_pending={ui.retry_pending} "
-
-            f"elapsed={duration(elapsed_total)}"
-        )
-
-        return (
-            2
-            if ui.deferred
-            else 0
-        )
-
-    finally:
-
-        # Stop accepting new HTTP work.
-
-        website.stop_event.set()
-
-        # Cancel queued tasks and wait for in-flight work.
-        # No HTTP worker writes to MySQL.
-
-        if pool is not None:
-
-            pool.shutdown(
-                wait=True,
-                cancel_futures=True,
-            )
-
-        website.close()
-
-        if db is not None:
-            db.close()
+    return run(args)
 
 
 # ============================================================
@@ -3347,17 +2767,15 @@ if __name__ == "__main__":
         )
 
     except KeyboardInterrupt:
-
-        Console(
-            stderr=True
-        ).print(
-            "\n[yellow]"
-            "STOPPED: Ctrl+C — "
-            "resume from last committed checkpoint."
-            "[/]"
+        Console(stderr=True).print(
+            "\n[yellow]STOPPED BY USER: current Phase preserved. "
+            "Rerun the same command to resume.[/]"
         )
-
         raise SystemExit(130)
+
+    except AccessDenied as exc:
+        Console(stderr=True).print(f"[bold red]ACCESS RESTRICTED:[/] {exc}")
+        raise SystemExit(1)
 
     except (
         CollectorError,
@@ -3370,7 +2788,7 @@ if __name__ == "__main__":
         Console(
             stderr=True
         ).print(
-            f"[bold red]STOPPED safely:[/] {exc}"
+            f"[bold red]{'PREFLIGHT FAILED' if '--preflight' in sys.argv else 'STOPPED safely'}:[/] {exc}"
         )
 
         raise SystemExit(1)
