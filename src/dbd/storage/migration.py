@@ -6,6 +6,7 @@ historical state is reported before any DDL rather than silently rewritten.
 from __future__ import annotations
 
 import re
+from contextlib import ExitStack
 from typing import Any
 
 from ..core.settings import settings
@@ -175,11 +176,12 @@ def _sql_plan(conn: Any) -> dict[str, Any]:
         elif _sql_procedure_signature(definition) != _sql_procedure_signature(ADMIT_DDL):
             p["blockers"].append("Existing DBD_CONTROL_ADMIT differs from approved contract")
     if control:
-        admin_count = int(_one(conn,
-            "SELECT COUNT(*) FROM dbo.DBD_CONTROL WHERE record_type='NODE' "
-            "AND JSON_VALUE(payload,'$.role')='ADMIN' "
-            "AND JSON_VALUE(payload,'$.approved')='true'") or 0)
-        if admin_count:
+        # An initialized Control plane cannot return to bootstrap mode if
+        # its sole Admin was subsequently revoked or de-authorized.
+        initialized = int(_one(conn,
+            "SELECT COUNT(*) FROM dbo.DBD_CONTROL "
+            "WHERE record_type IN ('NODE','SCHEDULE','GENERATION')") or 0)
+        if initialized:
             node = local_node_id()
             if node is None:
                 p["blockers"].append("Admin Coordinator setup required for migration")
@@ -428,8 +430,18 @@ def apply_migration(backend: str | None = None, *, expected: dict[str, Any]) -> 
     repo = production_repository(selected)
     if expected.get("backend") != selected or not expected.get("apply_permitted"):
         raise MigrationBlocked("Explicit approved migration plan is missing or blocked")
-    with repo.manager_lock() as lock:
+    with ExitStack() as locks:
+        lock = locks.enter_context(repo.manager_lock())
         repo.assert_manager_lock(lock)
+        if selected == "sqlserver":
+            # The Branch writer deliberately uses a separate EXISTING lock.
+            # Migration must own both resources to fence all six tables.
+            branch_lock = locks.enter_context(
+                repo.manager_lock(resource="TIPDI:DBD:v0.6:branch")
+            )
+            repo.assert_manager_lock(
+                branch_lock, resource="TIPDI:DBD:v0.6:branch"
+            )
         # TOCTOU fence: a preview is never used as DDL authorization after
         # catalog state or legacy evidence changes.
         current = inspect_migration(selected, owning_manager_lock=True)
