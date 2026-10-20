@@ -1190,7 +1190,23 @@ async def cycle_run(
         _emit(event,"warning",message="Branch phase incomplete: "+str(exc))
     _emit(event,"phase_completed",phase="BRANCH",generation=core.generation,
           stage=branch_state.get("stage","UNKNOWN"))
-    result=replace(core,branch=branch_state)
+    stage = str(branch_state.get("stage") or "").upper()
+    branch_incomplete = (
+        bool(branch_state.get("error"))
+        or bool(int(branch_state.get("deferred") or 0))
+        or bool(int(branch_state.get("review") or 0))
+        or stage not in {"CAUGHT_UP"}
+    )
+    overall = (
+        "COMPLETE_WITH_FAILURES"
+        if branch_incomplete and core.status in (
+            "COMPLETE", "COMPLETE_WITH_FAILURES", "ALREADY_COMPLETED"
+        ) else core.status
+    )
+    result=replace(core,status=overall,branch={
+        **branch_state, "core_status": core.status,
+        "branch_status": "PARTIAL" if branch_incomplete else "COMPLETE",
+    })
     _emit(event,"cycle_completed",**asdict(result))
     return result
 
