@@ -257,3 +257,32 @@ async def test_extended_reuses_core_generation_without_discovery(monkeypatch):
         ("coverage", 2), ("prepare", 2, "extended"),
         ("refresh", 2), ("collect", 2, "extended"), ("verify", 2, "extended"),
     ]
+
+
+def test_deferred_branch_waits_for_recorded_retry_window():
+    from datetime import datetime, timedelta, timezone
+    from dbd.pipelines.branch import _deferred_retry_ready
+
+    now = datetime(2026, 10, 20, 10, tzinfo=timezone.utc)
+    item = {
+        "collection_status": "DEFERRED_NETWORK",
+        "last_checked_at": now - timedelta(minutes=30),
+    }
+    assert not _deferred_retry_ready(item, now)
+    assert _deferred_retry_ready(
+        {**item, "last_checked_at": now - timedelta(hours=2)}, now
+    )
+    assert _deferred_retry_ready({**item, "last_checked_at": None}, now)
+    assert _deferred_retry_ready(
+        {"collection_status": "NO_BRANCH", "last_checked_at": now}, now
+    )
+
+
+def test_deferred_branch_rejects_invalid_durable_timestamps():
+    from dbd.pipelines.branch import BranchError, _deferred_retry_ready
+
+    with pytest.raises(BranchError, match="timestamp"):
+        _deferred_retry_ready({
+            "collection_status": "DEFERRED_PARSE",
+            "last_checked_at": "not-a-timestamp",
+        })
