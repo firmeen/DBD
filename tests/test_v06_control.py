@@ -129,7 +129,7 @@ def test_claim_only_during_collection_and_when_approved() -> None:
 
 def test_control_schema_has_only_one_extra_table_and_unique_record_key() -> None:
     from dbd.storage.sqlserver.schema import MANAGED_TABLES
-    assert len(MANAGED_TABLES) == 5
+    assert len(MANAGED_TABLES) == 6
     assert "dbo.DBD_CONTROL" not in MANAGED_TABLES
     assert "CREATE TABLE dbo.DBD_CONTROL" in CONTROL_DDL
     assert "UNIQUE(record_type, record_key)" in CONTROL_DDL
