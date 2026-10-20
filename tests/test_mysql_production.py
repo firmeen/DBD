@@ -13,10 +13,10 @@ from dbd.storage.production import ProductionLeaseLost
 from dbd.storage.sqlserver.schema import TABLE_COLUMNS, INDEXES
 
 
-def test_mysql_manages_exactly_the_five_canonical_production_tables():
+def test_mysql_manages_six_canonical_production_tables():
     assert schema.TABLES == (
         "DBD_COMPANY", "DBD_COMPANY_RELATION", "DBD_COMPANY_EVENT",
-        "DBD_FINANCIAL", "DBD_INDUSTRY",
+        "DBD_FINANCIAL", "DBD_INDUSTRY", "DBD_BRANCH",
     )
     for table in schema.TABLES:
         sql = schema.create_table_sql(table)

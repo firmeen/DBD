@@ -587,6 +587,8 @@ class V06Terminal:
         target[key] = value
 
     def _final_status(self, payload: Mapping[str, Any]) -> str:
+        if self.state.command == "migrate":
+            return str(payload.get("state") or "FAILED").upper()
         if self.state.command == "check-db":
             return "READY"
         if self.state.command in {"cycle-run", "cycle-loop"}:
@@ -742,19 +744,33 @@ class V06Terminal:
     def _render_migrate(self, width: int):
         if not self.state.result:
             body = Group(
-                self._centered("Applying safe schema contract", width, "cyan"),
+                self._centered("Inspecting / applying approved schema plan", width, "cyan"),
                 self._centered(self._motion("seal"), width, "cyan"),
             )
-            return self._panel(f"{self.state.backend.upper()} SCHEMA", body, "APPLYING", active=True)
+            return self._panel(f"{self.state.backend.upper()} SCHEMA", body, "RUNNING", active=True)
         result = self.state.result
-        created = result.get("created")
-        altered = result.get("altered")
+        state = str(result.get("state") or "FAILED").upper()
+        actions = result.get("actions") or []
+        blockers = result.get("blockers") or []
         items = [
-            ("Managed tables", result.get("managed_tables"), "migrate.tables"),
-            ("Created", len(created) if isinstance(created, list) else created, "migrate.created"),
-            ("Altered", len(altered) if isinstance(altered, list) else altered, "migrate.altered"),
+            ("Database", result.get("database"), "migrate.database"),
+            ("Existing tables", result.get("existing_tables"), "migrate.existing"),
+            ("Missing tables", len(result.get("missing_tables") or []), "migrate.missing"),
+            ("Planned operations", len(actions), "migrate.actions"),
+            ("Legacy rows", result.get("legacy_rows"), "migrate.legacy"),
+            ("Conflicts", result.get("data_conflicts"), "migrate.conflicts"),
         ]
-        return self._panel("SQL SERVER SCHEMA", self._metric_grid(items, width), "COMPLETE")
+        details = Text()
+        for action in actions[:8]:
+            details.append("\n  + " + str(action), style="cyan")
+        for blocker in blockers[:8]:
+            details.append("\n  ! " + str(blocker), style="red")
+        details.append("\nApply permitted: " + ("YES" if result.get("apply_permitted") else "NO"),
+                       style="green" if result.get("apply_permitted") else "red")
+        return self._panel(
+            "PRODUCTION SCHEMA MIGRATION",
+            Group(self._metric_grid(items, width), details), state,
+        )
 
     def _render_cutover(self, width: int):
         snapshot = self.state.result or self.state.cutover
@@ -1765,8 +1781,8 @@ class V06Terminal:
         if result_line:
             self._plain_write(result_line)
         finished = self.state.finished_at or self._wall_clock()
-        if status == "FAILED":
-            self._plain_write(f"Failed: {_timestamp(finished)} · Exit 1")
+        if status in {"FAILED", "BLOCKED"}:
+            self._plain_write(f"{status.title()}: {_timestamp(finished)}")
         elif status == "COMPLETE_WITH_FAILURES":
             self._plain_write(f"Completed with failures: {_timestamp(finished)}")
         else:
@@ -1782,12 +1798,13 @@ class V06Terminal:
                 f"managed_tables={payload.get('managed_tables')}"
             )
         if command == "migrate":
-            created = payload.get("created")
-            altered = payload.get("altered")
+            actions = payload.get("actions") or []
+            blockers = payload.get("blockers") or []
             return (
-                f"Result: status={status} managed_tables={payload.get('managed_tables')} "
-                f"created={len(created) if isinstance(created, list) else created} "
-                f"altered={len(altered) if isinstance(altered, list) else altered}"
+                f"Migration: state={status} backend={payload.get('backend')} "
+                f"database={payload.get('database')} actions={len(actions)} "
+                f"blockers={len(blockers)} apply={payload.get('apply_permitted')} "
+                + ("; ".join(str(x) for x in blockers[:3]) if blockers else "")
             )
         if command == "branch":
             return (

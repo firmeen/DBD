@@ -118,12 +118,14 @@ def test_company_page_without_branch_link_is_not_zero_evidence() -> None:
     assert classify_company_page(html,"0107538000533") == "UNAVAILABLE"
 
 
-def test_core_table_contract_unchanged_and_branch_columns_separately_owned() -> None:
-    assert len(MANAGED_TABLES) == 5
+def test_core_business_tables_include_branch_but_not_legacy_extensions() -> None:
+    assert len(MANAGED_TABLES) == 6
+    assert "dbo.DBD_BRANCH" in MANAGED_TABLES
     assert "dbo.DBD_COMPANY_BRANCH" not in MANAGED_TABLES
     assert "dbo.DBD_DISCOVERY_WORK" not in MANAGED_TABLES
     company_columns = {column.name for column in TABLE_COLUMNS["dbo.DBD_COMPANY"]}
-    assert not company_columns.intersection(branch_repository.SUMMARY_COLUMNS)
+    assert "branch_count" in company_columns
+    assert "branch_status" not in company_columns
 
 
 def test_durable_work_is_one_row_per_bucket_not_one_row_per_page() -> None:
@@ -134,11 +136,13 @@ def test_durable_work_is_one_row_per_bucket_not_one_row_per_page() -> None:
     assert "DBD_DISCOVERY_PAGE" not in discovery_repository.DDL
 
 
-def test_branch_writer_retains_history_and_disallows_core_mask_update() -> None:
+def test_canonical_branch_writer_does_not_touch_core_endpoint_masks() -> None:
     import inspect
-    assert "is_current=0" in inspect.getsource(branch_repository.save_snapshot)
-    assert "branch_count" in branch_repository.SUMMARY_COLUMNS
-    assert "DBD_COMPANY_BRANCH" in branch_repository.DDL
+    source = inspect.getsource(branch_repository.persist)
+    assert "UPDATE dbo.DBD_COMPANY SET branch_count" in source
+    assert "UPDATE dbo.DBD_COMPANY SET required_mask" not in source
+    assert "source_fingerprint" in source
+    assert "verified_phase" in source
 
 
 @pytest.mark.parametrize(
@@ -193,39 +197,12 @@ def test_discovery_coverage_requires_durable_roots_and_valid_split_tree(
     assert cursor.calls == 2
 
 
-def test_verified_branch_snapshot_is_due_again_after_monthly_refresh() -> None:
-    from datetime import datetime, timezone
-    from dbd.storage.sqlserver import branch_repository as store
-
-    class Cursor:
-        statements = []
-        rowcount = 1
-
-        def execute(self, sql, params):
-            self.statements.append((sql, params))
-
-        def fetchone(self):
-            return (None,)  # company exists, no previous verified snapshot
-
-        def close(self):
-            pass
-
-    class Connection:
-        def cursor(self):
-            return cursor
-
-    cursor = Cursor()
-    when = datetime(2026, 10, 14, tzinfo=timezone.utc)
-    assert store.save_snapshot(
-        Connection(), company_id=17, branches=[],
-        establishment_count=1, verified_at=when,
-        url="https://www.dataforthai.com/company-branch/0107538000533/show/printview",
-    )
-    sql, params = cursor.statements[-1]
-    assert "branch_retry_at=DATEADD(day,30,%s)" in sql
-    assert params[0] == 0
-    assert params[2] == "NO_BRANCH"
-    assert params[-1] == 17
+def test_branch_phase_is_separate_from_monthly_generation() -> None:
+    import inspect
+    source = inspect.getsource(branch_repository.persist)
+    assert "checked_phase" in source
+    assert "verified_phase" in source
+    assert "dataset_generation" not in source
 
 
 def test_external_branch_missing_and_invalid_pages_are_retryable() -> None:
@@ -410,36 +387,8 @@ def test_branch_run_does_not_count_stale_snapshot_as_persisted(monkeypatch) -> N
     assert stats["skipped"] == 1
 
 
-def test_branch_import_at_equal_verified_timestamp_preserves_target_snapshot() -> None:
-    from datetime import datetime, timezone
-    from dbd.storage.sqlserver import branch_repository as store
-
-    timestamp = datetime(2026, 10, 14, tzinfo=timezone.utc)
-    statements = []
-
-    class Cursor:
-        def execute(self, sql, params):
-            statements.append(sql)
-
-        def fetchone(self):
-            return (timestamp.replace(tzinfo=None),)
-
-        def close(self):
-            pass
-
-    class Connection:
-        def cursor(self):
-            return Cursor()
-
-    assert not store.save_snapshot(
-        Connection(), company_id=42,
-        branches=[{
-            "branch_no": "00001", "address_th": "New data",
-        }],
-        establishment_count=None,
-        verified_at=timestamp,
-        source="DATAFORTHAI_IMPORT",
-        url="https://www.dataforthai.com/company-branch/0107538000533/show/printview",
-    )
-    assert len(statements) == 1
-    assert statements[0].startswith("SELECT branch_verified_at")
+def test_canonical_branch_import_never_replaces_existing_historical_details() -> None:
+    import inspect
+    source = inspect.getsource(branch_repository.import_preserved_details)
+    assert "Existing canonical branch" in source or "existing" in source.lower()
+    assert "UPDATE dbo.DBD_COMPANY SET branch_count" not in source

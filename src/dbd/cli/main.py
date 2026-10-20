@@ -591,10 +591,17 @@ def main():
         sub.add_parser("check-db", help="Check database connectivity"),
         json_enabled=False,
     )
-    _add_output_options(
-        sub.add_parser("migrate", help="Converge the SQL Server production schema"),
-        json_enabled=False,
+    migration = _add_output_options(
+        sub.add_parser("migrate", help="Preview or explicitly apply the v0.6 production schema"),
     )
+    migration_modes = migration.add_mutually_exclusive_group()
+    migration_modes.add_argument("--check", "--dry-run", action="store_true",
+                                 help="Read-only schema and historical-data preflight (default)")
+    migration_modes.add_argument("--apply", action="store_true",
+                                 help="Apply only an inspected, approved migration plan")
+    migration.add_argument("--yes", action="store_true",
+                           help="Explicit additional approval for noninteractive --apply")
+
     _add_output_options(sub.add_parser("master-status", help="Count discovered and verified company identities"))
     _add_output_options(sub.add_parser("discover-status", help="Show discovery coverage"))
     _add_output_options(sub.add_parser("discover-retry", help="Requeue failed discovery buckets"))
@@ -836,8 +843,8 @@ def main():
     ):
         command_parser.add_argument("--backend", "--db", "-d", choices=("sqlserver", "mysql"))
     # Existing command parser objects were returned anonymously above.
-    for command in ("check-db", "migrate"):
-        sub.choices[command].add_argument("--backend", choices=("sqlserver", "mysql"))
+    sub.choices["check-db"].add_argument("--backend", choices=("sqlserver", "mysql"))
+    migration.add_argument("--backend", "--db", "-d", choices=("sqlserver", "mysql"))
     cutover = sub.add_parser(
         "cutover", help="Import legacy MySQL Generation 1 into the selected production target"
     )
@@ -859,12 +866,38 @@ def main():
 
             presenter.package_about(package_environment_snapshot())
         elif args.command == "migrate":
-            from ..storage.production import production_repository
+            from ..storage.migration import inspect_migration, apply_migration, MigrationBlocked
 
+            if args.yes and not args.apply:
+                raise ValueError("--yes requires --apply")
             backend = args.backend or settings.dbd_production_backend
-            v06_terminal = V06Terminal("migrate", app="DBD DATA").start(backend=backend)
-            result = production_repository(backend).ensure_schema()
-            v06_terminal.finish(result)
+            plan = inspect_migration(backend)
+            if args.json:
+                presenter.command_result("DBD · MIGRATION PREFLIGHT", plan)
+            else:
+                v06_terminal = V06Terminal("migrate", app="DBD DATA").start(backend=backend)
+                v06_terminal.finish(plan)
+                v06_terminal = None
+            if plan["state"] == "BLOCKED" and not args.apply:
+                raise SystemExit(2)
+            if args.apply:
+                if not plan["apply_permitted"]:
+                    raise MigrationBlocked("Migration BLOCKED: " + "; ".join(plan["blockers"]))
+                import sys
+                interactive = sys.stdin.isatty() and sys.stdout.isatty()
+                if interactive:
+                    answer = input("Type MIGRATE to approve the inspected plan: ")
+                    if answer.strip() != "MIGRATE":
+                        raise MigrationBlocked("Migration approval cancelled; no DDL executed")
+                elif not args.yes:
+                    raise MigrationBlocked("Noninteractive --apply requires --yes")
+                if not args.json:
+                    v06_terminal = V06Terminal("migrate", app="DBD DATA").start(backend=backend)
+                result = apply_migration(backend, expected=plan)
+                if args.json:
+                    presenter.command_result("DBD · MIGRATION RESULT", result)
+                else:
+                    v06_terminal.finish(result)
         elif args.command == "check-db":
             from ..storage.production import production_repository
 

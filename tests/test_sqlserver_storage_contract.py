@@ -24,13 +24,14 @@ from dbd.storage.sqlserver.schema import (
 )
 
 
-def test_v06_manages_exactly_five_sql_server_tables() -> None:
+def test_v06_manages_six_sql_server_business_tables() -> None:
     assert MANAGED_TABLES == (
         "dbo.DBD_COMPANY",
         "dbo.DBD_COMPANY_RELATION",
         "dbo.DBD_COMPANY_EVENT",
         "dbo.DBD_FINANCIAL",
         "dbo.DBD_INDUSTRY",
+        "dbo.DBD_BRANCH",
     )
     all_ddl = "\n".join(CREATE_TABLE_SQL.values()).upper()
     assert "DBD_MASTER_DEEP" not in all_ddl
