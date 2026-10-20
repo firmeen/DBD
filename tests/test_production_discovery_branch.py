@@ -270,6 +270,7 @@ def test_durable_split_allows_uncapped_child_count_with_bounded_page_metadata(
     parent = {
         "status": "COUNTED", "total_items": 30_000, "work_id": 17,
         "generation": 2, "scope_key": "full",
+        "filters_json": '{"keyword":"010","search_type":""}',
     }
     children = [
         SearchFilters(keyword="010", jp_types=["2"]),
