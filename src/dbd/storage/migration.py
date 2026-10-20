@@ -274,7 +274,34 @@ def _mysql_plan(conn: Any, *, owning_manager_lock: bool = False) -> dict[str, An
         p["blockers"].append("Wrong Production MySQL database")
     if int(_one(conn, "SELECT CAST(SUBSTRING_INDEX(VERSION(),'.',1) AS UNSIGNED)") or 0) < 8:
         p["blockers"].append("MySQL 8+ with functional-index and CHECK support required")
-    p["permissions"] = {"account": str(login), "ddl": "verify CREATE/ALTER/INDEX/REFERENCES grants"}
+    # SHOW GRANTS is read-only; never echo grant lines to the terminal.
+    # Roles with unexpanded privileges are intentionally fail-closed.
+    required = {"CREATE", "ALTER", "INDEX", "REFERENCES"}
+    granted: set[str] = set()
+    for record in _many(conn, "SHOW GRANTS"):
+        statement = str(record[0]).upper().replace("`", "")
+        if " ON " not in statement or " TO " not in statement:
+            continue
+        permissions, rest = statement.split(" ON ", 1)
+        scope = rest.split(" TO ", 1)[0].strip()
+        if scope not in {"*.*", settings.prod_mysql_database.upper() + ".*"}:
+            continue
+        if "ALL PRIVILEGES" in permissions:
+            granted.update(required)
+        elif permissions.startswith("GRANT "):
+            granted.update(
+                part.strip() for part in permissions.removeprefix("GRANT ").split(",")
+            )
+    missing_grants = sorted(required - granted)
+    p["permissions"] = {
+        "account": str(login), "required": sorted(required),
+        "verified": sorted(required & granted),
+        "missing": missing_grants,
+    }
+    if missing_grants:
+        p["blockers"].append(
+            "MySQL DDL privileges not demonstrated: " + ", ".join(missing_grants)
+        )
     held = _one(conn, "SELECT IS_USED_LOCK('dbd:v06:production:cycle')")
     if held is not None and not owning_manager_lock:
         p["active_workload"] = True
