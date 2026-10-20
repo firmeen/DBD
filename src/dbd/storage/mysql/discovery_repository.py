@@ -144,6 +144,35 @@ def next_work(conn, generation: int, scope: str) -> dict | None:
         ))
 
 
+def reopen_blocked_keyword(conn, generation: int, scope: str, *,
+                           semantics_certified: bool = False, limit: int = 100) -> int:
+    """Reopen only untouched unsafe-split buckets after semantic certification."""
+    if not semantics_certified:
+        return 0
+    if not 1 <= limit <= 1000:
+        raise ValueError("Keyword recovery limit must be 1..1000")
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT p.work_id FROM {TABLE} p "
+            "WHERE p.generation=%s AND p.scope_key=%s AND p.status='BLOCKED' "
+            "AND p.last_committed_page=0 AND p.total_items>10000 "
+            "AND p.last_error LIKE 'no_certified_lossless_split:%' "
+            f"AND NOT EXISTS (SELECT 1 FROM {TABLE} c WHERE c.parent_work_id=p.work_id) "
+            "ORDER BY p.updated_at,p.work_id LIMIT %s FOR UPDATE",
+            (generation,scope,limit),
+        )
+        ids=[int(row[0]) for row in cur.fetchall()]
+        for work_id in ids:
+            cur.execute(
+                f"UPDATE {TABLE} SET status='COUNTED',updated_at=UTC_TIMESTAMP(6) "
+                "WHERE work_id=%s AND status='BLOCKED' AND last_committed_page=0",
+                (work_id,),
+            )
+            if cur.rowcount!=1:
+                raise ContractError("Blocked keyword work changed before recovery commit")
+        return len(ids)
+
+
 def reopen_blocked_numeric(conn, generation: int, scope: str, *, limit: int = 100) -> int:
     if not 1 <= limit <= 1000:
         raise ValueError("Recovery limit must be 1..1000")
