@@ -488,7 +488,9 @@ def apply_migration(backend: str | None = None, *, expected: dict[str, Any]) -> 
                 result = ensure_schema(conn)
                 ensure_work(conn)
                 repo.validate_schema()
-            final = inspect_migration(selected)
+            # This process owns the MySQL manager lock. Do not classify our
+            # own lock as a competing workload during post-DDL verification.
+            final = inspect_migration(selected, owning_manager_lock=True)
         if final["state"] != "READY":
             raise MigrationBlocked(
                 "Schema DDL applied but final inspection not READY; recheck before rerun"
