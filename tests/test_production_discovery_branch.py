@@ -344,6 +344,8 @@ def test_branch_run_does_not_count_stale_snapshot_as_persisted(monkeypatch) -> N
     from dbd.storage.sqlserver.control_repository import ControlRepository
 
     class Repository:
+        backend = "sqlserver"
+
         @contextmanager
         def manager_lock(self, **kwargs):
             yield object()
@@ -353,38 +355,50 @@ def test_branch_run_does_not_count_stale_snapshot_as_persisted(monkeypatch) -> N
             yield object()
 
         def assert_manager_lock(self, *args, **kwargs):
-            return None
+            pass
 
     class FakeHttp:
         def __init__(self):
-            self.requests = 1
+            self.requests = 0
             self.stop = Event()
 
         def collect(self, jp_no):
+            self.requests += 1
             return {
-                "status": "COMPLETE", "branches": [{
-                    "branch_no": "00001",
-                    "address_th": "Test Road Bangkok",
-                }],
+                "status": "COMPLETE",
+                "branches": [{"branch_no": "00001", "address_th": "Test Road Bangkok"}],
                 "total": 2,
                 "url": "https://www.dataforthai.com/company-branch/"
                        + jp_no + "/show/printview",
             }
 
+        def close(self):
+            pass
+
     monkeypatch.setattr(setup_ui, "local_node_id", lambda: "node-admin")
     monkeypatch.setattr(ControlRepository, "require_admin", lambda *_: None)
-    monkeypatch.setattr(pipeline, "ProductionSqlServerRepository", Repository)
+    monkeypatch.setattr(ControlRepository, "_read", lambda *_args, **_kwargs: {"phase": 1})
     monkeypatch.setattr(pipeline, "BranchHttp", FakeHttp)
-    monkeypatch.setattr(pipeline.store, "validate_schema", lambda *_: None)
-    monkeypatch.setattr(pipeline.store, "candidates", lambda *_args, **_kwargs: [{
-        "company_id": 17, "registration_no": "0107538000533",
-    }])
-    monkeypatch.setattr(pipeline.store, "save_snapshot", lambda *_args, **_kwargs: False)
-    stats = pipeline.collect(limit=1)
-    assert stats["checked"] == 1
+    monkeypatch.setattr(pipeline.store if hasattr(pipeline, "store") else
+                        branch_repository, "validate_schema", lambda *_: None)
+    monkeypatch.setattr(branch_repository, "phase",
+                        lambda *_args, **_kwargs: {"phase": 1})
+    monkeypatch.setattr(branch_repository, "candidates",
+                        lambda _, *, after=None, **kwargs: (
+                            [{"company_id": 17, "juristic_type_code": "5",
+                              "registration_no": "0107538000533", "status_code": "1"}]
+                            if after is None else []
+                        ))
+    monkeypatch.setattr(branch_repository, "persist",
+                        lambda *_args, **_kwargs: "SKIPPED")
+    monkeypatch.setattr(branch_repository, "summary",
+                        lambda *_args, **_kwargs: {})
+    stats = pipeline.collect(limit=1, repository=Repository())
+    assert stats["checked"] == 0
     assert stats["verified"] == 0
     assert stats["branches"] == 0
     assert stats["skipped"] == 1
+
 
 
 def test_canonical_branch_import_never_replaces_existing_historical_details() -> None:
