@@ -1742,7 +1742,14 @@ def run_legacy_incremental_sync(
     event: EventCallback | None = None,
     backend: str = "sqlserver",
 ) -> dict[str, Any]:
-    """Import only new/authorized changed G1 values; never create G2 or delete."""
+    """Incrementally sync G1 using cooperative source-writer advisory fences.
+
+    External SQL clients not participating in these MySQL fences are outside
+    the exclusion guarantee. The independent second content pass detects
+    persistent drift but cannot prove the absence of transient A-to-B-to-A
+    mutations between observations. This is a code-level consistency model,
+    not an assertion that arbitrary Production writes are impossible.
+    """
     if not 1 <= batch_size <= 10000:
         raise ValueError("batch_size must be between 1 and 10000")
     repository = production_repository(backend)
