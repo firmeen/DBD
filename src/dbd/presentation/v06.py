@@ -789,7 +789,8 @@ class V06Terminal:
                 ("Target-only scope", snapshot.get("target_only_scope", 0), "cutover.target_only"),
                 ("Batches", snapshot.get("batches", 0), "cutover.batches"),
             ]
-            state = "COMPLETE" if self.state.result else "SYNCING"
+            state = (self.state.status if self.state.status in {"FAILED", "STOPPED"}
+                     else "COMPLETE" if self.state.result else "SYNCING")
             return self._panel(
                 f"MYSQL LEGACY → {self.state.backend.upper()} · NEW PHASE G1",
                 self._metric_grid(metrics, width),
