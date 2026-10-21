@@ -850,6 +850,8 @@ def main():
     )
     cutover.add_argument("--backend", choices=("sqlserver", "mysql"), default="sqlserver")
     cutover.add_argument("--batch-size", type=cutover_batch_size, default=500)
+    cutover.add_argument("--new-phase", action="store_true",
+                         help="G1-only legacy incremental synchronization (not a monthly cycle)")
     args = parser.parse_args()
     presenter = TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
@@ -906,11 +908,12 @@ def main():
             result = production_repository(backend).check_database()
             v06_terminal.finish(result)
         elif args.command == "cutover":
-            from ..cutover import run_generation1_cutover
+            from ..cutover import run_generation1_cutover, run_legacy_incremental_sync
 
             backend = args.backend
             v06_terminal = V06Terminal("cutover", app="DBD DATA").start(backend=backend)
-            result = run_generation1_cutover(
+            handler = run_legacy_incremental_sync if args.new_phase else run_generation1_cutover
+            result = handler(
                 backend=backend, batch_size=args.batch_size, event=v06_terminal.event,
             )
             v06_terminal.finish(result)
