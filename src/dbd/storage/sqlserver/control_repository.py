@@ -390,6 +390,55 @@ class ControlRepository:
             if schedule is not None and schedule.get("admin_node") != node_id:
                 raise ControlError("This is not the designated Admin Coordinator machine")
 
+    def require_cutover_access(self, conn, node_id: str) -> dict[str, Any]:
+        """Read-only Admin and *all-history* G1 admission under manager lock.
+
+        A completed control G2 is still permanent evidence against G1 import.
+        Caller owns the manager lock; this method never opens a new connection
+        or mutates the Control Plane.
+        """
+        self.validate_schema(conn)
+        if not node_id:
+            raise ControlError("Cutover requires a registered Admin Coordinator node")
+        self.require_node(conn, node_id, role="ADMIN")
+        if not self._has_admin_permission(conn):
+            raise ControlError("SQL Server login lacks Admin Control permissions")
+        schedule = self._read(conn, "SCHEDULE", "core")
+        if schedule is not None and schedule.get("admin_node") != node_id:
+            raise ControlError("Cutover must run on designated Admin Coordinator")
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT record_key,payload FROM {_TABLE} "
+                "WHERE record_type='GENERATION'"
+            )
+            records = cur.fetchall()
+        finally:
+            cur.close()
+        seen: set[int] = set()
+        for key, raw in records:
+            try:
+                item = json.loads(raw)
+                generation = item["generation"]
+                month = item["cycle_month"]
+                state = item["state"]
+                if (isinstance(generation, bool) or not isinstance(generation, int)
+                    or generation < 1 or not isinstance(month, str)
+                    or key != "core:" + month or not isinstance(state, str)):
+                    raise ValueError("inconsistent Generation identity")
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ControlError("Malformed monthly Generation record blocks G1 cutover") from exc
+            if generation in seen:
+                raise ControlError("Conflicting monthly Generation records block G1 cutover")
+            seen.add(generation)
+            if generation >= 2:
+                raise ControlError(
+                    f"Monthly Control already contains Generation {generation}; "
+                    "Generation 1 cutover permanently refused"
+                )
+        return {"authorized": True, "control_generations_checked": len(records),
+                "highest_control_generation": max(seen, default=0)}
+
     def can_execute_admission(self) -> bool:
         """Check the right to use the only Worker-writable control operation."""
         with connection() as conn:
