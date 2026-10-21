@@ -1622,6 +1622,9 @@ def _legacy_sync_industry_keys(prepared):
 def _legacy_sync_compare_domains(repository, conn, expected, observed,
                                  json_fields, column_types, financial_groups, *, write):
     inserted = updated = target_only = verified = 0
+    changed_keys: dict[str, set[tuple[Any, ...]]] = {
+        table: set() for table in ("relations", "events", "financial", "industries")
+    }
     for table in ("relations", "events", "financial", "industries"):
         wanted = _legacy_sync_index(table, expected[table], json_fields, column_types)
         found = _legacy_sync_index(table, observed[table], json_fields, column_types)
@@ -1643,13 +1646,23 @@ def _legacy_sync_compare_domains(repository, conn, expected, observed,
                     changes.append((int(existing[_LEGACY_SYNC_PK[table]]), fields))
             verified += 1
         if write:
+            changed_keys[table].update(
+                tuple(row.get(col) for col in _LEGACY_SYNC_KEYS[table])
+                for row in missing
+            )
+            changed_keys[table].update(
+                tuple(row.get(col) for col in _LEGACY_SYNC_KEYS[table])
+                for key, row in wanted.items() if key in found and
+                any(pk == found[key][_LEGACY_SYNC_PK[table]] for pk, _values in changes)
+            )
             repository.insert_legacy_sync_rows(conn, table, missing)
             repository.update_legacy_sync_rows(conn, table, changes)
         inserted += len(missing)
         updated += len(changes)
         target_only += len(found.keys() - wanted.keys())
     return {"domains_inserted": inserted, "domains_updated": updated,
-            "domains_verified": verified, "target_only_scope": target_only}
+            "domains_verified": verified, "target_only_scope": target_only,
+            "changed_keys": changed_keys}
 
 
 def _assert_legacy_sync_admission(repository, backend, manager_conn):
@@ -1764,6 +1777,7 @@ def run_legacy_incremental_sync(
                 _assert_source_snapshot(source_conn, baseline)
                 repository.assert_manager_lock(manager_conn)
                 counter = {"inserted": 0, "updated": 0, "unchanged": 0}
+                classifications: dict[tuple[str, str], str] = {}
                 with _legacy_sync_transaction(repository, stats, event) as conn:
                     keys = [item[0] for item in prepared]
                     observed = repository.read_cutover_rows(
@@ -1785,11 +1799,11 @@ def run_legacy_incremental_sync(
                                     conn, "companies",
                                     [(int(existing[identity]["company_id"]), change)],
                                 )
-                                counter["updated"] += 1
+                                classifications[identity] = "updated"
                             else:
-                                counter["unchanged"] += 1
+                                classifications[identity] = "unchanged"
                         else:
-                            counter["inserted"] += 1
+                            classifications[identity] = "inserted"
                     repository.insert_legacy_sync_rows(conn, "companies", new_companies)
                     # New company PKs are target-generated; reread after INSERT.
                     observed = repository.read_cutover_rows(
@@ -1807,6 +1821,21 @@ def run_legacy_incremental_sync(
                         repository, conn, expected_domains, observed,
                         json_fields, column_types, financial_groups, write=True,
                     )
+                    affected_ids = {
+                        key[0] for table in ("relations", "events", "financial")
+                        for key in domains["changed_keys"][table]
+                    }
+                    affected_industry = domains["changed_keys"]["industries"]
+                    for identity, _company, _relations, _events, _fin, industries in prepared:
+                        if classifications[identity] != "unchanged":
+                            continue
+                        if ids[identity] in affected_ids or any(
+                            tuple(item.get(k) for k in _LEGACY_SYNC_KEYS["industries"])
+                            in affected_industry for item in industries
+                        ):
+                            classifications[identity] = "updated"
+                    for classification in classifications.values():
+                        counter[classification] += 1
                     _assert_source_snapshot(source_conn, baseline)
                     repository.assert_manager_lock(manager_conn)
                 _assert_source_snapshot(source_conn, baseline)
