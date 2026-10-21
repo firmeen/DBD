@@ -954,6 +954,64 @@ class ProductionSqlServerRepository:
         finally:
             cur.close()
 
+    def read_cutover_rows(self, conn, identities, industry_keys):
+        """Bounded, read-only G1 readback; no business transformations here."""
+        if len(identities) > 1000 or len(industry_keys) > 1000:
+            raise ValueError("Cutover verification exceeds bounded micro-batch")
+        company_ids = self.company_ids(conn, identities)
+        ids = sorted(set(company_ids.values()))
+        result = {key: [] for key in (
+            "companies", "relations", "events", "financial", "industries"
+        )}
+        tables = (
+            ("companies", "dbo.DBD_COMPANY"),
+            ("relations", "dbo.DBD_COMPANY_RELATION"),
+            ("events", "dbo.DBD_COMPANY_EVENT"),
+            ("financial", "dbo.DBD_FINANCIAL"),
+        )
+
+        def select(sql, params, label):
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, tuple(params))
+                names = [str(item[0]) for item in cur.description]
+                result[label].extend(dict(zip(names, row, strict=True))
+                                     for row in cur.fetchall())
+            finally:
+                cur.close()
+
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join(["%s"] * len(chunk))
+            for label, table in tables:
+                select(
+                    f"SELECT * FROM {table} WHERE company_id IN ({placeholders})",
+                    chunk, label,
+                )
+        key_columns = (
+            "submit_objective_code", "fiscal_year", "business_size_code",
+            "location_type", "location_no",
+        )
+        for offset in range(0, len(industry_keys), 75):
+            chunk = industry_keys[offset:offset + 75]
+            predicates, params = [], []
+            for key in chunk:
+                if len(key) != 5:
+                    raise ValueError("Invalid Industry verification natural key")
+                parts = []
+                for col, value in zip(key_columns, key, strict=True):
+                    if value is None:
+                        parts.append(f"[{col}] IS NULL")
+                    else:
+                        parts.append(f"[{col}]=%s")
+                        params.append(value)
+                predicates.append("(" + " AND ".join(parts) + ")")
+            select(
+                "SELECT * FROM dbo.DBD_INDUSTRY WHERE " + " OR ".join(predicates),
+                params, "industries",
+            )
+        return result
+
     def upsert_relations(self, conn, rows: list[dict[str, Any]]) -> int:
         return _upsert_many(
             conn,
