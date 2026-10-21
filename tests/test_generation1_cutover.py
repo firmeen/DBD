@@ -964,6 +964,7 @@ def test_source_terminal_contract_queries_masks_and_deferred_runtime():
     assert "(required_mask & ~" in source
     assert "deep_invalid_masks" in source
     assert "deep_status_mismatch" in source
+    assert "deep_invalid_payloads" in source
     assert "source_invalid_identity" in source
     assert not any(word in source.upper() for word in ("DELETE FROM", "TRUNCATE TABLE"))
 
@@ -971,7 +972,7 @@ def test_source_terminal_contract_queries_masks_and_deferred_runtime():
 @pytest.mark.parametrize("blocked", [
     "runtime_pending", "runtime_running", "runtime_retry_wait",
     "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
-    "source_invalid_identity",
+    "deep_invalid_payloads", "source_invalid_identity",
 ])
 def test_preflight_rejects_every_source_terminal_blocker(monkeypatch, blocked):
     monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
@@ -988,7 +989,7 @@ def test_preflight_rejects_every_source_terminal_blocker(monkeypatch, blocked):
         "master_waiting", "runtime_pending", "runtime_running",
         "runtime_retry_wait", "discovery_active_leases", "deep_active",
         "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
-        "source_invalid_identity",
+        "deep_invalid_payloads", "source_invalid_identity",
     )}
     state.update(source_updated_at=None)
     state[blocked] = 1
