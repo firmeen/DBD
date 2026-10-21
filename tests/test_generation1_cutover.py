@@ -1528,3 +1528,75 @@ def test_incremental_refuses_collector_masks_on_existing_company():
     j, types, groups = cutover._legacy_sync_metadata()
     with pytest.raises(CutoverSafetyError, match="Collector-owned"):
         cutover._legacy_sync_changes("companies", expected, actual, j, types, groups)
+
+
+
+def test_incremental_financial_new_row_marks_existing_company_updated(monkeypatch):
+    source = _legacy_sync_source("0100000000001")
+    existing = {
+        "company_id": 7, "juristic_type_code": "5", "registration_no": source["jp_no"],
+        "company_name_th": source["jp_name"], "dbd_update_date": source["dbd_update_date"],
+        "source_updated_at": source["updated_at"], "dataset_generation": 1,
+        "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+
+    class FinancialRepo(_LegacySyncFakeRepository):
+        def __init__(self):
+            super().__init__([existing])
+            self.financial = {}
+
+        def read_cutover_rows(self, _conn, identities, industry_keys, **kwargs):
+            rows = super().read_cutover_rows(_conn, identities, industry_keys, **kwargs)
+            ids = {row["company_id"] for row in rows["companies"]}
+            rows["financial"] = [
+                dict(value) for key, value in self.financial.items() if key[0] in ids
+            ]
+            return rows
+
+        def insert_legacy_sync_rows(self, _conn, table, rows):
+            if table != "financial":
+                return super().insert_legacy_sync_rows(_conn, table, rows)
+            for row in rows:
+                key = (row["company_id"], row["fiscal_year"])
+                assert key not in self.financial
+                self.financial[key] = {**row, "financial_id": len(self.financial) + 1}
+
+        def update_legacy_sync_rows(self, _conn, table, changes):
+            if table == "financial":
+                raise AssertionError("No financial UPDATE expected")
+            return super().update_legacy_sync_rows(_conn, table, changes)
+
+    repo = FinancialRepo()
+    _legacy_sync_fake_setup(monkeypatch, repo, [source])
+    monkeypatch.setattr(cutover, "transform_financials", lambda _row, *, published_at: [{
+        "fiscal_year": "2568", "submission_payload": '{"year":2568}',
+        "submission_updated_at": datetime(2026, 10, 20),
+        "first_seen_generation": 1, "last_seen_generation": 1,
+        "published_at": published_at,
+    }])
+    result = cutover.run_legacy_incremental_sync(backend="mysql")
+    assert result["inserted"] == 0
+    assert result["updated"] == 1
+    assert result["unchanged"] == 0
+    assert result["domains_inserted"] == 1
+    assert (7, "2568") in repo.financial
+    second = cutover.run_legacy_incremental_sync(backend="mysql")
+    assert second["updated"] == 0 and second["unchanged"] == 1
+    assert second["domains_inserted"] == 0
+
+
+def test_incremental_financial_conflicting_revision_preserves_target():
+    expected = {
+        "company_id": 7, "fiscal_year": "2568", "submission_payload": '{"amount":200}',
+        "submission_updated_at": datetime(2026, 10, 20),
+        "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+    actual = {
+        **expected, "financial_id": 9,
+        "submission_payload": '{"amount":100}',
+        "submission_updated_at": datetime(2026, 10, 21),
+    }
+    j, types, groups = cutover._legacy_sync_metadata()
+    with pytest.raises(CutoverSafetyError, match="Unproven freshness"):
+        cutover._legacy_sync_changes("financial", expected, actual, j, types, groups)
+    assert actual["submission_payload"] == '{"amount":100}'
