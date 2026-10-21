@@ -1458,7 +1458,9 @@ def test_incremental_digest_detects_change_with_identical_watermark(monkeypatch)
     repo = _LegacySyncFakeRepository()
     _legacy_sync_fake_setup(monkeypatch, repo, [before],
                             source_versions=[[before], [after]])
-    with pytest.raises(CutoverSafetyError, match="content drift"):
+    # Any source mutation must fail before COMPLETE; mapped-value disagreement
+    # can be detected earlier than the final SHA-256 comparison.
+    with pytest.raises(CutoverSafetyError):
         cutover.run_legacy_incremental_sync(backend="mysql")
     assert repo.committed >= 1
 
@@ -1492,3 +1494,34 @@ def test_incremental_domain_with_missing_source_is_preserved():
         Repo(), object(), expected, actual, j, types, groups, write=False,
     )
     assert result["target_only_scope"] == 1
+
+
+def test_incremental_shared_industry_payload_conflict_is_never_overwritten():
+    from datetime import datetime
+    expected = {
+        "submit_objective_code": "1", "fiscal_year": "2568",
+        "business_size_code": None, "location_type": None, "location_no": None,
+        "payload": '{"a":2}', "source_updated_at": datetime(2026, 10, 21),
+        "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+    actual = {
+        **expected, "industry_id": 90, "payload": '{"a":1}',
+        "source_updated_at": datetime(2026, 10, 20),
+    }
+    j, types, groups = cutover._legacy_sync_metadata()
+    with pytest.raises(CutoverSafetyError, match="Industry"):
+        cutover._legacy_sync_changes("industries", expected, actual, j, types, groups)
+
+
+def test_incremental_refuses_collector_masks_on_existing_company():
+    expected = {
+        "juristic_type_code": "5", "registration_no": "0100000000001",
+        "done_mask": 127, "dbd_update_date": "2026-10-21",
+    }
+    actual = {
+        **expected, "company_id": 7, "dataset_generation": 1,
+        "first_seen_generation": 1, "last_seen_generation": 1, "done_mask": 0,
+    }
+    j, types, groups = cutover._legacy_sync_metadata()
+    with pytest.raises(CutoverSafetyError, match="Collector-owned"):
+        cutover._legacy_sync_changes("companies", expected, actual, j, types, groups)
