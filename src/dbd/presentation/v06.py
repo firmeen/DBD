@@ -788,6 +788,11 @@ class V06Terminal:
                 ("Target-only companies", snapshot.get("target_only_companies", 0), "cutover.target_companies"),
                 ("Target-only scope", snapshot.get("target_only_scope", 0), "cutover.target_only"),
                 ("Batches", snapshot.get("batches", 0), "cutover.batches"),
+                ("Source evidence", "VERIFIED" if snapshot.get("verification", {}).get(
+                    "source_content_verified") else "PENDING", "cutover.source_evidence"),
+                ("Target verification", "VERIFIED" if self.state.result and
+                 snapshot.get("verification", {}).get("companies_verified") ==
+                 snapshot.get("source_rows") else "PENDING", "cutover.target_verification"),
             ]
             state = (self.state.status if self.state.status in {"FAILED", "STOPPED"}
                      else "COMPLETE" if self.state.result else "SYNCING")
