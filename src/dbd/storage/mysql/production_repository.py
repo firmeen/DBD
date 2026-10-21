@@ -269,8 +269,9 @@ class ProductionMySqlRepository:
         """MySQL equivalent of bounded, read-only G1 readback."""
         if len(identities) > 1000:
             raise ValueError("Cutover verification exceeds bounded micro-batch")
-        company_ids = self.company_ids(conn, identities,
-                                       allow_missing=allow_missing, for_update=for_update)
+        company_ids = (self.company_ids(conn, identities,
+                                        allow_missing=allow_missing, for_update=for_update)
+                       if allow_missing or for_update else self.company_ids(conn, identities))
         ids = sorted(set(company_ids.values()))
         result = {key: [] for key in (
             "companies", "relations", "events", "financial", "industries"
