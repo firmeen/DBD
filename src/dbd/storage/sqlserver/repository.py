@@ -1053,7 +1053,7 @@ class ProductionSqlServerRepository:
             cur.close()
 
     def insert_legacy_sync_rows(self, conn, table: str, rows: list[dict[str, Any]]) -> None:
-        """INSERT-only; a duplicate natural key must fail instead of overwriting data."""
+        """Bounded INSERT-only batches; never turn a uniqueness race into an UPSERT."""
         tables = {
             "companies": "dbo.DBD_COMPANY", "relations": "dbo.DBD_COMPANY_RELATION",
             "events": "dbo.DBD_COMPANY_EVENT", "financial": "dbo.DBD_FINANCIAL",
@@ -1062,18 +1062,22 @@ class ProductionSqlServerRepository:
         if table not in tables:
             raise SqlServerWriteError("Invalid legacy sync table")
         columns = tuple(col for col in _table_write_columns(tables[table]) if col != "branch_count")
+        grouped: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
+        for row in rows:
+            if not row or set(row) - set(columns):
+                raise SqlServerWriteError("Unapproved legacy sync INSERT fields")
+            names = tuple(name for name in columns if name in row)
+            grouped.setdefault(names, []).append(
+                tuple(_production_value(row[name]) for name in names)
+            )
         cur = conn.cursor()
         try:
-            for row in rows:
-                if not row or set(row) - set(columns):
-                    raise SqlServerWriteError("Unapproved legacy sync INSERT fields")
-                names = tuple(name for name in columns if name in row)
-                cur.execute(
-                    f"INSERT INTO {tables[table]} (" +
-                    ",".join(f"[{name}]" for name in names) + ") VALUES (" +
-                    ",".join(["%s"] * len(names)) + ")",
-                    tuple(_production_value(row[name]) for name in names),
-                )
+            for names, parameters in grouped.items():
+                sql = (f"INSERT INTO {tables[table]} (" +
+                       ",".join(f"[{name}]" for name in names) + ") VALUES (" +
+                       ",".join(["%s"] * len(names)) + ")")
+                for offset in range(0, len(parameters), 200):
+                    cur.executemany(sql, parameters[offset:offset + 200])
         finally:
             cur.close()
 
