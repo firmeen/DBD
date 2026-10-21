@@ -1600,3 +1600,21 @@ def test_incremental_financial_conflicting_revision_preserves_target():
     with pytest.raises(CutoverSafetyError, match="Unproven freshness"):
         cutover._legacy_sync_changes("financial", expected, actual, j, types, groups)
     assert actual["submission_payload"] == '{"amount":100}'
+
+
+
+def test_incremental_large_window_uses_at_most_1000_company_micro_batches(monkeypatch):
+    source = [_legacy_sync_source(f"{n:013d}") for n in range(1001)]
+    class BoundedRepo(_LegacySyncFakeRepository):
+        def read_cutover_rows(self, _conn, identities, industry_keys, **kwargs):
+            assert len(identities) <= 1000
+            return super().read_cutover_rows(_conn, identities, industry_keys, **kwargs)
+    repo = BoundedRepo()
+    _legacy_sync_fake_setup(monkeypatch, repo, source)
+    result = cutover.run_legacy_incremental_sync(
+        backend="mysql", batch_size=10000,
+    )
+    assert result["scanned"] == 1001
+    assert result["windows"] == 1
+    assert result["batches"] == 2
+    assert result["inserted"] == 1001
