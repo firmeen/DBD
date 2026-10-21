@@ -232,7 +232,7 @@ class ProductionMySqlRepository:
             "next_generation": active or max(2, finalized + 1),
         }
 
-    def company_ids(self, conn, identities):
+    def company_ids(self, conn, identities, *, allow_missing=False, for_update=False):
         unique = list(dict.fromkeys(
             (_identity(a, "juristic_type_code"), _identity(b, "registration_no"))
             for a, b in identities
@@ -248,10 +248,10 @@ class ProductionMySqlRepository:
                 cur.execute(
                     "SELECT juristic_type_code,registration_no,company_id "
                     "FROM DBD_COMPANY WHERE (juristic_type_code,registration_no) "
-                    f"IN ({placeholders})", flat,
+                    f"IN ({placeholders})" + (" FOR UPDATE" if for_update else ""), flat,
                 )
                 result.update({(str(a), str(b)): int(pk) for a, b, pk in cur.fetchall()})
-        if len(result) != len(unique):
+        if not allow_missing and len(result) != len(unique):
             raise MySqlProductionWriteError("Unable to resolve MySQL company_id")
         return result
 
@@ -264,11 +264,13 @@ class ProductionMySqlRepository:
             conn, [(x["juristic_type_code"], x["registration_no"]) for x in rows]
         )
 
-    def read_cutover_rows(self, conn, identities, industry_keys):
+    def read_cutover_rows(self, conn, identities, industry_keys, *,
+                          allow_missing=False, for_update=False):
         """MySQL equivalent of bounded, read-only G1 readback."""
         if len(identities) > 1000:
             raise ValueError("Cutover verification exceeds bounded micro-batch")
-        company_ids = self.company_ids(conn, identities)
+        company_ids = self.company_ids(conn, identities,
+                                       allow_missing=allow_missing, for_update=for_update)
         ids = sorted(set(company_ids.values()))
         result = {key: [] for key in (
             "companies", "relations", "events", "financial", "industries"
@@ -292,7 +294,8 @@ class ProductionMySqlRepository:
             placeholders = ",".join(["%s"] * len(chunk))
             for label, table in tables:
                 select(
-                    f"SELECT * FROM `{table}` WHERE company_id IN ({placeholders})",
+                    f"SELECT * FROM `{table}` WHERE company_id IN ({placeholders})" +
+                    (" FOR UPDATE" if for_update else ""),
                     chunk, label,
                 )
         key_columns = (
@@ -314,10 +317,72 @@ class ProductionMySqlRepository:
                         params.append(value)
                 predicates.append("(" + " AND ".join(parts) + ")")
             select(
-                "SELECT * FROM DBD_INDUSTRY WHERE " + " OR ".join(predicates),
+                ("SELECT * FROM DBD_INDUSTRY WHERE " + " OR ".join(predicates) +
+                 (" FOR UPDATE" if for_update else "")),
                 params, "industries",
             )
         return result
+
+    def insert_legacy_sync_rows(self, conn, table, rows):
+        """INSERT only; natural-key conflicts fail instead of overwriting."""
+        tables = {
+            "companies": "DBD_COMPANY", "relations": "DBD_COMPANY_RELATION",
+            "events": "DBD_COMPANY_EVENT", "financial": "DBD_FINANCIAL",
+            "industries": "DBD_INDUSTRY",
+        }
+        if table not in tables:
+            raise MySqlProductionWriteError("Invalid legacy sync table")
+        columns = set(_columns(tables[table])) - {"branch_count"}
+        with conn.cursor() as cur:
+            for row in rows:
+                if not row or set(row) - columns:
+                    raise MySqlProductionWriteError("Unapproved legacy sync INSERT fields")
+                names = tuple(sorted(row))
+                cur.execute(
+                    f"INSERT INTO `{tables[table]}` (" +
+                    ",".join(f"`{name}`" for name in names) + ") VALUES (" +
+                    ",".join(["%s"] * len(names)) + ")",
+                    tuple(_production_value(row[name]) for name in names),
+                )
+
+    def update_legacy_sync_rows(self, conn, table, changes):
+        """Selective UPDATE; the G1 predicate prevents Generation regression."""
+        tables = {
+            "companies": ("DBD_COMPANY", "company_id"),
+            "relations": ("DBD_COMPANY_RELATION", "relation_id"),
+            "events": ("DBD_COMPANY_EVENT", "event_id"),
+            "financial": ("DBD_FINANCIAL", "financial_id"),
+            "industries": ("DBD_INDUSTRY", "industry_id"),
+        }
+        if table not in tables:
+            raise MySqlProductionWriteError("Invalid legacy sync table")
+        table_name, pk = tables[table]
+        prohibited = {
+            "company_id", "relation_id", "event_id", "financial_id", "industry_id",
+            "juristic_type_code", "registration_no", "relation_type", "event_type",
+            "source_key", "fiscal_year", "submit_objective_code", "business_size_code",
+            "location_type", "location_no", "first_seen_generation",
+            "last_seen_generation", "dataset_generation", "branch_count",
+            "lease_owner", "lease_expires_at", "retry_at", "required_mask",
+            "done_mask", "not_available_mask", "failed_mask", "collect_status",
+            "endpoint_meta",
+        }
+        accepted = set(_columns(table_name)) - prohibited
+        with conn.cursor() as cur:
+            for pk_value, values in changes:
+                if not values or set(values) - accepted:
+                    raise MySqlProductionWriteError("Unapproved legacy sync UPDATE field")
+                keys = tuple(sorted(values))
+                cur.execute(
+                    f"UPDATE `{table_name}` SET " +
+                    ",".join(f"`{name}`=%s" for name in keys) +
+                    f" WHERE `{pk}`=%s AND last_seen_generation=1" +
+                    (" AND dataset_generation=1" if table == "companies" else ""),
+                    tuple(_production_value(values[key]) for key in keys) +
+                    (int(pk_value),),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise MySqlProductionWriteError("Legacy sync update lost G1 row ownership")
 
     def upsert_relations(self, conn, rows):
         return _upsert_many(
