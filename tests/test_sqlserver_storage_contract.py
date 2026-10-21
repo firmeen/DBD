@@ -1086,3 +1086,48 @@ def test_targeted_sqlserver_core_claim_needs_admin_identity(monkeypatch) -> None
             lease_seconds=300, worker_prefix="worker-attempt",
             company_id=42,
         )
+
+
+
+def test_cutover_readback_is_read_only_bounded_and_natural_keyed(monkeypatch):
+    queries = []
+    target = {"company_id": 8, "juristic_type_code": "5",
+              "registration_no": "0100000000001", "company_name_th": "บริษัท ทดสอบ"}
+    class Cursor:
+        def __init__(self):
+            self.description = []
+            self.rows = []
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, sql, params=()):
+            assert sql.lstrip().upper().startswith("SELECT "), sql
+            assert len(params) <= 500
+            queries.append((sql, tuple(params)))
+            self.rows = [tuple(target.values())] if "DBD_COMPANY WHERE" in sql else []
+            self.description = [(k,) for k in target] if self.rows else [("company_id",)]
+        def fetchall(self):
+            return list(self.rows)
+        def close(self):
+            pass
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionSqlServerRepository()
+    monkeypatch.setattr(repo, "company_ids", lambda _conn, _keys: {
+        ("5", "0100000000001"): 8,
+    })
+    rows = repo.read_cutover_rows(
+        Connection(), [("5", "0100000000001")],
+        [("101", "2568", None, None, None)],
+    )
+    assert len(rows["companies"]) == 1
+    assert rows["companies"][0]["company_name_th"] == "บริษัท ทดสอบ"
+    assert rows["relations"] == rows["events"] == rows["financial"] == []
+    assert any("DBD_INDUSTRY" in query and "IS NULL" in query
+               for query, _ in queries)
+    assert not any("UPDATE " in query or "DELETE " in query or "INSERT " in query
+                   for query, _ in queries)
+    with pytest.raises(ValueError, match="bounded"):
+        repo.read_cutover_rows(Connection(), [("5", "1")] * 1001, [])
