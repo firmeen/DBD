@@ -1082,3 +1082,106 @@ def test_sqlserver_cutover_admission_uses_real_control_policy(monkeypatch):
     selected.clear()
     cutover._assert_cutover_target_admission(object(), "mysql", target_conn)
     assert selected == []
+
+
+
+@pytest.mark.parametrize("change", [
+    "none", "wrong_name", "wrong_identity", "extra_relation", "wrong_financial",
+    "changed_source",
+])
+def test_streamed_cutover_reconciliation_detects_equal_count_mismatches(
+    monkeypatch, change,
+):
+    from hashlib import sha256
+    source = {"jp_type_code": "5", "jp_no": "0100000000001", "jp_name": "บริษัท แรก"}
+    expected_company = {
+        "juristic_type_code": "5", "registration_no": "0100000000001",
+        "company_name_th": "บริษัท แรก",
+    }
+    target_company = {**expected_company, "company_id": 7}
+    if change == "wrong_name":
+        target_company["company_name_th"] = "บริษัท ไม่ตรงกัน"
+    if change == "wrong_identity":
+        target_company["registration_no"] = "0100000000002"
+    target_relation = {"company_id": 7, "relation_type": "COMMITTEE",
+                       "source_key": "unexpected"}
+    fin_expected = {"fiscal_year": "2568", "total_assets": Decimal("100.00")}
+    target_fin = {**fin_expected, "company_id": 7}
+    if change == "wrong_financial":
+        target_fin["total_assets"] = Decimal("101.00")
+    source_for_verify = {
+        **source, "jp_name": "บริษัท เปลี่ยน"
+    } if change == "changed_source" else source
+
+    class Repo:
+        @contextmanager
+        def transaction(self):
+            yield object()
+        def read_cutover_rows(self, _conn, identities, industry_keys):
+            assert identities == [("5", "0100000000001")]
+            return {
+                "companies": [target_company],
+                "relations": [target_relation] if change == "extra_relation" else [],
+                "events": [],
+                "financial": [target_fin],
+                "industries": [],
+            }
+
+    monkeypatch.setattr(
+        cutover, "source_batches",
+        lambda _conn, **_kw: iter([[source_for_verify]]),
+    )
+    monkeypatch.setattr(
+        cutover, "transform_company",
+        lambda row, **_kw: {**expected_company,
+                            "company_name_th": row["jp_name"]},
+    )
+    monkeypatch.setattr(cutover, "transform_relations", lambda *_a, **_kw: [])
+    monkeypatch.setattr(cutover, "transform_events", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        cutover, "transform_financials",
+        lambda *_a, **_kw: [dict(fin_expected)],
+    )
+    monkeypatch.setattr(cutover, "transform_industries", lambda *_a, **_kw: [])
+    digest = sha256()
+    cutover._source_digest_append(digest, source)
+
+    def run():
+        return cutover._verify_cutover_equivalence(
+            object(), Repo(), batch_size=1, published_at=datetime(2026, 10, 21),
+            expected_count=1, expected_digest=digest.hexdigest(),
+        )
+    if change == "none":
+        assert run()["source_content_verified"] is True
+    else:
+        with pytest.raises(CutoverSafetyError):
+            run()
+
+
+def test_sqlserver_control_denied_before_source_connection(monkeypatch):
+    events = []
+    class Repo:
+        def validate_schema(self):
+            return None
+        @contextmanager
+        def manager_lock(self):
+            events.append("manager")
+            yield object()
+        def assert_manager_lock(self, _conn):
+            return None
+        def generation_state(self, _conn):
+            return {"finalized_generation": 1, "last_seen_generation": 1,
+                    "active_generation": None}
+    @contextmanager
+    def source_never_opens():
+        events.append("SOURCE-OPENED")
+        yield object()
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repo())
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission",
+                        lambda *_a: (_ for _ in ()).throw(
+                            CutoverSafetyError("Admin authorization denied")
+                        ))
+    monkeypatch.setattr(cutover, "source_fence", source_never_opens)
+    with pytest.raises(CutoverSafetyError, match="authorization"):
+        cutover.run_generation1_cutover()
+    assert events == ["manager"]
