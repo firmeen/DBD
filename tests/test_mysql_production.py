@@ -418,3 +418,103 @@ def test_cutover_industry_readback_more_than_1000_keys_remains_sql_bounded(monke
     assert result["industries"] == []
     industry_queries = [sql for sql, _ in queries if "DBD_INDUSTRY" in sql]
     assert len(industry_queries) == 15
+
+
+def test_incremental_sync_repository_insert_and_selective_update_are_parameterized():
+    from datetime import datetime
+    calls = []
+    class Cursor:
+        rowcount = 1
+        def execute(self, sql, params=()):
+            calls.append((sql, tuple(params)))
+            assert "%s" in sql
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionMySqlRepository()
+    conn = Connection()
+    repo.insert_legacy_sync_rows(conn, "companies", [{
+        "juristic_type_code": "5", "registration_no": "0100000000001",
+        "company_name_th": "บริษัท ใหม่", "dataset_generation": 1,
+        "first_seen_generation": 1, "last_seen_generation": 1,
+        "published_at": datetime(2026, 10, 21),
+    }])
+    repo.update_legacy_sync_rows(conn, "companies", [(10, {
+        "company_name_th": "บริษัท อัปเดต",
+        "published_at": datetime(2026, 10, 21),
+    })])
+    assert len(calls) == 2
+    assert calls[0][0].startswith("INSERT INTO")
+    assert calls[1][0].startswith("UPDATE")
+    assert "last_seen_generation=1" in calls[1][0]
+    assert "dataset_generation=1" in calls[1][0]
+    assert "lease_owner" not in calls[1][0]
+    assert "branch_count" not in calls[1][0]
+    assert "UPDATE" not in calls[0][0]
+    assert calls[0][1][1] != ""  # Company identity was sent as a bound value
+
+
+@pytest.mark.parametrize("protected", [
+    "company_id", "first_seen_generation", "dataset_generation",
+    "last_seen_generation", "done_mask", "required_mask",
+    "lease_owner", "branch_count", "collect_status",
+])
+def test_incremental_sync_rejects_protected_update_columns(protected):
+    class Cursor:
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionMySqlRepository()
+    with pytest.raises(Exception, match="Unapproved"):
+        repo.update_legacy_sync_rows(Connection(), "companies", [(8, {protected: 42})])
+
+
+def test_incremental_sync_allows_missing_readback_for_new_company(monkeypatch):
+    repo = ProductionMySqlRepository()
+    selected = []
+    def lookup(_conn, identities, *, allow_missing=False, for_update=False):
+        selected.append((allow_missing, for_update))
+        return {}
+    monkeypatch.setattr(repo, "company_ids", lookup)
+    class Connection:
+        def cursor(self):
+            raise AssertionError("No existing company IDs: no data SELECT required")
+    rows = repo.read_cutover_rows(
+        Connection(), [("5", "0100000000001")], [],
+        allow_missing=True, for_update=True,
+    )
+    assert selected == [(True, True)]
+    assert not any(rows.values())
+
+
+def test_incremental_sync_global_integrity_queries_are_select_only():
+    seen = []
+    class Cursor:
+        def execute(self, sql, params=()):
+            assert sql.lstrip().upper().startswith("SELECT")
+            seen.append(sql)
+        def fetchone(self):
+            return (0,)
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    ProductionMySqlRepository().verify_legacy_sync_integrity(Connection())
+    assert len(seen) >= 8
