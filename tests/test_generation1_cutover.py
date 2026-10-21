@@ -1272,3 +1272,220 @@ def test_cutover_schema_typed_dates_decimals_and_nullable_distinction():
     assert not cutover._business_row_comparable(
         expected, {**target, "company_name_en": None}, set(), types
     )
+
+
+class _LegacySyncFakeRepository:
+    backend = "mysql"
+
+    def __init__(self, initial=(), *, generation=1, fail_insert=None):
+        self.rows = { (r["juristic_type_code"], r["registration_no"]): dict(r)
+                     for r in initial }
+        self.committed = 0
+        self.updates = 0
+        self.inserts = 0
+        self.generation = generation
+        self.fail_insert = fail_insert
+
+    def validate_schema(self):
+        return None
+
+    @contextmanager
+    def manager_lock(self):
+        yield object()
+
+    def assert_manager_lock(self, _conn):
+        pass
+
+    def generation_state(self, _conn):
+        return {
+            "finalized_generation": self.generation,
+            "last_seen_generation": self.generation,
+            "active_generation": None,
+        }
+
+    @contextmanager
+    def transaction(self):
+        original = {key: dict(row) for key, row in self.rows.items()}
+        counts = self.inserts, self.updates
+        try:
+            yield self
+        except Exception:
+            self.rows = original
+            self.inserts, self.updates = counts
+            raise
+        else:
+            self.committed += 1
+
+    def read_cutover_rows(self, _conn, identities, industry_keys, **_kwargs):
+        assert industry_keys == []
+        return {
+            "companies": [dict(self.rows[key]) for key in identities if key in self.rows],
+            "relations": [], "events": [], "financial": [], "industries": [],
+        }
+
+    def insert_legacy_sync_rows(self, _conn, table, rows):
+        assert table == "companies" or not rows
+        for row in rows:
+            key = row["juristic_type_code"], row["registration_no"]
+            if self.fail_insert == key:
+                raise RuntimeError("mocked database insertion failure")
+            assert key not in self.rows
+            self.rows[key] = {**row, "company_id": len(self.rows) + 1}
+            self.inserts += 1
+
+    def update_legacy_sync_rows(self, _conn, table, changes):
+        assert table == "companies" or not changes
+        for pk, values in changes:
+            row = next(row for row in self.rows.values() if row["company_id"] == pk)
+            assert not {"first_seen_generation", "last_seen_generation",
+                        "dataset_generation", "branch_count", "lease_owner"} & values.keys()
+            row.update(values)
+            self.updates += 1
+
+
+def _legacy_sync_source(number, name="บริษัท ทดสอบ", updated="2026-10-21"):
+    return {"jp_type_code": "5", "jp_no": str(number),
+            "name": name, "dbd_update_date": updated, "updated_at": updated}
+
+
+def _legacy_sync_fake_setup(monkeypatch, repo, source, *, source_versions=None):
+    copies = iter(source_versions) if source_versions is not None else None
+
+    @contextmanager
+    def fake_source_fence():
+        yield object()
+
+    def windows(_conn, *, batch_size):
+        rows = next(copies) if copies is not None else source
+        for start in range(0, len(rows), batch_size):
+            yield rows[start:start + batch_size]
+
+    def company(row, *, published_at):
+        return {
+            "juristic_type_code": row["jp_type_code"],
+            "registration_no": row["jp_no"],
+            "company_name_th": row["name"],
+            "dbd_update_date": row["dbd_update_date"],
+            "source_updated_at": row["updated_at"],
+            "published_at": published_at,
+            "dataset_generation": 1,
+            "first_seen_generation": 1,
+            "last_seen_generation": 1,
+        }
+
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: repo)
+    monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
+    monkeypatch.setattr(cutover, "source_preflight", lambda _conn: {
+        "source_rows": len(source), "source_updated_at": "2026-10-21",
+    })
+    monkeypatch.setattr(cutover, "_assert_source_snapshot", lambda *_args: None)
+    monkeypatch.setattr(cutover, "source_batches", windows)
+    monkeypatch.setattr(cutover, "transform_company", company)
+    for name in ("transform_relations", "transform_events", "transform_financials",
+                 "transform_industries"):
+        monkeypatch.setattr(cutover, name, lambda *_args, **_kwargs: [])
+
+
+def test_incremental_g1_new_then_replay_is_insert_then_skip(monkeypatch):
+    first = _legacy_sync_source("0100000000001")
+    second = _legacy_sync_source("0100000000002")
+    repo = _LegacySyncFakeRepository()
+    _legacy_sync_fake_setup(monkeypatch, repo, [first, second])
+    initial = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert (initial["inserted"], initial["updated"], initial["unchanged"]) == (2, 0, 0)
+    assert initial["verification"]["source_content_verified"] is True
+    assert len(repo.rows) == 2
+    repeat = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert (repeat["inserted"], repeat["updated"], repeat["unchanged"]) == (0, 0, 2)
+    assert repo.inserts == 2 and repo.updates == 0
+
+
+def test_incremental_changed_authoritative_profile_updates_selected_fields(monkeypatch):
+    row = _legacy_sync_source("0100000000001", updated="2026-10-21")
+    existing = {
+        "juristic_type_code": "5", "registration_no": row["jp_no"], "company_id": 9,
+        "company_name_th": "ชื่อเก่า", "dbd_update_date": "2026-10-20",
+        "source_updated_at": "2026-10-20", "published_at": datetime(2026, 10, 20),
+        "dataset_generation": 1, "first_seen_generation": 1, "last_seen_generation": 1,
+        "branch_count": 10, "lease_owner": None,
+    }
+    repo = _LegacySyncFakeRepository([existing])
+    _legacy_sync_fake_setup(monkeypatch, repo, [row])
+    result = cutover.run_legacy_incremental_sync(backend="mysql")
+    assert result["updated"] == 1 and result["inserted"] == 0
+    saved = next(iter(repo.rows.values()))
+    assert saved["company_name_th"] == row["name"]
+    assert saved["branch_count"] == 10 and saved["company_id"] == 9
+    assert saved["first_seen_generation"] == saved["dataset_generation"] == 1
+
+
+def test_incremental_refuses_unproven_profile_freshness(monkeypatch):
+    row = _legacy_sync_source("0100000000001", updated="2026-10-20")
+    existing = {
+        "juristic_type_code": "5", "registration_no": row["jp_no"], "company_id": 2,
+        "company_name_th": "เปลี่ยนจากระบบอื่น", "dbd_update_date": "2026-10-21",
+        "source_updated_at": "2026-10-21",
+        "dataset_generation": 1, "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+    repo = _LegacySyncFakeRepository([existing])
+    _legacy_sync_fake_setup(monkeypatch, repo, [row])
+    with pytest.raises(CutoverSafetyError, match="Unproven freshness"):
+        cutover.run_legacy_incremental_sync(backend="mysql")
+    assert repo.updates == 0 and repo.rows[("5", row["jp_no"])]["company_name_th"] == "เปลี่ยนจากระบบอื่น"
+
+
+def test_incremental_rejects_empty_target_and_g2_before_source(monkeypatch):
+    for generation in (None, 2):
+        repo = _LegacySyncFakeRepository(generation=generation)
+        _legacy_sync_fake_setup(monkeypatch, repo, [_legacy_sync_source("0100000000001")])
+        opened = []
+        @contextmanager
+        def forbidden_source():
+            opened.append(True)
+            yield object()
+        monkeypatch.setattr(cutover, "source_fence", forbidden_source)
+        with pytest.raises(CutoverSafetyError, match="G1 target"):
+            cutover.run_legacy_incremental_sync(backend="mysql")
+        assert not opened
+
+
+def test_incremental_digest_detects_change_with_identical_watermark(monkeypatch):
+    before = _legacy_sync_source("0100000000001", name="บริษัท ก่อน")
+    after = dict(before, name="บริษัท หลัง")
+    repo = _LegacySyncFakeRepository()
+    _legacy_sync_fake_setup(monkeypatch, repo, [before],
+                            source_versions=[[before], [after]])
+    with pytest.raises(CutoverSafetyError, match="content drift"):
+        cutover.run_legacy_incremental_sync(backend="mysql")
+    assert repo.committed >= 1
+
+
+def test_incremental_restart_preserves_committed_batch(monkeypatch):
+    a = _legacy_sync_source("0100000000001")
+    b = _legacy_sync_source("0100000000002")
+    repo = _LegacySyncFakeRepository(fail_insert=("5", b["jp_no"]))
+    _legacy_sync_fake_setup(monkeypatch, repo, [a, b])
+    with pytest.raises(RuntimeError, match="mocked database"):
+        cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert ("5", a["jp_no"]) in repo.rows and ("5", b["jp_no"]) not in repo.rows
+    repo.fail_insert = None
+    outcome = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert (outcome["unchanged"], outcome["inserted"]) == (1, 1)
+    assert len(repo.rows) == 2
+
+
+def test_incremental_domain_with_missing_source_is_preserved():
+    expected = {"relations": [], "events": [], "financial": [], "industries": []}
+    actual = {**expected, "relations": [{
+        "company_id": 1, "relation_type": "COMMITTEE", "source_key": "old",
+    }]}
+    class Repo:
+        def insert_legacy_sync_rows(self, *_args):
+            raise AssertionError("must not insert")
+        def update_legacy_sync_rows(self, *_args):
+            raise AssertionError("must not update")
+    j, types, groups = cutover._legacy_sync_metadata()
+    result = cutover._legacy_sync_compare_domains(
+        Repo(), object(), expected, actual, j, types, groups, write=False,
+    )
+    assert result["target_only_scope"] == 1
