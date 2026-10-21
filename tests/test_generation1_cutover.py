@@ -1104,6 +1104,9 @@ def test_streamed_cutover_reconciliation_detects_equal_count_mismatches(
         target_company["company_name_th"] = "บริษัท ไม่ตรงกัน"
     if change == "wrong_identity":
         target_company["registration_no"] = "0100000000002"
+    if change == "changed_source":
+        # Target now matches the changed source; only content digest must fail.
+        target_company["company_name_th"] = "บริษัท เปลี่ยน"
     target_relation = {"company_id": 7, "relation_type": "COMMITTEE",
                        "source_key": "unexpected"}
     fin_expected = {"fiscal_year": "2568", "total_assets": Decimal("100.00")}
