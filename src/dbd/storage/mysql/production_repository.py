@@ -266,7 +266,7 @@ class ProductionMySqlRepository:
 
     def read_cutover_rows(self, conn, identities, industry_keys):
         """MySQL equivalent of bounded, read-only G1 readback."""
-        if len(identities) > 1000 or len(industry_keys) > 1000:
+        if len(identities) > 1000:
             raise ValueError("Cutover verification exceeds bounded micro-batch")
         company_ids = self.company_ids(conn, identities)
         ids = sorted(set(company_ids.values()))
