@@ -436,6 +436,10 @@ class ControlRepository:
             if generation in seen:
                 raise ControlError("Conflicting monthly Generation records block G1 cutover")
             seen.add(generation)
+            if generation == 1 and state not in ("COMPLETED", "COMPLETE_WITH_FAILURES"):
+                raise ControlError(
+                    "Active monthly Control Generation 1 conflicts with cutover baseline"
+                )
             if generation >= 2:
                 raise ControlError(
                     f"Monthly Control already contains Generation {generation}; "
