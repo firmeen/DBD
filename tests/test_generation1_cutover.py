@@ -1239,3 +1239,36 @@ def test_source_keyset_rejects_duplicate_or_backward_identity(monkeypatch):
     monkeypatch.setattr(cutover, "_assert_source_fence", lambda _conn: None)
     with pytest.raises(CutoverSafetyError, match="Non-increasing"):
         list(cutover.source_batches(SimpleNamespace(cursor=Cursor), batch_size=500))
+
+
+
+def test_cutover_schema_typed_dates_decimals_and_nullable_distinction():
+    from datetime import date, datetime
+    from decimal import Decimal
+    expected = {
+        "registration_date": "2026-01-02",
+        "last_request_at": datetime(2026, 1, 2, 3, 4, 5),
+        "registered_capital": Decimal("1200.00"),
+        "postal_code": "00100",
+        "company_name_en": "",
+    }
+    target = {
+        **expected,
+        "registration_date": date(2026, 1, 2),
+        "last_request_at": "2026-01-02T03:04:05",
+        "registered_capital": Decimal("1200.000"),
+    }
+    types = {
+        "registration_date": "DATE",
+        "last_request_at": "DATETIME2(6)",
+        "registered_capital": "DECIMAL(20,2)",
+        "postal_code": "NVARCHAR(10)",
+        "company_name_en": "NVARCHAR(500)",
+    }
+    assert cutover._business_row_comparable(expected, target, set(), types)
+    assert not cutover._business_row_comparable(
+        expected, {**target, "postal_code": "100"}, set(), types
+    )
+    assert not cutover._business_row_comparable(
+        expected, {**target, "company_name_en": None}, set(), types
+    )
