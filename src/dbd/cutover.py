@@ -1240,9 +1240,15 @@ def _verify_cutover_equivalence(
     """
     from .storage.sqlserver.schema import JSON_CHECKS
 
+    names = {
+        "DBD_COMPANY": "companies", "DBD_COMPANY_RELATION": "relations",
+        "DBD_COMPANY_EVENT": "events", "DBD_FINANCIAL": "financial",
+        "DBD_INDUSTRY": "industries",
+    }
     json_fields = {
-        table.split(".")[-1].replace("DBD_", "").lower(): {column for _, column in items}
+        names[table.split(".")[-1]]: {column for _, column in items}
         for table, items in JSON_CHECKS.items()
+        if table.split(".")[-1] in names
     }
     tables = {
         "companies": (("juristic_type_code", "registration_no"), transform_company),
