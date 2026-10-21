@@ -792,11 +792,17 @@ def _source_stability_state(conn, *, full: bool = True) -> dict[str, Any]:
                      WHERE jp_type_code IS NULL OR TRIM(jp_type_code)=''
                         OR jp_no IS NULL OR TRIM(jp_no)=''
                      LIMIT 1) source_invalid_identity,
+              EXISTS(
+                SELECT 1 FROM (
+                  SELECT jp_type_code,jp_no FROM {SOURCE_TABLE}
+                  GROUP BY jp_type_code,jp_no HAVING COUNT(*)>1 LIMIT 1
+                ) duplicates
+              ) source_duplicate_identity,
     """
     light_sql = ",\n".join(
         f"0 AS {key}" for key in (
             "deep_unresolved", "deep_active", "deep_invalid_masks",
-            "deep_status_mismatch", "deep_invalid_payloads", "source_invalid_identity",
+            "deep_status_mismatch", "deep_invalid_payloads", "source_invalid_identity", "source_duplicate_identity",
         )
     ) + ","
     with conn.cursor() as cur:
@@ -824,6 +830,7 @@ def _source_stability_state(conn, *, full: bool = True) -> dict[str, Any]:
         "runtime_retry_wait", "discovery_active_leases", "deep_unresolved",
         "deep_active", "deep_invalid_masks", "deep_status_mismatch",
         "deep_invalid_payloads", "source_invalid_identity",
+        "source_duplicate_identity",
     )
     return {**{key: int(row[key] or 0) for key in fields},
             "source_updated_at": row["source_updated_at"]}
@@ -902,6 +909,7 @@ def source_preflight(conn) -> dict[str, Any]:
         "deep_status_mismatch": stability.get("deep_status_mismatch", 0),
         "deep_invalid_payloads": stability.get("deep_invalid_payloads", 0),
         "source_invalid_identity": stability.get("source_invalid_identity", 0),
+        "source_duplicate_identity": stability.get("source_duplicate_identity", 0),
     }
     if any(blockers.values()):
         details = ", ".join(f"{key}={value}" for key, value in blockers.items() if value)
@@ -978,7 +986,7 @@ def _assert_source_snapshot(conn, baseline: dict[str, Any]) -> None:
             "runtime_retry_wait", "discovery_active_leases",
             "deep_unresolved", "deep_active", "deep_invalid_masks",
             "deep_status_mismatch", "deep_invalid_payloads",
-            "source_invalid_identity",
+            "source_invalid_identity", "source_duplicate_identity",
         )
         if state.get(key, 0)
     }
