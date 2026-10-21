@@ -1618,3 +1618,25 @@ def test_incremental_large_window_uses_at_most_1000_company_micro_batches(monkey
     assert result["windows"] == 1
     assert result["batches"] == 2
     assert result["inserted"] == 1001
+
+
+
+@pytest.mark.parametrize("reason", ["Admin denied", "Control-only Generation 2"])
+def test_incremental_sqlserver_denies_unsafe_admission_before_source(monkeypatch, reason):
+    source = _legacy_sync_source("0100000000001")
+    repo = _LegacySyncFakeRepository()
+    repo.backend = "sqlserver"
+    _legacy_sync_fake_setup(monkeypatch, repo, [source])
+    source_opened = []
+    @contextmanager
+    def cannot_open_source():
+        source_opened.append(True)
+        yield object()
+    monkeypatch.setattr(cutover, "source_fence", cannot_open_source)
+    monkeypatch.setattr(
+        cutover, "_assert_cutover_target_admission",
+        lambda *_args: (_ for _ in ()).throw(CutoverSafetyError(reason)),
+    )
+    with pytest.raises(CutoverSafetyError, match=reason):
+        cutover.run_legacy_incremental_sync(backend="sqlserver")
+    assert not source_opened and repo.inserts == 0
