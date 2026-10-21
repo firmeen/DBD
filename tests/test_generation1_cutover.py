@@ -1323,6 +1323,9 @@ class _LegacySyncFakeRepository:
             "relations": [], "events": [], "financial": [], "industries": [],
         }
 
+    def verify_legacy_sync_integrity(self, _conn):
+        assert self.generation == 1
+
     def insert_legacy_sync_rows(self, _conn, table, rows):
         assert table == "companies" or not rows
         for row in rows:
