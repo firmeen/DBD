@@ -1323,6 +1323,9 @@ class _LegacySyncFakeRepository:
             "relations": [], "events": [], "financial": [], "industries": [],
         }
 
+    def count_generation_one(self):
+        return len(self.rows)
+
     def verify_legacy_sync_integrity(self, _conn):
         assert self.generation == 1
 
