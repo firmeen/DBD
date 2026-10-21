@@ -392,7 +392,9 @@ class ProductionMySqlRepository:
             "last_seen_generation", "dataset_generation", "branch_count",
             "lease_owner", "lease_expires_at", "retry_at", "required_mask",
             "done_mask", "not_available_mask", "failed_mask", "collect_status",
-            "endpoint_meta",
+            "endpoint_meta", "is_current", "last_endpoint", "last_http_status",
+            "last_error", "last_error_at", "last_request_at",
+            "collection_started_at", "collection_completed_at",
         }
         accepted = set(_columns(table_name)) - prohibited
         with conn.cursor() as cur:
