@@ -544,6 +544,12 @@ def test_cutover_holds_selected_manager_lock_through_target_transactions(
         return {"industries": 0, "companies": 1}
 
     monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
+    # The legacy fake exercises transaction/replay independently of the new gates.
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission", lambda *_a: None)
+    monkeypatch.setattr(
+        cutover, "_verify_cutover_equivalence",
+        lambda *_a, **_kw: {"source_content_verified": True},
+    )
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -633,6 +639,12 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
         yield object()
 
     monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
+    # The legacy fake exercises transaction/replay independently of the new gates.
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission", lambda *_a: None)
+    monkeypatch.setattr(
+        cutover, "_verify_cutover_equivalence",
+        lambda *_a, **_kw: {"source_content_verified": True},
+    )
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -837,6 +849,12 @@ def _large_cutover_fixture(monkeypatch, count, *, fail_at_commit=None):
         return {"companies": count, "industries": min(count, 10)}
 
     monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
+    # The legacy fake exercises transaction/replay independently of the new gates.
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission", lambda *_a: None)
+    monkeypatch.setattr(
+        cutover, "_verify_cutover_equivalence",
+        lambda *_a, **_kw: {"source_content_verified": True},
+    )
     monkeypatch.setattr(cutover, "source_fence", fenced)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -934,3 +952,133 @@ def test_large_window_checks_source_snapshot_before_committing_each_micro_batch(
     # Fail inside the second transaction, preserving only the first micro-batch.
     assert len(state["committed"]) == 1000
 
+
+
+
+# P1 cutover safety regression contracts; all database cursors are isolated fakes.
+def test_source_terminal_contract_queries_masks_and_deferred_runtime():
+    source = inspect.getsource(cutover._source_stability_state)
+    assert "status='PENDING'" in source
+    assert "status='RUNNING'" in source
+    assert "status='RETRY_WAIT'" in source
+    assert "(required_mask & ~" in source
+    assert "deep_invalid_masks" in source
+    assert "deep_status_mismatch" in source
+    assert "source_invalid_identity" in source
+    assert not any(word in source.upper() for word in ("DELETE FROM", "TRUNCATE TABLE"))
+
+
+@pytest.mark.parametrize("blocked", [
+    "runtime_pending", "runtime_running", "runtime_retry_wait",
+    "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
+    "source_invalid_identity",
+])
+def test_preflight_rejects_every_source_terminal_blocker(monkeypatch, blocked):
+    monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
+    monkeypatch.setattr(cutover, "_source_columns", lambda _conn, table: (
+        set(cutover.SOURCE_COLUMNS) if table == cutover.SOURCE_TABLE
+        else {"status"} if table == cutover.SOURCE_RUNTIME_TABLE
+        else {"lease_owner", "lease_version", "lease_expires_at"}
+        if table == cutover.SOURCE_DISCOVERY_TABLE else {"jp_type_code", "jp_no"}
+    ))
+    monkeypatch.setattr(cutover, "_count", lambda _conn, sql, *_args: (
+        4 if "FROM dbd_company_deep" in sql and "deep_status IN" not in sql else 0
+    ))
+    state = {name: 0 for name in (
+        "master_waiting", "runtime_pending", "runtime_running",
+        "runtime_retry_wait", "discovery_active_leases", "deep_active",
+        "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
+        "source_invalid_identity",
+    )}
+    state.update(source_updated_at=None)
+    state[blocked] = 1
+    monkeypatch.setattr(cutover, "_source_stability_state", lambda _conn: state)
+    with pytest.raises(CutoverSafetyError, match=blocked):
+        cutover.source_preflight(object())
+
+
+def test_terminal_failed_and_partial_do_not_block_when_masks_resolve(monkeypatch):
+    monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
+    monkeypatch.setattr(cutover, "_source_columns", lambda _conn, table: (
+        set(cutover.SOURCE_COLUMNS) if table == cutover.SOURCE_TABLE
+        else {"status"} if table == cutover.SOURCE_RUNTIME_TABLE
+        else {"lease_owner", "lease_version", "lease_expires_at"}
+        if table == cutover.SOURCE_DISCOVERY_TABLE else {"jp_type_code", "jp_no"}
+    ))
+    monkeypatch.setattr(cutover, "_count", lambda _conn, sql, *_args: (
+        2 if "FROM dbd_company_deep" in sql and "deep_status IN" not in sql else 0
+    ))
+    monkeypatch.setattr(cutover, "_source_stability_state", lambda _conn: {
+        "master_waiting": 0, "runtime_running": 0,
+        "discovery_active_leases": 0, "deep_active": 0,
+        "source_updated_at": None,
+    })
+    assert cutover.source_preflight(object())["source_rows"] == 2
+
+
+def test_cutover_digest_canonical_json_and_payload_drift():
+    from hashlib import sha256
+    from decimal import Decimal
+
+    def digest(row):
+        h = sha256()
+        cutover._source_digest_append(h, row)
+        return h.hexdigest()
+
+    row = {
+        "jp_type_code": "5", "jp_no": "0101234567890",
+        "profile_data": '{"b":2,"a":"ภาษาไทย"}',
+        "cap_amt": Decimal("1.00"),
+    }
+    assert digest(row) == digest({
+        **row, "profile_data": '{"a":"ภาษาไทย","b":2}',
+        "cap_amt": Decimal("1.0"),
+    })
+    assert digest(row) != digest({**row, "profile_data": '{"a":"อื่น","b":2}'})
+    assert digest(row) != digest({**row, "jp_no": "0101234567891"})
+    assert digest(row) != digest({**row, "cap_amt": None})
+    assert digest(row) != digest({**row, "cap_amt": ""})
+
+
+def test_cutover_business_equivalence_checks_payload_not_only_identity():
+    from decimal import Decimal
+
+    expected = {
+        "juristic_type_code": "5", "registration_no": "0101234567890",
+        "company_name_th": "บริษัท ภาษาไทย จำกัด",
+        "total_assets_latest": Decimal("123.40"),
+        "profile_payload": '{"b":2,"a":1}',
+        "published_at": datetime(2026, 10, 1),
+    }
+    actual = {
+        **expected, "company_name_th": "บริษัท เปลี่ยน จำกัด",
+        "profile_payload": '{"a":1,"b":2}',
+    }
+    assert not cutover._business_row_comparable(
+        expected, actual, {"profile_payload"}
+    )
+    assert cutover._business_row_comparable(
+        expected, {**actual, "company_name_th": expected["company_name_th"],
+                   "total_assets_latest": Decimal("123.400")}, {"profile_payload"}
+    )
+    assert not cutover._business_row_comparable(
+        expected, {**actual, "total_assets_latest": Decimal("124.00")}, {"profile_payload"}
+    )
+
+
+def test_sqlserver_cutover_admission_uses_real_control_policy(monkeypatch):
+    from dbd.storage.sqlserver import control_repository as control_sql
+    from dbd.presentation import setup
+
+    selected = []
+    monkeypatch.setattr(setup, "local_node_id", lambda: "admin-test")
+    monkeypatch.setattr(
+        control_sql.ControlRepository, "require_cutover_access",
+        lambda self, conn, node: selected.append((conn, node)),
+    )
+    target_conn = object()
+    cutover._assert_cutover_target_admission(object(), "sqlserver", target_conn)
+    assert selected == [(target_conn, "admin-test")]
+    selected.clear()
+    cutover._assert_cutover_target_admission(object(), "mysql", target_conn)
+    assert selected == []
