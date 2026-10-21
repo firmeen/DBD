@@ -966,13 +966,14 @@ def test_source_terminal_contract_queries_masks_and_deferred_runtime():
     assert "deep_status_mismatch" in source
     assert "deep_invalid_payloads" in source
     assert "source_invalid_identity" in source
+    assert "source_duplicate_identity" in source
     assert not any(word in source.upper() for word in ("DELETE FROM", "TRUNCATE TABLE"))
 
 
 @pytest.mark.parametrize("blocked", [
     "runtime_pending", "runtime_running", "runtime_retry_wait",
     "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
-    "deep_invalid_payloads", "source_invalid_identity",
+    "deep_invalid_payloads", "source_invalid_identity", "source_duplicate_identity",
 ])
 def test_preflight_rejects_every_source_terminal_blocker(monkeypatch, blocked):
     monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
@@ -990,6 +991,7 @@ def test_preflight_rejects_every_source_terminal_blocker(monkeypatch, blocked):
         "runtime_retry_wait", "discovery_active_leases", "deep_active",
         "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
         "deep_invalid_payloads", "source_invalid_identity",
+        "source_duplicate_identity",
     )}
     state.update(source_updated_at=None)
     state[blocked] = 1
@@ -1199,6 +1201,7 @@ def test_source_stability_full_scans_are_not_run_for_every_micro_batch():
         "runtime_retry_wait", "discovery_active_leases", "deep_unresolved",
         "deep_active", "deep_invalid_masks", "deep_status_mismatch",
         "deep_invalid_payloads", "source_invalid_identity",
+        "source_duplicate_identity",
     )
     class Cursor:
         def __enter__(self):
