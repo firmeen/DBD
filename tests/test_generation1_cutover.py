@@ -346,7 +346,7 @@ def test_source_preflight_rejects_live_distributed_discovery_lease(monkeypatch) 
     monkeypatch.setattr(
         cutover,
         "_source_stability_state",
-        lambda _conn: {
+        lambda _conn, **_kw: {
             "master_waiting": 0,
             "runtime_running": 0,
             "discovery_active_leases": 1,
@@ -366,7 +366,7 @@ def test_source_snapshot_detects_watermark_change(monkeypatch) -> None:
     monkeypatch.setattr(
         cutover,
         "_source_stability_state",
-        lambda _conn: {
+        lambda _conn, **_kw: {
             "master_waiting": 0,
             "runtime_running": 0,
             "discovery_active_leases": 0,
@@ -418,7 +418,7 @@ def test_source_preflight_refuses_empty_deep_table(monkeypatch) -> None:
     monkeypatch.setattr(
         cutover,
         "_source_stability_state",
-        lambda _conn: {
+        lambda _conn, **_kw: {
             "master_waiting": 0,
             "runtime_running": 0,
             "discovery_active_leases": 0,
@@ -993,7 +993,7 @@ def test_preflight_rejects_every_source_terminal_blocker(monkeypatch, blocked):
     )}
     state.update(source_updated_at=None)
     state[blocked] = 1
-    monkeypatch.setattr(cutover, "_source_stability_state", lambda _conn: state)
+    monkeypatch.setattr(cutover, "_source_stability_state", lambda _conn, **_kw: state)
     with pytest.raises(CutoverSafetyError, match=blocked):
         cutover.source_preflight(object())
 
