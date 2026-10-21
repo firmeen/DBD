@@ -1344,8 +1344,8 @@ class _LegacySyncFakeRepository:
 
 
 def _legacy_sync_source(number, name="บริษัท ทดสอบ", updated="2026-10-21"):
-    return {"jp_type_code": "5", "jp_no": str(number),
-            "name": name, "dbd_update_date": updated, "updated_at": updated}
+    return {"jp_type_code": "5", "jp_no": str(number), "jp_name": name,
+            "dbd_update_date": updated, "updated_at": updated}
 
 
 def _legacy_sync_fake_setup(monkeypatch, repo, source, *, source_versions=None):
@@ -1364,7 +1364,7 @@ def _legacy_sync_fake_setup(monkeypatch, repo, source, *, source_versions=None):
         return {
             "juristic_type_code": row["jp_type_code"],
             "registration_no": row["jp_no"],
-            "company_name_th": row["name"],
+            "company_name_th": row["jp_name"],
             "dbd_update_date": row["dbd_update_date"],
             "source_updated_at": row["updated_at"],
             "published_at": published_at,
@@ -1414,7 +1414,7 @@ def test_incremental_changed_authoritative_profile_updates_selected_fields(monke
     result = cutover.run_legacy_incremental_sync(backend="mysql")
     assert result["updated"] == 1 and result["inserted"] == 0
     saved = next(iter(repo.rows.values()))
-    assert saved["company_name_th"] == row["name"]
+    assert saved["company_name_th"] == row["jp_name"]
     assert saved["branch_count"] == 10 and saved["company_id"] == 9
     assert saved["first_seen_generation"] == saved["dataset_generation"] == 1
 
@@ -1451,7 +1451,7 @@ def test_incremental_rejects_empty_target_and_g2_before_source(monkeypatch):
 
 def test_incremental_digest_detects_change_with_identical_watermark(monkeypatch):
     before = _legacy_sync_source("0100000000001", name="บริษัท ก่อน")
-    after = dict(before, name="บริษัท หลัง")
+    after = dict(before, jp_name="บริษัท หลัง")
     repo = _LegacySyncFakeRepository()
     _legacy_sync_fake_setup(monkeypatch, repo, [before],
                             source_versions=[[before], [after]])
