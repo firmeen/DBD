@@ -324,6 +324,32 @@ class ProductionMySqlRepository:
             )
         return result
 
+    def verify_legacy_sync_integrity(self, conn) -> None:
+        """Read-only G1 generation/orphan checks; do not reject legitimate Target-only rows."""
+        checks = [
+            ("company generation", "SELECT COUNT(*) FROM DBD_COMPANY WHERE "
+             "dataset_generation<>1 OR first_seen_generation<>1 OR last_seen_generation<>1"),
+            ("relation orphan", "SELECT COUNT(*) FROM DBD_COMPANY_RELATION r "
+             "LEFT JOIN DBD_COMPANY c ON c.company_id=r.company_id WHERE c.company_id IS NULL"),
+            ("event orphan", "SELECT COUNT(*) FROM DBD_COMPANY_EVENT e "
+             "LEFT JOIN DBD_COMPANY c ON c.company_id=e.company_id WHERE c.company_id IS NULL"),
+            ("financial orphan", "SELECT COUNT(*) FROM DBD_FINANCIAL f "
+             "LEFT JOIN DBD_COMPANY c ON c.company_id=f.company_id WHERE c.company_id IS NULL"),
+        ]
+        for table in ("DBD_COMPANY_RELATION", "DBD_COMPANY_EVENT",
+                      "DBD_FINANCIAL", "DBD_INDUSTRY"):
+            checks.append((table + " generation",
+                           f"SELECT COUNT(*) FROM {table} WHERE "
+                           "first_seen_generation<>1 OR last_seen_generation<>1"))
+        with conn.cursor() as cur:
+            for label, sql in checks:
+                cur.execute(sql)
+                count = int(cur.fetchone()[0] or 0)
+                if count:
+                    raise MySqlProductionWriteError(
+                        f"Legacy sync integrity failed: {label} ({count} rows)"
+                    )
+
     def insert_legacy_sync_rows(self, conn, table, rows):
         """INSERT only; natural-key conflicts fail instead of overwriting."""
         tables = {
