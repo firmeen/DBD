@@ -1105,7 +1105,10 @@ def test_cutover_readback_is_read_only_bounded_and_natural_keyed(monkeypatch):
             assert sql.lstrip().upper().startswith("SELECT "), sql
             assert len(params) <= 500
             queries.append((sql, tuple(params)))
-            self.rows = [tuple(target.values())] if "DBD_COMPANY WHERE" in sql else []
+            self.rows = ([tuple(target.values())]
+                         if "DBD_COMPANY" in sql
+                         and "DBD_COMPANY_RELATION" not in sql
+                         and "DBD_COMPANY_EVENT" not in sql else [])
             self.description = [(k,) for k in target] if self.rows else [("company_id",)]
         def fetchall(self):
             return list(self.rows)
