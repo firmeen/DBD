@@ -1512,6 +1512,9 @@ def _legacy_sync_changes(
             continue
         if key in _LEGACY_SYNC_PROTECTED:
             raise CutoverSafetyError(f"Collector-owned {table}.{key} differs from Legacy")
+        if table == "companies" and key == "master_payload" and actual[key] is not None:
+            # The Deep row's updated_at is not a master-endpoint revision clock.
+            raise CutoverSafetyError("Unproven master provenance; target preserved")
         if table == "industries":
             # Shared across companies: a later encountered source row cannot
             # supersede another company's snapshot without global provenance.
@@ -1837,7 +1840,11 @@ def run_legacy_incremental_sync(
         with repository.transaction() as target_check:
             repository.verify_legacy_sync_integrity(target_check)
         repository.assert_manager_lock(manager_conn)
+        company_total = repository.count_generation_one()
+        if company_total < stats["source_rows"]:
+            raise CutoverSafetyError("Verified G1 target count is below legacy source count")
         stats.update({
+            "target_only_companies": company_total - stats["source_rows"],
             "domains_verified": verification["domains_verified"],
             "target_only_scope": verification["target_only_scope"],
             "verification": verification,
