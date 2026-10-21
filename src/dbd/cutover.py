@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from contextlib import ExitStack, contextmanager
@@ -17,7 +18,7 @@ from .contracts.financial import (
 )
 from .contracts.strict import normalize_collection
 from .core.exceptions import ContractError
-from .deep.catalog import latest_fiscal_year
+from .deep.catalog import ACTIVE_ENDPOINT_MASK, BASE_REQUIRED_MASK, latest_fiscal_year
 from .storage.mysql.engine import connect as mysql_connection
 from .storage.sqlserver.engine import connection as sqlserver_connection
 from .storage.production import production_repository
@@ -744,38 +745,63 @@ def _assert_source_database(conn) -> None:
 
 
 def _source_stability_state(conn) -> dict[str, Any]:
+    """Read-only evidence from the actual legacy runtime/mask contract.
+
+    Terminal PARTIAL/FAILED is allowed only when every required bit has
+    terminal outcome evidence; status text alone is never authoritative.
+    """
+    resolved = "(done_mask | not_available_mask | failed_mask)"
+    terminal = f"(({resolved} & required_mask) = required_mask)"
+    status_case = (
+        f"CASE WHEN {terminal} AND (failed_mask & required_mask)=0 THEN 'COMPLETE' "
+        f"WHEN {terminal} AND (failed_mask & required_mask)=required_mask THEN 'FAILED' "
+        f"WHEN {terminal} THEN 'PARTIAL' "
+        f"WHEN ({resolved} & required_mask)=0 THEN 'PENDING' ELSE 'COLLECTING' END"
+    )
     with conn.cursor() as cur:
         cur.execute(
             f"""
             SELECT
-              EXISTS(SELECT 1 FROM {SOURCE_MASTER_TABLE} LIMIT 1) AS master_waiting,
-              EXISTS(
-                SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
-                WHERE status='RUNNING'
-                LIMIT 1
-              ) AS runtime_running,
-              EXISTS(
-                SELECT 1 FROM {SOURCE_DISCOVERY_TABLE}
-                WHERE lease_owner IS NOT NULL
-                  AND lease_expires_at > UTC_TIMESTAMP(6)
-                LIMIT 1
-              ) AS discovery_active_leases,
-              EXISTS(
-                SELECT 1 FROM {SOURCE_TABLE}
-                WHERE deep_status IN ('PENDING','COLLECTING')
-                LIMIT 1
-              ) AS deep_active,
-              (SELECT MAX(updated_at) FROM {SOURCE_TABLE}) AS source_updated_at
+              EXISTS(SELECT 1 FROM {SOURCE_MASTER_TABLE} LIMIT 1) master_waiting,
+              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
+                     WHERE status='PENDING' LIMIT 1) runtime_pending,
+              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
+                     WHERE status='RUNNING' LIMIT 1) runtime_running,
+              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
+                     WHERE status='RETRY_WAIT' LIMIT 1) runtime_retry_wait,
+              EXISTS(SELECT 1 FROM {SOURCE_DISCOVERY_TABLE}
+                     WHERE lease_owner IS NOT NULL
+                       AND lease_expires_at > UTC_TIMESTAMP(6) LIMIT 1)
+                     discovery_active_leases,
+              EXISTS(SELECT 1 FROM {SOURCE_TABLE}
+                     WHERE (required_mask & ~{resolved})<>0 LIMIT 1) deep_unresolved,
+              EXISTS(SELECT 1 FROM {SOURCE_TABLE}
+                     WHERE deep_status IN ('PENDING','COLLECTING') LIMIT 1) deep_active,
+              EXISTS(SELECT 1 FROM {SOURCE_TABLE}
+                     WHERE required_mask NOT IN ({BASE_REQUIRED_MASK},{ACTIVE_ENDPOINT_MASK})
+                        OR (done_mask & not_available_mask)<>0
+                        OR (done_mask & failed_mask)<>0
+                        OR (not_available_mask & failed_mask)<>0
+                     LIMIT 1) deep_invalid_masks,
+              EXISTS(SELECT 1 FROM {SOURCE_TABLE}
+                     WHERE deep_status <> {status_case}
+                        OR deep_status IS NULL LIMIT 1) deep_status_mismatch,
+              EXISTS(SELECT 1 FROM {SOURCE_TABLE}
+                     WHERE jp_type_code IS NULL OR TRIM(jp_type_code)=''
+                        OR jp_no IS NULL OR TRIM(jp_no)=''
+                     LIMIT 1) source_invalid_identity,
+              (SELECT MAX(updated_at) FROM {SOURCE_TABLE}) source_updated_at
             """
         )
         row = cur.fetchone()
-    return {
-        "master_waiting": int(row["master_waiting"] or 0),
-        "runtime_running": int(row["runtime_running"] or 0),
-        "discovery_active_leases": int(row["discovery_active_leases"] or 0),
-        "deep_active": int(row["deep_active"] or 0),
-        "source_updated_at": row["source_updated_at"],
-    }
+    fields = (
+        "master_waiting", "runtime_pending", "runtime_running",
+        "runtime_retry_wait", "discovery_active_leases", "deep_unresolved",
+        "deep_active", "deep_invalid_masks", "deep_status_mismatch",
+        "source_invalid_identity",
+    )
+    return {**{key: int(row[key] or 0) for key in fields},
+            "source_updated_at": row["source_updated_at"]}
 
 
 def source_preflight(conn) -> dict[str, Any]:
@@ -838,10 +864,18 @@ def source_preflight(conn) -> dict[str, Any]:
     stability = _source_stability_state(conn)
 
     blockers = {
-        "master_waiting": master_waiting,
-        "runtime_running": runtime_running,
-        "discovery_active_leases": discovery_active_leases,
-        "deep_active": deep_active,
+        "master_waiting": max(master_waiting, stability.get("master_waiting", 0)),
+        "runtime_pending": stability.get("runtime_pending", 0),
+        "runtime_running": max(runtime_running, stability.get("runtime_running", 0)),
+        "runtime_retry_wait": stability.get("runtime_retry_wait", 0),
+        "discovery_active_leases": max(
+            discovery_active_leases, stability.get("discovery_active_leases", 0)
+        ),
+        "deep_active": max(deep_active, stability.get("deep_active", 0)),
+        "deep_unresolved": stability.get("deep_unresolved", 0),
+        "deep_invalid_masks": stability.get("deep_invalid_masks", 0),
+        "deep_status_mismatch": stability.get("deep_status_mismatch", 0),
+        "source_invalid_identity": stability.get("source_invalid_identity", 0),
     }
     if any(blockers.values()):
         details = ", ".join(f"{key}={value}" for key, value in blockers.items() if value)
@@ -914,12 +948,12 @@ def _assert_source_snapshot(conn, baseline: dict[str, Any]) -> None:
     blockers = {
         key: state[key]
         for key in (
-            "master_waiting",
-            "runtime_running",
-            "discovery_active_leases",
-            "deep_active",
+            "master_waiting", "runtime_pending", "runtime_running",
+            "runtime_retry_wait", "discovery_active_leases",
+            "deep_unresolved", "deep_active", "deep_invalid_masks",
+            "deep_status_mismatch", "source_invalid_identity",
         )
-        if state[key]
+        if state.get(key, 0)
     }
     if blockers:
         details = ", ".join(f"{key}={value}" for key, value in blockers.items())
@@ -971,9 +1005,73 @@ def source_batches(
             rows = [dict(item) for item in cur.fetchall()]
         if not rows:
             return
+        previous = (last_type, last_no) if last_type is not None else None
+        for row in rows:
+            identity = (
+                _required_text(row.get("jp_type_code"), "jp_type_code"),
+                _required_text(row.get("jp_no"), "jp_no"),
+            )
+            if previous is not None and identity <= previous:
+                raise CutoverSafetyError(
+                    "Non-increasing or duplicated legacy source keyset identity"
+                )
+            previous = identity
+        last_type, last_no = previous
         yield rows
-        last_type = str(rows[-1]["jp_type_code"])
-        last_no = str(rows[-1]["jp_no"])
+
+
+
+def _canonical_cutover_value(value: Any, *, json_field: bool = False) -> Any:
+    """Canonical, lossless-enough primitive for source digest / target comparisons."""
+    if json_field and value is not None:
+        value = _decode_json(value, field="cutover JSON evidence")
+    if value is None:
+        return ["null"]
+    if isinstance(value, Decimal):
+        return ["decimal", format(value.normalize(), "f")]
+    if isinstance(value, bool):
+        return ["bool", value]
+    if isinstance(value, int):
+        return ["integer", value]
+    if isinstance(value, float):
+        return ["decimal", format(Decimal(str(value)).normalize(), "f")]
+    if isinstance(value, datetime):
+        return ["datetime", value.isoformat(timespec="microseconds")]
+    if isinstance(value, date):
+        return ["date", value.isoformat()]
+    if isinstance(value, bytes):
+        value = value.decode("utf-8")
+    if isinstance(value, dict):
+        return ["object", [[str(key), _canonical_cutover_value(item)]
+                           for key, item in sorted(value.items(), key=lambda x: str(x[0]))]]
+    if isinstance(value, (list, tuple)):
+        return ["list", [_canonical_cutover_value(item) for item in value]]
+    return ["text", str(value).replace("\x00", "")]
+
+
+def _source_digest_append(hasher, row: dict[str, Any]) -> None:
+    """SHA256 length-framed canonical records; order fixed by SOURCE_COLUMNS."""
+    payload = [
+        _canonical_cutover_value(
+            row.get(column),
+            json_field=(column.endswith("_data") or column == "endpoint_meta"),
+        )
+        for column in SOURCE_COLUMNS
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    hasher.update(len(encoded).to_bytes(8, "big"))
+    hasher.update(encoded)
+
+
+def _source_content_digest(conn, *, batch_size: int) -> tuple[int, str]:
+    """Independent bounded second pass: detects equal-watermark content drift."""
+    seen = 0
+    digest = hashlib.sha256()
+    for rows in source_batches(conn, batch_size=batch_size):
+        for row in rows:
+            _source_digest_append(digest, row)
+            seen += 1
+    return seen, digest.hexdigest()
 
 
 def _attach_company_id(rows: list[dict[str, Any]], company_id: int) -> list[dict[str, Any]]:
