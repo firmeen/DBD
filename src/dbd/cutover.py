@@ -1198,6 +1198,161 @@ def verify_generation_one(
     return result
 
 
+def _assert_cutover_target_admission(repository, backend: str, manager_conn) -> None:
+    """SQL Server only: reuse the approved Admin identity and Control records."""
+    if backend != "sqlserver":
+        return
+    from .presentation.setup import local_node_id
+    from .storage.sqlserver.control_repository import ControlRepository
+
+    node_id = local_node_id()
+    if node_id is None:
+        raise CutoverSafetyError("SQL Server cutover requires registered Admin node identity")
+    ControlRepository().require_cutover_access(manager_conn, node_id)
+
+
+def _business_row_comparable(expected: dict[str, Any], actual: dict[str, Any],
+                             json_fields: set[str]) -> bool:
+    """Compare every mapped business field, excluding run-owned timestamps/PKs."""
+    for key, expected_value in expected.items():
+        if key in ("company_id", "published_at"):
+            continue
+        if key not in actual:
+            return False
+        if _canonical_cutover_value(
+            expected_value, json_field=key in json_fields
+        ) != _canonical_cutover_value(
+            actual[key], json_field=key in json_fields
+        ):
+            return False
+    return True
+
+
+def _verify_cutover_equivalence(
+    conn, repository, *, batch_size: int, published_at: datetime,
+    expected_count: int, expected_digest: str,
+) -> dict[str, Any]:
+    """Stream a second source pass and read back every mapped natural identity.
+
+    Global table-count/orphan checks remain the responsibility of the
+    existing verify_generation_one() gate; this closes its equal-count
+    wrong-identity/payload gap without holding all companies in memory.
+    """
+    from .storage.sqlserver.schema import JSON_CHECKS
+
+    json_fields = {
+        table.split(".")[-1].replace("DBD_", "").lower(): {column for _, column in items}
+        for table, items in JSON_CHECKS.items()
+    }
+    tables = {
+        "companies": (("juristic_type_code", "registration_no"), transform_company),
+        "relations": (("company_id", "relation_type", "source_key"), transform_relations),
+        "events": (("company_id", "event_type", "source_key"), transform_events),
+        "financial": (("company_id", "fiscal_year"), transform_financials),
+        "industries": (
+            ("submit_objective_code", "fiscal_year", "business_size_code",
+             "location_type", "location_no"), transform_industries,
+        ),
+    }
+    examined = 0
+    content = hashlib.sha256()
+    counters = {table: 0 for table in tables}
+    for window in source_batches(conn, batch_size=batch_size):
+        for offset in range(0, len(window), 1000):
+            source_rows = window[offset:offset + 1000]
+            for row in source_rows:
+                _source_digest_append(content, row)
+                examined += 1
+            identities = [
+                (_required_text(row.get("jp_type_code"), "jp_type_code"),
+                 _required_text(row.get("jp_no"), "jp_no"))
+                for row in source_rows
+            ]
+            prepared = [
+                (
+                    transform_company(row, published_at=published_at),
+                    transform_relations(row, published_at=published_at),
+                    transform_events(row, published_at=published_at),
+                    transform_financials(row, published_at=published_at),
+                    transform_industries(row, published_at=published_at),
+                )
+                for row in source_rows
+            ]
+            industry_keys = list(dict.fromkeys(
+                (
+                    industry["submit_objective_code"], industry["fiscal_year"],
+                    industry["business_size_code"], industry["location_type"],
+                    industry["location_no"],
+                )
+                for item in prepared for industry in item[4]
+            ))
+            with repository.transaction() as target_conn:
+                observed = repository.read_cutover_rows(
+                    target_conn, identities, industry_keys,
+                )
+            company_ids = {}
+            for company in observed["companies"]:
+                key = (str(company["juristic_type_code"]), str(company["registration_no"]))
+                if key in company_ids:
+                    raise CutoverSafetyError("Duplicate target company identity in cutover verification")
+                company_ids[key] = int(company["company_id"])
+            if set(company_ids) != set(identities):
+                raise CutoverSafetyError("Missing/unexpected target company identity in G1 verification")
+            expected_rows = {table: [] for table in tables}
+            for identity, prepared_company in zip(identities, prepared, strict=True):
+                company, relations, events, financial, industries = prepared_company
+                company_id = company_ids[identity]
+                expected_rows["companies"].append(company)
+                for name, items in (
+                    ("relations", relations), ("events", events),
+                    ("financial", financial),
+                ):
+                    expected_rows[name].extend(
+                        _attach_company_id(items, company_id)
+                    )
+                expected_rows["industries"].extend(industries)
+
+            for name, (natural_key, _) in tables.items():
+                expected_index = {}
+                actual_index = {}
+                for row in expected_rows[name]:
+                    key = tuple(row.get(column) for column in natural_key)
+                    if key in expected_index:
+                        if not _business_row_comparable(
+                            expected_index[key], row, json_fields.get(name, set())
+                        ):
+                            raise CutoverSafetyError(
+                                f"Conflicting source {name} natural key in cutover verification"
+                            )
+                    else:
+                        expected_index[key] = row
+                for row in observed[name]:
+                    key = tuple(row.get(column) for column in natural_key)
+                    if key in actual_index:
+                        raise CutoverSafetyError(
+                            f"Duplicate target {name} natural key in cutover verification"
+                        )
+                    actual_index[key] = row
+                if set(expected_index) != set(actual_index):
+                    raise CutoverSafetyError(
+                        f"Missing/extra {name} natural key in cutover verification"
+                    )
+                for key, item in expected_index.items():
+                    if not _business_row_comparable(
+                        item, actual_index[key], json_fields.get(name, set())
+                    ):
+                        raise CutoverSafetyError(
+                            f"Mapped {name} payload mismatch in Generation 1 verification"
+                        )
+                counters[name] += len(expected_index)
+    if examined != int(expected_count) or content.hexdigest() != expected_digest:
+        raise CutoverSafetyError(
+            "Legacy Source content/identity changed during Generation 1 cutover"
+        )
+    return {**counters, "source_rows_verified": examined,
+            "source_content_verified": True}
+
+
 def run_generation1_cutover(
     *,
     batch_size: int = 500,
@@ -1261,6 +1416,8 @@ def run_generation1_cutover(
                 f"{backend} already contains Generation {highest_generation}; "
                 "legacy Generation 1 cutover is permanently refused"
             )
+        _assert_cutover_target_admission(repository, backend, manager_conn)
+        repository.assert_manager_lock(manager_conn)
 
         # Legacy MySQL source opens only after target generation gate passes.
         fence_conn = stack.enter_context(source_fence())
@@ -1269,6 +1426,7 @@ def run_generation1_cutover(
         if event is not None:
             event("started", dict(stats))
 
+        source_content = hashlib.sha256()
         read_started = time.monotonic()
         for read_window in source_batches(fence_conn, batch_size=batch_size):
             stats["read_seconds"] += time.monotonic() - read_started
@@ -1290,6 +1448,7 @@ def run_generation1_cutover(
                 ] = []
 
                 for source in source_rows_batch:
+                    _source_digest_append(source_content, source)
                     identity = (
                         _required_text(source.get("jp_type_code"), "jp_type_code"),
                         _required_text(source.get("jp_no"), "jp_no"),
@@ -1399,6 +1558,15 @@ def run_generation1_cutover(
                 f"expected={stats['source_rows']}, scanned={stats['companies']}"
             )
         repository.assert_manager_lock(manager_conn)
+        # A bounded second Source traversal also compares every mapped
+        # Company/Domain business value read back from the target.
+        equivalence = _verify_cutover_equivalence(
+            fence_conn, repository, batch_size=batch_size,
+            published_at=published_at, expected_count=stats["source_rows"],
+            expected_digest=source_content.hexdigest(),
+        )
+        _assert_source_snapshot(fence_conn, preflight)
+        repository.assert_manager_lock(manager_conn)
         verification = verify_generation_one(
             int(stats["source_rows"]),
             expected_domain_counts={
@@ -1411,7 +1579,7 @@ def run_generation1_cutover(
         )
         _assert_source_snapshot(fence_conn, preflight)
         repository.assert_manager_lock(manager_conn)
-        stats["verification"] = verification
+        stats["verification"] = {**verification, **equivalence}
         stats["industries"] = verification["industries"]
         stats["elapsed_seconds"] = time.monotonic() - started
         if event is not None:
