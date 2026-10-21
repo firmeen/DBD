@@ -877,6 +877,7 @@ class ProductionSqlServerRepository:
         self,
         conn,
         identities: Iterable[tuple[str, str]],
+        *, allow_missing: bool = False, for_update: bool = False,
     ) -> dict[tuple[str, str], int]:
         unique = list(
             dict.fromkeys(
@@ -902,7 +903,7 @@ class ProductionSqlServerRepository:
                 cur.execute(
                     f"""
                     SELECT c.juristic_type_code,c.registration_no,c.company_id
-                    FROM dbo.DBD_COMPANY c
+                    FROM dbo.DBD_COMPANY c{' WITH (UPDLOCK,HOLDLOCK)' if for_update else ''}
                     JOIN (VALUES {values_sql}) v(juristic_type_code,registration_no)
                       ON v.juristic_type_code=c.juristic_type_code
                      AND v.registration_no=c.registration_no
@@ -913,7 +914,7 @@ class ProductionSqlServerRepository:
                     result[(str(jp_type), str(jp_no))] = int(company_id)
             finally:
                 cur.close()
-        if len(result) != len(unique):
+        if not allow_missing and len(result) != len(unique):
             missing = [identity for identity in unique if identity not in result]
             raise SqlServerWriteError(
                 "Unable to resolve SQL Server company_id for "
@@ -954,11 +955,13 @@ class ProductionSqlServerRepository:
         finally:
             cur.close()
 
-    def read_cutover_rows(self, conn, identities, industry_keys):
+    def read_cutover_rows(self, conn, identities, industry_keys, *,
+                          allow_missing=False, for_update=False):
         """Bounded, read-only G1 readback; no business transformations here."""
         if len(identities) > 1000:
             raise ValueError("Cutover verification exceeds bounded micro-batch")
-        company_ids = self.company_ids(conn, identities)
+        company_ids = self.company_ids(conn, identities,
+                                       allow_missing=allow_missing, for_update=for_update)
         ids = sorted(set(company_ids.values()))
         result = {key: [] for key in (
             "companies", "relations", "events", "financial", "industries"
@@ -985,7 +988,8 @@ class ProductionSqlServerRepository:
             placeholders = ",".join(["%s"] * len(chunk))
             for label, table in tables:
                 select(
-                    f"SELECT * FROM {table} WHERE company_id IN ({placeholders})",
+                    f"SELECT * FROM {table}{' WITH (UPDLOCK,HOLDLOCK)' if for_update else ''} "
+                    f"WHERE company_id IN ({placeholders})",
                     chunk, label,
                 )
         key_columns = (
@@ -1007,10 +1011,80 @@ class ProductionSqlServerRepository:
                         params.append(value)
                 predicates.append("(" + " AND ".join(parts) + ")")
             select(
-                "SELECT * FROM dbo.DBD_INDUSTRY WHERE " + " OR ".join(predicates),
+                ("SELECT * FROM dbo.DBD_INDUSTRY" +
+                 (" WITH (UPDLOCK,HOLDLOCK)" if for_update else "") +
+                 " WHERE " + " OR ".join(predicates)),
                 params, "industries",
             )
         return result
+
+    def insert_legacy_sync_rows(self, conn, table: str, rows: list[dict[str, Any]]) -> None:
+        """INSERT-only; a duplicate natural key must fail instead of overwriting data."""
+        tables = {
+            "companies": "dbo.DBD_COMPANY", "relations": "dbo.DBD_COMPANY_RELATION",
+            "events": "dbo.DBD_COMPANY_EVENT", "financial": "dbo.DBD_FINANCIAL",
+            "industries": "dbo.DBD_INDUSTRY",
+        }
+        if table not in tables:
+            raise SqlServerWriteError("Invalid legacy sync table")
+        columns = tuple(col for col in _table_write_columns(tables[table]) if col != "branch_count")
+        cur = conn.cursor()
+        try:
+            for row in rows:
+                if not row or set(row) - set(columns):
+                    raise SqlServerWriteError("Unapproved legacy sync INSERT fields")
+                names = tuple(name for name in columns if name in row)
+                cur.execute(
+                    f"INSERT INTO {tables[table]} (" +
+                    ",".join(f"[{name}]" for name in names) + ") VALUES (" +
+                    ",".join(["%s"] * len(names)) + ")",
+                    tuple(_production_value(row[name]) for name in names),
+                )
+        finally:
+            cur.close()
+
+    def update_legacy_sync_rows(self, conn, table: str,
+                                changes: list[tuple[int, dict[str, Any]]]) -> None:
+        """Apply only explicitly planned changed fields, fenced to G1 identities."""
+        allowed = {
+            "companies": ("dbo.DBD_COMPANY", "company_id"),
+            "relations": ("dbo.DBD_COMPANY_RELATION", "relation_id"),
+            "events": ("dbo.DBD_COMPANY_EVENT", "event_id"),
+            "financial": ("dbo.DBD_FINANCIAL", "financial_id"),
+            "industries": ("dbo.DBD_INDUSTRY", "industry_id"),
+        }
+        if table not in allowed:
+            raise SqlServerWriteError("Invalid legacy sync table")
+        table_name, pk = allowed[table]
+        prohibited = {
+            "company_id", "relation_id", "event_id", "financial_id", "industry_id",
+            "juristic_type_code", "registration_no", "relation_type", "event_type",
+            "source_key", "fiscal_year", "submit_objective_code", "business_size_code",
+            "location_type", "location_no", "first_seen_generation",
+            "last_seen_generation", "dataset_generation", "branch_count",
+            "lease_owner", "lease_expires_at", "retry_at", "required_mask",
+            "done_mask", "not_available_mask", "failed_mask", "collect_status",
+            "endpoint_meta",
+        }
+        accepted = set(_table_write_columns(table_name)) - prohibited
+        cur = conn.cursor()
+        try:
+            for pk_value, values in changes:
+                if not values or set(values) - accepted:
+                    raise SqlServerWriteError("Unapproved legacy sync UPDATE field")
+                keys = tuple(sorted(values))
+                cur.execute(
+                    f"UPDATE {table_name} SET " +
+                    ",".join(f"[{name}]=%s" for name in keys) +
+                    f" WHERE [{pk}]=%s AND last_seen_generation=1" +
+                    (" AND dataset_generation=1" if table == "companies" else ""),
+                    tuple(_production_value(values[key]) for key in keys) +
+                    (int(pk_value),),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise SqlServerWriteError("Legacy sync update lost G1 row ownership")
+        finally:
+            cur.close()
 
     def upsert_relations(self, conn, rows: list[dict[str, Any]]) -> int:
         return _upsert_many(
