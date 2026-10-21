@@ -1414,6 +1414,420 @@ def _verify_cutover_equivalence(
             "source_content_verified": True}
 
 
+# G1 incremental synchronization uses the same source transforms as initial cutover.
+# Only business fields whose existing G1 provenance can be proven newer may change.
+_LEGACY_SYNC_KEYS = {
+    "companies": ("juristic_type_code", "registration_no"),
+    "relations": ("company_id", "relation_type", "source_key"),
+    "events": ("company_id", "event_type", "source_key"),
+    "financial": ("company_id", "fiscal_year"),
+    "industries": ("submit_objective_code", "fiscal_year", "business_size_code",
+                   "location_type", "location_no"),
+}
+_LEGACY_SYNC_PK = {
+    "companies": "company_id", "relations": "relation_id",
+    "events": "event_id", "financial": "financial_id", "industries": "industry_id",
+}
+_LEGACY_SYNC_PROTECTED = frozenset((
+    "dataset_generation", "first_seen_generation", "last_seen_generation",
+    "required_mask", "done_mask", "not_available_mask", "failed_mask",
+    "collect_status", "endpoint_meta", "lease_owner", "lease_expires_at",
+    "retry_at", "last_endpoint", "last_http_status", "last_error",
+    "last_error_at", "last_request_at", "collection_started_at",
+    "collection_completed_at", "is_current",
+))
+_LEGACY_SYNC_AUDIT = frozenset((
+    "published_at", "source_updated_at", "submission_updated_at",
+    "statement_updated_at",
+))
+
+
+def _legacy_sync_metadata():
+    from .storage.sqlserver.schema import JSON_CHECKS, TABLE_COLUMNS
+    from .storage.sqlserver.repository import _SUBMISSION_COLUMNS, _STATEMENT_COLUMNS
+
+    labels = {
+        "DBD_COMPANY": "companies", "DBD_COMPANY_RELATION": "relations",
+        "DBD_COMPANY_EVENT": "events", "DBD_FINANCIAL": "financial",
+        "DBD_INDUSTRY": "industries",
+    }
+    json_fields = {
+        labels[table.split(".")[-1]]: {name for _, name in fields}
+        for table, fields in JSON_CHECKS.items() if table.split(".")[-1] in labels
+    }
+    column_types = {
+        labels[table.split(".")[-1]]: {column.name: column.sql_type for column in fields}
+        for table, fields in TABLE_COLUMNS.items() if table.split(".")[-1] in labels
+    }
+    return json_fields, column_types, (set(_SUBMISSION_COLUMNS), set(_STATEMENT_COLUMNS))
+
+
+def _legacy_sync_time(value: Any) -> datetime | None:
+    if value is None:
+        return None
+    try:
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, date):
+            parsed = datetime.combine(value, datetime.min.time())
+        else:
+            parsed = datetime.fromisoformat(str(value))
+        return (parsed.astimezone(timezone.utc).replace(tzinfo=None)
+                if parsed.tzinfo is not None else parsed)
+    except (ValueError, TypeError):
+        return None
+
+
+def _legacy_sync_changes(
+    table: str, expected: dict[str, Any], actual: dict[str, Any],
+    json_fields: dict[str, set[str]], column_types: dict[str, dict[str, str]],
+    financial_groups: tuple[set[str], set[str]],
+) -> dict[str, Any]:
+    """Return authorized changed fields, or refuse ambiguous source precedence.
+
+    G1 is necessary, not sufficient: each changed source-owned field also
+    needs matching lineage and an independent freshness indication.
+    """
+    if table not in _LEGACY_SYNC_KEYS:
+        raise CutoverSafetyError("Unsupported incremental sync table")
+    for key in _LEGACY_SYNC_KEYS[table]:
+        if key not in actual or actual[key] != expected[key]:
+            raise CutoverSafetyError(f"Missing or conflicting {table} natural identity")
+    if int(actual.get("first_seen_generation") or 0) != 1 or int(
+        actual.get("last_seen_generation") or 0
+    ) != 1:
+        raise CutoverSafetyError(f"{table} does not belong to Generation 1")
+    if table == "companies" and int(actual.get("dataset_generation") or 0) != 1:
+        raise CutoverSafetyError("Cannot change a non-G1 company")
+    changed = {}
+    for key, value in expected.items():
+        if key in _LEGACY_SYNC_KEYS[table] or key in _LEGACY_SYNC_AUDIT:
+            continue
+        if key not in actual:
+            raise CutoverSafetyError(f"Target readback omitted {table}.{key}")
+        if _business_row_comparable(
+            {key: value}, actual, json_fields.get(table, set()),
+            column_types.get(table, {}),
+        ):
+            continue
+        if key in _LEGACY_SYNC_PROTECTED:
+            raise CutoverSafetyError(f"Collector-owned {table}.{key} differs from Legacy")
+        if table == "financial":
+            submission, statement = financial_groups
+            if key in submission and expected.get("submission_payload") is None:
+                # Absent source endpoint is not an instruction to erase target.
+                continue
+            if key in statement and expected.get("statement_payload") is None:
+                continue
+            freshness_field = ("submission_updated_at" if key in submission else
+                               "statement_updated_at" if key in statement else None)
+        elif table == "companies":
+            # DBD profile update date, not the Deep row's last-write timestamp.
+            freshness_field = "dbd_update_date"
+        else:
+            freshness_field = "source_updated_at"
+        source_time = _legacy_sync_time(expected.get(freshness_field)) if freshness_field else None
+        target_time = _legacy_sync_time(actual.get(freshness_field)) if freshness_field else None
+        if value is None and actual[key] is not None:
+            raise CutoverSafetyError(
+                f"Legacy {table}.{key} cannot erase existing target evidence"
+            )
+        if actual[key] is not None and not (
+            source_time is not None and target_time is not None and source_time > target_time
+        ):
+            raise CutoverSafetyError(
+                f"Unproven freshness for changed {table}.{key}; target preserved"
+            )
+        changed[key] = value
+    if changed:
+        if table in ("companies", "relations", "events", "industries"):
+            source_time = _legacy_sync_time(expected.get("source_updated_at"))
+            target_time = _legacy_sync_time(actual.get("source_updated_at"))
+            if source_time is not None and (target_time is None or source_time > target_time):
+                changed["source_updated_at"] = expected["source_updated_at"]
+        if table == "financial":
+            for field in ("submission_updated_at", "statement_updated_at"):
+                source_time = _legacy_sync_time(expected.get(field))
+                target_time = _legacy_sync_time(actual.get(field))
+                if source_time is not None and (target_time is None or source_time > target_time):
+                    changed[field] = expected[field]
+        changed["published_at"] = expected["published_at"]
+    return changed
+
+
+def _legacy_sync_prepared(source_rows: list[dict[str, Any]], published_at: datetime):
+    prepared = []
+    for row in source_rows:
+        key = (_required_text(row.get("jp_type_code"), "jp_type_code"),
+               _required_text(row.get("jp_no"), "jp_no"))
+        prepared.append((
+            key, transform_company(row, published_at=published_at),
+            transform_relations(row, published_at=published_at),
+            transform_events(row, published_at=published_at),
+            transform_financials(row, published_at=published_at),
+            transform_industries(row, published_at=published_at),
+        ))
+    return prepared
+
+
+def _legacy_sync_domains(prepared, company_ids):
+    result: dict[str, list[dict[str, Any]]] = {
+        "relations": [], "events": [], "financial": [], "industries": [],
+    }
+    for key, _company, relations, events, financial, industries in prepared:
+        company_id = company_ids[key]
+        result["relations"].extend(_attach_company_id(relations, company_id))
+        result["events"].extend(_attach_company_id(events, company_id))
+        result["financial"].extend(_attach_company_id(financial, company_id))
+        result["industries"].extend(industries)
+    return result
+
+
+def _legacy_sync_index(table: str, rows, json_fields, column_types):
+    result = {}
+    for row in rows:
+        key = tuple(row.get(name) for name in _LEGACY_SYNC_KEYS[table])
+        if key in result:
+            # Same industry scope from multiple companies is legitimate only
+            # when the canonical business payloads are equivalent.
+            if not (_business_row_comparable(
+                result[key], row, json_fields.get(table, set()),
+                column_types.get(table, {}),
+            ) and _business_row_comparable(
+                row, result[key], json_fields.get(table, set()),
+                column_types.get(table, {}),
+            )):
+                raise CutoverSafetyError(f"Conflicting duplicate {table} natural key")
+        else:
+            result[key] = row
+    return result
+
+
+def _legacy_sync_industry_keys(prepared):
+    return list(dict.fromkeys(
+        (row["submit_objective_code"], row["fiscal_year"], row["business_size_code"],
+         row["location_type"], row["location_no"])
+        for _identity, _company, _relations, _events, _financial, industries in prepared
+        for row in industries
+    ))
+
+
+def _legacy_sync_compare_domains(repository, conn, expected, observed,
+                                 json_fields, column_types, financial_groups, *, write):
+    inserted = updated = target_only = verified = 0
+    for table in ("relations", "events", "financial", "industries"):
+        wanted = _legacy_sync_index(table, expected[table], json_fields, column_types)
+        found = _legacy_sync_index(table, observed[table], json_fields, column_types)
+        missing = []
+        changes = []
+        for key, row in wanted.items():
+            existing = found.get(key)
+            if existing is None:
+                if not write:
+                    raise CutoverSafetyError(f"Missing committed legacy sync {table} record")
+                missing.append(row)
+            else:
+                fields = _legacy_sync_changes(
+                    table, row, existing, json_fields, column_types, financial_groups,
+                )
+                if fields:
+                    if not write:
+                        raise CutoverSafetyError(f"Changed {table} record failed verification")
+                    changes.append((int(existing[_LEGACY_SYNC_PK[table]]), fields))
+            verified += 1
+        if write:
+            repository.insert_legacy_sync_rows(conn, table, missing)
+            repository.update_legacy_sync_rows(conn, table, changes)
+        inserted += len(missing)
+        updated += len(changes)
+        target_only += len(found.keys() - wanted.keys())
+    return {"domains_inserted": inserted, "domains_updated": updated,
+            "domains_verified": verified, "target_only_scope": target_only}
+
+
+def _assert_legacy_sync_admission(repository, backend, manager_conn):
+    state = repository.generation_state(manager_conn)
+    if (int(state.get("finalized_generation") or 0) != 1 or
+        int(state.get("last_seen_generation") or 0) != 1 or
+        int(state.get("active_generation") or 0) > 1):
+        raise CutoverSafetyError(
+            "Legacy incremental sync requires an existing G1 target; G2+ and empty targets are blocked"
+        )
+    _assert_cutover_target_admission(repository, backend, manager_conn)
+    repository.assert_manager_lock(manager_conn)
+
+
+def _verify_legacy_incremental_sync(
+    source_conn, repository, *, expected_count, expected_digest, batch_size,
+    published_at, json_fields, column_types, financial_groups,
+):
+    examined = 0
+    digest = hashlib.sha256()
+    domain_rows = target_only = 0
+    for window in source_batches(source_conn, batch_size=batch_size):
+        for off in range(0, len(window), 1000):
+            micro = window[off:off + 1000]
+            for item in micro:
+                _source_digest_append(digest, item)
+                examined += 1
+            prepared = _legacy_sync_prepared(micro, published_at)
+            keys = [x[0] for x in prepared]
+            with repository.transaction() as conn:
+                observed = repository.read_cutover_rows(
+                    conn, keys, _legacy_sync_industry_keys(prepared),
+                )
+                existing = _legacy_sync_index(
+                    "companies", observed["companies"], json_fields, column_types,
+                )
+                if len(existing) != len(keys):
+                    raise CutoverSafetyError("Missing target companies after legacy sync")
+                for key, expected, *_domains in prepared:
+                    fields = _legacy_sync_changes(
+                        "companies", expected, existing[key],
+                        json_fields, column_types, financial_groups,
+                    )
+                    if fields:
+                        raise CutoverSafetyError("Changed company failed sync verification")
+                domains = _legacy_sync_domains(
+                    prepared, {key: int(row["company_id"]) for key, row in existing.items()},
+                )
+                result = _legacy_sync_compare_domains(
+                    repository, conn, domains, observed, json_fields,
+                    column_types, financial_groups, write=False,
+                )
+                domain_rows += result["domains_verified"]
+                target_only += result["target_only_scope"]
+    if examined != expected_count or digest.hexdigest() != expected_digest:
+        raise CutoverSafetyError("Legacy sync source identity/content drift detected")
+    return {"companies_verified": examined, "domains_verified": domain_rows,
+            "target_only_scope": target_only, "source_content_verified": True}
+
+
+def run_legacy_incremental_sync(
+    *,
+    batch_size: int = 500,
+    event: EventCallback | None = None,
+    backend: str = "sqlserver",
+) -> dict[str, Any]:
+    """Import only new/authorized changed G1 values; never create G2 or delete."""
+    if not 1 <= batch_size <= 10000:
+        raise ValueError("batch_size must be between 1 and 10000")
+    repository = production_repository(backend)
+    repository.validate_schema()
+    published_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    json_fields, column_types, financial_groups = _legacy_sync_metadata()
+    stats: dict[str, Any] = {
+        "mode": "new-phase", "backend": backend, "generation": 1,
+        "source_rows": 0, "scanned": 0, "inserted": 0, "updated": 0,
+        "unchanged": 0, "conflicts": 0, "domains_inserted": 0,
+        "domains_updated": 0, "domains_verified": 0, "target_only_scope": 0,
+        "windows": 0, "batches": 0,
+    }
+    started = time.monotonic()
+    with ExitStack() as stack:
+        manager_conn = stack.enter_context(repository.manager_lock())
+        repository.assert_manager_lock(manager_conn)
+        _assert_legacy_sync_admission(repository, backend, manager_conn)
+        source_conn = stack.enter_context(source_fence())
+        baseline = source_preflight(source_conn)
+        stats["source_rows"] = int(baseline["source_rows"])
+        if event is not None:
+            event("started", dict(stats))
+        digest = hashlib.sha256()
+        for window in source_batches(source_conn, batch_size=batch_size):
+            stats["windows"] += 1
+            for off in range(0, len(window), 1000):
+                micro = window[off:off + 1000]
+                prepared = _legacy_sync_prepared(micro, published_at)
+                for item in micro:
+                    _source_digest_append(digest, item)
+                _assert_source_snapshot(source_conn, baseline)
+                repository.assert_manager_lock(manager_conn)
+                counter = {"inserted": 0, "updated": 0, "unchanged": 0}
+                with repository.transaction() as conn:
+                    keys = [item[0] for item in prepared]
+                    observed = repository.read_cutover_rows(
+                        conn, keys, [], allow_missing=True, for_update=True,
+                    )
+                    existing = _legacy_sync_index(
+                        "companies", observed["companies"], json_fields, column_types,
+                    )
+                    new_companies = [company for identity, company, *_ in prepared
+                                     if identity not in existing]
+                    for identity, expected, *_ in prepared:
+                        if identity in existing:
+                            change = _legacy_sync_changes(
+                                "companies", expected, existing[identity],
+                                json_fields, column_types, financial_groups,
+                            )
+                            if change:
+                                repository.update_legacy_sync_rows(
+                                    conn, "companies",
+                                    [(int(existing[identity]["company_id"]), change)],
+                                )
+                                counter["updated"] += 1
+                            else:
+                                counter["unchanged"] += 1
+                        else:
+                            counter["inserted"] += 1
+                    repository.insert_legacy_sync_rows(conn, "companies", new_companies)
+                    # New company PKs are target-generated; reread after INSERT.
+                    observed = repository.read_cutover_rows(
+                        conn, keys, _legacy_sync_industry_keys(prepared),
+                        for_update=True,
+                    )
+                    ids = {
+                        (str(row["juristic_type_code"]), str(row["registration_no"])):
+                        int(row["company_id"]) for row in observed["companies"]
+                    }
+                    if set(ids) != set(keys):
+                        raise CutoverSafetyError("Legacy sync company mapping incomplete")
+                    expected_domains = _legacy_sync_domains(prepared, ids)
+                    domains = _legacy_sync_compare_domains(
+                        repository, conn, expected_domains, observed,
+                        json_fields, column_types, financial_groups, write=True,
+                    )
+                    _assert_source_snapshot(source_conn, baseline)
+                    repository.assert_manager_lock(manager_conn)
+                _assert_source_snapshot(source_conn, baseline)
+                repository.assert_manager_lock(manager_conn)
+                stats["scanned"] += len(micro)
+                for label in ("inserted", "updated", "unchanged"):
+                    stats[label] += counter[label]
+                for label in ("domains_inserted", "domains_updated"):
+                    stats[label] += domains[label]
+                stats["batches"] += 1
+                stats["rate"] = stats["scanned"] / max(0.001, time.monotonic() - started)
+                if event is not None:
+                    event("progress", dict(stats))
+        if stats["scanned"] != stats["source_rows"]:
+            raise CutoverSafetyError("Legacy sync source traversal count mismatch")
+        _assert_source_snapshot(source_conn, baseline)
+        final_source = source_preflight(source_conn)
+        if (final_source["source_rows"] != baseline["source_rows"] or
+            final_source["source_updated_at"] != baseline["source_updated_at"]):
+            raise CutoverSafetyError("Legacy sync source changed before verification")
+        repository.assert_manager_lock(manager_conn)
+        verification = _verify_legacy_incremental_sync(
+            source_conn, repository, expected_count=stats["source_rows"],
+            expected_digest=digest.hexdigest(), batch_size=batch_size,
+            published_at=published_at, json_fields=json_fields,
+            column_types=column_types, financial_groups=financial_groups,
+        )
+        _assert_source_snapshot(source_conn, baseline)
+        repository.assert_manager_lock(manager_conn)
+        _assert_legacy_sync_admission(repository, backend, manager_conn)
+        stats.update({
+            "domains_verified": verification["domains_verified"],
+            "target_only_scope": verification["target_only_scope"],
+            "verification": verification,
+            "elapsed_seconds": time.monotonic() - started,
+        })
+        if event is not None:
+            event("complete", dict(stats))
+        return stats
+
+
 def run_generation1_cutover(
     *,
     batch_size: int = 500,
