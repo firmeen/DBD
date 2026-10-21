@@ -774,6 +774,26 @@ class V06Terminal:
 
     def _render_cutover(self, width: int):
         snapshot = self.state.result or self.state.cutover
+        if snapshot.get("mode") == "new-phase":
+            metrics = [
+                ("Generation", snapshot.get("generation", 1), "cutover.generation"),
+                ("Source rows", snapshot.get("source_rows", 0), "cutover.source"),
+                ("Scanned", snapshot.get("scanned", 0), "cutover.scanned"),
+                ("Inserted", snapshot.get("inserted", 0), "cutover.inserted"),
+                ("Updated", snapshot.get("updated", 0), "cutover.updated"),
+                ("Unchanged", snapshot.get("unchanged", 0), "cutover.unchanged"),
+                ("Conflicts", snapshot.get("conflicts", 0), "cutover.conflicts"),
+                ("Domain inserts", snapshot.get("domains_inserted", 0), "cutover.domain_insert"),
+                ("Domain updates", snapshot.get("domains_updated", 0), "cutover.domain_update"),
+                ("Target-only scope", snapshot.get("target_only_scope", 0), "cutover.target_only"),
+                ("Batches", snapshot.get("batches", 0), "cutover.batches"),
+            ]
+            state = "COMPLETE" if self.state.result else "SYNCING"
+            return self._panel(
+                f"MYSQL LEGACY → {self.state.backend.upper()} · NEW PHASE G1",
+                self._metric_grid(metrics, width),
+                state, active=not bool(self.state.result),
+            )
         items = [
             ("Generation", snapshot.get("generation", 1), "cutover.generation"),
             ("Source rows", snapshot.get("source_rows", 0), "cutover.source"),
