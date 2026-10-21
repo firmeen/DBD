@@ -428,6 +428,10 @@ def test_incremental_sync_repository_insert_and_selective_update_are_parameteriz
         def execute(self, sql, params=()):
             calls.append((sql, tuple(params)))
             assert "%s" in sql
+        def executemany(self, sql, rows):
+            assert rows and "%s" in sql
+            for params in rows:
+                calls.append((sql, tuple(params)))
         def close(self):
             pass
         def __enter__(self):
