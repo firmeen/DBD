@@ -351,7 +351,7 @@ class ProductionMySqlRepository:
                     )
 
     def insert_legacy_sync_rows(self, conn, table, rows):
-        """INSERT only; natural-key conflicts fail instead of overwriting."""
+        """Bounded INSERT-only batches; preserve unique-identity conflict failure."""
         tables = {
             "companies": "DBD_COMPANY", "relations": "DBD_COMPANY_RELATION",
             "events": "DBD_COMPANY_EVENT", "financial": "DBD_FINANCIAL",
@@ -359,18 +359,22 @@ class ProductionMySqlRepository:
         }
         if table not in tables:
             raise MySqlProductionWriteError("Invalid legacy sync table")
-        columns = set(_columns(tables[table])) - {"branch_count"}
+        allowed = set(_columns(tables[table])) - {"branch_count"}
+        grouped: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
+        for row in rows:
+            if not row or set(row) - allowed:
+                raise MySqlProductionWriteError("Unapproved legacy sync INSERT fields")
+            names = tuple(sorted(row))
+            grouped.setdefault(names, []).append(
+                tuple(_production_value(row[name]) for name in names)
+            )
         with conn.cursor() as cur:
-            for row in rows:
-                if not row or set(row) - columns:
-                    raise MySqlProductionWriteError("Unapproved legacy sync INSERT fields")
-                names = tuple(sorted(row))
-                cur.execute(
-                    f"INSERT INTO `{tables[table]}` (" +
-                    ",".join(f"`{name}`" for name in names) + ") VALUES (" +
-                    ",".join(["%s"] * len(names)) + ")",
-                    tuple(_production_value(row[name]) for name in names),
-                )
+            for names, parameters in grouped.items():
+                sql = (f"INSERT INTO `{tables[table]}` (" +
+                       ",".join(f"`{name}`" for name in names) + ") VALUES (" +
+                       ",".join(["%s"] * len(names)) + ")")
+                for offset in range(0, len(parameters), 200):
+                    cur.executemany(sql, parameters[offset:offset + 200])
 
     def update_legacy_sync_rows(self, conn, table, changes):
         """Selective UPDATE; the G1 predicate prevents Generation regression."""
