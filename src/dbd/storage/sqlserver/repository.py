@@ -1019,6 +1019,39 @@ class ProductionSqlServerRepository:
             )
         return result
 
+    def verify_legacy_sync_integrity(self, conn) -> None:
+        """Read-only global generation and orphan checks; Target-only G1 rows are permitted."""
+        checks = [
+            ("company generation", "SELECT COUNT(*) FROM dbo.DBD_COMPANY WHERE "
+             "dataset_generation<>1 OR first_seen_generation<>1 OR last_seen_generation<>1"),
+            ("relation orphan", "SELECT COUNT(*) FROM dbo.DBD_COMPANY_RELATION r "
+             "LEFT JOIN dbo.DBD_COMPANY c ON c.company_id=r.company_id WHERE c.company_id IS NULL"),
+            ("event orphan", "SELECT COUNT(*) FROM dbo.DBD_COMPANY_EVENT e "
+             "LEFT JOIN dbo.DBD_COMPANY c ON c.company_id=e.company_id WHERE c.company_id IS NULL"),
+            ("financial orphan", "SELECT COUNT(*) FROM dbo.DBD_FINANCIAL f "
+             "LEFT JOIN dbo.DBD_COMPANY c ON c.company_id=f.company_id WHERE c.company_id IS NULL"),
+        ]
+        for table in ("RELATION", "EVENT", "FINANCIAL", "INDUSTRY"):
+            checks.append((
+                table + " generation",
+                f"SELECT COUNT(*) FROM dbo.DBD_COMPANY_{table} WHERE " +
+                "first_seen_generation<>1 OR last_seen_generation<>1"
+                if table in ("RELATION", "EVENT") else
+                f"SELECT COUNT(*) FROM dbo.DBD_{table} WHERE " +
+                "first_seen_generation<>1 OR last_seen_generation<>1",
+            ))
+        cur = conn.cursor()
+        try:
+            for label, sql in checks:
+                cur.execute(sql)
+                count = int(cur.fetchone()[0] or 0)
+                if count:
+                    raise SqlServerWriteError(
+                        f"Legacy sync integrity failed: {label} ({count} rows)"
+                    )
+        finally:
+            cur.close()
+
     def insert_legacy_sync_rows(self, conn, table: str, rows: list[dict[str, Any]]) -> None:
         """INSERT-only; a duplicate natural key must fail instead of overwriting data."""
         tables = {
