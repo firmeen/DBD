@@ -1512,6 +1512,10 @@ def _legacy_sync_changes(
             continue
         if key in _LEGACY_SYNC_PROTECTED:
             raise CutoverSafetyError(f"Collector-owned {table}.{key} differs from Legacy")
+        if table == "industries":
+            # Shared across companies: a later encountered source row cannot
+            # supersede another company's snapshot without global provenance.
+            raise CutoverSafetyError("Conflicting shared Industry benchmark evidence")
         if table == "financial":
             submission, statement = financial_groups
             if key in submission and expected.get("submission_payload") is None:
@@ -1703,6 +1707,19 @@ def _verify_legacy_incremental_sync(
             "target_only_scope": target_only, "source_content_verified": True}
 
 
+@contextmanager
+def _legacy_sync_transaction(repository, stats, event):
+    """Report a failed classification while retaining transactional rollback."""
+    try:
+        with repository.transaction() as conn:
+            yield conn
+    except CutoverSafetyError:
+        stats["conflicts"] += 1
+        if event is not None:
+            event("progress", dict(stats))
+        raise
+
+
 def run_legacy_incremental_sync(
     *,
     batch_size: int = 500,
@@ -1744,7 +1761,7 @@ def run_legacy_incremental_sync(
                 _assert_source_snapshot(source_conn, baseline)
                 repository.assert_manager_lock(manager_conn)
                 counter = {"inserted": 0, "updated": 0, "unchanged": 0}
-                with repository.transaction() as conn:
+                with _legacy_sync_transaction(repository, stats, event) as conn:
                     keys = [item[0] for item in prepared]
                     observed = repository.read_cutover_rows(
                         conn, keys, [], allow_missing=True, for_update=True,
