@@ -18,7 +18,10 @@ from .contracts.financial import (
 )
 from .contracts.strict import normalize_collection
 from .core.exceptions import ContractError
-from .deep.catalog import ACTIVE_ENDPOINT_MASK, BASE_REQUIRED_MASK, latest_fiscal_year
+from .deep.catalog import (
+    ACTIVE_ENDPOINT_MASK, ACTIVE_ENDPOINTS, BASE_REQUIRED_MASK,
+    DESTINATION_COLUMNS, ENDPOINT_BITS, latest_fiscal_year,
+)
 from .storage.mysql.engine import connect as mysql_connection
 from .storage.sqlserver.engine import connection as sqlserver_connection
 from .storage.production import production_repository
@@ -758,6 +761,14 @@ def _source_stability_state(conn) -> dict[str, Any]:
         f"WHEN {terminal} THEN 'PARTIAL' "
         f"WHEN ({resolved} & required_mask)=0 THEN 'PENDING' ELSE 'COLLECTING' END"
     )
+    payload_rules = " OR ".join(
+        f"((done_mask & {ENDPOINT_BITS[endpoint]})<>0 "
+        f"AND ({DESTINATION_COLUMNS[endpoint]} IS NULL "
+        f"OR JSON_TYPE({DESTINATION_COLUMNS[endpoint]})='NULL')) "
+        f"OR ((not_available_mask & {ENDPOINT_BITS[endpoint]})<>0 "
+        f"AND {DESTINATION_COLUMNS[endpoint]} IS NOT NULL)"
+        for endpoint in ACTIVE_ENDPOINTS
+    )
     with conn.cursor() as cur:
         cur.execute(
             f"""
@@ -787,6 +798,8 @@ def _source_stability_state(conn) -> dict[str, Any]:
                      WHERE deep_status <> {status_case}
                         OR deep_status IS NULL LIMIT 1) deep_status_mismatch,
               EXISTS(SELECT 1 FROM {SOURCE_TABLE}
+                     WHERE {payload_rules} LIMIT 1) deep_invalid_payloads,
+              EXISTS(SELECT 1 FROM {SOURCE_TABLE}
                      WHERE jp_type_code IS NULL OR TRIM(jp_type_code)=''
                         OR jp_no IS NULL OR TRIM(jp_no)=''
                      LIMIT 1) source_invalid_identity,
@@ -798,7 +811,7 @@ def _source_stability_state(conn) -> dict[str, Any]:
         "master_waiting", "runtime_pending", "runtime_running",
         "runtime_retry_wait", "discovery_active_leases", "deep_unresolved",
         "deep_active", "deep_invalid_masks", "deep_status_mismatch",
-        "source_invalid_identity",
+        "deep_invalid_payloads", "source_invalid_identity",
     )
     return {**{key: int(row[key] or 0) for key in fields},
             "source_updated_at": row["source_updated_at"]}
@@ -875,6 +888,7 @@ def source_preflight(conn) -> dict[str, Any]:
         "deep_unresolved": stability.get("deep_unresolved", 0),
         "deep_invalid_masks": stability.get("deep_invalid_masks", 0),
         "deep_status_mismatch": stability.get("deep_status_mismatch", 0),
+        "deep_invalid_payloads": stability.get("deep_invalid_payloads", 0),
         "source_invalid_identity": stability.get("source_invalid_identity", 0),
     }
     if any(blockers.values()):
@@ -951,7 +965,8 @@ def _assert_source_snapshot(conn, baseline: dict[str, Any]) -> None:
             "master_waiting", "runtime_pending", "runtime_running",
             "runtime_retry_wait", "discovery_active_leases",
             "deep_unresolved", "deep_active", "deep_invalid_masks",
-            "deep_status_mismatch", "source_invalid_identity",
+            "deep_status_mismatch", "deep_invalid_payloads",
+            "source_invalid_identity",
         )
         if state.get(key, 0)
     }
