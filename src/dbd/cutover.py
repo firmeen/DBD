@@ -1817,6 +1817,9 @@ def run_legacy_incremental_sync(
         _assert_source_snapshot(source_conn, baseline)
         repository.assert_manager_lock(manager_conn)
         _assert_legacy_sync_admission(repository, backend, manager_conn)
+        with repository.transaction() as target_check:
+            repository.verify_legacy_sync_integrity(target_check)
+        repository.assert_manager_lock(manager_conn)
         stats.update({
             "domains_verified": verification["domains_verified"],
             "target_only_scope": verification["target_only_scope"],
