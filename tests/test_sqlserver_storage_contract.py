@@ -1134,3 +1134,33 @@ def test_cutover_readback_is_read_only_bounded_and_natural_keyed(monkeypatch):
                    for query, _ in queries)
     with pytest.raises(ValueError, match="bounded"):
         repo.read_cutover_rows(Connection(), [("5", "1")] * 1001, [])
+
+
+
+def test_cutover_industry_readback_more_than_1000_keys_remains_sql_bounded(monkeypatch):
+    """One company may map more than 1,000 distinct industry scopes."""
+    queries = []
+    class Cursor:
+        description = [("industry_id",)]
+        def execute(self, sql, params=()):
+            assert sql.lstrip().upper().startswith("SELECT "), sql
+            assert len(params) <= 500
+            queries.append((sql, tuple(params)))
+        def fetchall(self):
+            return []
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionSqlServerRepository()
+    monkeypatch.setattr(repo, "company_ids", lambda _conn, _keys: {})
+    keys = [(str(n), "2568", None, None, None) for n in range(1100)]
+    result = repo.read_cutover_rows(Connection(), [], keys)
+    assert result["industries"] == []
+    industry_queries = [sql for sql, _ in queries if "DBD_INDUSTRY" in sql]
+    assert len(industry_queries) == 15
