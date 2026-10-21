@@ -747,7 +747,7 @@ def _assert_source_database(conn) -> None:
         )
 
 
-def _source_stability_state(conn) -> dict[str, Any]:
+def _source_stability_state(conn, *, full: bool = True) -> dict[str, Any]:
     """Read-only evidence from the actual legacy runtime/mask contract.
 
     Terminal PARTIAL/FAILED is allowed only when every required bit has
@@ -769,21 +769,10 @@ def _source_stability_state(conn) -> dict[str, Any]:
         f"AND {DESTINATION_COLUMNS[endpoint]} IS NOT NULL)"
         for endpoint in ACTIVE_ENDPOINTS
     )
-    with conn.cursor() as cur:
-        cur.execute(
-            f"""
-            SELECT
-              EXISTS(SELECT 1 FROM {SOURCE_MASTER_TABLE} LIMIT 1) master_waiting,
-              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
-                     WHERE status='PENDING' LIMIT 1) runtime_pending,
-              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
-                     WHERE status='RUNNING' LIMIT 1) runtime_running,
-              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
-                     WHERE status='RETRY_WAIT' LIMIT 1) runtime_retry_wait,
-              EXISTS(SELECT 1 FROM {SOURCE_DISCOVERY_TABLE}
-                     WHERE lease_owner IS NOT NULL
-                       AND lease_expires_at > UTC_TIMESTAMP(6) LIMIT 1)
-                     discovery_active_leases,
+    # Full-source invariant scans run only at initial/final preflight.
+    # The frequent per-micro-batch fence check must stay O(index lookups)
+    # rather than rescanning millions of clean deep rows three times per batch.
+    full_sql = f"""
               EXISTS(SELECT 1 FROM {SOURCE_TABLE}
                      WHERE (required_mask & ~{resolved})<>0 LIMIT 1) deep_unresolved,
               EXISTS(SELECT 1 FROM {SOURCE_TABLE}
@@ -803,6 +792,29 @@ def _source_stability_state(conn) -> dict[str, Any]:
                      WHERE jp_type_code IS NULL OR TRIM(jp_type_code)=''
                         OR jp_no IS NULL OR TRIM(jp_no)=''
                      LIMIT 1) source_invalid_identity,
+    """
+    light_sql = ",\n".join(
+        f"0 AS {key}" for key in (
+            "deep_unresolved", "deep_active", "deep_invalid_masks",
+            "deep_status_mismatch", "deep_invalid_payloads", "source_invalid_identity",
+        )
+    ) + ","
+    with conn.cursor() as cur:
+        cur.execute(
+            f"""
+            SELECT
+              EXISTS(SELECT 1 FROM {SOURCE_MASTER_TABLE} LIMIT 1) master_waiting,
+              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
+                     WHERE status='PENDING' LIMIT 1) runtime_pending,
+              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
+                     WHERE status='RUNNING' LIMIT 1) runtime_running,
+              EXISTS(SELECT 1 FROM {SOURCE_RUNTIME_TABLE}
+                     WHERE status='RETRY_WAIT' LIMIT 1) runtime_retry_wait,
+              EXISTS(SELECT 1 FROM {SOURCE_DISCOVERY_TABLE}
+                     WHERE lease_owner IS NOT NULL
+                       AND lease_expires_at > UTC_TIMESTAMP(6) LIMIT 1)
+                     discovery_active_leases,
+              {full_sql if full else light_sql}
               (SELECT MAX(updated_at) FROM {SOURCE_TABLE}) source_updated_at
             """
         )
@@ -958,7 +970,7 @@ def _assert_source_fence(conn) -> None:
 def _assert_source_snapshot(conn, baseline: dict[str, Any]) -> None:
     _assert_source_fence(conn)
     _assert_source_database(conn)
-    state = _source_stability_state(conn)
+    state = _source_stability_state(conn, full=False)
     blockers = {
         key: state[key]
         for key in (
@@ -1077,16 +1089,6 @@ def _source_digest_append(hasher, row: dict[str, Any]) -> None:
     hasher.update(len(encoded).to_bytes(8, "big"))
     hasher.update(encoded)
 
-
-def _source_content_digest(conn, *, batch_size: int) -> tuple[int, str]:
-    """Independent bounded second pass: detects equal-watermark content drift."""
-    seen = 0
-    digest = hashlib.sha256()
-    for rows in source_batches(conn, batch_size=batch_size):
-        for row in rows:
-            _source_digest_append(digest, row)
-            seen += 1
-    return seen, digest.hexdigest()
 
 
 def _attach_company_id(rows: list[dict[str, Any]], company_id: int) -> list[dict[str, Any]]:
