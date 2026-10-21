@@ -422,9 +422,14 @@ class ControlRepository:
                 generation = item["generation"]
                 month = item["cycle_month"]
                 state = item["state"]
+                from ...control import GENERATION_STATES
                 if (isinstance(generation, bool) or not isinstance(generation, int)
                     or generation < 1 or not isinstance(month, str)
-                    or key != "core:" + month or not isinstance(state, str)):
+                    or len(month) != 7 or month[4] != "-"
+                    or not month[:4].isdigit() or not month[5:].isdigit()
+                    or not 1 <= int(month[5:]) <= 12
+                    or key != "core:" + month
+                    or state not in set(GENERATION_STATES) | {"COMPLETE_WITH_FAILURES"}):
                     raise ValueError("inconsistent Generation identity")
             except (ValueError, KeyError, TypeError) as exc:
                 raise ControlError("Malformed monthly Generation record blocks G1 cutover") from exc
