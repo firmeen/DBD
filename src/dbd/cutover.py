@@ -1650,10 +1650,10 @@ def _legacy_sync_compare_domains(repository, conn, expected, observed,
                 tuple(row.get(col) for col in _LEGACY_SYNC_KEYS[table])
                 for row in missing
             )
+            updated_pks = {int(pk) for pk, _values in changes}
             changed_keys[table].update(
-                tuple(row.get(col) for col in _LEGACY_SYNC_KEYS[table])
-                for key, row in wanted.items() if key in found and
-                any(pk == found[key][_LEGACY_SYNC_PK[table]] for pk, _values in changes)
+                key for key in wanted if key in found and
+                int(found[key][_LEGACY_SYNC_PK[table]]) in updated_pks
             )
             repository.insert_legacy_sync_rows(conn, table, missing)
             repository.update_legacy_sync_rows(conn, table, changes)
