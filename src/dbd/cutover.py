@@ -1236,19 +1236,42 @@ def _assert_cutover_target_admission(repository, backend: str, manager_conn) -> 
     ControlRepository().require_cutover_access(manager_conn, node_id)
 
 
-def _business_row_comparable(expected: dict[str, Any], actual: dict[str, Any],
-                             json_fields: set[str]) -> bool:
-    """Compare every mapped business field, excluding run-owned timestamps/PKs."""
+def _business_row_comparable(
+    expected: dict[str, Any], actual: dict[str, Any],
+    json_fields: set[str], column_types: dict[str, str] | None = None,
+) -> bool:
+    """Compare mapped values using existing Production Schema scalar types."""
+    types = column_types or {}
+
+    def canonical(value: Any, key: str) -> Any:
+        if value is None:
+            return ["null"]
+        declared = types.get(key, "").upper()
+        if declared == "DATE":
+            parsed = (
+                value.date() if isinstance(value, datetime)
+                else value if isinstance(value, date) and not isinstance(value, datetime)
+                else date.fromisoformat(str(value))
+            )
+            return ["date", parsed.isoformat()]
+        if declared.startswith("DATETIME"):
+            parsed = (
+                value if isinstance(value, datetime)
+                else datetime.fromisoformat(str(value))
+            )
+            if parsed.tzinfo is not None:
+                parsed = parsed.astimezone(timezone.utc).replace(tzinfo=None)
+            return ["datetime", parsed.isoformat(timespec="microseconds")]
+        if declared.startswith("DECIMAL"):
+            return ["decimal", format(Decimal(str(value)).normalize(), "f")]
+        return _canonical_cutover_value(value, json_field=key in json_fields)
+
     for key, expected_value in expected.items():
         if key in ("company_id", "published_at"):
             continue
         if key not in actual:
             return False
-        if _canonical_cutover_value(
-            expected_value, json_field=key in json_fields
-        ) != _canonical_cutover_value(
-            actual[key], json_field=key in json_fields
-        ):
+        if canonical(expected_value, key) != canonical(actual[key], key):
             return False
     return True
 
@@ -1263,7 +1286,7 @@ def _verify_cutover_equivalence(
     existing verify_generation_one() gate; this closes its equal-count
     wrong-identity/payload gap without holding all companies in memory.
     """
-    from .storage.sqlserver.schema import JSON_CHECKS
+    from .storage.sqlserver.schema import JSON_CHECKS, TABLE_COLUMNS
 
     names = {
         "DBD_COMPANY": "companies", "DBD_COMPANY_RELATION": "relations",
@@ -1273,6 +1296,11 @@ def _verify_cutover_equivalence(
     json_fields = {
         names[table.split(".")[-1]]: {column for _, column in items}
         for table, items in JSON_CHECKS.items()
+        if table.split(".")[-1] in names
+    }
+    column_types = {
+        names[table.split(".")[-1]]: {col.name: col.sql_type for col in columns}
+        for table, columns in TABLE_COLUMNS.items()
         if table.split(".")[-1] in names
     }
     tables = {
@@ -1350,7 +1378,8 @@ def _verify_cutover_equivalence(
                     key = tuple(row.get(column) for column in natural_key)
                     if key in expected_index:
                         if not _business_row_comparable(
-                            expected_index[key], row, json_fields.get(name, set())
+                            expected_index[key], row, json_fields.get(name, set()),
+                            column_types.get(name, {}),
                         ):
                             raise CutoverSafetyError(
                                 f"Conflicting source {name} natural key in cutover verification"
@@ -1370,7 +1399,8 @@ def _verify_cutover_equivalence(
                     )
                 for key, item in expected_index.items():
                     if not _business_row_comparable(
-                        item, actual_index[key], json_fields.get(name, set())
+                        item, actual_index[key], json_fields.get(name, set()),
+                        column_types.get(name, {}),
                     ):
                         raise CutoverSafetyError(
                             f"Mapped {name} payload mismatch in Generation 1 verification"
