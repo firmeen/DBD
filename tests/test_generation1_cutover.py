@@ -1189,3 +1189,50 @@ def test_sqlserver_control_denied_before_source_connection(monkeypatch):
     with pytest.raises(CutoverSafetyError, match="authorization"):
         cutover.run_generation1_cutover()
     assert events == ["manager"]
+
+
+
+def test_source_stability_full_scans_are_not_run_for_every_micro_batch():
+    statements = []
+    field_names = (
+        "master_waiting", "runtime_pending", "runtime_running",
+        "runtime_retry_wait", "discovery_active_leases", "deep_unresolved",
+        "deep_active", "deep_invalid_masks", "deep_status_mismatch",
+        "deep_invalid_payloads", "source_invalid_identity",
+    )
+    class Cursor:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, sql):
+            statements.append(sql)
+        def fetchone(self):
+            return {**{key: 0 for key in field_names},
+                    "source_updated_at": datetime(2026, 10, 21)}
+    conn = SimpleNamespace(cursor=Cursor)
+    cutover._source_stability_state(conn, full=False)
+    assert "0 AS deep_invalid_masks" in statements[-1]
+    assert "WHERE required_mask NOT IN" not in statements[-1]
+    cutover._source_stability_state(conn, full=True)
+    assert "WHERE required_mask NOT IN" in statements[-1]
+    assert "JSON_TYPE(" in statements[-1]
+
+
+def test_source_keyset_rejects_duplicate_or_backward_identity(monkeypatch):
+    source = [
+        {"jp_type_code": "5", "jp_no": "0100000000002"},
+        {"jp_type_code": "5", "jp_no": "0100000000001"},
+    ]
+    class Cursor:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, _sql, _params):
+            return None
+        def fetchall(self):
+            return source
+    monkeypatch.setattr(cutover, "_assert_source_fence", lambda _conn: None)
+    with pytest.raises(CutoverSafetyError, match="Non-increasing"):
+        list(cutover.source_batches(SimpleNamespace(cursor=Cursor), batch_size=500))
