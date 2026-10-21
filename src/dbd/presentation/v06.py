@@ -785,6 +785,7 @@ class V06Terminal:
                 ("Conflicts", snapshot.get("conflicts", 0), "cutover.conflicts"),
                 ("Domain inserts", snapshot.get("domains_inserted", 0), "cutover.domain_insert"),
                 ("Domain updates", snapshot.get("domains_updated", 0), "cutover.domain_update"),
+                ("Target-only companies", snapshot.get("target_only_companies", 0), "cutover.target_companies"),
                 ("Target-only scope", snapshot.get("target_only_scope", 0), "cutover.target_only"),
                 ("Batches", snapshot.get("batches", 0), "cutover.batches"),
             ]
