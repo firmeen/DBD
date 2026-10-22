@@ -1640,3 +1640,27 @@ def test_incremental_sqlserver_denies_unsafe_admission_before_source(monkeypatch
     with pytest.raises(CutoverSafetyError, match=reason):
         cutover.run_legacy_incremental_sync(backend="sqlserver")
     assert not source_opened and repo.inserts == 0
+
+
+
+def test_incremental_shared_industry_equal_payload_different_observation_times():
+    first = {
+        "submit_objective_code": "101", "fiscal_year": "2568",
+        "business_size_code": None, "location_type": None, "location_no": None,
+        "payload": '{"a":1,"b":2}',
+        "source_updated_at": datetime(2026, 10, 20),
+    }
+    second = dict(first, source_updated_at=datetime(2026, 10, 21),
+                  payload='{"b":2,"a":1}')
+    json_fields, types, _groups = cutover._legacy_sync_metadata()
+    index = cutover._legacy_sync_index(
+        "industries", [first, second], json_fields, types,
+    )
+    assert len(index) == 1
+    record = next(iter(index.values()))
+    assert record["source_updated_at"] == datetime(2026, 10, 21)
+    with pytest.raises(CutoverSafetyError, match="Conflicting duplicate industries"):
+        cutover._legacy_sync_index(
+            "industries", [first, dict(second, payload='{"a":9}')],
+            json_fields, types,
+        )
