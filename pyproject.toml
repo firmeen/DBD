@@ -6,6 +6,9 @@ build-backend = "setuptools.build_meta"
 name = "dbd-data"
 dynamic = ["version"]
 description = "TIPDI DBD data ingestion and collection platform"
+authors = [
+  { name = "firmeen" }
+]
 requires-python = ">=3.11"
 dependencies = [
   "curl_cffi>=0.7,<1",
