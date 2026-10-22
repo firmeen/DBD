@@ -1595,16 +1595,27 @@ def _legacy_sync_index(table: str, rows, json_fields, column_types):
     for row in rows:
         key = tuple(row.get(name) for name in _LEGACY_SYNC_KEYS[table])
         if key in result:
-            # Same industry scope from multiple companies is legitimate only
-            # when the canonical business payloads are equivalent.
+            # A shared Industry payload may have multiple observation times.
+            # Source timestamp is provenance, not a distinct business scope.
+            prior = result[key]
+            comparison_prior = dict(prior)
+            comparison_row = dict(row)
+            if table == "industries":
+                comparison_prior.pop("source_updated_at", None)
+                comparison_row.pop("source_updated_at", None)
             if not (_business_row_comparable(
-                result[key], row, json_fields.get(table, set()),
+                comparison_prior, comparison_row, json_fields.get(table, set()),
                 column_types.get(table, {}),
             ) and _business_row_comparable(
-                row, result[key], json_fields.get(table, set()),
+                comparison_row, comparison_prior, json_fields.get(table, set()),
                 column_types.get(table, {}),
             )):
                 raise CutoverSafetyError(f"Conflicting duplicate {table} natural key")
+            if table == "industries":
+                old_time = _legacy_sync_time(prior.get("source_updated_at"))
+                new_time = _legacy_sync_time(row.get("source_updated_at"))
+                if new_time is not None and (old_time is None or new_time > old_time):
+                    result[key] = row
         else:
             result[key] = row
     return result
