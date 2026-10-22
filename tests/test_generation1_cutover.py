@@ -1509,11 +1509,15 @@ def test_incremental_shared_industry_payload_conflict_is_never_overwritten():
     }
     actual = {
         **expected, "industry_id": 90, "payload": '{"a":1}',
-        "source_updated_at": datetime(2026, 10, 20),
+        "source_updated_at": datetime(2026, 10, 21),
     }
     j, types, groups = cutover._legacy_sync_metadata()
-    with pytest.raises(CutoverSafetyError, match="Industry"):
+    with pytest.raises(CutoverSafetyError, match="Unproven freshness"):
         cutover._legacy_sync_changes("industries", expected, actual, j, types, groups)
+    authorized = dict(actual, source_updated_at=datetime(2026, 10, 20))
+    changes = cutover._legacy_sync_changes("industries", expected, authorized, j, types, groups)
+    assert changes["payload"] == expected["payload"]
+    assert changes["source_updated_at"] == expected["source_updated_at"]
 
 
 def test_incremental_refuses_collector_masks_on_existing_company():
