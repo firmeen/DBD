@@ -22,3 +22,7 @@ dist/
 pytest-cache-files-*/
 
 canary*
+
+export*
+.dbd*
+branch_upgrade_backup/
