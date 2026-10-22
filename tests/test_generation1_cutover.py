@@ -1453,7 +1453,10 @@ def test_incremental_refuses_unproven_profile_freshness(monkeypatch):
 
 def test_incremental_rejects_empty_target_and_g2_before_source(monkeypatch):
     for generation in (None, 2):
-        repo = _LegacySyncFakeRepository(generation=generation)
+        repo = _LegacySyncFakeRepository(
+            [_legacy_sync_baseline()] if generation == 2 else [],
+            generation=generation,
+        )
         _legacy_sync_fake_setup(monkeypatch, repo, [_legacy_sync_source("0100000000001")])
         opened = []
         @contextmanager
@@ -1639,7 +1642,7 @@ def test_incremental_large_window_uses_at_most_1000_company_micro_batches(monkey
 @pytest.mark.parametrize("reason", ["Admin denied", "Control-only Generation 2"])
 def test_incremental_sqlserver_denies_unsafe_admission_before_source(monkeypatch, reason):
     source = _legacy_sync_source("0100000000001")
-    repo = _LegacySyncFakeRepository()
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()])
     repo.backend = "sqlserver"
     _legacy_sync_fake_setup(monkeypatch, repo, [source])
     source_opened = []
