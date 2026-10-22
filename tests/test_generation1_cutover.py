@@ -1297,9 +1297,10 @@ class _LegacySyncFakeRepository:
         pass
 
     def generation_state(self, _conn):
+        active = self.generation if self.rows else None
         return {
-            "finalized_generation": self.generation,
-            "last_seen_generation": self.generation,
+            "finalized_generation": active,
+            "last_seen_generation": active,
             "active_generation": None,
         }
 
@@ -1354,6 +1355,16 @@ def _legacy_sync_source(number, name="บริษัท ทดสอบ", updat
             "dbd_update_date": updated, "updated_at": updated}
 
 
+def _legacy_sync_baseline():
+    """Independent preexisting G1 identity required before incremental admission."""
+    return {
+        "juristic_type_code": "5", "registration_no": "9999999999999",
+        "company_id": 9900001, "company_name_th": "Target-only existing G1",
+        "dataset_generation": 1, "first_seen_generation": 1,
+        "last_seen_generation": 1,
+    }
+
+
 def _legacy_sync_fake_setup(monkeypatch, repo, source, *, source_versions=None):
     copies = iter(source_versions) if source_versions is not None else None
 
@@ -1395,12 +1406,12 @@ def _legacy_sync_fake_setup(monkeypatch, repo, source, *, source_versions=None):
 def test_incremental_g1_new_then_replay_is_insert_then_skip(monkeypatch):
     first = _legacy_sync_source("0100000000001")
     second = _legacy_sync_source("0100000000002")
-    repo = _LegacySyncFakeRepository()
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()])
     _legacy_sync_fake_setup(monkeypatch, repo, [first, second])
     initial = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
     assert (initial["inserted"], initial["updated"], initial["unchanged"]) == (2, 0, 0)
     assert initial["verification"]["source_content_verified"] is True
-    assert len(repo.rows) == 2
+    assert len(repo.rows) == 3
     repeat = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
     assert (repeat["inserted"], repeat["updated"], repeat["unchanged"]) == (0, 0, 2)
     assert repo.inserts == 2 and repo.updates == 0
@@ -1458,7 +1469,7 @@ def test_incremental_rejects_empty_target_and_g2_before_source(monkeypatch):
 def test_incremental_digest_detects_change_with_identical_watermark(monkeypatch):
     before = _legacy_sync_source("0100000000001", name="บริษัท ก่อน")
     after = dict(before, jp_name="บริษัท หลัง")
-    repo = _LegacySyncFakeRepository()
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()])
     _legacy_sync_fake_setup(monkeypatch, repo, [before],
                             source_versions=[[before], [after]])
     # Any source mutation must fail before COMPLETE; mapped-value disagreement
@@ -1471,7 +1482,7 @@ def test_incremental_digest_detects_change_with_identical_watermark(monkeypatch)
 def test_incremental_restart_preserves_committed_batch(monkeypatch):
     a = _legacy_sync_source("0100000000001")
     b = _legacy_sync_source("0100000000002")
-    repo = _LegacySyncFakeRepository(fail_insert=("5", b["jp_no"]))
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()], fail_insert=("5", b["jp_no"]))
     _legacy_sync_fake_setup(monkeypatch, repo, [a, b])
     with pytest.raises(RuntimeError, match="mocked database"):
         cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
@@ -1479,7 +1490,7 @@ def test_incremental_restart_preserves_committed_batch(monkeypatch):
     repo.fail_insert = None
     outcome = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
     assert (outcome["unchanged"], outcome["inserted"]) == (1, 1)
-    assert len(repo.rows) == 2
+    assert len(repo.rows) == 3
 
 
 def test_incremental_domain_with_missing_source_is_preserved():
@@ -1613,7 +1624,7 @@ def test_incremental_large_window_uses_at_most_1000_company_micro_batches(monkey
         def read_cutover_rows(self, _conn, identities, industry_keys, **kwargs):
             assert len(identities) <= 1000
             return super().read_cutover_rows(_conn, identities, industry_keys, **kwargs)
-    repo = BoundedRepo()
+    repo = BoundedRepo([_legacy_sync_baseline()])
     _legacy_sync_fake_setup(monkeypatch, repo, source)
     result = cutover.run_legacy_incremental_sync(
         backend="mysql", batch_size=10000,
