@@ -1414,6 +1414,10 @@ def _verify_cutover_equivalence(
             "source_content_verified": True}
 
 
+class LegacySyncConflict(CutoverSafetyError):
+    """Ambiguous or divergent G1 business evidence: no implicit overwrite."""
+
+
 # G1 incremental synchronization uses the same source transforms as initial cutover.
 # Only business fields whose existing G1 provenance can be proven newer may change.
 _LEGACY_SYNC_KEYS = {
@@ -1511,14 +1515,14 @@ def _legacy_sync_changes(
         ):
             continue
         if key in _LEGACY_SYNC_PROTECTED:
-            raise CutoverSafetyError(f"Collector-owned {table}.{key} differs from Legacy")
+            raise LegacySyncConflict(f"Collector-owned {table}.{key} differs from Legacy")
         if table == "companies" and key == "master_payload" and actual[key] is not None:
             # The Deep row's updated_at is not a master-endpoint revision clock.
-            raise CutoverSafetyError("Unproven master provenance; target preserved")
+            raise LegacySyncConflict("Unproven master provenance; target preserved")
         if table == "industries":
             # Shared across companies: a later encountered source row cannot
             # supersede another company's snapshot without global provenance.
-            raise CutoverSafetyError("Conflicting shared Industry benchmark evidence")
+            raise LegacySyncConflict("Conflicting shared Industry benchmark evidence")
         if table == "financial":
             submission, statement = financial_groups
             if key in submission and expected.get("submission_payload") is None:
@@ -1536,13 +1540,13 @@ def _legacy_sync_changes(
         source_time = _legacy_sync_time(expected.get(freshness_field)) if freshness_field else None
         target_time = _legacy_sync_time(actual.get(freshness_field)) if freshness_field else None
         if value is None and actual[key] is not None:
-            raise CutoverSafetyError(
+            raise LegacySyncConflict(
                 f"Legacy {table}.{key} cannot erase existing target evidence"
             )
         if actual[key] is not None and not (
             source_time is not None and target_time is not None and source_time > target_time
         ):
-            raise CutoverSafetyError(
+            raise LegacySyncConflict(
                 f"Unproven freshness for changed {table}.{key}; target preserved"
             )
         changed[key] = value
@@ -1610,7 +1614,7 @@ def _legacy_sync_index(table: str, rows, json_fields, column_types):
                 comparison_row, comparison_prior, json_fields.get(table, set()),
                 column_types.get(table, {}),
             )):
-                raise CutoverSafetyError(f"Conflicting duplicate {table} natural key")
+                raise LegacySyncConflict(f"Conflicting duplicate {table} natural key")
             if table == "industries":
                 old_time = _legacy_sync_time(prior.get("source_updated_at"))
                 new_time = _legacy_sync_time(row.get("source_updated_at"))
@@ -1740,7 +1744,7 @@ def _legacy_sync_transaction(repository, stats, event):
     try:
         with repository.transaction() as conn:
             yield conn
-    except CutoverSafetyError:
+    except LegacySyncConflict:
         stats["conflicts"] += 1
         if event is not None:
             event("progress", dict(stats))
