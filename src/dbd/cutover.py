@@ -1520,9 +1520,12 @@ def _legacy_sync_changes(
             # The Deep row's updated_at is not a master-endpoint revision clock.
             raise LegacySyncConflict("Unproven master provenance; target preserved")
         if table == "industries":
-            # Shared across companies: a later encountered source row cannot
-            # supersede another company's snapshot without global provenance.
-            raise LegacySyncConflict("Conflicting shared Industry benchmark evidence")
+            # The benchmark endpoint provides scope-specific source_updated_at.
+            # Reject ambiguous ordering; a newer revision may supersede a G1
+            # benchmark only after the same natural key was locked/read.
+            if (not _legacy_sync_time(expected.get("source_updated_at"))
+                or not _legacy_sync_time(actual.get("source_updated_at"))):
+                raise LegacySyncConflict("Unproven shared Industry benchmark provenance")
         if table == "financial":
             submission, statement = financial_groups
             if key in submission and expected.get("submission_payload") is None:
