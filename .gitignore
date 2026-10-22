@@ -24,3 +24,5 @@ pytest-cache-files-*/
 canary*
 
 .dbd*
+
+export*
