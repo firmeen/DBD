@@ -1386,7 +1386,8 @@ class DeepCollector:
         admission = None
         if self.node_id and getattr(self.repo, "backend", None) == "sqlserver":
             from ..storage.sqlserver.control_repository import ControlRepository
-            admission = lambda: ControlRepository().admit(self.node_id, self.generation)
+            def admission():
+                return ControlRepository().admit(self.node_id, self.generation)
         async with FixedRateDbdClient(
             concurrency=self.concurrency,
             rate_per_second=self.rate_per_second,

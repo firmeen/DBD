@@ -129,7 +129,7 @@ def test_claim_only_during_collection_and_when_approved() -> None:
 
 def test_control_schema_has_only_one_extra_table_and_unique_record_key() -> None:
     from dbd.storage.sqlserver.schema import MANAGED_TABLES
-    assert len(MANAGED_TABLES) == 5
+    assert len(MANAGED_TABLES) == 6
     assert "dbo.DBD_CONTROL" not in MANAGED_TABLES
     assert "CREATE TABLE dbo.DBD_CONTROL" in CONTROL_DDL
     assert "UNIQUE(record_type, record_key)" in CONTROL_DDL
@@ -228,7 +228,7 @@ def test_recovery_reconciles_crash_after_business_finalize(monkeypatch) -> None:
     monkeypatch.setattr(control_sql, "transaction", fake_transaction)
     from dbd.storage.sqlserver import discovery_repository
     monkeypatch.setattr(discovery_repository, "coverage",
-                        lambda _conn, _generation, _scope: {"ok": True})
+                        lambda _conn, _generation, _scope: {"ok": True, "certified": True})
     monkeypatch.setattr(repo, "require_admin", lambda _node: None)
     monkeypatch.setattr(
         repo, "_read",
@@ -382,3 +382,93 @@ def test_unfinished_g1_cutover_cannot_be_auto_adopted(monkeypatch) -> None:
             auto=True, manual_confirmed=False,
             now=datetime(2026, 10, 20, tzinfo=timezone.utc),
         )
+
+
+@pytest.mark.parametrize("record", [
+    ("core:2026-10", '{"generation":2,"cycle_month":"2026-10","state":"SCHEDULED"}'),
+    ("core:2026-10", '{"generation":2,"cycle_month":"2026-10","state":"COMPLETED"}'),
+    ("core:2026-09", '{"generation":4,"cycle_month":"2026-09","state":"COMPLETE_WITH_FAILURES"}'),
+    ("core:2026-10", '{"generation":"2","cycle_month":"2026-10","state":"SCHEDULED"}'),
+    ("core:2026-10", 'not-json'),
+    ("core:2026-11", '{"generation":1,"cycle_month":"2026-10","state":"SCHEDULED"}'),
+])
+def test_cutover_control_generation_fence_rejects_conflict(monkeypatch, record):
+    class Cursor:
+        description = (("record_key",), ("payload",))
+        def execute(self, sql, params=()):
+            assert "record_type='GENERATION'" in sql
+            assert "INSERT" not in sql.upper()
+        def fetchall(self):
+            return [record]
+        def close(self):
+            pass
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    repo = ControlRepository()
+    monkeypatch.setattr(repo, "validate_schema", lambda _conn: None)
+    monkeypatch.setattr(repo, "require_node", lambda *_a, **_kw: {"approved": True})
+    monkeypatch.setattr(repo, "_has_admin_permission", lambda _conn: True)
+    monkeypatch.setattr(repo, "_read", lambda _conn, kind, key: (
+        {"admin_node": "admin-test"} if kind == "SCHEDULE" else None
+    ))
+    with pytest.raises(ControlError):
+        repo.require_cutover_access(Conn(), "admin-test")
+
+
+def test_cutover_control_empty_history_allows_approved_admin(monkeypatch):
+    class Cursor:
+        def execute(self, sql, params=()):
+            assert "record_type='GENERATION'" in sql
+        def fetchall(self):
+            return []
+        def close(self):
+            pass
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    repo = ControlRepository()
+    monkeypatch.setattr(repo, "validate_schema", lambda _conn: None)
+    monkeypatch.setattr(repo, "require_node", lambda *_a, **_kw: {"approved": True})
+    monkeypatch.setattr(repo, "_has_admin_permission", lambda _conn: True)
+    monkeypatch.setattr(repo, "_read", lambda _conn, kind, key: (
+        {"admin_node": "admin-test"} if kind == "SCHEDULE" else None
+    ))
+    assert repo.require_cutover_access(Conn(), "admin-test")["authorized"] is True
+
+
+@pytest.mark.parametrize("node,role,approved,login,admin", [
+    ("admin-test", "WORKER", True, "sql-admin", "admin-test"),
+    ("admin-test", "ADMIN", False, "sql-admin", "admin-test"),
+    ("admin-test", "ADMIN", True, "other-login", "admin-test"),
+    ("admin-test", "ADMIN", True, "sql-admin", "different-admin"),
+])
+def test_cutover_admin_authorization_rejects_invalid_identity(
+    monkeypatch, node, role, approved, login, admin
+):
+    class Cursor:
+        def execute(self, sql, params=()):
+            assert "record_type='GENERATION'" in sql
+        def fetchall(self):
+            return []
+        def close(self):
+            pass
+
+    class Conn:
+        def cursor(self):
+            return Cursor()
+
+    repo = ControlRepository()
+    monkeypatch.setattr(repo, "validate_schema", lambda _conn: None)
+    monkeypatch.setattr(repo, "_read", lambda _conn, kind, key: (
+        {"role": role, "approved": approved, "sql_login": login}
+        if kind == "NODE" else {"admin_node": admin}
+    ))
+    monkeypatch.setattr(repo, "original_login", lambda _conn: "sql-admin")
+    monkeypatch.setattr(repo, "_has_admin_permission", lambda _conn: True)
+    with pytest.raises(ControlError):
+        repo.require_cutover_access(Conn(), node)

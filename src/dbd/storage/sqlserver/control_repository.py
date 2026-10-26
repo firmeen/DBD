@@ -8,10 +8,17 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
-from uuid import uuid4
 from typing import Any
+from uuid import uuid4
 
-from ...control import ControlError, choose_monthly_generation, ensure_transition, iso, month_key, scheduled_utc
+from ...control import (
+    ControlError,
+    choose_monthly_generation,
+    ensure_transition,
+    iso,
+    month_key,
+    scheduled_utc,
+)
 from .engine import connection, transaction
 
 _TABLE = "dbo.DBD_CONTROL"
@@ -390,6 +397,64 @@ class ControlRepository:
             if schedule is not None and schedule.get("admin_node") != node_id:
                 raise ControlError("This is not the designated Admin Coordinator machine")
 
+    def require_cutover_access(self, conn, node_id: str) -> dict[str, Any]:
+        """Read-only Admin and *all-history* G1 admission under manager lock.
+
+        A completed control G2 is still permanent evidence against G1 import.
+        Caller owns the manager lock; this method never opens a new connection
+        or mutates the Control Plane.
+        """
+        self.validate_schema(conn)
+        if not node_id:
+            raise ControlError("Cutover requires a registered Admin Coordinator node")
+        self.require_node(conn, node_id, role="ADMIN")
+        if not self._has_admin_permission(conn):
+            raise ControlError("SQL Server login lacks Admin Control permissions")
+        schedule = self._read(conn, "SCHEDULE", "core")
+        if schedule is not None and schedule.get("admin_node") != node_id:
+            raise ControlError("Cutover must run on designated Admin Coordinator")
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                f"SELECT record_key,payload FROM {_TABLE} "
+                "WHERE record_type='GENERATION'"
+            )
+            records = cur.fetchall()
+        finally:
+            cur.close()
+        seen: set[int] = set()
+        for key, raw in records:
+            try:
+                item = json.loads(raw)
+                generation = item["generation"]
+                month = item["cycle_month"]
+                state = item["state"]
+                from ...control import GENERATION_STATES
+                if (isinstance(generation, bool) or not isinstance(generation, int)
+                    or generation < 1 or not isinstance(month, str)
+                    or len(month) != 7 or month[4] != "-"
+                    or not month[:4].isdigit() or not month[5:].isdigit()
+                    or not 1 <= int(month[5:]) <= 12
+                    or key != "core:" + month
+                    or state not in set(GENERATION_STATES) | {"COMPLETE_WITH_FAILURES"}):
+                    raise ValueError("inconsistent Generation identity")
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ControlError("Malformed monthly Generation record blocks G1 cutover") from exc
+            if generation in seen:
+                raise ControlError("Conflicting monthly Generation records block G1 cutover")
+            seen.add(generation)
+            if generation == 1 and state not in ("COMPLETED", "COMPLETE_WITH_FAILURES"):
+                raise ControlError(
+                    "Active monthly Control Generation 1 conflicts with cutover baseline"
+                )
+            if generation >= 2:
+                raise ControlError(
+                    f"Monthly Control already contains Generation {generation}; "
+                    "Generation 1 cutover permanently refused"
+                )
+        return {"authorized": True, "control_generations_checked": len(records),
+                "highest_control_generation": max(seen, default=0)}
+
     def can_execute_admission(self) -> bool:
         """Check the right to use the only Worker-writable control operation."""
         with connection() as conn:
@@ -503,9 +568,10 @@ class ControlRepository:
                 evidence = discovery_work.coverage(
                     conn, int(active["generation"]), "full"
                 )
-                if not evidence["ok"]:
+                if not evidence.get("certified"):
                     raise ControlError(
-                        "Cannot reconcile completed business Generation while "
+                        "Cannot reconcile completed business Generation without "
+                        "certified full-universe Discovery; "
                         "durable Discovery coverage remains incomplete: "
                         + str(evidence)
                     )

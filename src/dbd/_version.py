@@ -4,4 +4,4 @@ This is the single source of truth for both setuptools package metadata and
 runtime CLI version output.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

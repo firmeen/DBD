@@ -346,7 +346,7 @@ def test_source_preflight_rejects_live_distributed_discovery_lease(monkeypatch) 
     monkeypatch.setattr(
         cutover,
         "_source_stability_state",
-        lambda _conn: {
+        lambda _conn, **_kw: {
             "master_waiting": 0,
             "runtime_running": 0,
             "discovery_active_leases": 1,
@@ -366,7 +366,7 @@ def test_source_snapshot_detects_watermark_change(monkeypatch) -> None:
     monkeypatch.setattr(
         cutover,
         "_source_stability_state",
-        lambda _conn: {
+        lambda _conn, **_kw: {
             "master_waiting": 0,
             "runtime_running": 0,
             "discovery_active_leases": 0,
@@ -418,7 +418,7 @@ def test_source_preflight_refuses_empty_deep_table(monkeypatch) -> None:
     monkeypatch.setattr(
         cutover,
         "_source_stability_state",
-        lambda _conn: {
+        lambda _conn, **_kw: {
             "master_waiting": 0,
             "runtime_running": 0,
             "discovery_active_leases": 0,
@@ -544,6 +544,12 @@ def test_cutover_holds_selected_manager_lock_through_target_transactions(
         return {"industries": 0, "companies": 1}
 
     monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
+    # The legacy fake exercises transaction/replay independently of the new gates.
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission", lambda *_a: None)
+    monkeypatch.setattr(
+        cutover, "_verify_cutover_equivalence",
+        lambda *_a, **_kw: {"source_content_verified": True},
+    )
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -633,6 +639,12 @@ def test_cutover_restarts_after_committed_batch_without_duplicate_companies(
         yield object()
 
     monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
+    # The legacy fake exercises transaction/replay independently of the new gates.
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission", lambda *_a: None)
+    monkeypatch.setattr(
+        cutover, "_verify_cutover_equivalence",
+        lambda *_a, **_kw: {"source_content_verified": True},
+    )
     monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -837,6 +849,12 @@ def _large_cutover_fixture(monkeypatch, count, *, fail_at_commit=None):
         return {"companies": count, "industries": min(count, 10)}
 
     monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repository())
+    # The legacy fake exercises transaction/replay independently of the new gates.
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission", lambda *_a: None)
+    monkeypatch.setattr(
+        cutover, "_verify_cutover_equivalence",
+        lambda *_a, **_kw: {"source_content_verified": True},
+    )
     monkeypatch.setattr(cutover, "source_fence", fenced)
     monkeypatch.setattr(
         cutover, "source_preflight",
@@ -934,3 +952,733 @@ def test_large_window_checks_source_snapshot_before_committing_each_micro_batch(
     # Fail inside the second transaction, preserving only the first micro-batch.
     assert len(state["committed"]) == 1000
 
+
+
+
+# P1 cutover safety regression contracts; all database cursors are isolated fakes.
+def test_source_terminal_contract_queries_masks_and_deferred_runtime():
+    source = inspect.getsource(cutover._source_stability_state)
+    assert "status='PENDING'" in source
+    assert "status='RUNNING'" in source
+    assert "status='RETRY_WAIT'" in source
+    assert "(required_mask & ~" in source
+    assert "deep_invalid_masks" in source
+    assert "deep_status_mismatch" in source
+    assert "deep_invalid_payloads" in source
+    assert "source_invalid_identity" in source
+    assert "source_duplicate_identity" in source
+    assert not any(word in source.upper() for word in ("DELETE FROM", "TRUNCATE TABLE"))
+
+
+@pytest.mark.parametrize("blocked", [
+    "runtime_pending", "runtime_running", "runtime_retry_wait",
+    "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
+    "deep_invalid_payloads", "source_invalid_identity", "source_duplicate_identity",
+])
+def test_preflight_rejects_every_source_terminal_blocker(monkeypatch, blocked):
+    monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
+    monkeypatch.setattr(cutover, "_source_columns", lambda _conn, table: (
+        set(cutover.SOURCE_COLUMNS) if table == cutover.SOURCE_TABLE
+        else {"status"} if table == cutover.SOURCE_RUNTIME_TABLE
+        else {"lease_owner", "lease_version", "lease_expires_at"}
+        if table == cutover.SOURCE_DISCOVERY_TABLE else {"jp_type_code", "jp_no"}
+    ))
+    monkeypatch.setattr(cutover, "_count", lambda _conn, sql, *_args: (
+        4 if "FROM dbd_company_deep" in sql and "deep_status IN" not in sql else 0
+    ))
+    state = {name: 0 for name in (
+        "master_waiting", "runtime_pending", "runtime_running",
+        "runtime_retry_wait", "discovery_active_leases", "deep_active",
+        "deep_unresolved", "deep_invalid_masks", "deep_status_mismatch",
+        "deep_invalid_payloads", "source_invalid_identity",
+        "source_duplicate_identity",
+    )}
+    state.update(source_updated_at=None)
+    state[blocked] = 1
+    monkeypatch.setattr(cutover, "_source_stability_state", lambda _conn, **_kw: state)
+    with pytest.raises(CutoverSafetyError, match=blocked):
+        cutover.source_preflight(object())
+
+
+def test_terminal_failed_and_partial_do_not_block_when_masks_resolve(monkeypatch):
+    monkeypatch.setattr(cutover, "_assert_source_database", lambda _conn: None)
+    monkeypatch.setattr(cutover, "_source_columns", lambda _conn, table: (
+        set(cutover.SOURCE_COLUMNS) if table == cutover.SOURCE_TABLE
+        else {"status"} if table == cutover.SOURCE_RUNTIME_TABLE
+        else {"lease_owner", "lease_version", "lease_expires_at"}
+        if table == cutover.SOURCE_DISCOVERY_TABLE else {"jp_type_code", "jp_no"}
+    ))
+    monkeypatch.setattr(cutover, "_count", lambda _conn, sql, *_args: (
+        2 if "FROM dbd_company_deep" in sql and "deep_status IN" not in sql else 0
+    ))
+    monkeypatch.setattr(cutover, "_source_stability_state", lambda _conn: {
+        "master_waiting": 0, "runtime_running": 0,
+        "discovery_active_leases": 0, "deep_active": 0,
+        "source_updated_at": None,
+    })
+    assert cutover.source_preflight(object())["source_rows"] == 2
+
+
+def test_cutover_digest_canonical_json_and_payload_drift():
+    from hashlib import sha256
+    from decimal import Decimal
+
+    def digest(row):
+        h = sha256()
+        cutover._source_digest_append(h, row)
+        return h.hexdigest()
+
+    row = {
+        "jp_type_code": "5", "jp_no": "0101234567890",
+        "profile_data": '{"b":2,"a":"ภาษาไทย"}',
+        "cap_amt": Decimal("1.00"),
+    }
+    assert digest(row) == digest({
+        **row, "profile_data": '{"a":"ภาษาไทย","b":2}',
+        "cap_amt": Decimal("1.0"),
+    })
+    assert digest(row) != digest({**row, "profile_data": '{"a":"อื่น","b":2}'})
+    assert digest(row) != digest({**row, "jp_no": "0101234567891"})
+    assert digest(row) != digest({**row, "cap_amt": None})
+    assert digest(row) != digest({**row, "cap_amt": ""})
+
+
+def test_cutover_business_equivalence_checks_payload_not_only_identity():
+    from decimal import Decimal
+
+    expected = {
+        "juristic_type_code": "5", "registration_no": "0101234567890",
+        "company_name_th": "บริษัท ภาษาไทย จำกัด",
+        "total_assets_latest": Decimal("123.40"),
+        "profile_payload": '{"b":2,"a":1}',
+        "published_at": datetime(2026, 10, 1),
+    }
+    actual = {
+        **expected, "company_name_th": "บริษัท เปลี่ยน จำกัด",
+        "profile_payload": '{"a":1,"b":2}',
+    }
+    assert not cutover._business_row_comparable(
+        expected, actual, {"profile_payload"}
+    )
+    assert cutover._business_row_comparable(
+        expected, {**actual, "company_name_th": expected["company_name_th"],
+                   "total_assets_latest": Decimal("123.400")}, {"profile_payload"}
+    )
+    assert not cutover._business_row_comparable(
+        expected, {**actual, "total_assets_latest": Decimal("124.00")}, {"profile_payload"}
+    )
+
+
+def test_sqlserver_cutover_admission_uses_real_control_policy(monkeypatch):
+    from dbd.storage.sqlserver import control_repository as control_sql
+    from dbd.presentation import setup
+
+    selected = []
+    monkeypatch.setattr(setup, "local_node_id", lambda: "admin-test")
+    monkeypatch.setattr(
+        control_sql.ControlRepository, "require_cutover_access",
+        lambda self, conn, node: selected.append((conn, node)),
+    )
+    target_conn = object()
+    cutover._assert_cutover_target_admission(object(), "sqlserver", target_conn)
+    assert selected == [(target_conn, "admin-test")]
+    selected.clear()
+    cutover._assert_cutover_target_admission(object(), "mysql", target_conn)
+    assert selected == []
+
+
+
+@pytest.mark.parametrize("change", [
+    "none", "wrong_name", "wrong_identity", "extra_relation", "wrong_financial",
+    "changed_source",
+])
+def test_streamed_cutover_reconciliation_detects_equal_count_mismatches(
+    monkeypatch, change,
+):
+    from hashlib import sha256
+    source = {"jp_type_code": "5", "jp_no": "0100000000001", "jp_name": "บริษัท แรก"}
+    expected_company = {
+        "juristic_type_code": "5", "registration_no": "0100000000001",
+        "company_name_th": "บริษัท แรก",
+    }
+    target_company = {**expected_company, "company_id": 7}
+    if change == "wrong_name":
+        target_company["company_name_th"] = "บริษัท ไม่ตรงกัน"
+    if change == "wrong_identity":
+        target_company["registration_no"] = "0100000000002"
+    if change == "changed_source":
+        # Target now matches the changed source; only content digest must fail.
+        target_company["company_name_th"] = "บริษัท เปลี่ยน"
+    target_relation = {"company_id": 7, "relation_type": "COMMITTEE",
+                       "source_key": "unexpected"}
+    fin_expected = {"fiscal_year": "2568", "total_assets": Decimal("100.00")}
+    target_fin = {**fin_expected, "company_id": 7}
+    if change == "wrong_financial":
+        target_fin["total_assets"] = Decimal("101.00")
+    source_for_verify = {
+        **source, "jp_name": "บริษัท เปลี่ยน"
+    } if change == "changed_source" else source
+
+    class Repo:
+        @contextmanager
+        def transaction(self):
+            yield object()
+        def read_cutover_rows(self, _conn, identities, industry_keys):
+            assert identities == [("5", "0100000000001")]
+            return {
+                "companies": [target_company],
+                "relations": [target_relation] if change == "extra_relation" else [],
+                "events": [],
+                "financial": [target_fin],
+                "industries": [],
+            }
+
+    monkeypatch.setattr(
+        cutover, "source_batches",
+        lambda _conn, **_kw: iter([[source_for_verify]]),
+    )
+    monkeypatch.setattr(
+        cutover, "transform_company",
+        lambda row, **_kw: {**expected_company,
+                            "company_name_th": row["jp_name"]},
+    )
+    monkeypatch.setattr(cutover, "transform_relations", lambda *_a, **_kw: [])
+    monkeypatch.setattr(cutover, "transform_events", lambda *_a, **_kw: [])
+    monkeypatch.setattr(
+        cutover, "transform_financials",
+        lambda *_a, **_kw: [dict(fin_expected)],
+    )
+    monkeypatch.setattr(cutover, "transform_industries", lambda *_a, **_kw: [])
+    digest = sha256()
+    cutover._source_digest_append(digest, source)
+
+    def run():
+        return cutover._verify_cutover_equivalence(
+            object(), Repo(), batch_size=1, published_at=datetime(2026, 10, 21),
+            expected_count=1, expected_digest=digest.hexdigest(),
+        )
+    if change == "none":
+        assert run()["source_content_verified"] is True
+    else:
+        with pytest.raises(CutoverSafetyError):
+            run()
+
+
+def test_sqlserver_control_denied_before_source_connection(monkeypatch):
+    events = []
+    class Repo:
+        def validate_schema(self):
+            return None
+        @contextmanager
+        def manager_lock(self):
+            events.append("manager")
+            yield object()
+        def assert_manager_lock(self, _conn):
+            return None
+        def generation_state(self, _conn):
+            return {"finalized_generation": 1, "last_seen_generation": 1,
+                    "active_generation": None}
+    @contextmanager
+    def source_never_opens():
+        events.append("SOURCE-OPENED")
+        yield object()
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: Repo())
+    monkeypatch.setattr(cutover, "_assert_cutover_target_admission",
+                        lambda *_a: (_ for _ in ()).throw(
+                            CutoverSafetyError("Admin authorization denied")
+                        ))
+    monkeypatch.setattr(cutover, "source_fence", source_never_opens)
+    with pytest.raises(CutoverSafetyError, match="authorization"):
+        cutover.run_generation1_cutover()
+    assert events == ["manager"]
+
+
+
+def test_source_stability_full_scans_are_not_run_for_every_micro_batch():
+    statements = []
+    field_names = (
+        "master_waiting", "runtime_pending", "runtime_running",
+        "runtime_retry_wait", "discovery_active_leases", "deep_unresolved",
+        "deep_active", "deep_invalid_masks", "deep_status_mismatch",
+        "deep_invalid_payloads", "source_invalid_identity",
+        "source_duplicate_identity",
+    )
+    class Cursor:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, sql):
+            statements.append(sql)
+        def fetchone(self):
+            return {**{key: 0 for key in field_names},
+                    "source_updated_at": datetime(2026, 10, 21)}
+    conn = SimpleNamespace(cursor=Cursor)
+    cutover._source_stability_state(conn, full=False)
+    assert "0 AS deep_invalid_masks" in statements[-1]
+    assert "WHERE required_mask NOT IN" not in statements[-1]
+    cutover._source_stability_state(conn, full=True)
+    assert "WHERE required_mask NOT IN" in statements[-1]
+    assert "JSON_TYPE(" in statements[-1]
+
+
+def test_source_keyset_rejects_duplicate_or_backward_identity(monkeypatch):
+    source = [
+        {"jp_type_code": "5", "jp_no": "0100000000002"},
+        {"jp_type_code": "5", "jp_no": "0100000000001"},
+    ]
+    class Cursor:
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, _sql, _params):
+            return None
+        def fetchall(self):
+            return source
+    monkeypatch.setattr(cutover, "_assert_source_fence", lambda _conn: None)
+    with pytest.raises(CutoverSafetyError, match="Non-increasing"):
+        list(cutover.source_batches(SimpleNamespace(cursor=Cursor), batch_size=500))
+
+
+
+def test_cutover_schema_typed_dates_decimals_and_nullable_distinction():
+    from datetime import date, datetime
+    from decimal import Decimal
+    expected = {
+        "registration_date": "2026-01-02",
+        "last_request_at": datetime(2026, 1, 2, 3, 4, 5),
+        "registered_capital": Decimal("1200.00"),
+        "postal_code": "00100",
+        "company_name_en": "",
+    }
+    target = {
+        **expected,
+        "registration_date": date(2026, 1, 2),
+        "last_request_at": "2026-01-02T03:04:05",
+        "registered_capital": Decimal("1200.000"),
+    }
+    types = {
+        "registration_date": "DATE",
+        "last_request_at": "DATETIME2(6)",
+        "registered_capital": "DECIMAL(20,2)",
+        "postal_code": "NVARCHAR(10)",
+        "company_name_en": "NVARCHAR(500)",
+    }
+    assert cutover._business_row_comparable(expected, target, set(), types)
+    assert not cutover._business_row_comparable(
+        expected, {**target, "postal_code": "100"}, set(), types
+    )
+    assert not cutover._business_row_comparable(
+        expected, {**target, "company_name_en": None}, set(), types
+    )
+
+
+class _LegacySyncFakeRepository:
+    backend = "mysql"
+
+    def __init__(self, initial=(), *, generation=1, fail_insert=None):
+        self.rows = { (r["juristic_type_code"], r["registration_no"]): dict(r)
+                     for r in initial }
+        self.committed = 0
+        self.updates = 0
+        self.inserts = 0
+        self.generation = generation
+        self.fail_insert = fail_insert
+
+    def validate_schema(self):
+        return None
+
+    @contextmanager
+    def manager_lock(self):
+        yield object()
+
+    def assert_manager_lock(self, _conn):
+        pass
+
+    def generation_state(self, _conn):
+        active = self.generation if self.rows else None
+        return {
+            "finalized_generation": active,
+            "last_seen_generation": active,
+            "active_generation": None,
+        }
+
+    @contextmanager
+    def transaction(self):
+        original = {key: dict(row) for key, row in self.rows.items()}
+        counts = self.inserts, self.updates
+        try:
+            yield self
+        except Exception:
+            self.rows = original
+            self.inserts, self.updates = counts
+            raise
+        else:
+            self.committed += 1
+
+    def read_cutover_rows(self, _conn, identities, industry_keys, **_kwargs):
+        assert industry_keys == []
+        return {
+            "companies": [dict(self.rows[key]) for key in identities if key in self.rows],
+            "relations": [], "events": [], "financial": [], "industries": [],
+        }
+
+    def count_generation_one(self):
+        return len(self.rows)
+
+    def verify_legacy_sync_integrity(self, _conn):
+        assert self.generation == 1
+
+    def insert_legacy_sync_rows(self, _conn, table, rows):
+        assert table == "companies" or not rows
+        for row in rows:
+            key = row["juristic_type_code"], row["registration_no"]
+            if self.fail_insert == key:
+                raise RuntimeError("mocked database insertion failure")
+            assert key not in self.rows
+            self.rows[key] = {**row, "company_id": len(self.rows) + 1}
+            self.inserts += 1
+
+    def update_legacy_sync_rows(self, _conn, table, changes):
+        assert table == "companies" or not changes
+        for pk, values in changes:
+            row = next(row for row in self.rows.values() if row["company_id"] == pk)
+            assert not {"first_seen_generation", "last_seen_generation",
+                        "dataset_generation", "branch_count", "lease_owner"} & values.keys()
+            row.update(values)
+            self.updates += 1
+
+
+def _legacy_sync_source(number, name="บริษัท ทดสอบ", updated="2026-10-21"):
+    return {"jp_type_code": "5", "jp_no": str(number), "jp_name": name,
+            "dbd_update_date": updated, "updated_at": updated}
+
+
+def _legacy_sync_baseline():
+    """Independent preexisting G1 identity required before incremental admission."""
+    return {
+        "juristic_type_code": "5", "registration_no": "9999999999999",
+        "company_id": 9900001, "company_name_th": "Target-only existing G1",
+        "dataset_generation": 1, "first_seen_generation": 1,
+        "last_seen_generation": 1,
+    }
+
+
+def _legacy_sync_fake_setup(monkeypatch, repo, source, *, source_versions=None):
+    copies = iter(source_versions) if source_versions is not None else None
+
+    @contextmanager
+    def fake_source_fence():
+        yield object()
+
+    def windows(_conn, *, batch_size):
+        rows = next(copies) if copies is not None else source
+        for start in range(0, len(rows), batch_size):
+            yield rows[start:start + batch_size]
+
+    def company(row, *, published_at):
+        return {
+            "juristic_type_code": row["jp_type_code"],
+            "registration_no": row["jp_no"],
+            "company_name_th": row["jp_name"],
+            "dbd_update_date": row["dbd_update_date"],
+            "source_updated_at": row["updated_at"],
+            "published_at": published_at,
+            "dataset_generation": 1,
+            "first_seen_generation": 1,
+            "last_seen_generation": 1,
+        }
+
+    monkeypatch.setattr(cutover, "production_repository", lambda _backend: repo)
+    monkeypatch.setattr(cutover, "source_fence", fake_source_fence)
+    monkeypatch.setattr(cutover, "source_preflight", lambda _conn: {
+        "source_rows": len(source), "source_updated_at": "2026-10-21",
+    })
+    monkeypatch.setattr(cutover, "_assert_source_snapshot", lambda *_args: None)
+    monkeypatch.setattr(cutover, "source_batches", windows)
+    monkeypatch.setattr(cutover, "transform_company", company)
+    for name in ("transform_relations", "transform_events", "transform_financials",
+                 "transform_industries"):
+        monkeypatch.setattr(cutover, name, lambda *_args, **_kwargs: [])
+
+
+def test_incremental_g1_new_then_replay_is_insert_then_skip(monkeypatch):
+    first = _legacy_sync_source("0100000000001")
+    second = _legacy_sync_source("0100000000002")
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()])
+    _legacy_sync_fake_setup(monkeypatch, repo, [first, second])
+    initial = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert (initial["inserted"], initial["updated"], initial["unchanged"]) == (2, 0, 0)
+    assert initial["verification"]["source_content_verified"] is True
+    assert len(repo.rows) == 3
+    repeat = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert (repeat["inserted"], repeat["updated"], repeat["unchanged"]) == (0, 0, 2)
+    assert repo.inserts == 2 and repo.updates == 0
+
+
+def test_incremental_changed_authoritative_profile_updates_selected_fields(monkeypatch):
+    row = _legacy_sync_source("0100000000001", updated="2026-10-21")
+    existing = {
+        "juristic_type_code": "5", "registration_no": row["jp_no"], "company_id": 9,
+        "company_name_th": "ชื่อเก่า", "dbd_update_date": "2026-10-20",
+        "source_updated_at": "2026-10-20", "published_at": datetime(2026, 10, 20),
+        "dataset_generation": 1, "first_seen_generation": 1, "last_seen_generation": 1,
+        "branch_count": 10, "lease_owner": None,
+    }
+    repo = _LegacySyncFakeRepository([existing])
+    _legacy_sync_fake_setup(monkeypatch, repo, [row])
+    result = cutover.run_legacy_incremental_sync(backend="mysql")
+    assert result["updated"] == 1 and result["inserted"] == 0
+    saved = next(iter(repo.rows.values()))
+    assert saved["company_name_th"] == row["jp_name"]
+    assert saved["branch_count"] == 10 and saved["company_id"] == 9
+    assert saved["first_seen_generation"] == saved["dataset_generation"] == 1
+
+
+def test_incremental_refuses_unproven_profile_freshness(monkeypatch):
+    row = _legacy_sync_source("0100000000001", updated="2026-10-20")
+    existing = {
+        "juristic_type_code": "5", "registration_no": row["jp_no"], "company_id": 2,
+        "company_name_th": "เปลี่ยนจากระบบอื่น", "dbd_update_date": "2026-10-21",
+        "source_updated_at": "2026-10-21",
+        "dataset_generation": 1, "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+    repo = _LegacySyncFakeRepository([existing])
+    _legacy_sync_fake_setup(monkeypatch, repo, [row])
+    with pytest.raises(CutoverSafetyError, match="Unproven freshness"):
+        cutover.run_legacy_incremental_sync(backend="mysql")
+    assert repo.updates == 0 and repo.rows[("5", row["jp_no"])]["company_name_th"] == "เปลี่ยนจากระบบอื่น"
+
+
+def test_incremental_rejects_empty_target_and_g2_before_source(monkeypatch):
+    for generation in (None, 2):
+        repo = _LegacySyncFakeRepository(
+            [_legacy_sync_baseline()] if generation == 2 else [],
+            generation=generation,
+        )
+        _legacy_sync_fake_setup(monkeypatch, repo, [_legacy_sync_source("0100000000001")])
+        opened = []
+        @contextmanager
+        def forbidden_source():
+            opened.append(True)
+            yield object()
+        monkeypatch.setattr(cutover, "source_fence", forbidden_source)
+        with pytest.raises(CutoverSafetyError, match="G1 target"):
+            cutover.run_legacy_incremental_sync(backend="mysql")
+        assert not opened
+
+
+def test_incremental_digest_detects_change_with_identical_watermark(monkeypatch):
+    before = _legacy_sync_source("0100000000001", name="บริษัท ก่อน")
+    after = dict(before, jp_name="บริษัท หลัง")
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()])
+    _legacy_sync_fake_setup(monkeypatch, repo, [before],
+                            source_versions=[[before], [after]])
+    # Any source mutation must fail before COMPLETE; mapped-value disagreement
+    # can be detected earlier than the final SHA-256 comparison.
+    with pytest.raises(CutoverSafetyError):
+        cutover.run_legacy_incremental_sync(backend="mysql")
+    assert repo.committed >= 1
+
+
+def test_incremental_restart_preserves_committed_batch(monkeypatch):
+    a = _legacy_sync_source("0100000000001")
+    b = _legacy_sync_source("0100000000002")
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()], fail_insert=("5", b["jp_no"]))
+    _legacy_sync_fake_setup(monkeypatch, repo, [a, b])
+    with pytest.raises(RuntimeError, match="mocked database"):
+        cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert ("5", a["jp_no"]) in repo.rows and ("5", b["jp_no"]) not in repo.rows
+    repo.fail_insert = None
+    outcome = cutover.run_legacy_incremental_sync(backend="mysql", batch_size=1)
+    assert (outcome["unchanged"], outcome["inserted"]) == (1, 1)
+    assert len(repo.rows) == 3
+
+
+def test_incremental_domain_with_missing_source_is_preserved():
+    expected = {"relations": [], "events": [], "financial": [], "industries": []}
+    actual = {**expected, "relations": [{
+        "company_id": 1, "relation_type": "COMMITTEE", "source_key": "old",
+    }]}
+    class Repo:
+        def insert_legacy_sync_rows(self, *_args):
+            raise AssertionError("must not insert")
+        def update_legacy_sync_rows(self, *_args):
+            raise AssertionError("must not update")
+    j, types, groups = cutover._legacy_sync_metadata()
+    result = cutover._legacy_sync_compare_domains(
+        Repo(), object(), expected, actual, j, types, groups, write=False,
+    )
+    assert result["target_only_scope"] == 1
+
+
+def test_incremental_shared_industry_payload_conflict_is_never_overwritten():
+    from datetime import datetime
+    expected = {
+        "submit_objective_code": "1", "fiscal_year": "2568",
+        "business_size_code": None, "location_type": None, "location_no": None,
+        "payload": '{"a":2}', "source_updated_at": datetime(2026, 10, 21),
+        "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+    actual = {
+        **expected, "industry_id": 90, "payload": '{"a":1}',
+        "source_updated_at": datetime(2026, 10, 21),
+    }
+    j, types, groups = cutover._legacy_sync_metadata()
+    with pytest.raises(CutoverSafetyError, match="Unproven freshness"):
+        cutover._legacy_sync_changes("industries", expected, actual, j, types, groups)
+    authorized = dict(actual, source_updated_at=datetime(2026, 10, 20))
+    changes = cutover._legacy_sync_changes("industries", expected, authorized, j, types, groups)
+    assert changes["payload"] == expected["payload"]
+    assert changes["source_updated_at"] == expected["source_updated_at"]
+
+
+def test_incremental_refuses_collector_masks_on_existing_company():
+    expected = {
+        "juristic_type_code": "5", "registration_no": "0100000000001",
+        "done_mask": 127, "dbd_update_date": "2026-10-21",
+    }
+    actual = {
+        **expected, "company_id": 7, "dataset_generation": 1,
+        "first_seen_generation": 1, "last_seen_generation": 1, "done_mask": 0,
+    }
+    j, types, groups = cutover._legacy_sync_metadata()
+    with pytest.raises(CutoverSafetyError, match="Collector-owned"):
+        cutover._legacy_sync_changes("companies", expected, actual, j, types, groups)
+
+
+
+def test_incremental_financial_new_row_marks_existing_company_updated(monkeypatch):
+    source = _legacy_sync_source("0100000000001")
+    existing = {
+        "company_id": 7, "juristic_type_code": "5", "registration_no": source["jp_no"],
+        "company_name_th": source["jp_name"], "dbd_update_date": source["dbd_update_date"],
+        "source_updated_at": source["updated_at"], "dataset_generation": 1,
+        "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+
+    class FinancialRepo(_LegacySyncFakeRepository):
+        def __init__(self):
+            super().__init__([existing])
+            self.financial = {}
+
+        def read_cutover_rows(self, _conn, identities, industry_keys, **kwargs):
+            rows = super().read_cutover_rows(_conn, identities, industry_keys, **kwargs)
+            ids = {row["company_id"] for row in rows["companies"]}
+            rows["financial"] = [
+                dict(value) for key, value in self.financial.items() if key[0] in ids
+            ]
+            return rows
+
+        def insert_legacy_sync_rows(self, _conn, table, rows):
+            if table != "financial":
+                return super().insert_legacy_sync_rows(_conn, table, rows)
+            for row in rows:
+                key = (row["company_id"], row["fiscal_year"])
+                assert key not in self.financial
+                self.financial[key] = {**row, "financial_id": len(self.financial) + 1}
+
+        def update_legacy_sync_rows(self, _conn, table, changes):
+            if table == "financial":
+                raise AssertionError("No financial UPDATE expected")
+            return super().update_legacy_sync_rows(_conn, table, changes)
+
+    repo = FinancialRepo()
+    _legacy_sync_fake_setup(monkeypatch, repo, [source])
+    monkeypatch.setattr(cutover, "transform_financials", lambda _row, *, published_at: [{
+        "fiscal_year": "2568", "submission_payload": '{"year":2568}',
+        "submission_updated_at": datetime(2026, 10, 20),
+        "first_seen_generation": 1, "last_seen_generation": 1,
+        "published_at": published_at,
+    }])
+    result = cutover.run_legacy_incremental_sync(backend="mysql")
+    assert result["inserted"] == 0
+    assert result["updated"] == 1
+    assert result["unchanged"] == 0
+    assert result["domains_inserted"] == 1
+    assert (7, "2568") in repo.financial
+    second = cutover.run_legacy_incremental_sync(backend="mysql")
+    assert second["updated"] == 0 and second["unchanged"] == 1
+    assert second["domains_inserted"] == 0
+
+
+def test_incremental_financial_conflicting_revision_preserves_target():
+    expected = {
+        "company_id": 7, "fiscal_year": "2568", "submission_payload": '{"amount":200}',
+        "submission_updated_at": datetime(2026, 10, 20),
+        "first_seen_generation": 1, "last_seen_generation": 1,
+    }
+    actual = {
+        **expected, "financial_id": 9,
+        "submission_payload": '{"amount":100}',
+        "submission_updated_at": datetime(2026, 10, 21),
+    }
+    j, types, groups = cutover._legacy_sync_metadata()
+    with pytest.raises(CutoverSafetyError, match="Unproven freshness"):
+        cutover._legacy_sync_changes("financial", expected, actual, j, types, groups)
+    assert actual["submission_payload"] == '{"amount":100}'
+
+
+
+def test_incremental_large_window_uses_at_most_1000_company_micro_batches(monkeypatch):
+    source = [_legacy_sync_source(f"{n:013d}") for n in range(1001)]
+    class BoundedRepo(_LegacySyncFakeRepository):
+        def read_cutover_rows(self, _conn, identities, industry_keys, **kwargs):
+            assert len(identities) <= 1000
+            return super().read_cutover_rows(_conn, identities, industry_keys, **kwargs)
+    repo = BoundedRepo([_legacy_sync_baseline()])
+    _legacy_sync_fake_setup(monkeypatch, repo, source)
+    result = cutover.run_legacy_incremental_sync(
+        backend="mysql", batch_size=10000,
+    )
+    assert result["scanned"] == 1001
+    assert result["windows"] == 1
+    assert result["batches"] == 2
+    assert result["inserted"] == 1001
+
+
+
+@pytest.mark.parametrize("reason", ["Admin denied", "Control-only Generation 2"])
+def test_incremental_sqlserver_denies_unsafe_admission_before_source(monkeypatch, reason):
+    source = _legacy_sync_source("0100000000001")
+    repo = _LegacySyncFakeRepository([_legacy_sync_baseline()])
+    repo.backend = "sqlserver"
+    _legacy_sync_fake_setup(monkeypatch, repo, [source])
+    source_opened = []
+    @contextmanager
+    def cannot_open_source():
+        source_opened.append(True)
+        yield object()
+    monkeypatch.setattr(cutover, "source_fence", cannot_open_source)
+    monkeypatch.setattr(
+        cutover, "_assert_cutover_target_admission",
+        lambda *_args: (_ for _ in ()).throw(CutoverSafetyError(reason)),
+    )
+    with pytest.raises(CutoverSafetyError, match=reason):
+        cutover.run_legacy_incremental_sync(backend="sqlserver")
+    assert not source_opened and repo.inserts == 0
+
+
+
+def test_incremental_shared_industry_equal_payload_different_observation_times():
+    first = {
+        "submit_objective_code": "101", "fiscal_year": "2568",
+        "business_size_code": None, "location_type": None, "location_no": None,
+        "payload": '{"a":1,"b":2}',
+        "source_updated_at": datetime(2026, 10, 20),
+    }
+    second = dict(first, source_updated_at=datetime(2026, 10, 21),
+                  payload='{"b":2,"a":1}')
+    json_fields, types, _groups = cutover._legacy_sync_metadata()
+    index = cutover._legacy_sync_index(
+        "industries", [first, second], json_fields, types,
+    )
+    assert len(index) == 1
+    record = next(iter(index.values()))
+    assert record["source_updated_at"] == datetime(2026, 10, 21)
+    with pytest.raises(CutoverSafetyError, match="Conflicting duplicate industries"):
+        cutover._legacy_sync_index(
+            "industries", [first, dict(second, payload='{"a":9}')],
+            json_fields, types,
+        )

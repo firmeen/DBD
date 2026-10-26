@@ -233,7 +233,6 @@ class TerminalPresenter:
         if author_email:
             author_label = f"{author_label} · {author_email}" if author_label else author_email
         profile_table.add_row("AUTHOR", author_label or "—")
-        profile_table.add_row("LICENSE", str(identity.get("license") or "—"))
 
         runtime_table = Table.grid(padding=(0, 2))
         runtime_table.add_column(style="dim", no_wrap=True)
@@ -273,11 +272,6 @@ class TerminalPresenter:
         install_table.add_row(
             "DEPENDENCIES",
             f"{_int(installation.get('dependency_count')):,} direct requirement(s)",
-        )
-        required_by = list(installation.get("required_by") or [])
-        install_table.add_row(
-            "REQUIRED BY",
-            ", ".join(required_by) if required_by else "—",
         )
 
         issues = list(integrity.get("issues") or [])

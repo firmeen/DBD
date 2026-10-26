@@ -13,7 +13,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-_CYCLE_PHASES = ("PRECHECK", "DISCOVER", "PREPARE", "COLLECT", "VERIFY", "FINALIZE")
+_CYCLE_PHASES = ("PRECHECK", "DISCOVER", "PREPARE", "COLLECT", "VERIFY", "FINALIZE", "BRANCH")
 _COLLECTION_COUNTERS = (
     "companies_claimed",
     "companies_finished",
@@ -587,6 +587,8 @@ class V06Terminal:
         target[key] = value
 
     def _final_status(self, payload: Mapping[str, Any]) -> str:
+        if self.state.command == "migrate":
+            return str(payload.get("state") or "FAILED").upper()
         if self.state.command == "check-db":
             return "READY"
         if self.state.command in {"cycle-run", "cycle-loop"}:
@@ -742,22 +744,63 @@ class V06Terminal:
     def _render_migrate(self, width: int):
         if not self.state.result:
             body = Group(
-                self._centered("Applying safe schema contract", width, "cyan"),
+                self._centered("Inspecting / applying approved schema plan", width, "cyan"),
                 self._centered(self._motion("seal"), width, "cyan"),
             )
-            return self._panel(f"{self.state.backend.upper()} SCHEMA", body, "APPLYING", active=True)
+            return self._panel(f"{self.state.backend.upper()} SCHEMA", body, "RUNNING", active=True)
         result = self.state.result
-        created = result.get("created")
-        altered = result.get("altered")
+        state = str(result.get("state") or "FAILED").upper()
+        actions = result.get("actions") or []
+        blockers = result.get("blockers") or []
         items = [
-            ("Managed tables", result.get("managed_tables"), "migrate.tables"),
-            ("Created", len(created) if isinstance(created, list) else created, "migrate.created"),
-            ("Altered", len(altered) if isinstance(altered, list) else altered, "migrate.altered"),
+            ("Database", result.get("database"), "migrate.database"),
+            ("Existing tables", result.get("existing_tables"), "migrate.existing"),
+            ("Missing tables", len(result.get("missing_tables") or []), "migrate.missing"),
+            ("Planned operations", len(actions), "migrate.actions"),
+            ("Legacy rows", result.get("legacy_rows"), "migrate.legacy"),
+            ("Conflicts", result.get("data_conflicts"), "migrate.conflicts"),
         ]
-        return self._panel("SQL SERVER SCHEMA", self._metric_grid(items, width), "COMPLETE")
+        details = Text()
+        for action in actions[:8]:
+            details.append("\n  + " + str(action), style="cyan")
+        for blocker in blockers[:8]:
+            details.append("\n  ! " + str(blocker), style="red")
+        details.append("\nApply permitted: " + ("YES" if result.get("apply_permitted") else "NO"),
+                       style="green" if result.get("apply_permitted") else "red")
+        return self._panel(
+            "PRODUCTION SCHEMA MIGRATION",
+            Group(self._metric_grid(items, width), details), state,
+        )
 
     def _render_cutover(self, width: int):
         snapshot = self.state.result or self.state.cutover
+        if snapshot.get("mode") == "new-phase":
+            metrics = [
+                ("Generation", snapshot.get("generation", 1), "cutover.generation"),
+                ("Source rows", snapshot.get("source_rows", 0), "cutover.source"),
+                ("Scanned", snapshot.get("scanned", 0), "cutover.scanned"),
+                ("Inserted", snapshot.get("inserted", 0), "cutover.inserted"),
+                ("Updated", snapshot.get("updated", 0), "cutover.updated"),
+                ("Unchanged", snapshot.get("unchanged", 0), "cutover.unchanged"),
+                ("Conflicts", snapshot.get("conflicts", 0), "cutover.conflicts"),
+                ("Domain inserts", snapshot.get("domains_inserted", 0), "cutover.domain_insert"),
+                ("Domain updates", snapshot.get("domains_updated", 0), "cutover.domain_update"),
+                ("Target-only companies", snapshot.get("target_only_companies", 0), "cutover.target_companies"),
+                ("Target-only scope", snapshot.get("target_only_scope", 0), "cutover.target_only"),
+                ("Batches", snapshot.get("batches", 0), "cutover.batches"),
+                ("Source evidence", "VERIFIED" if snapshot.get("verification", {}).get(
+                    "source_content_verified") else "PENDING", "cutover.source_evidence"),
+                ("Target verification", "VERIFIED" if self.state.result and
+                 snapshot.get("verification", {}).get("companies_verified") ==
+                 snapshot.get("source_rows") else "PENDING", "cutover.target_verification"),
+            ]
+            state = (self.state.status if self.state.status in {"FAILED", "STOPPED"}
+                     else "COMPLETE" if self.state.result else "SYNCING")
+            return self._panel(
+                f"MYSQL LEGACY → {self.state.backend.upper()} · NEW PHASE G1",
+                self._metric_grid(metrics, width),
+                state, active=not bool(self.state.result),
+            )
         items = [
             ("Generation", snapshot.get("generation", 1), "cutover.generation"),
             ("Source rows", snapshot.get("source_rows", 0), "cutover.source"),
@@ -861,17 +904,33 @@ class V06Terminal:
         return self._panel(heading, Group(*content), status, active=not self.state.result)
 
     def _render_branch(self, width: int):
-        values = self.state.result or self.state.branch
+        nested = ((self.state.result.get("branch") or {}) if
+                  self.state.command in {"cycle-run", "cycle-loop"} else {})
+        values = nested or self.state.result or self.state.branch
+        phase_id = values.get("phase")
         items = [
-            ("Checked",values.get("checked",0),"branch.checked"),
-            ("Verified",values.get("verified",0),"branch.verified"),
-            ("Branches",values.get("branches",0),"branch.branches"),
-            ("Deferred",values.get("deferred",0),"branch.deferred"),
-            ("HTTP attempts",values.get("http_requests",0),"branch.requests"),
+            ("Branch phase", phase_id, "branch.phase"),
+            ("Pass", values.get("pass"), "branch.pass"),
+            ("Source examined", values.get("examined",0), "branch.examined"),
+            ("Terminal", values.get("terminal",0), "branch.terminal"),
+            ("Unchecked", values.get("unchecked",0), "branch.unchecked"),
+            ("Deferred", values.get("deferred",0), "branch.deferred"),
+            ("Review", values.get("review",0), "branch.review"),
+            ("Skipped HTTP", values.get("skipped",0), "branch.skipped"),
+            ("Committed checks", values.get("checked",0), "branch.checked"),
+            ("Verified", values.get("verified",0), "branch.verified"),
+            ("Branch rows", values.get("branches",0), "branch.branches"),
+            ("HTTP requests", values.get("http_requests",0), "branch.requests"),
+            ("Flow NOW (5s)", values.get("flow_now"), "branch.flow_now"),
+            ("Flow 1m", values.get("flow_1m"), "branch.flow_1m"),
+            ("Flow 5m", values.get("flow_5m"), "branch.flow_5m"),
+            ("Flow 1h", values.get("flow_1h"), "branch.flow_1h"),
         ]
-        status = self.state.status if self.state.result else "RUNNING"
-        body = self._metric_grid(items,width)
-        return self._panel("BRANCH ENRICHMENT",body,status,active=not bool(self.state.result))
+        status = (str(values.get("stage") or self.state.status).upper()
+                  if self.state.result else "RUNNING")
+        return self._panel("BRANCH ENRICHMENT",
+                           self._metric_grid(items,width),status,
+                           active=not bool(self.state.result))
 
     def _render_prepare(self, width: int):
         if self.state.result:
@@ -1160,6 +1219,12 @@ class V06Terminal:
                 ("Endpoint failed", collection.get("endpoints_failed"), "cycle.endpoints_failed"),
                 ("Finalized rows", result.get("finalized_rows"), "cycle.finalized_rows"),
             ]
+            branch = dict(result.get("branch") or {})
+            if branch:
+                result_items.extend([
+                    ("Core outcome", branch.get("core_status"), "cycle.core_status"),
+                    ("Branch outcome", branch.get("branch_status"), "cycle.branch_status"),
+                ])
             blocks = [
                 cycle_panel,
                 self._panel(
@@ -1171,6 +1236,8 @@ class V06Terminal:
             verification = dict(result.get("verification") or {})
             if self._verification_significant(result, verification):
                 blocks.append(self._render_verification_result(verification, width))
+            if result.get("branch"):
+                blocks.append(self._render_branch(width))
             return blocks
 
         active_phase = self.state.phase or "PRECHECK"
@@ -1192,6 +1259,8 @@ class V06Terminal:
                 self._active_status(),
                 width,
             )
+        elif active_phase == "BRANCH":
+            active = self._render_branch(width)
         elif active_phase == "FINALIZE":
             active = self._render_activity_panel(
                 "FINALIZATION",
@@ -1745,8 +1814,8 @@ class V06Terminal:
         if result_line:
             self._plain_write(result_line)
         finished = self.state.finished_at or self._wall_clock()
-        if status == "FAILED":
-            self._plain_write(f"Failed: {_timestamp(finished)} · Exit 1")
+        if status in {"FAILED", "BLOCKED"}:
+            self._plain_write(f"{status.title()}: {_timestamp(finished)}")
         elif status == "COMPLETE_WITH_FAILURES":
             self._plain_write(f"Completed with failures: {_timestamp(finished)}")
         else:
@@ -1762,12 +1831,13 @@ class V06Terminal:
                 f"managed_tables={payload.get('managed_tables')}"
             )
         if command == "migrate":
-            created = payload.get("created")
-            altered = payload.get("altered")
+            actions = payload.get("actions") or []
+            blockers = payload.get("blockers") or []
             return (
-                f"Result: status={status} managed_tables={payload.get('managed_tables')} "
-                f"created={len(created) if isinstance(created, list) else created} "
-                f"altered={len(altered) if isinstance(altered, list) else altered}"
+                f"Migration: state={status} backend={payload.get('backend')} "
+                f"database={payload.get('database')} actions={len(actions)} "
+                f"blockers={len(blockers)} apply={payload.get('apply_permitted')} "
+                + ("; ".join(str(x) for x in blockers[:3]) if blockers else "")
             )
         if command == "branch":
             return (
@@ -1792,9 +1862,15 @@ class V06Terminal:
                 f"company_id={payload.get('company_id')}"
             )
         if command in {"cycle-run", "cycle-loop"}:
+            branch = dict(payload.get("branch") or {})
+            detail = (
+                f" core={branch.get('core_status')} branch={branch.get('branch_status')}"
+                f" branch_stage={branch.get('stage')}"
+                if branch else ""
+            )
             return (
                 f"Result: status={payload.get('status')} generation={payload.get('generation')} "
-                f"finalized_rows={payload.get('finalized_rows')}"
+                f"finalized_rows={payload.get('finalized_rows')}" + detail
             )
         if command == "prepare":
             return (

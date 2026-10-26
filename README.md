@@ -1,5 +1,29 @@
 # DBD Data Platform
 
+## v0.6 Migration command #04 — safety contract (PR #102 draft)
+
+`dbd-data migrate` is **read-only by default**. Use `--check` (or `--dry-run`) to inspect the selected Production database before authorizing DDL. `--backend sqlserver|mysql`, `--db` and `-d` select the backend; the `.env` default remains supported.
+
+```powershell
+dbd-data migrate --backend sqlserver --check
+dbd-data migrate --backend mysql --check
+# Review the actual plan, legacy evidence, permissions and BLOCKERS first.
+dbd-data migrate --backend sqlserver --apply
+dbd-data migrate --backend mysql --apply
+# Noninteractive automation ONLY, after explicit operator approval:
+dbd-data migrate --backend sqlserver --apply --yes
+dbd-data check-db --backend sqlserver
+```
+
+Interactive `--apply` requires typing `MIGRATE`. Noninteractive Apply requires both `--apply --yes`. `--check` never executes DDL or writes Control, Generation, Discovery, Branch or business rows. The approved plan is re-read under the existing Production Manager Lock; another schema/state change blocks Apply.
+
+SQL Server uses a transaction and rolls it back when an exception occurs. MySQL DDL commits implicitly: a failure may leave additive DDL already committed; inspect with `--check` before retrying. Never assume Ctrl+C reverses MySQL DDL. Neither backend is authorized to DROP or TRUNCATE old tables. Existing `DBD_COMPANY_BRANCH` and PR #100 summary fields are retained.
+
+**Historical Branch Count warning:** PR #100 `branch_count` may exclude HQ; v0.6 `DBD_COMPANY.branch_count` includes HQ. Ambiguous PR #100 rows, conflicting counts, and historical detail rows without sufficient evidence block schema convergence rather than receive automatic `+1` or `1`. Review `dbd-data branch import -c -d sqlserver --source sqlserver-extension` and the original Journal first; do not manually mutate verified counts to bypass the gate. This migration does **not** import Branch details, collect HTTP, start a Generation, or reset checkpoints.
+
+The six canonical business tables are `DBD_COMPANY`, `DBD_COMPANY_RELATION`, `DBD_COMPANY_EVENT`, `DBD_FINANCIAL`, `DBD_INDUSTRY`, `DBD_BRANCH`. SQL Server `DBD_CONTROL` and `DBD_DISCOVERY_WORK`, and MySQL `DBD_DISCOVERY_WORK`, are separate operational structures. Read-only `--check` must never be interpreted as test evidence for isolated database migration or Windows interruption compatibility. PR #102 remains Draft until those gates are independently validated.
+
+
 ระบบ Production สำหรับค้นหาและเก็บข้อมูลบริษัทจาก DBD DataWarehouse ลง SQL Server แบบทำงานต่อเนื่อง ตรวจสอบได้ และกลับมาทำต่อได้เมื่อ process หยุดกลางทาง
 
 เอกสารหน้าแรกนี้อธิบายเฉพาะเส้นทาง Production ปัจจุบัน หากต้องการรายละเอียดเชิงลึกให้ไปยังเอกสารที่ลิงก์ไว้ท้ายหน้า
@@ -40,17 +64,66 @@ SQL Server Production Dataset
 
 ## Production Storage
 
-Production ใช้ SQL Server เป็นฐานข้อมูลหลัก
+Production v0.6 ใช้ **6 ตารางธุรกิจ** ที่มี Contract ร่วมกันสำหรับ SQL Server และ Production MySQL แยกจากฐาน Legacy Dataset 1:
 
-ฐานข้อมูลที่ตั้งค่าโดยทั่วไปคือ TIPDataIntelligence และระบบ v0.6 ดูแล 5 ตาราง:
-
-| Table | หน้าที่ |
+| ตาราง | หน้าที่ |
 | --- | --- |
-| dbo.DBD_COMPANY | ข้อมูลหลักบริษัท สถานะการเก็บข้อมูล lease และ Generation |
-| dbo.DBD_COMPANY_RELATION | กรรมการ ผู้มีอำนาจลงนาม และความสัมพันธ์แบบรายการ |
-| dbo.DBD_COMPANY_EVENT | เหตุการณ์เปลี่ยนแปลง โอน แปรสภาพ หรือควบรวม |
-| dbo.DBD_FINANCIAL | ข้อมูลการนำส่งและงบการเงินแยกตามปี |
-| dbo.DBD_INDUSTRY | ข้อมูล benchmark และข้อมูลอุตสาหกรรม |
+| `DBD_COMPANY` | ตัวตนบริษัท Core-7 และ `branch_count` (จำนวนสถานประกอบการ **รวมสำนักงานใหญ่**) |
+| `DBD_COMPANY_RELATION` | กรรมการ ผู้เกี่ยวข้อง และอำนาจลงนาม |
+| `DBD_COMPANY_EVENT` | เหตุการณ์เปลี่ยนแปลง |
+| `DBD_FINANCIAL` | ข้อมูลการเงินตามปีบัญชี |
+| `DBD_INDUSTRY` | Industry Benchmark |
+| `DBD_BRANCH` | สำนักงานใหญ่ (เลขภายใน `00000`), สาขา และผลตรวจรายบริษัท |
+
+`branch_count=1` **ไม่ได้** แปลว่าไม่มีสาขาที่ตรวจยืนยันแล้ว ต้องดู `DBD_BRANCH.collection_status` ของสำนักงานใหญ่ด้วย
+
+นอกจากนี้ SQL Server มี `DBD_CONTROL` และ `DBD_DISCOVERY_WORK` สำหรับสิทธิ์/รอบงานและ Durable Page Resume ตามเดิม ส่วน Production MySQL มีตารางงาน Discovery เท่าที่จำเป็นเพื่อให้ Resume แบบ Transactional ได้ ไม่เพิ่ม Redis หรือ Service ใหม่
+
+> **ข้อควรระวัง:** PR #102 เป็น Draft Implementation ยังไม่ได้รับรองว่า Production Migration, MySQL/SQL Server Integration และ Windows Ctrl+C ผ่านการทดสอบจริง ห้ามรัน `migrate`, `cutover` หรือ Collector ในฐาน Production จาก Draft Branch โดยไม่มีการตรวจสอบและอนุมัติ
+
+## Branch Collection และ Resume
+
+DataForThai เป็นแหล่งข้อมูลเพิ่มเติม ไม่ใช่ Endpoint ที่ 8 ของ DBD Core-7 และมี **Branch Phase แยกจาก Monthly Core Generation** รันคำสั่งเดิมเพื่อ Resume หรือรับบริษัทที่เพิ่งค้นพบ:
+
+~~~powershell
+dbd-data branch -c -d sqlserver
+dbd-data branch -d sqlserver
+# หากหยุดแล้วกลับมา ให้ใช้คำสั่งเดิม ไม่ต้องสร้าง Phase ใหม่
+dbd-data branch -d sqlserver
+~~~
+
+เมื่อต้องการ Refresh ทุกบริษัทใน Scope อีกครั้งอย่างชัดแจ้งเท่านั้น:
+
+~~~powershell
+dbd-data branch -d sqlserver --new-phase
+~~~
+
+ตรวจการนำเข้าข้อมูลเก่าก่อนทำจริง (อ่าน Legacy MySQL และไฟล์ Journal/Checkpoint แบบ Read-only):
+
+~~~powershell
+dbd-data branch import -c -d sqlserver
+# เมื่อผ่านการตรวจสอบและได้รับอนุมัติ จึงนำเข้าข้อมูลจริง
+# dbd-data branch import -d sqlserver
+# หากใช้ส่วนขยายสาขาเดิมใน PR #100:
+dbd-data branch import -c -d sqlserver --source sqlserver-extension
+# หลังตรวจ Conflict และได้รับอนุมัติ:
+# dbd-data branch import -d sqlserver --source sqlserver-extension
+~~~
+
+หากมี `.dbd_branch_results.jsonl`, `.dbd_branch_checkpoint.json` หรือข้อมูลสาขาเก่าที่ยังไม่ได้ Reconcile ต้อง Import ให้ครบและแก้ Conflict ก่อนเริ่ม HTTP จริง ระบบต้องไม่ถือว่าไม่มีสาขาเพียงเพราะไม่มี Branch Rows
+
+`NO_BRANCH` = ตรวจ HQ-only สำเร็จ, `NO_BRANCH_LISTED` = ไม่พบลิงก์รายการสาขา, `UNAVAILABLE` = ข้อมูลไม่พร้อม (Legacy Terminal), `DEFERRED_*` = ยังตรวจไม่สำเร็จและรอ Run ถัดไป, `STALE_BRANCHES` = สาขาที่เคยมีหายจากภาพใหม่และต้อง Review โดยไม่ลบข้อมูลเก่า
+
+Production MySQL ใช้ `-d mysql` กับคำสั่งเดียวกัน แต่ Phase Marker บนไฟล์ต้องสำรองและเก็บคู่กับฐาน Production MySQL; อย่าย้ายฐานข้อมูลโดยไม่ย้ายไฟล์ Phase Marker ที่เกี่ยวข้อง
+
+### Full Production Cycle
+
+~~~powershell
+dbd-data cycle run -d sqlserver
+~~~
+
+Cycle เรียก Discovery → Core-7 → Verification/Finalization → Branch Reconciliation จาก Terminal เดียว โดยรายงานสถานะ Core และ Branch แยกจากกัน หาก DataForThai ไม่พร้อม Core ที่ Complete แล้วจะไม่ถูกเปิดใหม่เพราะเหตุนี้
+
 
 ## เริ่มใช้งาน
 
@@ -79,7 +152,7 @@ dbd-data check-db
 ถ้าเป็น environment ใหม่ หรือ source code มี schema contract ใหม่ ให้ converge schema ก่อนแล้วตรวจ:
 
 ~~~powershell
-dbd-data migrate
+dbd-data migrate --check
 dbd-data check-db
 ~~~
 
@@ -258,7 +331,7 @@ Generation 1 Cutover เป็นงานครั้งเดียวสำ�
 ลำดับหลัก:
 
 ~~~powershell
-dbd-data migrate
+dbd-data migrate --check
 dbd-data check-db
 python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
 dbd-data cycle status --phase core
@@ -290,7 +363,7 @@ dbd-data fetch-company <COMPANY_CODE> --phase core
 ### งานดูแลระบบหรือขั้นตอนพิเศษ
 
 ~~~powershell
-dbd-data migrate
+dbd-data migrate --check
 dbd-data discover --phase core
 dbd-deep prepare --phase core
 dbd-deep collect --phase core
@@ -327,9 +400,10 @@ python .\scripts\cutover_mysql_generation1_to_sqlserver.py --batch-size 500
 
 v0.6 uses one Discovery/Deep/Cycle engine with a selectable independent output
 database. SQL Server remains the default. Choosing MySQL does not copy, reset,
-or read SQL Server progress. Each target owns five equivalent production tables
+or read SQL Server progress. Each target owns six canonical production business tables
 (`DBD_COMPANY`, `DBD_COMPANY_RELATION`, `DBD_COMPANY_EVENT`,
-`DBD_FINANCIAL`, `DBD_INDUSTRY`) with separate generation, masks and leases.
+`DBD_FINANCIAL`, `DBD_INDUSTRY`, `DBD_BRANCH`) with separate Core
+generation, Core masks, and Branch Phase state.
 
 ```powershell
 dbd-data check-db --backend sqlserver
@@ -346,6 +420,6 @@ before the selected target begins G2. Full details: `docs/RUNBOOK.md`.
 
 ## SQL Server monthly Core control (v0.6)
 
-After the Admin has applied the control schema, use `dbd-data setup` once to configure the operator/node and monthly schedule. The normal command remains `dbd-data cycle run --phase core`; Windows Task Scheduler invokes the same command with the single `--auto` switch. A finished generation cannot restart in the same month. SQL Server is the shared production backend, the Admin can run alone, and optionally approved Worker machines join using `dbd-deep collect --phase core --backend sqlserver --continuous`. The five business table contracts and MySQL v0.6 backend are not changed by this control feature.
+After the Admin has applied the control schema, use `dbd-data setup` once to configure the operator/node and monthly schedule. The normal command remains `dbd-data cycle run --phase core`; Windows Task Scheduler invokes the same command with the single `--auto` switch. A finished generation cannot restart in the same month. SQL Server is the shared production backend, the Admin can run alone, and optionally approved Worker machines join using `dbd-deep collect --phase core --backend sqlserver --continuous`. The six business table contracts and MySQL v0.6 backend are not changed by this control feature.
 
 See [Admin setup](docs/ADMIN_SETUP.md) and [Worker setup](docs/WORKER_SETUP.md) for Windows Task Scheduler, SQL permissions and safe resume.

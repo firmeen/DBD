@@ -1,5 +1,29 @@
 # Production Operations and Troubleshooting
 
+## v0.6 Migration command #04 — safety contract (PR #102 draft)
+
+`dbd-data migrate` is **read-only by default**. Use `--check` (or `--dry-run`) to inspect the selected Production database before authorizing DDL. `--backend sqlserver|mysql`, `--db` and `-d` select the backend; the `.env` default remains supported.
+
+```powershell
+dbd-data migrate --backend sqlserver --check
+dbd-data migrate --backend mysql --check
+# Review the actual plan, legacy evidence, permissions and BLOCKERS first.
+dbd-data migrate --backend sqlserver --apply
+dbd-data migrate --backend mysql --apply
+# Noninteractive automation ONLY, after explicit operator approval:
+dbd-data migrate --backend sqlserver --apply --yes
+dbd-data check-db --backend sqlserver
+```
+
+Interactive `--apply` requires typing `MIGRATE`. Noninteractive Apply requires both `--apply --yes`. `--check` never executes DDL or writes Control, Generation, Discovery, Branch or business rows. The approved plan is re-read under the existing Production Manager Lock; another schema/state change blocks Apply.
+
+SQL Server uses a transaction and rolls it back when an exception occurs. MySQL DDL commits implicitly: a failure may leave additive DDL already committed; inspect with `--check` before retrying. Never assume Ctrl+C reverses MySQL DDL. Neither backend is authorized to DROP or TRUNCATE old tables. Existing `DBD_COMPANY_BRANCH` and PR #100 summary fields are retained.
+
+**Historical Branch Count warning:** PR #100 `branch_count` may exclude HQ; v0.6 `DBD_COMPANY.branch_count` includes HQ. Ambiguous PR #100 rows, conflicting counts, and historical detail rows without sufficient evidence block schema convergence rather than receive automatic `+1` or `1`. Review `dbd-data branch import -c -d sqlserver --source sqlserver-extension` and the original Journal first; do not manually mutate verified counts to bypass the gate. This migration does **not** import Branch details, collect HTTP, start a Generation, or reset checkpoints.
+
+The six canonical business tables are `DBD_COMPANY`, `DBD_COMPANY_RELATION`, `DBD_COMPANY_EVENT`, `DBD_FINANCIAL`, `DBD_INDUSTRY`, `DBD_BRANCH`. SQL Server `DBD_CONTROL` and `DBD_DISCOVERY_WORK`, and MySQL `DBD_DISCOVERY_WORK`, are separate operational structures. Read-only `--check` must never be interpreted as test evidence for isolated database migration or Windows interruption compatibility. PR #102 remains Draft until those gates are independently validated.
+
+
 เอกสารนี้ใช้เมื่อต้องตอบคำถามว่า “ตอนนี้เกิดอะไรขึ้น และควรทำอะไรต่อ”
 
 หลักแรกคือดู durable state ใน SQL Server ก่อนแก้ไขอะไร
@@ -173,7 +197,7 @@ dbd-data check-db
 ถ้าปัญหาเป็น schema และ migration เป็นสิ่งที่ต้องใช้:
 
 ~~~powershell
-dbd-data migrate
+dbd-data migrate --check
 dbd-data check-db
 ~~~
 
@@ -346,3 +370,30 @@ request rate. Never bypass an application lock or retry by deleting data.
 ## Monthly control recovery
 
 `--auto` exits without starting when not due/already completed; this is not a failure. Manual early start requires confirmation and audit. If a Generation was interrupted, run the same Core cycle to resume before the next month. An Admin may approve/revoke a Worker node using `dbd-data setup`; revocation blocks new claims and in-flight commits at the SQL gate. Remote workers do not acquire Coordinator locks. During `DRAINING` the Coordinator waits for live company leases, then verifies before Finalize. Shared Rate admission failure must **not** fall back to local rate. A Windows Task that runs under a noninteractive logon does not show the Terminal UI; use current-user interactive principal without highest privileges. See [Admin setup](ADMIN_SETUP.md) and [Worker setup](WORKER_SETUP.md).
+
+## Branch Resume / Import Troubleshooting (PR #102 Draft)
+
+Check actual durable Core state and independent Branch Phase:
+~~~powershell
+dbd-data status -d sqlserver
+dbd-data branch -c -d sqlserver
+dbd-data branch import -c -d sqlserver
+dbd-data branch import -c -d sqlserver --source sqlserver-extension
+~~~
+
+- **No Phase Marker but legacy data exists:** stop; restore original Journal/
+  Checkpoint and perform historical import. Do not delete the files or start
+  a new Phase to evade the blocker.
+- **`DEFERRED_*`:** rerun the same `dbd-data branch` command next invocation.
+  One invocation must not amplify repeated retries of the same identity.
+- **`STALE_BRANCHES`:** review missing old branch numbers and source evidence.
+  Existing verified count and rows stay untouched. Do not delete them.
+- **`UNAVAILABLE` / `NO_BRANCH_LISTED`:** historical terminal outcomes,
+  never a verified count of zero branches. Ordinary rerun skips them until
+  explicitly refreshed in a new Phase.
+- **HTTP 401/403/429:** stop safely; do not rotate identity or bypass source
+  restrictions. Core-7 completion must not be invalidated.
+- **Schema differs from six-table contract:** stop normal collection; review
+  additive migration separately, including old nullable summary fields.
+- **Ctrl+C:** after the process finishes stopping, rerun the same command.
+  Do not run two writers against the same Branch Phase.

@@ -1,5 +1,29 @@
 # Production Architecture
 
+## v0.6 Migration command #04 — safety contract (PR #102 draft)
+
+`dbd-data migrate` is **read-only by default**. Use `--check` (or `--dry-run`) to inspect the selected Production database before authorizing DDL. `--backend sqlserver|mysql`, `--db` and `-d` select the backend; the `.env` default remains supported.
+
+```powershell
+dbd-data migrate --backend sqlserver --check
+dbd-data migrate --backend mysql --check
+# Review the actual plan, legacy evidence, permissions and BLOCKERS first.
+dbd-data migrate --backend sqlserver --apply
+dbd-data migrate --backend mysql --apply
+# Noninteractive automation ONLY, after explicit operator approval:
+dbd-data migrate --backend sqlserver --apply --yes
+dbd-data check-db --backend sqlserver
+```
+
+Interactive `--apply` requires typing `MIGRATE`. Noninteractive Apply requires both `--apply --yes`. `--check` never executes DDL or writes Control, Generation, Discovery, Branch or business rows. The approved plan is re-read under the existing Production Manager Lock; another schema/state change blocks Apply.
+
+SQL Server uses a transaction and rolls it back when an exception occurs. MySQL DDL commits implicitly: a failure may leave additive DDL already committed; inspect with `--check` before retrying. Never assume Ctrl+C reverses MySQL DDL. Neither backend is authorized to DROP or TRUNCATE old tables. Existing `DBD_COMPANY_BRANCH` and PR #100 summary fields are retained.
+
+**Historical Branch Count warning:** PR #100 `branch_count` may exclude HQ; v0.6 `DBD_COMPANY.branch_count` includes HQ. Ambiguous PR #100 rows, conflicting counts, and historical detail rows without sufficient evidence block schema convergence rather than receive automatic `+1` or `1`. Review `dbd-data branch import -c -d sqlserver --source sqlserver-extension` and the original Journal first; do not manually mutate verified counts to bypass the gate. This migration does **not** import Branch details, collect HTTP, start a Generation, or reset checkpoints.
+
+The six canonical business tables are `DBD_COMPANY`, `DBD_COMPANY_RELATION`, `DBD_COMPANY_EVENT`, `DBD_FINANCIAL`, `DBD_INDUSTRY`, `DBD_BRANCH`. SQL Server `DBD_CONTROL` and `DBD_DISCOVERY_WORK`, and MySQL `DBD_DISCOVERY_WORK`, are separate operational structures. Read-only `--check` must never be interpreted as test evidence for isolated database migration or Windows interruption compatibility. PR #102 remains Draft until those gates are independently validated.
+
+
 เอกสารนี้อธิบายโครงสร้าง Production v0.6 เท่านั้น โดยเน้นว่าแต่ละส่วนมีหน้าที่อะไร ข้อมูลไหลอย่างไร และระบบรักษาความถูกต้องอย่างไร
 
 ## ภาพรวม
@@ -452,3 +476,33 @@ set remains empty pending real upstream coverage evidence; a nonpartitionable
 overflow remains durable BLOCKED, never DONE. A future explicitly authorized
 recovery may recheck safely blocked zero-page oversize work after numeric
 certification, without resetting committed pages or core Business data.
+
+## Canonical Branch and Production MySQL durability — PR #102
+
+`DBD_BRANCH` is the sixth canonical business table, with `branch_id` as the
+surrogate PK and a unique `(company_id,branch_no)`. The internal `00000` row
+holds the per-company Branch Phase outcome; real branches carry source address
+details. `DBD_COMPANY.branch_count` is HQ-inclusive and is owned **only** by
+the Branch transaction writer, not Core-7 company upserts. A default of 1 is
+not itself verified HQ-only evidence.
+
+The legal identity `(juristic_type_code, registration_no)` is the Branch work
+selection key. Every invocation starts from the beginning, and the keyset
+cursor is scoped to the current scan pass. Per-company HQ phase results
+prevent duplicate same-phase HTTP requests. Source business-field fingerprints
+are audit evidence, not time-based selectors. Branch Phase advances only with
+an explicit `--new-phase`, independently from the monthly Core Generation.
+
+SQL Server preserves existing `DBD_CONTROL` and `DBD_DISCOVERY_WORK`. MySQL
+uses a minimal `DBD_DISCOVERY_WORK` table for atomic company/page checkpoint
+writes and the existing JSONL path for append-only global Branch Phase events.
+Company-level Branch results belong in `DBD_BRANCH`, not in another queue
+or result table.
+
+A stale external printview that omits a previously known branch becomes
+`STALE_BRANCHES` rather than deactivating/deleting its old row or reducing the
+previous verified count. Legacy imports preserve the source and its outcome,
+and are never counted as a fresh live HTTP verification.
+
+The canonical schema migration does **not** automatically erase the PR100
+`DBD_COMPANY_BRANCH` extension or its old `DBD_COMPANY` metadata.

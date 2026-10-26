@@ -1,248 +1,386 @@
-"""SQL Server-only, additive company branch enrichment extension.
+"""Canonical SQL Server branch persistence. All writes use caller-owned transactions.
 
-Branch writes never participate in the seven DBD Core endpoint masks. Only a
-fully validated external snapshot can retire prior branches or replace counts.
+DBD_BRANCH HQ row stores per-company phase results. DBD_CONTROL reuses its
+existing AUDIT record type for a durable active branch phase pointer, avoiding
+an additional table or a destructive control schema migration.
 """
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 from ...core.exceptions import ContractError
+from .control_repository import ControlRepository
+from .schema import validate_schema as validate_production_schema
 
-TABLE = "dbo.DBD_COMPANY_BRANCH"
-SUMMARY_COLUMNS = {
-    "branch_count": "INT NULL",
-    "establishment_count": "INT NULL",
-    "branch_status": "NVARCHAR(20) NULL",
-    "branch_source": "NVARCHAR(32) NULL",
-    "branch_checked_at": "DATETIME2(6) NULL",
-    "branch_verified_at": "DATETIME2(6) NULL",
-    "branch_retry_at": "DATETIME2(6) NULL",
-    "branch_last_error": "NVARCHAR(1024) NULL",
-}
-DDL = """
-IF OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH', N'U') IS NULL
-BEGIN
-  CREATE TABLE dbo.DBD_COMPANY_BRANCH (
-    company_id BIGINT NOT NULL,
-    branch_no NVARCHAR(5) NOT NULL,
-    branch_name NVARCHAR(500) NULL,
-    address_th NVARCHAR(MAX) NOT NULL,
-    province_name NVARCHAR(191) NULL,
-    district_name NVARCHAR(191) NULL,
-    subdistrict_name NVARCHAR(191) NULL,
-    postal_code NVARCHAR(10) NULL,
-    latitude DECIMAL(10,7) NULL,
-    longitude DECIMAL(10,7) NULL,
-    geo_source NVARCHAR(32) NULL,
-    source_url NVARCHAR(500) NOT NULL,
-    is_current BIT NOT NULL DEFAULT 1,
-    first_seen_at DATETIME2(6) NOT NULL DEFAULT SYSUTCDATETIME(),
-    last_verified_at DATETIME2(6) NOT NULL,
-    CONSTRAINT PK_DBD_COMPANY_BRANCH PRIMARY KEY(company_id,branch_no),
-    CONSTRAINT FK_DBD_COMPANY_BRANCH_COMPANY FOREIGN KEY(company_id)
-      REFERENCES dbo.DBD_COMPANY(company_id),
-    CONSTRAINT CK_DBD_COMPANY_BRANCH_NUMBER CHECK
-      (LEN(branch_no)=5 AND branch_no NOT LIKE '%[^0-9]%')
-  );
-  CREATE INDEX IX_DBD_COMPANY_BRANCH_PROVINCE
-    ON dbo.DBD_COMPANY_BRANCH(province_name,company_id);
-END
-"""
+TABLE = "dbo.DBD_BRANCH"
+TERMINAL = frozenset({
+    "OK", "NO_BRANCH", "LEGACY_OK", "NO_BRANCH_LISTED",
+    "UNAVAILABLE", "NOT_LISTED",
+})
+REVIEW = frozenset({"STALE_BRANCHES"})
+PHASE_RECORD_KEY = "branch-active-phase"
 
 
 def ensure_schema(conn) -> None:
-    cur = conn.cursor()
-    try:
-        for name, ddl in SUMMARY_COLUMNS.items():
-            cur.execute(
-                "SELECT 1 FROM sys.columns WHERE object_id=OBJECT_ID(N'dbo.DBD_COMPANY') "
-                "AND name=%s",
-                (name,),
-            )
-            if cur.fetchone() is None:
-                cur.execute(f"ALTER TABLE dbo.DBD_COMPANY ADD [{name}] {ddl}")
-        cur.execute(DDL)
-    finally:
-        cur.close()
+    """The six-table canonical schema is managed by sqlserver.schema only."""
+    validate_schema(conn)
 
 
 def validate_schema(conn) -> None:
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH',N'U')")
-        if cur.fetchone()[0] is None:
-            raise ContractError("DBD_COMPANY_BRANCH missing: run dbd-data migrate")
-        cur.execute(
-            "SELECT TABLE_NAME,COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS "
-            "WHERE TABLE_SCHEMA='dbo' AND TABLE_NAME IN "
-            "('DBD_COMPANY','DBD_COMPANY_BRANCH')"
-        )
-        columns = {}
-        for table, field in cur.fetchall():
-            columns.setdefault(str(table).upper(), set()).add(str(field))
-        if not set(SUMMARY_COLUMNS).issubset(columns.get("DBD_COMPANY", set())):
-            raise ContractError("DBD_COMPANY missing branch summary columns")
-        required = {
-            "company_id","branch_no","branch_name","address_th","province_name",
-            "district_name","subdistrict_name","postal_code","latitude",
-            "longitude","geo_source","source_url","is_current","first_seen_at",
-            "last_verified_at",
-        }
-        if not required.issubset(columns.get("DBD_COMPANY_BRANCH", set())):
-            raise ContractError("DBD_COMPANY_BRANCH missing required columns")
-        cur.execute(
-            "SELECT name FROM sys.key_constraints "
-            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH') "
-            "AND type='PK'"
-        )
-        if "PK_DBD_COMPANY_BRANCH" not in {str(row[0]) for row in cur.fetchall()}:
-            raise ContractError("DBD_COMPANY_BRANCH primary key is missing")
-        cur.execute(
-            "SELECT name,is_disabled,is_not_trusted FROM sys.foreign_keys "
-            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH')"
-        )
-        keys = {str(name):(bool(disabled),bool(untrusted))
-                for name,disabled,untrusted in cur.fetchall()}
-        if keys.get("FK_DBD_COMPANY_BRANCH_COMPANY") != (False,False):
-            raise ContractError("DBD_COMPANY_BRANCH company FK is missing or untrusted")
-        cur.execute(
-            "SELECT name,is_disabled,is_not_trusted FROM sys.check_constraints "
-            "WHERE parent_object_id=OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH')"
-        )
-        checks = {str(name):(bool(disabled),bool(untrusted))
-                  for name,disabled,untrusted in cur.fetchall()}
-        if checks.get("CK_DBD_COMPANY_BRANCH_NUMBER") != (False,False):
-            raise ContractError("DBD_COMPANY_BRANCH branch number CHECK is missing or untrusted")
-    finally:
-        cur.close()
+    validate_production_schema(conn)
+    ControlRepository().validate_schema(conn)
 
 
-def candidates(conn, *, after: int = 0, limit: int = 100,
-               status_codes: tuple[str,...] = ("1","A","B")) -> list[dict]:
+def phase(conn, *, codes: tuple[str, ...], new_phase: bool = False,
+          read_only: bool = False, legacy_phase: int | None = None) -> dict:
+    """The manager lock must be held by the caller before any phase mutation."""
+    if not codes or tuple(sorted(set(codes))) != tuple(codes):
+        raise ContractError("Branch phase scope must be normalized")
+    prior = ControlRepository._read(conn, "AUDIT", PHASE_RECORD_KEY, lock=not read_only)
+    if prior is None:
+        with conn.cursor() as cur:
+            cur.execute(f"SELECT TOP (1) company_id FROM {TABLE}")
+            orphaned = cur.fetchone() is not None
+            cur.execute("SELECT OBJECT_ID(N'dbo.DBD_COMPANY_BRANCH',N'U')")
+            if cur.fetchone()[0] is not None:
+                cur.execute("SELECT TOP (1) company_id FROM dbo.DBD_COMPANY_BRANCH")
+                orphaned = orphaned or cur.fetchone() is not None
+            # PR #100 also stored terminal outcomes in company summary
+            # columns; these can exist even if there are no detail rows.
+            cur.execute(
+                "SELECT 1 FROM sys.columns WHERE "
+                "object_id=OBJECT_ID(N'dbo.DBD_COMPANY') AND name=N'branch_status'"
+            )
+            if cur.fetchone() is not None:
+                cur.execute(
+                    "SELECT TOP (1) company_id FROM dbo.DBD_COMPANY "
+                    "WHERE branch_status IS NOT NULL"
+                )
+                orphaned = orphaned or cur.fetchone() is not None
+        if orphaned and legacy_phase is None:
+            raise ContractError(
+                "Historical branch rows exist without a durable Phase marker; "
+                "review/import historical branch state before initial collection"
+            )
+        if new_phase:
+            raise ContractError("--new-phase requires an existing Phase")
+        if legacy_phase is not None and legacy_phase < 1:
+            raise ContractError("Invalid legacy Branch Phase")
+        state = {"phase": legacy_phase or 1, "scope": list(codes),
+                 "origin": "legacy" if legacy_phase is not None else "initial",
+                 "import_complete": legacy_phase is None}
+    else:
+        if not isinstance(prior.get("phase"), int) or prior["phase"] < 1:
+            raise ContractError("Corrupt durable branch phase marker")
+        if legacy_phase is not None and int(prior["phase"]) != legacy_phase:
+            raise ContractError("Legacy Phase does not match existing Production Branch Phase")
+        if (prior.get("origin") == "legacy" and not prior.get("import_complete")
+            and legacy_phase is None):
+            raise ContractError("Legacy Branch Import is incomplete; finish import before live HTTP")
+        scope = prior.get("scope")
+        if not isinstance(scope,list) or not scope:
+            raise ContractError("Corrupt branch phase scope")
+        if scope != list(codes) and not new_phase:
+            raise ContractError(
+                f"Branch Phase {prior['phase']} scope mismatch: "
+                f"expected {','.join(scope)}, got {','.join(codes)}; "
+                "use original scope or explicit --new-phase"
+            )
+        state = dict(prior)
+        if new_phase:
+            state = {"phase": prior["phase"]+1, "scope": list(codes), "origin": "refresh"}
+    if not read_only and (prior is None or new_phase):
+        ControlRepository._put(conn, "AUDIT", PHASE_RECORD_KEY, state)
+        ControlRepository._audit(conn, "BRANCH_PHASE_START", state)
+    return state
+
+
+def finish_legacy_import(conn, phase_id: int) -> None:
+    """Only after all historical identities reconcile without conflicts."""
+    state=ControlRepository._read(conn,"AUDIT",PHASE_RECORD_KEY,lock=True)
+    if (state is None or state.get("phase")!=phase_id
+        or state.get("origin")!="legacy"):
+        raise ContractError("No matching legacy Branch Phase to finalize")
+    if state.get("import_complete"):
+        return
+    state["import_complete"]=True
+    ControlRepository._put(conn,"AUDIT",PHASE_RECORD_KEY,state)
+    ControlRepository._audit(conn,"BRANCH_LEGACY_IMPORT_COMPLETE",{"phase":phase_id})
+
+
+def candidates(conn, *, after: tuple[str,str] | None = None,
+               limit: int = 100, status_codes: tuple[str,...] = ("1","A","B")) -> list[dict]:
+    """Rescan natural identities from the beginning, regardless of old cursors."""
     if not 1 <= limit <= 1000 or not status_codes:
-        raise ValueError("Invalid branch selection scope")
-    cur = conn.cursor()
-    try:
-        marks = ",".join("%s" for _ in status_codes)
-        cur.execute(
-            f"SELECT TOP ({int(limit)}) company_id,juristic_type_code,registration_no,"
-            "company_name_th,branch_status,branch_verified_at FROM dbo.DBD_COMPANY "
-            "WHERE company_id>%s "
-            f"AND status_code IN ({marks}) "
-            "AND (branch_status IS NULL OR "
-            "     (branch_retry_at IS NOT NULL AND branch_retry_at<=SYSUTCDATETIME())) "
-            "ORDER BY company_id",
-            (after,*status_codes),
+        raise ValueError("Invalid branch candidate batch/scope")
+    marks = ",".join("%s" for _ in status_codes)
+    cursor_sql = ""
+    params: tuple = tuple(status_codes)
+    if after is not None:
+        cursor_sql = (
+            "AND (c.juristic_type_code>%s OR "
+            "(c.juristic_type_code=%s AND c.registration_no>%s)) "
         )
-        return [
-            {"company_id":int(row[0]),"juristic_type_code":str(row[1]),
-             "registration_no":str(row[2]),"company_name_th":row[3],
-             "branch_status":row[4],"branch_verified_at":row[5]}
-            for row in cur.fetchall()
-        ]
-    finally:
-        cur.close()
+        params += (after[0],after[0],after[1])
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT TOP ({int(limit)}) c.company_id,c.juristic_type_code,"
+            "c.registration_no,c.company_name_th,c.company_name_en,"
+            "c.status_code,c.address_th,c.province_code,c.district_code,"
+            "c.subdistrict_code,c.postal_code,c.branch_count,"
+            "b.collection_status,b.checked_phase,b.verified_phase,"
+            "b.source_fingerprint,b.reported_total,b.last_checked_at "
+            "FROM dbo.DBD_COMPANY c "
+            f"LEFT JOIN {TABLE} b ON b.company_id=c.company_id AND b.branch_no=N'00000' "
+            f"WHERE c.status_code IN ({marks}) {cursor_sql} "
+            "ORDER BY c.juristic_type_code,c.registration_no",
+            params,
+        )
+        names = ("company_id","juristic_type_code","registration_no",
+                 "company_name_th","company_name_en","status_code",
+                 "address_th","province_code","district_code",
+                 "subdistrict_code","postal_code","branch_count",
+                 "collection_status","checked_phase","verified_phase",
+                 "source_fingerprint","reported_total","last_checked_at")
+        return [dict(zip(names,row,strict=True)) for row in cur.fetchall()]
 
 
-def save_snapshot(conn, *, company_id: int, branches: list[dict],
-                  establishment_count: int | None, verified_at: datetime,
-                  url: str, source: str = "DATAFORTHAI") -> bool:
-    """Replace a complete company snapshot atomically; never accept partial HTML."""
-    if establishment_count is not None:
-        if establishment_count < 0 or establishment_count < len(branches):
-            raise ContractError("External establishment total does not match branches")
-        if establishment_count - len(branches) not in (0, 1):
-            raise ContractError("Unexpected headquarters count in branch snapshot")
-    elif source != "DATAFORTHAI_IMPORT":
-        raise ContractError("Live branch snapshot requires a validated establishment total")
-    numbers = [str(item["branch_no"]) for item in branches]
-    if len(numbers) != len(set(numbers)) or any(
-        len(no)!=5 or not no.isascii() or not no.isdecimal() for no in numbers
-    ):
-        raise ContractError("Invalid or duplicate branch code")
-    if any(not str(item.get("address_th") or "").strip() for item in branches):
-        raise ContractError("Branch address is required")
-    now = verified_at.astimezone(timezone.utc).replace(tzinfo=None) if verified_at.tzinfo else verified_at
-    cur = conn.cursor()
-    try:
+def _branch_numbers(conn, company_id: int) -> set[str]:
+    with conn.cursor() as cur:
         cur.execute(
-            "SELECT branch_verified_at FROM dbo.DBD_COMPANY WITH (UPDLOCK,HOLDLOCK) "
-            "WHERE company_id=%s", (company_id,),
-        )
-        record = cur.fetchone()
-        if record is None:
-            raise ContractError("Branch references an unknown company_id")
-        if record[0] is not None and record[0] >= now:
-            # Equal timestamps are not evidence that an imported snapshot
-            # supersedes the stored one. Avoid silently overwriting history.
-            return False
-        cur.execute(
-            f"UPDATE {TABLE} SET is_current=0 WHERE company_id=%s",
+            f"SELECT branch_no FROM {TABLE} WITH (UPDLOCK,HOLDLOCK) "
+            "WHERE company_id=%s AND branch_no<>N'00000' AND is_current=1",
             (company_id,),
         )
-        for entry in branches:
-            no = str(entry["branch_no"])
-            values = (
-                entry.get("branch_name"),entry["address_th"],
-                entry.get("province_name"),entry.get("district_name"),
-                entry.get("subdistrict_name"),entry.get("postal_code"),
-                url,now,company_id,no,
-            )
-            cur.execute(
-                f"UPDATE {TABLE} SET branch_name=%s,address_th=%s,"
-                "province_name=%s,district_name=%s,subdistrict_name=%s,"
-                "postal_code=%s,source_url=%s,is_current=1,last_verified_at=%s "
-                "WHERE company_id=%s AND branch_no=%s",
-                values,
-            )
-            if cur.rowcount == 0:
+        return {str(r[0]) for r in cur.fetchall()}
+
+
+def persist(conn, *, company: dict, phase_id: int, fingerprint: str,
+            status: str, branches: list[dict] | None = None,
+            total: int | None = None, source_url: str | None = None,
+            source_kind: str = "DATAFORTHAI", reason: str | None = None,
+            verified_at: datetime | None = None) -> str:
+    """Commit HQ result + validated details + count in the caller's transaction."""
+    if phase_id < 1 or re.fullmatch(r"[0-9a-f]{64}",fingerprint) is None:
+        raise ContractError("Invalid branch phase/fingerprint")
+    if status not in TERMINAL | REVIEW and not re.fullmatch(r"DEFERRED_[A-Z0-9_]+",status):
+        raise ContractError(f"Unknown branch status {status!r}")
+    branches = [] if branches is None else branches
+    numbers = [str(b["branch_no"]) for b in branches]
+    if len(numbers)!=len(set(numbers)) or any(
+        not re.fullmatch(r"[0-9]{5}",number) or number=="00000" for number in numbers
+    ):
+        raise ContractError("Duplicate, malformed or reserved branch number")
+    if any(not str(b.get("address_th") or "").strip() for b in branches):
+        raise ContractError("Branch address required")
+    verified = status in {"OK","NO_BRANCH","LEGACY_OK"}
+    directly_verified = status in {"OK","NO_BRANCH"} and source_kind != "DATAFORTHAI_IMPORT"
+    if verified and (total != len(branches)+1 or not source_url or
+                     (status in ("OK","LEGACY_OK")) != bool(branches)):
+        raise ContractError("Verified branch snapshot requires HQ and exact total")
+    seed_stale = (status=="STALE_BRANCHES"
+                  and source_kind=="DATAFORTHAI_IMPORT" and bool(branches))
+    if seed_stale and total != len(branches)+1:
+        raise ContractError("Historical stale branch count must include HQ")
+    if status=="LEGACY_OK" and source_kind!="DATAFORTHAI_IMPORT":
+        raise ContractError("Imported legacy result requires explicit legacy source kind")
+    if not verified and branches and status not in REVIEW:
+        raise ContractError("Non-verified result cannot replace branch data")
+
+    marker=ControlRepository._read(conn,"AUDIT",PHASE_RECORD_KEY,lock=True)
+    if marker is None or marker.get("phase")!=phase_id:
+        raise ContractError("Branch Phase changed before result commit")
+    company_id = int(company["company_id"])
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    if verified_at is not None and source_kind != "DATAFORTHAI_IMPORT":
+        raise ContractError("Only historical imports may supply verified_at")
+    observed_at = (verified_at.astimezone(timezone.utc).replace(tzinfo=None)
+                   if verified_at is not None and verified_at.tzinfo is not None
+                   else verified_at or now)
+    # Retain a validated historical fetch timestamp for audit, but never
+    # advance verified_phase as if the imported rows were collected live.
+    has_verified_time = directly_verified or (
+        source_kind=="DATAFORTHAI_IMPORT" and verified_at is not None
+        and status in {"OK","LEGACY_OK"}
+    )
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT branch_count FROM dbo.DBD_COMPANY WITH (UPDLOCK,HOLDLOCK) "
+            "WHERE company_id=%s AND juristic_type_code=%s AND registration_no=%s",
+            (company_id,str(company["juristic_type_code"]),str(company["registration_no"])),
+        )
+        current = cur.fetchone()
+        if current is None:
+            raise ContractError("Unknown or changed company legal identity")
+        cur.execute(
+            f"SELECT checked_phase,collection_status,verified_phase,source_fingerprint FROM {TABLE} "
+            "WITH (UPDLOCK,HOLDLOCK) WHERE company_id=%s AND branch_no=N'00000'",
+            (company_id,),
+        )
+        old_hq = cur.fetchone()
+        if old_hq is not None and (
+            (old_hq[0] is not None and old_hq[0] > phase_id) or
+            (old_hq[2] is not None and old_hq[2] > phase_id)
+        ):
+            raise ContractError("A newer Branch Phase result already exists")
+        if (old_hq is not None and old_hq[0] == phase_id
+            and old_hq[1] in TERMINAL | REVIEW):
+            # Fingerprint is audit metadata, not an HTTP replay key.
+            return "SKIPPED"
+    previous = _branch_numbers(conn, company_id)
+    if (source_kind=="DATAFORTHAI_IMPORT" and verified and previous and old_hq is None):
+        raise ContractError(
+            "Existing canonical branch details lack HQ provenance; "
+            "historical import must not replace a potentially newer snapshot"
+        )
+
+    # A verified count from an earlier source must never be reduced when
+    # the newly observed data cannot account for all prior establishments.
+    if verified and total is not None and int(current[0] or 1)>total:
+        status="STALE_BRANCHES"
+        verified=False
+        reason=(
+            f"Incoming total {total} is below preserved count {current[0]}; "
+            "manual reconciliation required"
+        )
+    if verified and previous - set(numbers):
+        status="STALE_BRANCHES"
+        verified=False
+        reason="Previous branch numbers missing: "+",".join(sorted(previous-set(numbers))[:12])
+    if status=="STALE_BRANCHES" and not reason:
+        reason="Branch snapshot requires manual review"
+    with conn.cursor() as cur:
+        if verified or seed_stale:
+            for branch in branches:
+                no=str(branch["branch_no"])
+                values=(branch.get("branch_name"),branch["address_th"],
+                        branch.get("province_name"),branch.get("district_name"),
+                        branch.get("subdistrict_name"),branch.get("postal_code"),
+                        source_url,source_kind,now,observed_at,company_id,no)
                 cur.execute(
-                    f"INSERT INTO {TABLE} "
-                    "(company_id,branch_no,branch_name,address_th,province_name,"
-                    "district_name,subdistrict_name,postal_code,source_url,"
-                    "is_current,last_verified_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s)",
-                    (company_id,no,entry.get("branch_name"),entry["address_th"],
-                     entry.get("province_name"),entry.get("district_name"),
-                     entry.get("subdistrict_name"),entry.get("postal_code"),
-                     url,now),
+                    f"UPDATE {TABLE} SET branch_name=%s,address_th=%s,"
+                    "province_name=%s,district_name=%s,subdistrict_name=%s,"
+                    "postal_code=%s,source_url=%s,source_kind=%s,"
+                    "is_current=1,last_checked_at=%s,last_verified_at=%s "
+                    "WHERE company_id=%s AND branch_no=%s",
+                    values,
                 )
+                if cur.rowcount==0:
+                    cur.execute(
+                        f"INSERT INTO {TABLE} "
+                        "(company_id,branch_no,branch_name,address_th,province_name,"
+                        "district_name,subdistrict_name,postal_code,source_url,source_kind,"
+                        "is_current,first_seen_at,last_checked_at,last_verified_at) "
+                        "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,%s)",
+                        (company_id,no,branch.get("branch_name"),branch["address_th"],
+                         branch.get("province_name"),branch.get("district_name"),
+                         branch.get("subdistrict_name"),branch.get("postal_code"),
+                         source_url,source_kind,now,now,observed_at),
+                    )
+            if verified:
+                cur.execute(
+                    "UPDATE dbo.DBD_COMPANY SET branch_count=%s WHERE company_id=%s",
+                    (total,company_id),
+                )
+            elif seed_stale:
+                cur.execute(
+                    "UPDATE dbo.DBD_COMPANY SET branch_count=CASE WHEN branch_count<%s THEN %s ELSE branch_count END WHERE company_id=%s",
+                    (total,total,company_id),
+                )
+        # Preserve prior verified metadata when recording a failure or review.
+        if old_hq is None:
+            cur.execute(
+                f"INSERT INTO {TABLE} "
+                "(company_id,branch_no,branch_name,address_th,source_url,source_kind,"
+                "first_seen_at,last_checked_at,last_verified_at,collection_status,"
+                "checked_phase,verified_phase,source_fingerprint,reported_total,last_error) "
+                "VALUES (%s,N'00000',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                (company_id,company.get("company_name_th"),None,
+                 source_url,source_kind,now,now,observed_at if has_verified_time else None,
+                 status,phase_id,phase_id if directly_verified else None,fingerprint,
+                 total if verified else None,(reason or "")[:1024] or None),
+            )
+        elif verified:
+            cur.execute(
+                f"UPDATE {TABLE} SET collection_status=%s,checked_phase=%s,"
+                "verified_phase=%s,source_fingerprint=%s,reported_total=%s,"
+                "source_url=%s,source_kind=%s,last_checked_at=%s,last_verified_at=%s,"
+                "last_error=NULL WHERE company_id=%s AND branch_no=N'00000'",
+                (status,phase_id,phase_id if directly_verified else None,
+                 fingerprint,total,source_url,source_kind,now,
+                 observed_at if has_verified_time else None,company_id),
+            )
+        else:
+            cur.execute(
+                f"UPDATE {TABLE} SET collection_status=%s,checked_phase=%s,"
+                "source_fingerprint=%s,last_checked_at=%s,last_error=%s "
+                "WHERE company_id=%s AND branch_no=N'00000'",
+                (status,phase_id,fingerprint,now,(reason or "")[:1024] or None,company_id),
+            )
+    return status
+
+
+
+def import_preserved_details(conn, *, company_id: int, branches: list[dict],
+                             source_url: str) -> None:
+    """Preserve historical detail rows; never overwrite an existing snapshot."""
+    numbers=[str(b["branch_no"]) for b in branches]
+    if len(set(numbers))!=len(numbers) or any(
+        not re.fullmatch(r"[0-9]{5}",n) or n=="00000" for n in numbers
+    ) or any(not str(b.get("address_th") or "").strip() for b in branches):
+        raise ContractError("Invalid historical branch details")
+    now=datetime.now(timezone.utc).replace(tzinfo=None)
+    with conn.cursor() as cur:
         cur.execute(
-            "UPDATE dbo.DBD_COMPANY SET branch_count=%s,establishment_count=%s,"
-            "branch_status=%s,branch_source=%s,branch_checked_at=%s,"
-            "branch_verified_at=%s,branch_retry_at=DATEADD(day,30,%s),"
-            "branch_last_error=NULL "
-            "WHERE company_id=%s",
-            (len(branches),establishment_count,
-             "COMPLETE" if branches else "NO_BRANCH",source,now,now,now,company_id),
+            "SELECT company_id FROM dbo.DBD_COMPANY WITH (UPDLOCK,HOLDLOCK) WHERE company_id=%s",
+            (company_id,),
         )
-        return True
-    finally:
-        cur.close()
-
-
-def defer(conn, *, company_id: int, reason: str,
-          retry_at: datetime | None = None,
-          status: str = "UNAVAILABLE") -> None:
-    """Failures never erase the last certified snapshot or branch count.
-
-    Retry timing is explicit so permanent-looking missing/invalid pages can
-    be rechecked later instead of silently disappearing from selection.
-    """
-    if status not in {"RETRY", "UNAVAILABLE", "NOT_LISTED", "INVALID"}:
-        raise ContractError("Unknown branch failure status")
-    if status == "RETRY" and retry_at is None:
-        raise ContractError("Retry status requires a due time")
-    cur = conn.cursor()
-    try:
+        if cur.fetchone() is None:
+            raise ContractError("Legacy branch company missing")
+        for b in branches:
+            no=str(b["branch_no"])
+            cur.execute(
+                f"SELECT address_th,source_url FROM {TABLE} WITH (UPDLOCK,HOLDLOCK) "
+                "WHERE company_id=%s AND branch_no=%s",
+                (company_id,no),
+            )
+            prior=cur.fetchone()
+            if prior is not None:
+                if str(prior[0] or "").strip()!=str(b["address_th"]).strip() or (
+                    str(prior[1] or "")!=source_url
+                ):
+                    raise ContractError(
+                        f"Historical branch {no} conflicts with canonical data; "
+                        "refusing to overwrite possibly newer evidence"
+                    )
+                continue
+            cur.execute(
+                f"INSERT INTO {TABLE} (company_id,branch_no,branch_name,address_th,"
+                "province_name,district_name,subdistrict_name,postal_code,source_url,"
+                "source_kind,is_current,first_seen_at,last_checked_at) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,'DATAFORTHAI_IMPORT',1,%s,%s)",
+                (company_id,no,b.get("branch_name"),b["address_th"],
+                 b.get("province_name"),b.get("district_name"),
+                 b.get("subdistrict_name"),b.get("postal_code"),source_url,now,now),
+            )
         cur.execute(
-            "UPDATE dbo.DBD_COMPANY SET branch_status=%s,"
-            "branch_checked_at=SYSUTCDATETIME(),branch_retry_at=%s,"
-            "branch_last_error=%s WHERE company_id=%s",
-            (status,retry_at,reason[:1024],company_id),
+            "UPDATE dbo.DBD_COMPANY SET branch_count="
+            "CASE WHEN branch_count<%s THEN %s ELSE branch_count END "
+            "WHERE company_id=%s",(len(branches)+1,len(branches)+1,company_id),
         )
-        if cur.rowcount != 1:
-            raise ContractError("Branch candidate disappeared before defer")
-    finally:
-        cur.close()
+
+
+def summary(conn, phase_id: int) -> dict:
+    with conn.cursor() as cur:
+        cur.execute(
+            f"SELECT collection_status,COUNT_BIG(*) FROM {TABLE} "
+            "WHERE branch_no=N'00000' AND checked_phase=%s "
+            "GROUP BY collection_status", (phase_id,),
+        )
+        counts={str(s):int(n) for s,n in cur.fetchall()}
+    terminal=sum(n for s,n in counts.items() if s in TERMINAL)
+    deferred=sum(n for s,n in counts.items() if s.startswith("DEFERRED_"))
+    review=sum(n for s,n in counts.items() if s in REVIEW)
+    return {"phase":phase_id,"terminal":terminal,"deferred":deferred,
+            "review":review,"recorded":sum(counts.values()),"by_status":counts}

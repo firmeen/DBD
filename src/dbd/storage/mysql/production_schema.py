@@ -8,7 +8,11 @@ from __future__ import annotations
 import re
 
 from ..sqlserver.schema import (
-    TABLE_COLUMNS, INDEXES, FOREIGN_KEYS, JSON_CHECKS, EXTRA_CHECKS,
+    EXTRA_CHECKS,
+    FOREIGN_KEYS,
+    INDEXES,
+    JSON_CHECKS,
+    TABLE_COLUMNS,
 )
 
 TABLES = tuple(name.split(".", 1)[1] for name in TABLE_COLUMNS)
@@ -42,6 +46,9 @@ def _column_definition(column) -> str:
 
 
 def _check(expression: str) -> str:
+    # SQL Server LEN/LIKE character class is not MySQL syntax.
+    if expression.startswith("LEN([branch_no])=5"):
+        return "`branch_no` REGEXP '^[0-9]{5}$'"
     return expression.replace("[", "`").replace("]", "`").replace("N'", "'")
 
 
@@ -105,6 +112,38 @@ def _indexes(conn, table: str) -> set[str]:
         return {str(row[0]) for row in cur.fetchall()}
 
 
+
+def _matches_industry_scope_expression(expression: object, column: str) -> bool:
+    """Accept MySQL catalog formatting, never different index semantics.
+
+    Functional parts must remain COALESCE(the expected column, '').
+    Parentheses/identifier quoting/recognized literal charset annotations
+    are harmless; fallback values or a different column are not.
+    """
+    if expression is None:
+        return False
+    normalized = re.sub(r"\s+", "", str(expression).lower())
+    normalized = normalized.replace("`", "")
+    normalized = normalized.replace("_utf8mb4''", "''")
+    normalized = normalized.replace("_utf8mb3''", "''")
+    while normalized.startswith("(") and normalized.endswith(")"):
+        depth = 0
+        balanced = True
+        for pos, ch in enumerate(normalized):
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0 and pos != len(normalized) - 1:
+                    balanced = False
+                    break
+        if not balanced or depth:
+            break
+        normalized = normalized[1:-1]
+    return normalized == f"coalesce({column.lower()},'')"
+
+
+
 def _verify_indexes(conn, table: str) -> None:
     with conn.cursor() as cur:
         cur.execute(
@@ -135,10 +174,7 @@ def _verify_indexes(conn, table: str) -> None:
             if table == "DBD_INDUSTRY" and name == "UQ_DBD_INDUSTRY_SCOPE" and col not in {
                 "submit_objective_code", "fiscal_year",
             }:
-                simplified = re.sub(r"[\\s`()]", "", str(expression or "").lower())
-                # MySQL may annotate string literals with their charset.
-                simplified = simplified.replace("_utf8mb4", "")
-                if simplified != f"coalesce{col.lower()},''":
+                if not _matches_industry_scope_expression(expression, col):
                     raise RuntimeError(f"{table} nullable scope index mismatch {name}")
             elif str(stored_column or "").lower() != col.lower() or expression is not None:
                 raise RuntimeError(f"{table} index column mismatch {name}")
@@ -154,6 +190,34 @@ def _columns(conn, table: str) -> dict[str, tuple[str, str, str]]:
         )
         return {row[0]: (str(row[1]).lower(), str(row[2]), str(row[3]).lower())
                 for row in cur.fetchall()}
+
+
+
+def _normalize_check_expression(expression: object) -> str:
+    value = re.sub(r"\s+", "", str(expression).lower().replace("`", ""))
+    value = value.replace("_utf8mb4'", "'").replace("_utf8mb3'", "'")
+    # MySQL exposes REGEXP as regexp_like() in CHECK_CONSTRAINTS.
+    match = re.fullmatch(r"regexp_like\((\w+),('(?:[^']|'')*')\)", value)
+    if match:
+        value = match.group(1) + "regexp" + match.group(2)
+    # SQL catalog adds redundant outer parentheses and parentheses around constants.
+    value = re.sub(r"\((-?[0-9]+)\)", r"\1", value)
+    while value.startswith("(") and value.endswith(")"):
+        level = 0
+        fully_wrapped = True
+        for i, ch in enumerate(value):
+            level += (ch == "(") - (ch == ")")
+            if level == 0 and i != len(value) - 1:
+                fully_wrapped = False
+                break
+        if not fully_wrapped or level:
+            break
+        value = value[1:-1]
+    match = re.fullmatch(r"regexp_like\((\w+),('(?:[^']|'')*')\)", value)
+    if match:
+        value = match.group(1) + "regexp" + match.group(2)
+    return value
+
 
 
 def validate_schema(conn) -> dict[str, object]:
@@ -187,9 +251,21 @@ def validate_schema(conn) -> dict[str, object]:
         for name, _ in JSON_CHECKS.get(f"dbo.{table}", ()):
             if name not in constraints:
                 raise RuntimeError(f"{table} missing JSON check {name}")
-        for name, _ in EXTRA_CHECKS.get(f"dbo.{table}", ()):
+        for name, expression in EXTRA_CHECKS.get(f"dbo.{table}", ()):
             if name not in constraints:
                 raise RuntimeError(f"{table} missing check {name}")
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT cc.CHECK_CLAUSE FROM information_schema.CHECK_CONSTRAINTS cc "
+                    "WHERE cc.CONSTRAINT_SCHEMA=DATABASE() AND cc.CONSTRAINT_NAME=%s",
+                    (name,),
+                )
+                actual = cur.fetchone()
+            if not actual:
+                raise RuntimeError(f"{table} missing check definition {name}")
+            # MySQL normalizes quoting and parentheses in CHECK_CLAUSE.
+            if _normalize_check_expression(actual[0]) != _normalize_check_expression(_check(expression)):
+                raise RuntimeError(f"{table} incompatible check definition {name}")
         if f"dbo.{table}" in FOREIGN_KEYS:
             fk_name = FOREIGN_KEYS[f"dbo.{table}"][0]
             if fk_name not in constraints:
@@ -200,6 +276,10 @@ def validate_schema(conn) -> dict[str, object]:
 def ensure_schema(conn) -> dict[str, object]:
     existing = _tables(conn)
     created = []
+    # DDL is allowed only from explicit migrate, never normal collection.
+    if "DBD_COMPANY" in existing and "branch_count" not in _columns(conn, "DBD_COMPANY"):
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE `DBD_COMPANY` ADD COLUMN `branch_count` INT NOT NULL DEFAULT 1")
     for table in TABLES:
         if table.upper() not in existing:
             with conn.cursor() as cur:
@@ -210,4 +290,32 @@ def ensure_schema(conn) -> dict[str, object]:
             if name not in present:
                 with conn.cursor() as cur:
                     cur.execute(_index_sql(table, name, unique, columns))
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT CONSTRAINT_NAME FROM information_schema.TABLE_CONSTRAINTS "
+                "WHERE CONSTRAINT_SCHEMA=DATABASE() AND TABLE_NAME=%s", (table,),
+            )
+            constraints = {str(row[0]) for row in cur.fetchall()}
+        planned_checks = [
+            (name, f"`{column}` IS NULL OR JSON_VALID(`{column}`)")
+            for name, column in JSON_CHECKS.get(f"dbo.{table}", ())
+        ] + [
+            (name, _check(expression))
+            for name, expression in EXTRA_CHECKS.get(f"dbo.{table}", ())
+        ]
+        for name, predicate in planned_checks:
+            if name in constraints:
+                continue
+            with conn.cursor() as cur:
+                # CHECK rejects FALSE, but permits UNKNOWN / NULL.
+                cur.execute(f"SELECT COUNT(*) FROM `{table}` WHERE NOT ({predicate})")
+                bad = int(cur.fetchone()[0] or 0)
+                if bad:
+                    raise RuntimeError(
+                        f"{table} has {bad} rows violating required {name}; refusing ALTER"
+                    )
+                cur.execute(
+                    f"ALTER TABLE `{table}` ADD CONSTRAINT `{name}` CHECK ({predicate})"
+                )
+            constraints.add(name)
     return {**validate_schema(conn), "created": created}

@@ -10,6 +10,7 @@ MANAGED_TABLES = (
     "dbo.DBD_COMPANY_EVENT",
     "dbo.DBD_FINANCIAL",
     "dbo.DBD_INDUSTRY",
+    "dbo.DBD_BRANCH",
 )
 
 
@@ -106,6 +107,7 @@ COMPANY_COLUMNS = (
     ColumnSpec("endpoint_meta", "NVARCHAR(MAX)"),
     ColumnSpec("source_updated_at", "DATETIME2(6)"),
     ColumnSpec("published_at", "DATETIME2(6)", False),
+    ColumnSpec("branch_count", "INT", False, default_sql="1"),
 )
 
 RELATION_COLUMNS = (
@@ -241,12 +243,40 @@ INDUSTRY_COLUMNS = (
     ColumnSpec("published_at", "DATETIME2(6)", False),
 )
 
+BRANCH_COLUMNS = (
+    ColumnSpec("branch_id", "BIGINT", False, identity=True),
+    ColumnSpec("company_id", "BIGINT", False),
+    ColumnSpec("branch_no", "NVARCHAR(5)", False),
+    ColumnSpec("branch_name", "NVARCHAR(500)"),
+    ColumnSpec("address_th", "NVARCHAR(MAX)"),
+    ColumnSpec("province_name", "NVARCHAR(191)"),
+    ColumnSpec("district_name", "NVARCHAR(191)"),
+    ColumnSpec("subdistrict_name", "NVARCHAR(191)"),
+    ColumnSpec("postal_code", "NVARCHAR(10)"),
+    ColumnSpec("latitude", "DECIMAL(10,7)"),
+    ColumnSpec("longitude", "DECIMAL(10,7)"),
+    ColumnSpec("geo_source", "NVARCHAR(32)"),
+    ColumnSpec("source_url", "NVARCHAR(500)"),
+    ColumnSpec("source_kind", "NVARCHAR(32)"),
+    ColumnSpec("is_current", "BIT", False, default_sql="1"),
+    ColumnSpec("first_seen_at", "DATETIME2(6)"),
+    ColumnSpec("last_checked_at", "DATETIME2(6)"),
+    ColumnSpec("last_verified_at", "DATETIME2(6)"),
+    ColumnSpec("collection_status", "NVARCHAR(32)"),
+    ColumnSpec("checked_phase", "INT"),
+    ColumnSpec("verified_phase", "INT"),
+    ColumnSpec("source_fingerprint", "NVARCHAR(64)"),
+    ColumnSpec("reported_total", "INT"),
+    ColumnSpec("last_error", "NVARCHAR(1024)"),
+)
+
 TABLE_COLUMNS = {
     "dbo.DBD_COMPANY": COMPANY_COLUMNS,
     "dbo.DBD_COMPANY_RELATION": RELATION_COLUMNS,
     "dbo.DBD_COMPANY_EVENT": EVENT_COLUMNS,
     "dbo.DBD_FINANCIAL": FINANCIAL_COLUMNS,
     "dbo.DBD_INDUSTRY": INDUSTRY_COLUMNS,
+    "dbo.DBD_BRANCH": BRANCH_COLUMNS,
 }
 
 PRIMARY_KEYS = {
@@ -255,6 +285,7 @@ PRIMARY_KEYS = {
     "dbo.DBD_COMPANY_EVENT": ("PK_DBD_COMPANY_EVENT", "event_id"),
     "dbo.DBD_FINANCIAL": ("PK_DBD_FINANCIAL", "financial_id"),
     "dbo.DBD_INDUSTRY": ("PK_DBD_INDUSTRY", "industry_id"),
+    "dbo.DBD_BRANCH": ("PK_DBD_BRANCH", "branch_id"),
 }
 
 INDEXES = {
@@ -286,6 +317,11 @@ INDEXES = {
             ),
         ),
     ),
+    "dbo.DBD_BRANCH": (
+        ("UQ_DBD_BRANCH_COMPANY_NO", True, ("company_id", "branch_no")),
+        ("IX_DBD_BRANCH_PROVINCE", False, ("province_name", "company_id")),
+        ("IX_DBD_BRANCH_STATUS", False, ("checked_phase", "collection_status")),
+    ),
 }
 
 FOREIGN_KEYS = {
@@ -307,6 +343,7 @@ FOREIGN_KEYS = {
         "dbo.DBD_COMPANY",
         "company_id",
     ),
+    "dbo.DBD_BRANCH": ("FK_DBD_BRANCH_COMPANY", "company_id", "dbo.DBD_COMPANY", "company_id"),
 }
 
 JSON_CHECKS = {
@@ -333,7 +370,12 @@ JSON_CHECKS = {
 }
 
 EXTRA_CHECKS = {
+    "dbo.DBD_BRANCH": (
+        ("CK_DBD_BRANCH_NUMBER", "LEN([branch_no])=5 AND [branch_no] COLLATE Latin1_General_100_BIN2 NOT LIKE '%[^0-9]%'"),
+        ("CK_DBD_BRANCH_PHASE", "([checked_phase] IS NULL OR [checked_phase]>=1) AND ([verified_phase] IS NULL OR [verified_phase]>=1)"),
+    ),
     "dbo.DBD_COMPANY": (
+        ("CK_DBD_COMPANY_BRANCH_COUNT", "[branch_count] >= 1"),
         (
             "CK_DBD_COMPANY_MASKS_DISJOINT",
             "([done_mask] & [not_available_mask]) = 0 "
@@ -785,7 +827,7 @@ def ensure_schema(conn) -> dict[str, object]:
             for column in TABLE_COLUMNS[table_name]:
                 if column.name in actual:
                     continue
-                if not column.nullable:
+                if not column.nullable and not (table_name == "dbo.DBD_COMPANY" and column.name == "branch_count"):
                     raise SqlServerSchemaError(
                         f"{table_name} is missing non-null column {column.name}; "
                         "automatic backfill is intentionally refused"

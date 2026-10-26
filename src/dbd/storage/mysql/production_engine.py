@@ -4,8 +4,8 @@ from __future__ import annotations
 from contextlib import contextmanager
 from functools import lru_cache
 
-from sqlalchemy import URL, create_engine
 from pymysql.constants import CLIENT
+from sqlalchemy import URL, create_engine
 
 from ...core.settings import settings
 

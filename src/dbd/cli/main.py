@@ -591,10 +591,17 @@ def main():
         sub.add_parser("check-db", help="Check database connectivity"),
         json_enabled=False,
     )
-    _add_output_options(
-        sub.add_parser("migrate", help="Converge the SQL Server production schema"),
-        json_enabled=False,
+    migration = _add_output_options(
+        sub.add_parser("migrate", help="Preview or explicitly apply the v0.6 production schema"),
     )
+    migration_modes = migration.add_mutually_exclusive_group()
+    migration_modes.add_argument("--check", "--dry-run", action="store_true",
+                                 help="Read-only schema and historical-data preflight (default)")
+    migration_modes.add_argument("--apply", action="store_true",
+                                 help="Apply only an inspected, approved migration plan")
+    migration.add_argument("--yes", action="store_true",
+                           help="Explicit additional approval for noninteractive --apply")
+
     _add_output_options(sub.add_parser("master-status", help="Count discovered and verified company identities"))
     _add_output_options(sub.add_parser("discover-status", help="Show discovery coverage"))
     _add_output_options(sub.add_parser("discover-retry", help="Requeue failed discovery buckets"))
@@ -793,6 +800,10 @@ def main():
     branch_parser.add_argument("--check", "-c", action="store_true",
                                help="Read-only preview")
     branch_parser.add_argument("--limit", "-l", type=positive)
+    branch_parser.add_argument("--new-phase", action="store_true",
+                               help="Explicitly refresh Branch in a new Phase; never for ordinary resume")
+    branch_parser.add_argument("--source", choices=("legacy-mysql","sqlserver-extension"),
+                               default="legacy-mysql", help="Import source; only used with branch import")
     branch_parser.add_argument("--db", "-d", "--backend",
                                choices=("sqlserver", "mysql"))
 
@@ -832,13 +843,15 @@ def main():
     ):
         command_parser.add_argument("--backend", "--db", "-d", choices=("sqlserver", "mysql"))
     # Existing command parser objects were returned anonymously above.
-    for command in ("check-db", "migrate"):
-        sub.choices[command].add_argument("--backend", choices=("sqlserver", "mysql"))
+    sub.choices["check-db"].add_argument("--backend", choices=("sqlserver", "mysql"))
+    migration.add_argument("--backend", "--db", "-d", choices=("sqlserver", "mysql"))
     cutover = sub.add_parser(
         "cutover", help="Import legacy MySQL Generation 1 into the selected production target"
     )
     cutover.add_argument("--backend", choices=("sqlserver", "mysql"), default="sqlserver")
     cutover.add_argument("--batch-size", type=cutover_batch_size, default=500)
+    cutover.add_argument("--new-phase", action="store_true",
+                         help="G1-only legacy incremental synchronization (not a monthly cycle)")
     args = parser.parse_args()
     presenter = TerminalPresenter(
         json_mode=bool(getattr(args, "json", False)),
@@ -855,12 +868,38 @@ def main():
 
             presenter.package_about(package_environment_snapshot())
         elif args.command == "migrate":
-            from ..storage.production import production_repository
+            from ..storage.migration import MigrationBlocked, apply_migration, inspect_migration
 
+            if args.yes and not args.apply:
+                raise ValueError("--yes requires --apply")
             backend = args.backend or settings.dbd_production_backend
-            v06_terminal = V06Terminal("migrate", app="DBD DATA").start(backend=backend)
-            result = production_repository(backend).ensure_schema()
-            v06_terminal.finish(result)
+            plan = inspect_migration(backend)
+            if args.json:
+                presenter.command_result("DBD · MIGRATION PREFLIGHT", plan)
+            else:
+                v06_terminal = V06Terminal("migrate", app="DBD DATA").start(backend=backend)
+                v06_terminal.finish(plan)
+                v06_terminal = None
+            if plan["state"] == "BLOCKED" and not args.apply:
+                raise SystemExit(2)
+            if args.apply:
+                if not plan["apply_permitted"]:
+                    raise MigrationBlocked("Migration BLOCKED: " + "; ".join(plan["blockers"]))
+                import sys
+                interactive = sys.stdin.isatty() and sys.stdout.isatty()
+                if interactive:
+                    answer = input("Type MIGRATE to approve the inspected plan: ")
+                    if answer.strip() != "MIGRATE":
+                        raise MigrationBlocked("Migration approval cancelled; no DDL executed")
+                elif not args.yes:
+                    raise MigrationBlocked("Noninteractive --apply requires --yes")
+                if not args.json:
+                    v06_terminal = V06Terminal("migrate", app="DBD DATA").start(backend=backend)
+                result = apply_migration(backend, expected=plan)
+                if args.json:
+                    presenter.command_result("DBD · MIGRATION RESULT", result)
+                else:
+                    v06_terminal.finish(result)
         elif args.command == "check-db":
             from ..storage.production import production_repository
 
@@ -869,54 +908,86 @@ def main():
             result = production_repository(backend).check_database()
             v06_terminal.finish(result)
         elif args.command == "cutover":
-            from ..cutover import run_generation1_cutover
+            from ..cutover import run_generation1_cutover, run_legacy_incremental_sync
 
             backend = args.backend
             v06_terminal = V06Terminal("cutover", app="DBD DATA").start(backend=backend)
-            result = run_generation1_cutover(
+            handler = run_legacy_incremental_sync if args.new_phase else run_generation1_cutover
+            result = handler(
                 backend=backend, batch_size=args.batch_size, event=v06_terminal.event,
             )
             v06_terminal.finish(result)
         elif args.command == "branch":
-            from ..pipelines.branch import collect as collect_branches, import_mysql
+            from ..pipelines.branch import (
+                collect as collect_branches,
+            )
+            from ..pipelines.branch import (
+                import_mysql,
+                import_sqlserver_extension,
+            )
             selected = args.backend or settings.dbd_production_backend
-            if selected != "sqlserver":
-                raise ValueError("Branch enrichment currently requires SQL Server production")
             if args.action == "import":
-                result = import_mysql(check=args.check, limit=args.limit)
+                if args.new_phase:
+                    raise ValueError("Branch import cannot start a new refresh phase")
+                if args.source == "sqlserver-extension":
+                    if selected!="sqlserver":
+                        raise ValueError("The SQL Server extension exists only on the SQL Server backend")
+                    result=import_sqlserver_extension(check=args.check,limit=args.limit)
+                else:
+                    result=import_mysql(check=args.check,limit=args.limit,backend=selected)
                 presenter.command_result("DBD · BRANCH IMPORT", result)
+            elif args.source != "legacy-mysql":
+                raise ValueError("--source is only allowed with 'dbd-data branch import'")
             elif args.check:
-                from ..storage.sqlserver import branch_repository
-                from ..storage.sqlserver.engine import connection
-                with connection() as conn:
-                    branch_repository.validate_schema(conn)
-                    pending = branch_repository.candidates(conn, limit=min(args.limit or 50, 1000))
-                presenter.command_result(
-                    "DBD · BRANCH PREVIEW",
-                    {"read_only": True, "candidate_sample": len(pending),
-                     "first_company_id": pending[0]["company_id"] if pending else None},
-                )
+                if args.new_phase:
+                    raise ValueError("--check and --new-phase cannot be combined")
+                result = collect_branches(backend=selected,preflight=True)
+                presenter.command_result("DBD · BRANCH PREVIEW", result)
             else:
                 v06_terminal = V06Terminal("branch", app="DBD DATA").start(
                     backend=selected,
                 )
-                result = collect_branches(event=v06_terminal.event, limit=args.limit)
+                result = collect_branches(
+                    event=v06_terminal.event, limit=args.limit,
+                    backend=selected, new_phase=args.new_phase,
+                )
                 v06_terminal.finish(result)
         elif args.command == "recover":
-            from ..storage.sqlserver import discovery_repository as discovery_work
-            from ..storage.sqlserver.engine import connection
             from ..storage.production import production_repository
             selected = args.backend or settings.dbd_production_backend
-            if selected != "sqlserver":
-                raise ValueError("Durable Production Discovery recovery requires SQL Server")
             repo = production_repository(selected)
+            if selected == "mysql":
+                from ..storage.mysql import discovery_repository as discovery_work
+            else:
+                from ..storage.sqlserver import discovery_repository as discovery_work
             current = repo.generation_state()
             generation = current.get("active_generation")
-            if generation is None:
-                raise ValueError("No active Production Generation to resume")
-            with connection() as conn:
+            from ..pipelines.discovery import PRODUCTION_ROOT_COVERAGE_CERTIFIED
+            with repo.transaction() as conn:
                 discovery_work.validate_schema(conn)
-                preview = discovery_work.coverage(conn,int(generation),"full")
+                if selected == "mysql":
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            "SELECT MAX(generation) FROM DBD_DISCOVERY_WORK "
+                            "WHERE scope_key='full'"
+                        )
+                        tree_generation = cur.fetchone()[0]
+                    if tree_generation is not None:
+                        generation = int(tree_generation)
+                if generation is None:
+                    raise ValueError("No durable active Discovery tree/generation to recover")
+                tree_preview = discovery_work.coverage(conn,int(generation),"full")
+                preview = {
+                    **tree_preview,
+                    "tree_ok":bool(tree_preview["ok"]),
+                    "root_scope_certified":PRODUCTION_ROOT_COVERAGE_CERTIFIED,
+                    "ok":bool(tree_preview["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED),
+                    "coverage_claim":(
+                        "VERIFIED" if tree_preview["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED
+                        else "UNVERIFIED_ROOT_SCOPE" if tree_preview["ok"]
+                        else "INCOMPLETE"
+                    ),
+                }
             if args.check:
                 presenter.command_result("DBD · RECOVERY PREVIEW", {
                     "read_only":True,"generation":int(generation),**preview})
@@ -927,41 +998,71 @@ def main():
                 )
                 recovered_generation, result = asyncio.run(discover(
                     backend=selected, event=v06_terminal.event,
-                    recovery_limit=args.limit,
-                    recovery_pass=True,
+                    recovery_limit=args.limit, recovery_pass=True,
                 ))
-                with connection() as conn:
-                    remaining = discovery_work.coverage(
+                with repo.transaction() as conn:
+                    tree_remaining = discovery_work.coverage(
                         conn, int(recovered_generation), "full"
                     )
+                root_certified=PRODUCTION_ROOT_COVERAGE_CERTIFIED
+                coverage_claim=(
+                    "VERIFIED" if tree_remaining["ok"] and root_certified
+                    else "UNVERIFIED_ROOT_SCOPE" if tree_remaining["ok"]
+                    else "INCOMPLETE"
+                )
                 v06_terminal.finish({
                     "generation":recovered_generation,
                     "partitions":result.buckets_processed,
                     "pages":result.pages_fetched,
                     "companies":result.companies_written,
                     "recovery_pass":"FINISHED",
-                    "coverage":"VERIFIED" if remaining["ok"] else "INCOMPLETE",
-                    "unresolved":sum(remaining.get(k,0) for k in
+                    "tree_ok":bool(tree_remaining["ok"]),
+                    "root_scope_certified":root_certified,
+                    "coverage":coverage_claim,
+                    "unresolved":sum(tree_remaining.get(k,0) for k in
                                      ("pending","counted","fetching","failed","blocked")),
-                },status="COMPLETE" if remaining["ok"] else "COMPLETE_WITH_FAILURES")
+                },status="COMPLETE" if tree_remaining["ok"] and root_certified else "FAILED")
+                if not (tree_remaining["ok"] and root_certified):
+                    raise SystemExit(1)
         elif args.command == "status":
             from dataclasses import asdict
+
             from ..workflow import status as production_status
             selected = args.backend or settings.dbd_production_backend
             data = asyncio.run(production_status(
                 phase="core",backend=selected,coverage=False))
             result = asdict(data)
-            if selected == "sqlserver":
-                from ..storage.sqlserver import discovery_repository as discovery_work
-                from ..storage.sqlserver.engine import connection
+            if selected in ("sqlserver","mysql"):
+                from ..pipelines.discovery import PRODUCTION_ROOT_COVERAGE_CERTIFIED
                 from ..storage.production import production_repository
-                state = production_repository(selected).generation_state()
+                if selected == "mysql":
+                    from ..storage.mysql import discovery_repository as discovery_work
+                else:
+                    from ..storage.sqlserver import discovery_repository as discovery_work
+                repo = production_repository(selected)
+                state = repo.generation_state()
                 gen = state.get("active_generation")
                 if gen is not None:
-                    with connection() as conn:
-                        result["discovery"] = discovery_work.coverage(
-                            conn,int(gen),"full"
-                        )
+                    with repo.transaction() as conn:
+                        tree = discovery_work.coverage(conn,int(gen),"full")
+                    result["discovery"] = {
+                        **tree,
+                        "tree_ok":bool(tree["ok"]),
+                        "root_scope_certified":PRODUCTION_ROOT_COVERAGE_CERTIFIED,
+                        "ok":bool(tree["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED),
+                        "coverage_claim":(
+                            "VERIFIED" if tree["ok"] and PRODUCTION_ROOT_COVERAGE_CERTIFIED
+                            else "UNVERIFIED_ROOT_SCOPE" if tree["ok"]
+                            else "INCOMPLETE"
+                        ),
+                    }
+            from ..pipelines.branch import status as branch_status
+            try:
+                result["branch"] = branch_status(backend=selected)
+            except Exception as exc:
+                # A missing external Branch schema/phase must not hide healthy
+                # Core-7 state; expose the blocker instead of claiming success.
+                result["branch"] = {"state":"BLOCKED","reason":safe_error(exc)}
             presenter.command_result("DBD · PRODUCTION STATUS", result)
         elif args.command == "collect":
             from ..workflow import collect as production_collect
@@ -1196,7 +1297,9 @@ def main():
                     )
                 payload = asdict(result)
                 v06_terminal.finish(payload)
-                if result.status == "FAILED":
+                # Incomplete Branch enrichment is not a clean cycle success.
+                branch = result.branch or {}
+                if result.status == "FAILED" or branch.get("branch_status") == "PARTIAL":
                     raise SystemExit(1)
     except KeyboardInterrupt:
         if v06_terminal is not None:

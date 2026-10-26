@@ -38,6 +38,52 @@ JP_TYPES = ("0", "2", "3", "5", "7", "8", "9", "A")
 BUSINESS_SIZES = ("S", "M", "L")
 EXTRA_PREFIX_SEEDS = ("099",)
 
+# The current full-universe root strategy is NOT certified. The repository's
+# own source reference documents that normal search (type="") can match names,
+# registration numbers and other text, so province-like numeric keywords are
+# not proven exhaustive or pairwise disjoint. Never finalize a Generation on
+# the strength of a completed tree until a lossless root strategy is proven.
+PRODUCTION_ROOT_COVERAGE_CERTIFIED = False
+
+
+def root_coverage_contract(*, seeds: list[str] | None = None,
+                           search_type: str = "", max_buckets: int | None = None) -> dict:
+    """Separate a complete registered tree from an authoritative universe proof.
+
+    The normal DBD keyword Search is not documented as an exhaustive/disjoint
+    registration-prefix search. No observed page count can certify that fact.
+    """
+    scoped = bool(seeds or search_type or max_buckets is not None)
+    return {
+        "scope": "diagnostic" if scoped else "full",
+        "root_strategy_known": True,
+        "search_semantics_certified": False,
+        "exhaustive": False,
+        "disjoint": False,
+        "certified": False,
+        "reason": (
+            "Scoped Search is not a complete company universe"
+            if scoped else
+            "DBD normal keyword Search has no authoritative exhaustive, "
+            "disjoint registration-prefix semantics proof"
+        ),
+    }
+
+
+def require_certified_full_universe_discovery(
+    *, seeds: list[str] | None, search_type: str,
+    max_buckets: int | None, recovery_pass: bool = False,
+) -> None:
+    """Fail closed before monthly state changes when root coverage is unproven."""
+    evidence = root_coverage_contract(
+        seeds=seeds, search_type=search_type, max_buckets=max_buckets,
+    )
+    if evidence["scope"] == "full" and not recovery_pass and not evidence["certified"]:
+        raise ContractError(
+            "Full-universe Discovery is blocked: roots are not proven exhaustive "
+            "and disjoint; " + str(evidence["reason"])
+        )
+
 
 @dataclass
 class DiscoveryResult:
@@ -150,6 +196,101 @@ def _direct_categorical_plans(
             if len({child.key() for child in children}) == len(children):
                 candidates.append((dimension,children))
     return candidates
+
+
+
+def _keyword_expansion_candidates(filters: SearchFilters) -> list[SearchFilters]:
+    """Bounded, syntactic registration-prefix *candidates*, never a certificate.
+
+    DBD normal Search can also match names and substrings. Advancing a keyword
+    is unsafe without independently established prefix/exhaustiveness semantics.
+    Preserve all other filters and advance at most to a 13-digit identity.
+    """
+    from dataclasses import replace
+
+    keyword = filters.keyword
+    if (not keyword.isascii() or not keyword.isdecimal()
+        or not 3 <= len(keyword) < 13 or filters.search_type):
+        return []
+    children = [replace(filters, keyword=keyword + str(n)) for n in range(10)]
+    keys = [child.key() for child in children]
+    if len(set(keys)) != 10 or filters.key() in keys:
+        return []
+    return children
+
+
+def validate_certified_split_shape(parent: dict, children: list[SearchFilters],
+                                   dimension: str) -> None:
+    """Repository-side structural fence for a proposed certified partition.
+
+    Source-semantic certification belongs to the planner; a repository must
+    additionally refuse a malformed parent/child filter relationship.
+    Keyword candidates are deliberately NOT certifiable with current evidence.
+    """
+    if dimension == "keyword":
+        if not root_coverage_contract()["search_semantics_certified"]:
+            raise ContractError("Keyword split has no certified search semantics")
+        raw = parent.get("filters_json")
+        if not raw:
+            raise ContractError("Certified split requires persisted parent filters")
+        original = SearchFilters(**json.loads(raw))
+        expected = _keyword_expansion_candidates(original)
+        if len(expected) != 10 or {c.key() for c in children} != {c.key() for c in expected}:
+            raise ContractError("Keyword child identities do not preserve a complete parent partition")
+        return
+    if dimension not in ("juristic_type", "province", "status", "business_size"):
+        raise ContractError("Split dimension has no certified search semantics")
+    raw = parent.get("filters_json")
+    if not raw:
+        raise ContractError("Certified split requires persisted parent filters")
+    parent_filters = SearchFilters(**json.loads(raw))
+    fields = {
+        "juristic_type": "jp_types", "province": "pv_codes",
+        "status": "jp_statuses", "business_size": "business_sizes",
+    }
+    selected = fields[dimension]
+    if getattr(parent_filters, selected):
+        raise ContractError("Cannot split an already constrained categorical dimension")
+    if len(children) < 2 or len({c.key() for c in children}) != len(children):
+        raise ContractError("Certified split children must have unique identities")
+    values = []
+    from dataclasses import replace
+    for child in children:
+        candidate = getattr(child, selected)
+        if len(candidate) != 1 or replace(child, **{selected: []}).key() != parent_filters.key():
+            raise ContractError("Split child does not preserve its parent's search filters")
+        values.append(str(candidate[0]))
+    if len(values) != len(set(values)):
+        raise ContractError("Overlapping categorical split constraints")
+
+
+def validate_search_scope(rows: list[dict], filters: SearchFilters) -> None:
+    """Reject company rows outside their requested disjoint categorical filters.
+
+    Count parity alone cannot prove non-overlap if a source silently ignores a
+    filter. Verify every returned identity has each constrained attribute.
+    This also detects requests whose search filters changed semantics upstream.
+    """
+    categorical = (
+        (filters.jp_types, "jpTypeCode"),
+        (filters.pv_codes, "pvCode"),
+        (filters.jp_statuses, "jpStatCode"),
+        (filters.business_sizes, "businessSizeCode"),
+    )
+    constraints = [
+        ({str(value) for value in expected},field)
+        for expected,field in categorical if expected
+    ]
+    for row in rows:
+        if not isinstance(row,dict):
+            raise ContractError("Search returned a non-object company row")
+        for allowed,field in constraints:
+            if str(row.get(field) or "") not in allowed:
+                raise ContractError(
+                    f"Search response ignored or violated scoped filter {field}"
+                )
+
+
 
 
 async def fetch_provinces(client: AsyncDbdClient) -> list[str]:
@@ -822,13 +963,37 @@ async def _direct_page(
         timeout=settings.dbd_count_timeout_seconds if page_no == 1 else None,
     )
     data = response.data
+    meta = data.get("meta") if isinstance(data,dict) else None
+    if (not isinstance(meta,dict) or type(meta.get("itemsPerPage")) is not int
+        or meta["itemsPerPage"] != 10):
+        raise ContractError(
+            f"Search page {page_no} is missing the source's integer itemsPerPage=10 contract"
+        )
     page = parse_search_response(data)
     if page.current_page != page_no:
         raise ContractError(
             f"Search returned page {page.current_page} for requested page {page_no}"
         )
-    if not page.rows and page.total_items > 0:
-        raise ContractError(f"Search page {page_no} is empty for a non-empty partition")
+    if page.items_per_page != 10 or len(page.rows)>10:
+        raise ContractError(
+            f"Search page {page_no} violated its 10-row pagination contract"
+        )
+    if page.total_items > 0 and page_no > page.total_pages:
+        raise ContractError(
+            f"Search page {page_no} is beyond reported totalPages={page.total_pages}"
+        )
+    if page.total_items <= MAX_ROWS_PER_QUERY and page.total_pages != (page.total_items+9)//10:
+        raise ContractError(
+            f"Search page {page_no} pagination total does not reconcile"
+        )
+    expected_rows=min(10,max(0,page.total_items-(page_no-1)*10))
+    if len(page.rows) != expected_rows:
+        raise ContractError(
+            f"Search page {page_no} is incomplete: expected {expected_rows} rows, "
+            f"received {len(page.rows)}"
+        )
+    if page.total_items == 0 and page_no != 1:
+        raise ContractError("Empty Search partition cannot have pages after page 1")
     return data, response.requested_at
 
 
@@ -851,10 +1016,8 @@ async def run(
 ) -> DiscoveryResult:
     """Direct v0.6 Search traversal into the selected production DBD_COMPANY.
 
-    SQL Server resumes a durable Generation-scoped bucket tree and commits
-    company writes with contiguous page checkpoints. The separate Production
-    MySQL path currently retains in-memory traversal with idempotent upserts;
-    do not advertise MySQL page-level resume until its extension is built.
+    Both Production backends use a durable Generation-scoped bucket tree.
+    Company writes and contiguous page checkpoints share one transaction.
     """
     if distributed:
         raise ValueError(
@@ -868,6 +1031,11 @@ async def run(
 
     repo = repository if repository is not None else production_repository()
     explicitly_scoped = bool(seeds or search_type or max_buckets is not None)
+    if getattr(repo, "backend", None) in ("sqlserver", "mysql"):
+        require_certified_full_universe_discovery(
+            seeds=seeds,search_type=search_type,max_buckets=max_buckets,
+            recovery_pass=recovery_pass,
+        )
     global_rate = settings.dbd_rate_per_second if rate is None else rate
     admission = None
     if getattr(repo, "backend", None) == "sqlserver":
@@ -886,7 +1054,8 @@ async def run(
         if node_id is None:
             raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
         await asyncio.to_thread(control.require_admin, node_id)
-        admission = lambda: control.admit(node_id, int(generation))
+        def admission():
+            return control.admit(node_id, int(generation))
 
     buckets_processed = 0
     pages_fetched = 0
@@ -937,7 +1106,7 @@ async def run(
                 | set(EXTRA_PREFIX_SEEDS)
             )
 
-        if getattr(repo, "backend", None) == "sqlserver":
+        if getattr(repo, "backend", None) in ("sqlserver", "mysql"):
             return await _run_durable_discovery(
                 repo, client, seeds, search_type=search_type,
                 provinces=provinces, generation=int(generation),
@@ -1098,13 +1267,16 @@ async def _run_durable_discovery(
     recovery_limit: int | None = None,
     recovery_pass: bool = False,
 ) -> DiscoveryResult:
-    """SQL Server G2+ Discovery: one durable tree and atomic page checkpoints.
+    """Production G2+ Discovery: one durable tree and atomic page checkpoints.
 
     No second HTTP client, queue service, or company writer. The Core-7
     repository owns business writes and shares the checkpoint transaction.
     Uncertified partition dimensions remain BLOCKED, never marked complete.
     """
-    from ..storage.sqlserver import discovery_repository as work
+    if getattr(repo, "backend", None) == "mysql":
+        from ..storage.mysql import discovery_repository as work
+    else:
+        from ..storage.sqlserver import discovery_repository as work
 
     # A manually supplied keyword, search type or bound is diagnostic only.
     # These may never share the monthly full-universe durable root set.
@@ -1179,6 +1351,13 @@ async def _run_durable_discovery(
     def observed_statuses(conn):
         cur = conn.cursor()
         try:
+            if getattr(repo, "backend", None) == "mysql":
+                cur.execute(
+                    "SELECT DISTINCT status_code FROM DBD_COMPANY "
+                    "WHERE status_code IS NOT NULL AND status_code<>'' "
+                    "ORDER BY status_code LIMIT 16"
+                )
+                return tuple(str(row[0]) for row in cur.fetchall())
             cur.execute(
                 "SELECT DISTINCT TOP (16) status_code FROM dbo.DBD_COMPANY "
                 "WHERE status_code IS NOT NULL AND status_code<>N'' "
@@ -1191,16 +1370,20 @@ async def _run_durable_discovery(
     status_candidates = await atomic(observed_statuses)
 
     if recovery_pass:
-        from .discovery_numeric import PRODUCTION_CERTIFIED_DIMENSIONS
-        if PRODUCTION_CERTIFIED_DIMENSIONS:
+        evidence = root_coverage_contract(
+            seeds=seeds if explicitly_scoped else None, search_type=search_type,
+            max_buckets=max_buckets,
+        )
+        if evidence["search_semantics_certified"]:
             reopened = await atomic(
-                work.reopen_blocked_numeric, generation, scope,
+                work.reopen_blocked_keyword, generation, scope,
+                semantics_certified=True,
                 limit=min(int(recovery_limit or 100), 1000),
             )
-            notify(
-                "discovery_progress", stage="RECONCILING",
-                reopened_buckets=reopened,
-            )
+            notify("discovery_progress", stage="RECONCILING",
+                   reopened_buckets=reopened)
+        # No new certification means no automatic BLOCKED retry. Previously
+        # stored pages and other failure reasons must remain untouched.
 
     async def pulse() -> None:
         nonlocal durable_snapshot, last_summary_at
@@ -1273,9 +1456,9 @@ async def _run_durable_discovery(
                         try:
                             child_data, _ = await _direct_page(client,child,1)
                         except DeepPermanentHttpError as exc:
-                            if exc.status == 400 and dimension == "status":
+                            if exc.status == 400:
                                 candidate_ok = False
-                                reasons.append("status_filter_not_supported")
+                                reasons.append(dimension + ":filter_not_supported")
                                 break
                             raise
                         observed = parse_search_response(child_data)
@@ -1283,6 +1466,15 @@ async def _run_durable_discovery(
                         candidate_counts.append(
                             (observed.total_items, observed.total_pages)
                         )
+                        try:
+                            validate_search_scope(observed.rows, child)
+                        except ContractError as exc:
+                            # Only an incompatible *candidate* filter is safe
+                            # to skip. Invalid pagination, HTTP, auth and
+                            # persistence errors remain fatal.
+                            candidate_ok = False
+                            reasons.append(dimension + ":filter_not_respected:" + str(exc)[:120])
+                            break
                         for row in observed.rows:
                             identity = (row.get("jpTypeCode"),row.get("jpNo"))
                             if all(identity):
@@ -1295,57 +1487,80 @@ async def _run_durable_discovery(
                     if sum(item[0] for item in candidate_counts) != parent.total_items:
                         reasons.append(dimension + ":count_parity_failed")
                         continue
+                    # Child counts were collected at different times. Verify
+                    # the parent has not drifted before certifying the tree.
+                    current_data, _ = await _direct_page(client,filters,1)
+                    current_parent = parse_search_response(current_data)
+                    pages_fetched += 1
+                    if (current_parent.total_items != parent.total_items or
+                        current_parent.total_pages != parent.total_pages):
+                        reasons.append(dimension + ":parent_count_drift")
+                        continue
                     children = planned
                     counts = candidate_counts
                     split_dimension = dimension
                     break
 
                 if children is None:
-                    from .discovery_numeric import (
-                        PRODUCTION_CERTIFIED_DIMENSIONS,
-                        NumericObservation,
-                        numeric_partition_structure,
-                        plan_numeric_split,
-                    )
-                    if PRODUCTION_CERTIFIED_DIMENSIONS:
-                        async def numeric_count(candidate: SearchFilters):
-                            nonlocal pages_fetched
-                            child_data, _ = await _direct_page(client,candidate,1)
-                            child_page = parse_search_response(child_data)
+                    # Probe a bounded decimal-prefix candidate, never assume
+                    # that numeric-looking keywords mean registration prefixes.
+                    keyword_children = _keyword_expansion_candidates(filters)
+                    if not keyword_children:
+                        reasons.append("keyword_expansion_not_applicable")
+                    elif not all(
+                        str(row.get("jpNo") or "").startswith(filters.keyword)
+                        for row in parent.rows if isinstance(row, dict)
+                    ):
+                        reasons.append("keyword_parent_matches_non_prefix_company")
+                    else:
+                        keyword_counts = []
+                        keyword_seen = set()
+                        keyword_valid = True
+                        for child in keyword_children:
+                            from ..deep.http import DeepPermanentHttpError
+                            try:
+                                data, _ = await _direct_page(client, child, 1)
+                            except DeepPermanentHttpError as exc:
+                                if exc.status == 400:
+                                    reasons.append("keyword_child_filter_unsupported")
+                                    keyword_valid = False
+                                    break
+                                raise
+                            observed = parse_search_response(data)
                             pages_fetched += 1
-                            return NumericObservation(
-                                child_page.total_items,child_page.rows,
-                            )
-
-                        plan = await plan_numeric_split(
-                            filters, parent.total_items, numeric_count,
-                            parent.rows,
-                            dimensions=tuple(PRODUCTION_CERTIFIED_DIMENSIONS),
-                        )
-                        if (
-                            plan.candidate
-                            and plan.dimension in PRODUCTION_CERTIFIED_DIMENSIONS
-                            and numeric_partition_structure(
-                                filters.key(),
-                                [child.key() for child in plan.children],
-                                certified=PRODUCTION_CERTIFIED_DIMENSIONS,
-                            )
-                        ):
-                            fresh, _ = await _direct_page(client,filters,1)
-                            pages_fetched += 1
-                            checked = parse_search_response(fresh)
-                            if (checked.total_items == parent.total_items
-                                and checked.total_pages == parent.total_pages):
-                                children = plan.children
-                                counts = [
-                                    (obs.count,(obs.count+9)//10)
-                                    for obs in plan.child_observations
-                                ]
-                                split_dimension = str(plan.dimension)
+                            validate_search_scope(observed.rows, child)
+                            for row in observed.rows:
+                                identity = (str(row.get("jpTypeCode") or ""),
+                                            str(row.get("jpNo") or ""))
+                                if (not identity[1].startswith(child.keyword)
+                                    or identity in keyword_seen):
+                                    keyword_valid = False
+                                    reasons.append("keyword_non_prefix_or_sample_overlap")
+                                    break
+                                keyword_seen.add(identity)
+                            if not keyword_valid:
+                                break
+                            keyword_counts.append((observed.total_items, observed.total_pages))
+                        if keyword_valid and len(keyword_counts) == 10:
+                            child_totals = [total for total, _ in keyword_counts]
+                            if (sum(child_totals) != parent.total_items
+                                or max(child_totals) >= parent.total_items):
+                                reasons.append("keyword_count_mismatch_or_no_progress")
                             else:
-                                reasons.append("numeric_parent_count_drift")
-                        else:
-                            reasons.append(plan.reason)
+                                latest_data, _ = await _direct_page(client, filters, 1)
+                                pages_fetched += 1
+                                latest = parse_search_response(latest_data)
+                                if (latest.total_items != parent.total_items
+                                    or latest.total_pages != parent.total_pages):
+                                    reasons.append("keyword_parent_count_drift")
+                                elif not root_coverage_contract()["search_semantics_certified"]:
+                                    reasons.append("keyword_prefix_semantics_not_certified")
+                                else:
+                                    children = keyword_children
+                                    counts = keyword_counts
+                                    split_dimension = "keyword"
+                        elif not reasons:
+                            reasons.append("keyword_candidate_invalid")
 
                 if children is None:
                     reason = "no_certified_lossless_split:" + ",".join(reasons)[:900]
@@ -1368,6 +1583,10 @@ async def _run_durable_discovery(
             active.update(stage="FETCHING", pages_done=previous,
                           pages_total=total_pages)
             chunk_size = max(1, min(32, concurrency * 2))
+            # Bounded to at most one source partition (<=10,000 identities).
+            # Detect API pages with repeated companies before committing a
+            # second copy as though it represented a different page.
+            observed_identities: set[tuple[str,str]] = set()
             next_page = previous + 1
             while next_page <= total_pages:
                 numbers = list(range(next_page, min(total_pages + 1,
@@ -1389,12 +1608,22 @@ async def _run_durable_discovery(
                             obj.total_pages != parent.total_pages or
                             len(obj.rows) == 0):
                             raise ContractError("Discovery pagination drift or empty page")
+                        validate_search_scope(obj.rows, filters)
                         rows, rejected = _normalize_direct_rows(
                             obj.rows, published_at=_now())
                         invalid += rejected
                         if rejected:
                             raise ContractError(
                                 "Invalid company row; refusing to checkpoint incomplete page")
+                        for row in rows:
+                            identity=(str(row["juristic_type_code"]),
+                                      str(row["registration_no"]))
+                            if identity in observed_identities:
+                                raise ContractError(
+                                    "Search pagination repeated a company identity "
+                                    "within the current discovery partition"
+                                )
+                            observed_identities.add(identity)
                         batch.extend(rows)
                 except BaseException:
                     for pending in tasks.values():

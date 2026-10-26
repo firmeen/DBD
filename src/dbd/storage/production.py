@@ -8,7 +8,6 @@ from typing import Literal, TypeAlias
 
 from ..core.settings import settings
 
-
 Backend: TypeAlias = Literal["sqlserver", "mysql"]
 
 

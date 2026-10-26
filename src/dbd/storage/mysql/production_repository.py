@@ -13,7 +13,6 @@ import pymysql
 
 from ...core.settings import settings
 from ...deep.catalog import CORE_ENDPOINT_MASK, core_discovery_plan
-
 from ..production import ProductionLeaseLost
 from ..sqlserver.repository import (
     _COMPANY_STATE_COLUMNS,
@@ -54,7 +53,10 @@ def _upsert_many(conn, table: str, rows: list[dict[str, Any]], *,
     """Bounded multi-row upserts; PyMySQL splits statements by max packet length."""
     if not rows:
         return 0
-    columns = _columns(table)
+    # Branch count is exclusively owned by the Branch snapshot writer.
+    # Initial company UPSERT uses the SQL default; refresh preserves last verified count.
+    columns = tuple(c for c in _columns(table)
+                    if not (table == "DBD_COMPANY" and c == "branch_count"))
     preserve = set(natural_key) | {"first_seen_generation"}
     unknown = set().union(*(set(row) for row in rows)) - set(columns)
     if unknown:
@@ -132,13 +134,19 @@ class ProductionMySqlRepository:
         return isinstance(exc, (pymysql.err.OperationalError, pymysql.err.InterfaceError))
 
     def ensure_schema(self) -> dict[str, object]:
-        # MySQL DDL is auto-committing. It is always an explicit migrate action.
+        # Explicit migrate only. MySQL DDL auto-commits, never mix with page writes.
+        from . import discovery_repository as discovery_work
         with connection() as conn:
-            return ensure_schema(conn)
+            result = ensure_schema(conn)
+            discovery_work.ensure_schema(conn)
+            return result
 
     def validate_schema(self) -> dict[str, object]:
+        from . import discovery_repository as discovery_work
         with connection() as conn:
-            return validate_schema(conn)
+            result = validate_schema(conn)
+            discovery_work.validate_schema(conn)
+            return result
 
     def check_database(self) -> dict[str, object]:
         info = check_connection()
@@ -223,7 +231,7 @@ class ProductionMySqlRepository:
             "next_generation": active or max(2, finalized + 1),
         }
 
-    def company_ids(self, conn, identities):
+    def company_ids(self, conn, identities, *, allow_missing=False, for_update=False):
         unique = list(dict.fromkeys(
             (_identity(a, "juristic_type_code"), _identity(b, "registration_no"))
             for a, b in identities
@@ -239,10 +247,10 @@ class ProductionMySqlRepository:
                 cur.execute(
                     "SELECT juristic_type_code,registration_no,company_id "
                     "FROM DBD_COMPANY WHERE (juristic_type_code,registration_no) "
-                    f"IN ({placeholders})", flat,
+                    f"IN ({placeholders})" + (" FOR UPDATE" if for_update else ""), flat,
                 )
                 result.update({(str(a), str(b)): int(pk) for a, b, pk in cur.fetchall()})
-        if len(result) != len(unique):
+        if not allow_missing and len(result) != len(unique):
             raise MySqlProductionWriteError("Unable to resolve MySQL company_id")
         return result
 
@@ -254,6 +262,159 @@ class ProductionMySqlRepository:
         return self.company_ids(
             conn, [(x["juristic_type_code"], x["registration_no"]) for x in rows]
         )
+
+    def read_cutover_rows(self, conn, identities, industry_keys, *,
+                          allow_missing=False, for_update=False):
+        """MySQL equivalent of bounded, read-only G1 readback."""
+        if len(identities) > 1000:
+            raise ValueError("Cutover verification exceeds bounded micro-batch")
+        company_ids = (self.company_ids(conn, identities,
+                                        allow_missing=allow_missing, for_update=for_update)
+                       if allow_missing or for_update else self.company_ids(conn, identities))
+        ids = sorted(set(company_ids.values()))
+        result = {key: [] for key in (
+            "companies", "relations", "events", "financial", "industries"
+        )}
+        tables = (
+            ("companies", "DBD_COMPANY"),
+            ("relations", "DBD_COMPANY_RELATION"),
+            ("events", "DBD_COMPANY_EVENT"),
+            ("financial", "DBD_FINANCIAL"),
+        )
+
+        def select(sql, params, label):
+            with conn.cursor() as cur:
+                cur.execute(sql, tuple(params))
+                names = [str(item[0]) for item in cur.description]
+                result[label].extend(dict(zip(names, row, strict=True))
+                                     for row in cur.fetchall())
+
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join(["%s"] * len(chunk))
+            for label, table in tables:
+                select(
+                    f"SELECT * FROM `{table}` WHERE company_id IN ({placeholders})" +
+                    (" FOR UPDATE" if for_update else ""),
+                    chunk, label,
+                )
+        key_columns = (
+            "submit_objective_code", "fiscal_year", "business_size_code",
+            "location_type", "location_no",
+        )
+        for offset in range(0, len(industry_keys), 75):
+            chunk = industry_keys[offset:offset + 75]
+            predicates, params = [], []
+            for key in chunk:
+                if len(key) != 5:
+                    raise ValueError("Invalid Industry verification natural key")
+                parts = []
+                for col, value in zip(key_columns, key, strict=True):
+                    if value is None:
+                        parts.append(f"`{col}` IS NULL")
+                    else:
+                        parts.append(f"`{col}`=%s")
+                        params.append(value)
+                predicates.append("(" + " AND ".join(parts) + ")")
+            select(
+                ("SELECT * FROM DBD_INDUSTRY WHERE " + " OR ".join(predicates) +
+                 (" FOR UPDATE" if for_update else "")),
+                params, "industries",
+            )
+        return result
+
+    def verify_legacy_sync_integrity(self, conn) -> None:
+        """Read-only G1 generation/orphan checks; do not reject legitimate Target-only rows."""
+        checks = [
+            ("company generation", "SELECT COUNT(*) FROM DBD_COMPANY WHERE "
+             "dataset_generation<>1 OR first_seen_generation<>1 OR last_seen_generation<>1"),
+            ("relation orphan", "SELECT COUNT(*) FROM DBD_COMPANY_RELATION r "
+             "LEFT JOIN DBD_COMPANY c ON c.company_id=r.company_id WHERE c.company_id IS NULL"),
+            ("event orphan", "SELECT COUNT(*) FROM DBD_COMPANY_EVENT e "
+             "LEFT JOIN DBD_COMPANY c ON c.company_id=e.company_id WHERE c.company_id IS NULL"),
+            ("financial orphan", "SELECT COUNT(*) FROM DBD_FINANCIAL f "
+             "LEFT JOIN DBD_COMPANY c ON c.company_id=f.company_id WHERE c.company_id IS NULL"),
+        ]
+        for table in ("DBD_COMPANY_RELATION", "DBD_COMPANY_EVENT",
+                      "DBD_FINANCIAL", "DBD_INDUSTRY"):
+            checks.append((table + " generation",
+                           f"SELECT COUNT(*) FROM {table} WHERE "
+                           "first_seen_generation<>1 OR last_seen_generation<>1"))
+        with conn.cursor() as cur:
+            for label, sql in checks:
+                cur.execute(sql)
+                count = int(cur.fetchone()[0] or 0)
+                if count:
+                    raise MySqlProductionWriteError(
+                        f"Legacy sync integrity failed: {label} ({count} rows)"
+                    )
+
+    def insert_legacy_sync_rows(self, conn, table, rows):
+        """Bounded INSERT-only batches; preserve unique-identity conflict failure."""
+        tables = {
+            "companies": "DBD_COMPANY", "relations": "DBD_COMPANY_RELATION",
+            "events": "DBD_COMPANY_EVENT", "financial": "DBD_FINANCIAL",
+            "industries": "DBD_INDUSTRY",
+        }
+        if table not in tables:
+            raise MySqlProductionWriteError("Invalid legacy sync table")
+        allowed = set(_columns(tables[table])) - {"branch_count"}
+        grouped: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
+        for row in rows:
+            if not row or set(row) - allowed:
+                raise MySqlProductionWriteError("Unapproved legacy sync INSERT fields")
+            names = tuple(sorted(row))
+            grouped.setdefault(names, []).append(
+                tuple(_production_value(row[name]) for name in names)
+            )
+        with conn.cursor() as cur:
+            for names, parameters in grouped.items():
+                sql = (f"INSERT INTO `{tables[table]}` (" +
+                       ",".join(f"`{name}`" for name in names) + ") VALUES (" +
+                       ",".join(["%s"] * len(names)) + ")")
+                for offset in range(0, len(parameters), 200):
+                    cur.executemany(sql, parameters[offset:offset + 200])
+
+    def update_legacy_sync_rows(self, conn, table, changes):
+        """Selective UPDATE; the G1 predicate prevents Generation regression."""
+        tables = {
+            "companies": ("DBD_COMPANY", "company_id"),
+            "relations": ("DBD_COMPANY_RELATION", "relation_id"),
+            "events": ("DBD_COMPANY_EVENT", "event_id"),
+            "financial": ("DBD_FINANCIAL", "financial_id"),
+            "industries": ("DBD_INDUSTRY", "industry_id"),
+        }
+        if table not in tables:
+            raise MySqlProductionWriteError("Invalid legacy sync table")
+        table_name, pk = tables[table]
+        prohibited = {
+            "company_id", "relation_id", "event_id", "financial_id", "industry_id",
+            "juristic_type_code", "registration_no", "relation_type", "event_type",
+            "source_key", "fiscal_year", "submit_objective_code", "business_size_code",
+            "location_type", "location_no", "first_seen_generation",
+            "last_seen_generation", "dataset_generation", "branch_count",
+            "lease_owner", "lease_expires_at", "retry_at", "required_mask",
+            "done_mask", "not_available_mask", "failed_mask", "collect_status",
+            "endpoint_meta", "is_current", "last_endpoint", "last_http_status",
+            "last_error", "last_error_at", "last_request_at",
+            "collection_started_at", "collection_completed_at",
+        }
+        accepted = set(_columns(table_name)) - prohibited
+        with conn.cursor() as cur:
+            for pk_value, values in changes:
+                if not values or set(values) - accepted:
+                    raise MySqlProductionWriteError("Unapproved legacy sync UPDATE field")
+                keys = tuple(sorted(values))
+                cur.execute(
+                    f"UPDATE `{table_name}` SET " +
+                    ",".join(f"`{name}`=%s" for name in keys) +
+                    f" WHERE `{pk}`=%s AND last_seen_generation=1" +
+                    (" AND dataset_generation=1" if table == "companies" else ""),
+                    tuple(_production_value(values[key]) for key in keys) +
+                    (int(pk_value),),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise MySqlProductionWriteError("Legacy sync update lost G1 row ownership")
 
     def upsert_relations(self, conn, rows):
         return _upsert_many(
@@ -587,6 +748,32 @@ class ProductionMySqlRepository:
                     (int(new_req), new_status, bool(outstanding), int(pk)),
                 )
         return len(rows), (int(rows[-1][0]) if rows else None)
+
+    def refresh_phase_outcomes(
+        self, conn, *, generation, phase_mask, limit, after_company_id=0,
+    ):
+        """Explicit bounded phase refresh; keep all unselected outcomes."""
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT company_id FROM DBD_COMPANY WHERE "
+                "last_seen_generation=%s AND company_id>%s "
+                "AND ((done_mask | not_available_mask | failed_mask) & %s)<>0 "
+                "AND (lease_owner IS NULL OR lease_expires_at<=UTC_TIMESTAMP(6)) "
+                "ORDER BY company_id LIMIT %s FOR UPDATE",
+                (int(generation),int(after_company_id),int(phase_mask),int(limit)),
+            )
+            ids=[int(row[0]) for row in cur.fetchall()]
+            for company_id in ids:
+                cur.execute(
+                    "UPDATE DBD_COMPANY SET "
+                    "done_mask=done_mask & ~%s, "
+                    "not_available_mask=not_available_mask & ~%s, "
+                    "failed_mask=failed_mask & ~%s, retry_at=NULL, "
+                    "collect_status='PENDING',collection_completed_at=NULL "
+                    "WHERE company_id=%s",
+                    (int(phase_mask),int(phase_mask),int(phase_mask),company_id),
+                )
+        return len(ids), (ids[-1] if ids else None)
 
     def claim_company(
         self, conn, *, generation, phase_mask, lease_seconds, worker_prefix, company_id=None,

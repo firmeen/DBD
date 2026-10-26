@@ -704,6 +704,18 @@ async def test_sqlserver_auto_cycle_not_due_skips_all_http_and_finalize(monkeypa
     from dbd.storage.sqlserver import control_repository
 
     class FakeControl:
+        def require_admin(self, _node):
+            pass
+
+        def schedule(self):
+            return {"day": 31, "hour": 23, "minute": 59}
+
+        def active_generation(self):
+            return None
+
+        def generation(self, _month):
+            return None
+
         def select_cycle(self, _node, _state, **kwargs):
             assert kwargs["auto"] is True
             return "NOT_DUE", None
@@ -712,6 +724,15 @@ async def test_sqlserver_auto_cycle_not_due_skips_all_http_and_finalize(monkeypa
     repo.backend = "sqlserver"
     monkeypatch.setattr(setup_module, "local_node_id", lambda: "node-test")
     monkeypatch.setattr(control_repository, "ControlRepository", FakeControl)
+    from dbd.control import MonthlyDecision
+    from dbd import control as control_policy
+    monkeypatch.setattr(
+        control_policy, "choose_monthly_generation",
+        lambda **kw: MonthlyDecision(
+            "NOT_DUE", "2026-10", kw["now"], kw["generation_state"]["next_generation"],
+        ),
+    )
+
 
     async def never_discover(*_args, **_kwargs):
         raise AssertionError("NOT_DUE must never issue upstream Search")
@@ -732,6 +753,18 @@ async def test_sqlserver_manual_before_due_requires_confirmation(monkeypatch) ->
     from dbd.storage.sqlserver import control_repository
 
     class FakeControl:
+        def require_admin(self, _node):
+            pass
+
+        def schedule(self):
+            return {"day": 31, "hour": 23, "minute": 59}
+
+        def active_generation(self):
+            return None
+
+        def generation(self, _month):
+            return None
+
         def select_cycle(self, _node, _state, **kwargs):
             assert not kwargs["auto"]
             assert not kwargs["manual_confirmed"]
@@ -741,6 +774,15 @@ async def test_sqlserver_manual_before_due_requires_confirmation(monkeypatch) ->
     repo.backend = "sqlserver"
     monkeypatch.setattr(setup_module, "local_node_id", lambda: "node-test")
     monkeypatch.setattr(control_repository, "ControlRepository", FakeControl)
+    from dbd.control import MonthlyDecision
+    from dbd import control as control_policy
+    monkeypatch.setattr(
+        control_policy, "choose_monthly_generation",
+        lambda **kw: MonthlyDecision(
+            "NOT_DUE", "2026-10", kw["now"], kw["generation_state"]["next_generation"],
+        ),
+    )
+
 
     with pytest.raises(EarlyStartConfirmationRequired):
         await workflow.cycle_run(phase="core", repository=repo, verbose=False)

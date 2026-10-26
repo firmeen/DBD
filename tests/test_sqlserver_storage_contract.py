@@ -24,13 +24,14 @@ from dbd.storage.sqlserver.schema import (
 )
 
 
-def test_v06_manages_exactly_five_sql_server_tables() -> None:
+def test_v06_manages_six_sql_server_business_tables() -> None:
     assert MANAGED_TABLES == (
         "dbo.DBD_COMPANY",
         "dbo.DBD_COMPANY_RELATION",
         "dbo.DBD_COMPANY_EVENT",
         "dbo.DBD_FINANCIAL",
         "dbo.DBD_INDUSTRY",
+        "dbo.DBD_BRANCH",
     )
     all_ddl = "\n".join(CREATE_TABLE_SQL.values()).upper()
     assert "DBD_MASTER_DEEP" not in all_ddl
@@ -1085,3 +1086,185 @@ def test_targeted_sqlserver_core_claim_needs_admin_identity(monkeypatch) -> None
             lease_seconds=300, worker_prefix="worker-attempt",
             company_id=42,
         )
+
+
+
+def test_cutover_readback_is_read_only_bounded_and_natural_keyed(monkeypatch):
+    queries = []
+    target = {"company_id": 8, "juristic_type_code": "5",
+              "registration_no": "0100000000001", "company_name_th": "บริษัท ทดสอบ"}
+    class Cursor:
+        def __init__(self):
+            self.description = []
+            self.rows = []
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+        def execute(self, sql, params=()):
+            assert sql.lstrip().upper().startswith("SELECT "), sql
+            assert len(params) <= 500
+            queries.append((sql, tuple(params)))
+            self.rows = ([tuple(target.values())]
+                         if "DBD_COMPANY" in sql
+                         and "DBD_COMPANY_RELATION" not in sql
+                         and "DBD_COMPANY_EVENT" not in sql else [])
+            self.description = [(k,) for k in target] if self.rows else [("company_id",)]
+        def fetchall(self):
+            return list(self.rows)
+        def close(self):
+            pass
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionSqlServerRepository()
+    monkeypatch.setattr(repo, "company_ids", lambda _conn, _keys: {
+        ("5", "0100000000001"): 8,
+    })
+    rows = repo.read_cutover_rows(
+        Connection(), [("5", "0100000000001")],
+        [("101", "2568", None, None, None)],
+    )
+    assert len(rows["companies"]) == 1
+    assert rows["companies"][0]["company_name_th"] == "บริษัท ทดสอบ"
+    assert rows["relations"] == rows["events"] == rows["financial"] == []
+    assert any("DBD_INDUSTRY" in query and "IS NULL" in query
+               for query, _ in queries)
+    assert not any("UPDATE " in query or "DELETE " in query or "INSERT " in query
+                   for query, _ in queries)
+    with pytest.raises(ValueError, match="bounded"):
+        repo.read_cutover_rows(Connection(), [("5", "1")] * 1001, [])
+
+
+
+def test_cutover_industry_readback_more_than_1000_keys_remains_sql_bounded(monkeypatch):
+    """One company may map more than 1,000 distinct industry scopes."""
+    queries = []
+    class Cursor:
+        description = [("industry_id",)]
+        def execute(self, sql, params=()):
+            assert sql.lstrip().upper().startswith("SELECT "), sql
+            assert len(params) <= 500
+            queries.append((sql, tuple(params)))
+        def fetchall(self):
+            return []
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionSqlServerRepository()
+    monkeypatch.setattr(repo, "company_ids", lambda _conn, _keys: {})
+    keys = [(str(n), "2568", None, None, None) for n in range(1100)]
+    result = repo.read_cutover_rows(Connection(), [], keys)
+    assert result["industries"] == []
+    industry_queries = [sql for sql, _ in queries if "DBD_INDUSTRY" in sql]
+    assert len(industry_queries) == 15
+
+
+def test_incremental_sync_repository_insert_and_selective_update_are_parameterized():
+    from datetime import datetime
+    calls = []
+    class Cursor:
+        rowcount = 1
+        def execute(self, sql, params=()):
+            calls.append((sql, tuple(params)))
+            assert "%s" in sql
+        def executemany(self, sql, rows):
+            assert rows and "%s" in sql
+            for params in rows:
+                calls.append((sql, tuple(params)))
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionSqlServerRepository()
+    conn = Connection()
+    repo.insert_legacy_sync_rows(conn, "companies", [{
+        "juristic_type_code": "5", "registration_no": "0100000000001",
+        "company_name_th": "บริษัท ใหม่", "dataset_generation": 1,
+        "first_seen_generation": 1, "last_seen_generation": 1,
+        "published_at": datetime(2026, 10, 21),
+    }])
+    repo.update_legacy_sync_rows(conn, "companies", [(10, {
+        "company_name_th": "บริษัท อัปเดต",
+        "published_at": datetime(2026, 10, 21),
+    })])
+    assert len(calls) == 2
+    assert calls[0][0].startswith("INSERT INTO")
+    assert calls[1][0].startswith("UPDATE")
+    assert "last_seen_generation=1" in calls[1][0]
+    assert "dataset_generation=1" in calls[1][0]
+    assert "lease_owner" not in calls[1][0]
+    assert "branch_count" not in calls[1][0]
+    assert "UPDATE" not in calls[0][0]
+    assert calls[0][1][1] != ""  # Company identity was sent as a bound value
+
+
+@pytest.mark.parametrize("protected", [
+    "company_id", "first_seen_generation", "dataset_generation",
+    "last_seen_generation", "done_mask", "required_mask",
+    "lease_owner", "branch_count", "collect_status",
+])
+def test_incremental_sync_rejects_protected_update_columns(protected):
+    class Cursor:
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    repo = ProductionSqlServerRepository()
+    with pytest.raises(Exception, match="Unapproved"):
+        repo.update_legacy_sync_rows(Connection(), "companies", [(8, {protected: 42})])
+
+
+def test_incremental_sync_allows_missing_readback_for_new_company(monkeypatch):
+    repo = ProductionSqlServerRepository()
+    selected = []
+    def lookup(_conn, identities, *, allow_missing=False, for_update=False):
+        selected.append((allow_missing, for_update))
+        return {}
+    monkeypatch.setattr(repo, "company_ids", lookup)
+    class Connection:
+        def cursor(self):
+            raise AssertionError("No existing company IDs: no data SELECT required")
+    rows = repo.read_cutover_rows(
+        Connection(), [("5", "0100000000001")], [],
+        allow_missing=True, for_update=True,
+    )
+    assert selected == [(True, True)]
+    assert not any(rows.values())
+
+
+def test_incremental_sync_global_integrity_queries_are_select_only():
+    seen = []
+    class Cursor:
+        def execute(self, sql, params=()):
+            assert sql.lstrip().upper().startswith("SELECT")
+            seen.append(sql)
+        def fetchone(self):
+            return (0,)
+        def close(self):
+            pass
+        def __enter__(self):
+            return self
+        def __exit__(self, *_args):
+            return False
+    class Connection:
+        def cursor(self):
+            return Cursor()
+    ProductionSqlServerRepository().verify_legacy_sync_integrity(Connection())
+    assert len(seen) >= 8

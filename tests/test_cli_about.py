@@ -151,3 +151,80 @@ def test_failed_cycle_returns_nonzero_exit_code(monkeypatch) -> None:
     assert exc.value.code == 1
     assert captured["payload"]["status"] == "FAILED"
     assert captured["closed"] is True
+
+
+
+@pytest.mark.parametrize("incremental", [False, True])
+def test_cutover_dispatch_preserves_original_and_routes_new_phase(monkeypatch, incremental):
+    import dbd.cutover as cutover
+    called = []
+
+    class FakeTerminal:
+        def __init__(self, command, *, app):
+            assert command == "cutover"
+        def start(self, **_kwargs):
+            return self
+        def event(self, *_args):
+            pass
+        def finish(self, result):
+            assert result["mode"] == ("new-phase" if incremental else "initial")
+        def close(self):
+            pass
+        def fail(self, message):
+            raise AssertionError(message)
+        def interrupt(self):
+            pass
+
+    def handle(mode):
+        def handler(**kw):
+            called.append((mode, kw["backend"], kw["batch_size"]))
+            return {"mode": mode}
+        return handler
+
+    monkeypatch.setattr(cli_main, "V06Terminal", FakeTerminal)
+    monkeypatch.setattr(cutover, "run_generation1_cutover", handle("initial"))
+    monkeypatch.setattr(cutover, "run_legacy_incremental_sync", handle("new-phase"))
+    args = ["dbd-data", "cutover", "--backend", "mysql", "--batch-size", "10000"]
+    if incremental:
+        args.append("--new-phase")
+    monkeypatch.setattr(sys, "argv", args)
+    cli_main.main()
+    assert called == [(("new-phase" if incremental else "initial"), "mysql", 10000)]
+
+
+@pytest.mark.parametrize("extra", [
+    ["--batch-size", "0"], ["--batch-size", "10001"], ["--backend", "postgres"],
+    ["--force"], ["--delete-missing"],
+])
+def test_cutover_rejects_unapproved_arguments(monkeypatch, extra):
+    monkeypatch.setattr(sys, "argv", ["dbd-data", "cutover", "--new-phase", *extra])
+    with pytest.raises(SystemExit) as error:
+        cli_main.main()
+    assert error.value.code == 2
+
+
+def test_incremental_handler_error_returns_nonzero_without_finish(monkeypatch):
+    import dbd.cutover as cutover
+    calls = []
+    class Terminal:
+        def __init__(self, *_args, **_kwargs):
+            pass
+        def start(self, **_kwargs):
+            return self
+        def event(self, *_args):
+            pass
+        def finish(self, _result):
+            calls.append("finish")
+        def fail(self, _message):
+            calls.append("fail")
+        def close(self):
+            pass
+    monkeypatch.setattr(cli_main, "V06Terminal", Terminal)
+    monkeypatch.setattr(
+        cutover, "run_legacy_incremental_sync",
+        lambda **_kw: (_ for _ in ()).throw(RuntimeError("mocked failure")),
+    )
+    monkeypatch.setattr(sys, "argv", ["dbd-data", "cutover", "--new-phase"])
+    with pytest.raises(SystemExit) as error:
+        cli_main.main()
+    assert error.value.code == 1 and calls == ["fail"]

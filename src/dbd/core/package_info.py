@@ -101,6 +101,12 @@ def _invalid_distribution_entries() -> list[str]:
                 result.append(str(entry))
     return sorted(set(result), key=str.lower)
 
+def _project_url(metadata, label: str) -> str:
+    for entry in metadata.get_all("Project-URL", []) or []:
+        name, separator, url = entry.partition(",")
+        if separator and name.strip().casefold() == label.casefold():
+            return url.strip()
+    return ""
 
 def _required_by(package_name: str) -> list[str]:
     wanted = _normalize_name(package_name)
@@ -216,7 +222,10 @@ def package_environment_snapshot() -> dict:
             "installed_version": installed_version,
             "version_match": version_match,
             "summary": str(metadata.get("Summary") or ""),
-            "home_page": str(metadata.get("Home-page") or ""),
+            "home_page": str(
+                metadata.get("Home-page")
+                or _project_url(metadata, "Homepage")
+            ),
             "author": str(metadata.get("Author") or ""),
             "author_email": str(metadata.get("Author-email") or ""),
             "license": str(metadata.get("License") or ""),

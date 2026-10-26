@@ -831,3 +831,37 @@ def test_v06_branch_deferred_pass_is_not_a_clean_success() -> None:
     text = output.getvalue()
     assert "Completed with failures" in text
     assert "deferred=2" in text
+
+
+
+def test_cutover_new_phase_render_uses_real_incremental_counters() -> None:
+    output = StringIO()
+    terminal = V06Terminal("cutover", stream=output, tty=False).start(backend="mysql")
+    data = {
+        "mode": "new-phase", "generation": 1, "source_rows": 10000,
+        "scanned": 10000, "inserted": 25, "updated": 45, "unchanged": 9930,
+        "conflicts": 0, "domains_inserted": 12, "domains_updated": 3,
+        "target_only_scope": 7, "batches": 10,
+    }
+    terminal.event("started", data)
+    terminal.console.print(terminal._render_cutover(120))
+    rendered = output.getvalue()
+    assert "NEW PHASE G1" in rendered
+    for label in ("Inserted", "Updated", "Unchanged", "Conflicts"):
+        assert label in rendered
+    assert terminal.state.result is None
+    terminal.finish({**data, "verification": {"source_content_verified": True}})
+    assert terminal.state.status == "COMPLETE"
+    terminal.close()
+
+
+def test_cutover_new_phase_failure_cannot_mark_terminal_complete() -> None:
+    terminal = V06Terminal("cutover", stream=StringIO(), tty=False).start(backend="mysql")
+    terminal.event("progress", {
+        "mode": "new-phase", "scanned": 1, "inserted": 0, "updated": 0,
+        "unchanged": 0, "conflicts": 1,
+    })
+    terminal.fail("source freshness conflict")
+    assert terminal.state.status == "FAILED"
+    assert terminal.state.result is None
+    terminal.close()

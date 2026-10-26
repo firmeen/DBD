@@ -1,5 +1,29 @@
 # Production Validation
 
+## v0.6 Migration command #04 — safety contract (PR #102 draft)
+
+`dbd-data migrate` is **read-only by default**. Use `--check` (or `--dry-run`) to inspect the selected Production database before authorizing DDL. `--backend sqlserver|mysql`, `--db` and `-d` select the backend; the `.env` default remains supported.
+
+```powershell
+dbd-data migrate --backend sqlserver --check
+dbd-data migrate --backend mysql --check
+# Review the actual plan, legacy evidence, permissions and BLOCKERS first.
+dbd-data migrate --backend sqlserver --apply
+dbd-data migrate --backend mysql --apply
+# Noninteractive automation ONLY, after explicit operator approval:
+dbd-data migrate --backend sqlserver --apply --yes
+dbd-data check-db --backend sqlserver
+```
+
+Interactive `--apply` requires typing `MIGRATE`. Noninteractive Apply requires both `--apply --yes`. `--check` never executes DDL or writes Control, Generation, Discovery, Branch or business rows. The approved plan is re-read under the existing Production Manager Lock; another schema/state change blocks Apply.
+
+SQL Server uses a transaction and rolls it back when an exception occurs. MySQL DDL commits implicitly: a failure may leave additive DDL already committed; inspect with `--check` before retrying. Never assume Ctrl+C reverses MySQL DDL. Neither backend is authorized to DROP or TRUNCATE old tables. Existing `DBD_COMPANY_BRANCH` and PR #100 summary fields are retained.
+
+**Historical Branch Count warning:** PR #100 `branch_count` may exclude HQ; v0.6 `DBD_COMPANY.branch_count` includes HQ. Ambiguous PR #100 rows, conflicting counts, and historical detail rows without sufficient evidence block schema convergence rather than receive automatic `+1` or `1`. Review `dbd-data branch import -c -d sqlserver --source sqlserver-extension` and the original Journal first; do not manually mutate verified counts to bypass the gate. This migration does **not** import Branch details, collect HTTP, start a Generation, or reset checkpoints.
+
+The six canonical business tables are `DBD_COMPANY`, `DBD_COMPANY_RELATION`, `DBD_COMPANY_EVENT`, `DBD_FINANCIAL`, `DBD_INDUSTRY`, `DBD_BRANCH`. SQL Server `DBD_CONTROL` and `DBD_DISCOVERY_WORK`, and MySQL `DBD_DISCOVERY_WORK`, are separate operational structures. Read-only `--check` must never be interpreted as test evidence for isolated database migration or Windows interruption compatibility. PR #102 remains Draft until those gates are independently validated.
+
+
 เอกสารนี้ตอบคำถามว่า “เรารู้ได้อย่างไรว่ารอบข้อมูลนี้อยู่ในสถานะที่เชื่อถือได้”
 
 Production validation แบ่งเป็น 4 ระดับ:
@@ -20,7 +44,7 @@ dbd-data check-db
 ถ้า schema ต้อง converge:
 
 ~~~powershell
-dbd-data migrate
+dbd-data migrate --check
 dbd-data check-db
 ~~~
 
@@ -264,3 +288,66 @@ for actual executed tests.
 The sole newly added extension test module for these features is
 `tests/test_production_discovery_branch.py`; extend existing test modules
 instead of adding separate ones for each new domain.
+
+## PR #102 — Branch and MySQL Discovery acceptance gates
+
+Canonical business tables: **six**. Branch is DataForThai enrichment,
+**not** an eighth DBD endpoint. `branch_count` includes HQ and may default to
+1 before verification, which must be distinguished by HQ `collection_status`.
+
+Required tests before Production rollout:
+- MySQL and SQL Server durable Discovery page checkpoint and company write
+  must commit/roll back atomically in **isolated test databases**.
+- Numeric split remains uncertified until real-source filter behavior and
+  complete, disjoint coverage are demonstrated; the planner alone cannot
+  certify nationwide completeness.
+- A newly inserted identity before an old cursor must be processed. A terminal
+  current-phase HQ outcome must not trigger duplicate DataForThai HTTP.
+- Journal/checkpoint and PR100 SQL branch extension imports require an explicit
+  preview, validation of original timestamps/branches, and idempotent reruns.
+- Old verified branch details/count must not disappear on timeout, stale
+  printview or import conflict.
+- Core-7 and Branch statuses must be reported separately. Branch source failure
+  must not undo Core Completion.
+- Windows PowerShell 5.1/7 Ctrl+C tests and CI must run successfully or remain
+  explicitly **unverified**.
+
+The implementation introduces offline tests
+`tests/test_v06_production_completion.py` and
+`tests/test_v06_completion_guards.py`. These tests do **not** substitute for
+isolated SQL Server/MySQL integration and Windows runtime validation.
+
+
+## Production Completion hardening — source evidence before release
+
+The branch printview parser now requires company identity evidence from the
+HTML or a trusted same-host canonical URL. If identity cannot be proved or
+another company appears, record a recoverable invalid-HTML result; do not mark
+`NO_BRANCH`. This is intentionally fail-closed until the source HTML contract
+is confirmed using approved, controlled evidence.
+
+The branch writer blocks any reduction of a previously known HQ-inclusive
+establishment count even if historical detail rows are incomplete; the new
+result becomes `STALE_BRANCHES` for review. Canonical old branch addresses
+are never overwritten by a conflicting Legacy Import. Old PR100
+`DBD_COMPANY.branch_status` is treated as historical outcome evidence even
+without old branch detail rows.
+
+Discovery checks a second parent count after categorical child queries,
+enforces the source's 10-row page contract, and detects duplicate identities
+across newly fetched pages of a partition. This is not proof of a stable
+snapshot across an interrupted multi-day enumeration. Nationwide coverage
+must remain unverified without upstream consistency evidence.
+
+`dbd-data branch import --source sqlserver-extension -c -d sqlserver`
+performs read-only source preflight before approved canonical schema DDL and
+reports blockers without creating a Phase or issuing HTTP requests.
+
+
+### Nullable Production MySQL branch_count — restart-safe preservation
+
+When inspection proves a nullable historical `branch_count` contains **only NULL/zero and no positive historical count**, the approved MySQL Apply first renames the original column to `legacy_branch_count_pre_v06` without rewriting its values. It then adds the canonical `branch_count INT NOT NULL DEFAULT 1`. This is intentional preservation of legacy evidence. If MySQL stops after the rename, the next `--check` identifies the missing canonical column and allows the safe additive step. Positive or ambiguous historical values block the operation.
+
+For SQL Server, the corresponding narrow null/zero normalization and NOT NULL conversion occur within the SQL Server transaction, which rolls back on failure. SQL Server Apply acquires both existing cycle and Branch writer coordination resources before any DDL. The standalone PR #100 extension must still be separately reconciled and is *not* automatically imported by `migrate`.
+
+**Verification limitation:** CLI/unit tests are committed but have not been run successfully in an isolated test environment. The GitHub Actions checks remain failed without retrievable job logs. Do not migrate Production until SQL Server/MySQL isolated integration, PR #100 evidence reconciliation and Windows Ctrl+C tests pass.

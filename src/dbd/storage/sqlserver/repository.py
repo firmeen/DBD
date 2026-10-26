@@ -16,12 +16,12 @@ from ...contracts.master_deep import (
 from ...core.settings import settings
 from ...deep.catalog import CORE_ENDPOINT_MASK, core_discovery_plan
 from ..production import ProductionLeaseLost
+from .control_repository import ControlRepository
 from .engine import _pymssql, check_connection, connection
 from .engine import transaction as sqlserver_transaction
 from .schema import MANAGED_TABLES, TABLE_COLUMNS
 from .schema import ensure_schema as ensure_production_schema
 from .schema import validate_schema as validate_production_schema
-from .control_repository import ControlRepository
 
 TARGET_TABLE = "dbo.DBD_MASTER_DEEP"
 
@@ -669,7 +669,7 @@ def _table_write_columns(table_name: str) -> tuple[str, ...]:
     return tuple(
         column.name
         for column in TABLE_COLUMNS[table_name]
-        if not column.identity
+        if not column.identity and not (table_name == "dbo.DBD_COMPANY" and column.name == "branch_count")
     )
 
 
@@ -768,7 +768,7 @@ class ProductionSqlServerRepository:
         with self.transaction() as conn:
             result = ensure_production_schema(conn)
             ControlRepository().ensure_schema(conn)
-            from . import discovery_repository, branch_repository
+            from . import branch_repository, discovery_repository
             discovery_repository.ensure_schema(conn)
             branch_repository.ensure_schema(conn)
             return result
@@ -877,6 +877,7 @@ class ProductionSqlServerRepository:
         self,
         conn,
         identities: Iterable[tuple[str, str]],
+        *, allow_missing: bool = False, for_update: bool = False,
     ) -> dict[tuple[str, str], int]:
         unique = list(
             dict.fromkeys(
@@ -902,7 +903,7 @@ class ProductionSqlServerRepository:
                 cur.execute(
                     f"""
                     SELECT c.juristic_type_code,c.registration_no,c.company_id
-                    FROM dbo.DBD_COMPANY c
+                    FROM dbo.DBD_COMPANY c{' WITH (UPDLOCK,HOLDLOCK)' if for_update else ''}
                     JOIN (VALUES {values_sql}) v(juristic_type_code,registration_no)
                       ON v.juristic_type_code=c.juristic_type_code
                      AND v.registration_no=c.registration_no
@@ -913,7 +914,7 @@ class ProductionSqlServerRepository:
                     result[(str(jp_type), str(jp_no))] = int(company_id)
             finally:
                 cur.close()
-        if len(result) != len(unique):
+        if not allow_missing and len(result) != len(unique):
             missing = [identity for identity in unique if identity not in result]
             raise SqlServerWriteError(
                 "Unable to resolve SQL Server company_id for "
@@ -951,6 +952,177 @@ class ProductionSqlServerRepository:
                 raise SqlServerWriteError(
                     f"Unable to update DBD_COMPANY state for company_id={company_id}"
                 )
+        finally:
+            cur.close()
+
+    def read_cutover_rows(self, conn, identities, industry_keys, *,
+                          allow_missing=False, for_update=False):
+        """Bounded, read-only G1 readback; no business transformations here."""
+        if len(identities) > 1000:
+            raise ValueError("Cutover verification exceeds bounded micro-batch")
+        company_ids = (self.company_ids(conn, identities,
+                                        allow_missing=allow_missing, for_update=for_update)
+                       if allow_missing or for_update else self.company_ids(conn, identities))
+        ids = sorted(set(company_ids.values()))
+        result = {key: [] for key in (
+            "companies", "relations", "events", "financial", "industries"
+        )}
+        tables = (
+            ("companies", "dbo.DBD_COMPANY"),
+            ("relations", "dbo.DBD_COMPANY_RELATION"),
+            ("events", "dbo.DBD_COMPANY_EVENT"),
+            ("financial", "dbo.DBD_FINANCIAL"),
+        )
+
+        def select(sql, params, label):
+            cur = conn.cursor()
+            try:
+                cur.execute(sql, tuple(params))
+                names = [str(item[0]) for item in cur.description]
+                result[label].extend(dict(zip(names, row, strict=True))
+                                     for row in cur.fetchall())
+            finally:
+                cur.close()
+
+        for offset in range(0, len(ids), 500):
+            chunk = ids[offset:offset + 500]
+            placeholders = ",".join(["%s"] * len(chunk))
+            for label, table in tables:
+                select(
+                    f"SELECT * FROM {table}{' WITH (UPDLOCK,HOLDLOCK)' if for_update else ''} "
+                    f"WHERE company_id IN ({placeholders})",
+                    chunk, label,
+                )
+        key_columns = (
+            "submit_objective_code", "fiscal_year", "business_size_code",
+            "location_type", "location_no",
+        )
+        for offset in range(0, len(industry_keys), 75):
+            chunk = industry_keys[offset:offset + 75]
+            predicates, params = [], []
+            for key in chunk:
+                if len(key) != 5:
+                    raise ValueError("Invalid Industry verification natural key")
+                parts = []
+                for col, value in zip(key_columns, key, strict=True):
+                    if value is None:
+                        parts.append(f"[{col}] IS NULL")
+                    else:
+                        parts.append(f"[{col}]=%s")
+                        params.append(value)
+                predicates.append("(" + " AND ".join(parts) + ")")
+            select(
+                ("SELECT * FROM dbo.DBD_INDUSTRY" +
+                 (" WITH (UPDLOCK,HOLDLOCK)" if for_update else "") +
+                 " WHERE " + " OR ".join(predicates)),
+                params, "industries",
+            )
+        return result
+
+    def verify_legacy_sync_integrity(self, conn) -> None:
+        """Read-only global generation and orphan checks; Target-only G1 rows are permitted."""
+        checks = [
+            ("company generation", "SELECT COUNT(*) FROM dbo.DBD_COMPANY WHERE "
+             "dataset_generation<>1 OR first_seen_generation<>1 OR last_seen_generation<>1"),
+            ("relation orphan", "SELECT COUNT(*) FROM dbo.DBD_COMPANY_RELATION r "
+             "LEFT JOIN dbo.DBD_COMPANY c ON c.company_id=r.company_id WHERE c.company_id IS NULL"),
+            ("event orphan", "SELECT COUNT(*) FROM dbo.DBD_COMPANY_EVENT e "
+             "LEFT JOIN dbo.DBD_COMPANY c ON c.company_id=e.company_id WHERE c.company_id IS NULL"),
+            ("financial orphan", "SELECT COUNT(*) FROM dbo.DBD_FINANCIAL f "
+             "LEFT JOIN dbo.DBD_COMPANY c ON c.company_id=f.company_id WHERE c.company_id IS NULL"),
+        ]
+        for table in ("RELATION", "EVENT", "FINANCIAL", "INDUSTRY"):
+            checks.append((
+                table + " generation",
+                f"SELECT COUNT(*) FROM dbo.DBD_COMPANY_{table} WHERE " +
+                "first_seen_generation<>1 OR last_seen_generation<>1"
+                if table in ("RELATION", "EVENT") else
+                f"SELECT COUNT(*) FROM dbo.DBD_{table} WHERE " +
+                "first_seen_generation<>1 OR last_seen_generation<>1",
+            ))
+        cur = conn.cursor()
+        try:
+            for label, sql in checks:
+                cur.execute(sql)
+                count = int(cur.fetchone()[0] or 0)
+                if count:
+                    raise SqlServerWriteError(
+                        f"Legacy sync integrity failed: {label} ({count} rows)"
+                    )
+        finally:
+            cur.close()
+
+    def insert_legacy_sync_rows(self, conn, table: str, rows: list[dict[str, Any]]) -> None:
+        """Bounded INSERT-only batches; never turn a uniqueness race into an UPSERT."""
+        tables = {
+            "companies": "dbo.DBD_COMPANY", "relations": "dbo.DBD_COMPANY_RELATION",
+            "events": "dbo.DBD_COMPANY_EVENT", "financial": "dbo.DBD_FINANCIAL",
+            "industries": "dbo.DBD_INDUSTRY",
+        }
+        if table not in tables:
+            raise SqlServerWriteError("Invalid legacy sync table")
+        columns = tuple(col for col in _table_write_columns(tables[table]) if col != "branch_count")
+        grouped: dict[tuple[str, ...], list[tuple[Any, ...]]] = {}
+        for row in rows:
+            if not row or set(row) - set(columns):
+                raise SqlServerWriteError("Unapproved legacy sync INSERT fields")
+            names = tuple(name for name in columns if name in row)
+            grouped.setdefault(names, []).append(
+                tuple(_production_value(row[name]) for name in names)
+            )
+        cur = conn.cursor()
+        try:
+            for names, parameters in grouped.items():
+                sql = (f"INSERT INTO {tables[table]} (" +
+                       ",".join(f"[{name}]" for name in names) + ") VALUES (" +
+                       ",".join(["%s"] * len(names)) + ")")
+                for offset in range(0, len(parameters), 200):
+                    cur.executemany(sql, parameters[offset:offset + 200])
+        finally:
+            cur.close()
+
+    def update_legacy_sync_rows(self, conn, table: str,
+                                changes: list[tuple[int, dict[str, Any]]]) -> None:
+        """Apply only explicitly planned changed fields, fenced to G1 identities."""
+        allowed = {
+            "companies": ("dbo.DBD_COMPANY", "company_id"),
+            "relations": ("dbo.DBD_COMPANY_RELATION", "relation_id"),
+            "events": ("dbo.DBD_COMPANY_EVENT", "event_id"),
+            "financial": ("dbo.DBD_FINANCIAL", "financial_id"),
+            "industries": ("dbo.DBD_INDUSTRY", "industry_id"),
+        }
+        if table not in allowed:
+            raise SqlServerWriteError("Invalid legacy sync table")
+        table_name, pk = allowed[table]
+        prohibited = {
+            "company_id", "relation_id", "event_id", "financial_id", "industry_id",
+            "juristic_type_code", "registration_no", "relation_type", "event_type",
+            "source_key", "fiscal_year", "submit_objective_code", "business_size_code",
+            "location_type", "location_no", "first_seen_generation",
+            "last_seen_generation", "dataset_generation", "branch_count",
+            "lease_owner", "lease_expires_at", "retry_at", "required_mask",
+            "done_mask", "not_available_mask", "failed_mask", "collect_status",
+            "endpoint_meta", "is_current", "last_endpoint", "last_http_status",
+            "last_error", "last_error_at", "last_request_at",
+            "collection_started_at", "collection_completed_at",
+        }
+        accepted = set(_table_write_columns(table_name)) - prohibited
+        cur = conn.cursor()
+        try:
+            for pk_value, values in changes:
+                if not values or set(values) - accepted:
+                    raise SqlServerWriteError("Unapproved legacy sync UPDATE field")
+                keys = tuple(sorted(values))
+                cur.execute(
+                    f"UPDATE {table_name} SET " +
+                    ",".join(f"[{name}]=%s" for name in keys) +
+                    f" WHERE [{pk}]=%s AND last_seen_generation=1" +
+                    (" AND dataset_generation=1" if table == "companies" else ""),
+                    tuple(_production_value(values[key]) for key in keys) +
+                    (int(pk_value),),
+                )
+                if int(cur.rowcount or 0) != 1:
+                    raise SqlServerWriteError("Legacy sync update lost G1 row ownership")
         finally:
             cur.close()
 
@@ -1489,6 +1661,40 @@ class ProductionSqlServerRepository:
             changed = int(row[0] or 0)
             last_company_id = None if row[1] is None else int(row[1])
             return changed, last_company_id
+        finally:
+            cur.close()
+
+    def refresh_phase_outcomes(
+        self, conn, *, generation: int, phase_mask: int,
+        limit: int, after_company_id: int = 0,
+    ) -> tuple[int, int | None]:
+        """Explicit bounded phase refresh; leave all other mask bits unchanged."""
+        cur = conn.cursor()
+        try:
+            cur.execute(
+                """
+                DECLARE @changed TABLE (company_id BIGINT NOT NULL);
+                ;WITH target AS (
+                    SELECT TOP (%s) * FROM dbo.DBD_COMPANY WITH (UPDLOCK,ROWLOCK)
+                    WHERE last_seen_generation=%s AND company_id>%s
+                      AND (done_mask | not_available_mask | failed_mask) & %s <> 0
+                      AND (lease_owner IS NULL OR lease_expires_at<=SYSUTCDATETIME())
+                    ORDER BY company_id
+                )
+                UPDATE target SET
+                    done_mask=done_mask & ~%s,
+                    not_available_mask=not_available_mask & ~%s,
+                    failed_mask=failed_mask & ~%s,
+                    retry_at=NULL,collect_status=N'PENDING',
+                    collection_completed_at=NULL
+                OUTPUT inserted.company_id INTO @changed(company_id);
+                SELECT COUNT(*),MAX(company_id) FROM @changed;
+                """,
+                (int(limit),int(generation),int(after_company_id),int(phase_mask),
+                 int(phase_mask),int(phase_mask),int(phase_mask)),
+            )
+            row=cur.fetchone()
+            return int(row[0] or 0), (int(row[1]) if row[1] is not None else None)
         finally:
             cur.close()
 
