@@ -38,6 +38,11 @@ dependencies = [
   "beautifulsoup4>=4.13,<5",
 ]
 
+[project.urls]
+Homepage = "https://github.com/firmeen/DBD"
+Repository = "https://github.com/firmeen/DBD"
+Issues = "https://github.com/firmeen/DBD/issues"
+
 [project.optional-dependencies]
 dev = ["pytest>=8,<10", "pytest-asyncio>=1,<2", "ruff>=0.12,<1", "websockets>=17,<18"]
 gateway = ["websockets>=17,<18"]
