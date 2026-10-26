@@ -868,7 +868,7 @@ def main():
 
             presenter.package_about(package_environment_snapshot())
         elif args.command == "migrate":
-            from ..storage.migration import inspect_migration, apply_migration, MigrationBlocked
+            from ..storage.migration import MigrationBlocked, apply_migration, inspect_migration
 
             if args.yes and not args.apply:
                 raise ValueError("--yes requires --apply")
@@ -920,6 +920,8 @@ def main():
         elif args.command == "branch":
             from ..pipelines.branch import (
                 collect as collect_branches,
+            )
+            from ..pipelines.branch import (
                 import_mysql,
                 import_sqlserver_extension,
             )
@@ -1024,6 +1026,7 @@ def main():
                     raise SystemExit(1)
         elif args.command == "status":
             from dataclasses import asdict
+
             from ..workflow import status as production_status
             selected = args.backend or settings.dbd_production_backend
             data = asyncio.run(production_status(

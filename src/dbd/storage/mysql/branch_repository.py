@@ -6,15 +6,14 @@ and details live transactionally in DBD_BRANCH and are never duplicated in it.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from pathlib import Path
 import json
 import os
 import re
+from datetime import datetime, timezone
+from pathlib import Path
 
 from ...core.exceptions import ContractError
-from ..sqlserver.branch_repository import TERMINAL, REVIEW
-
+from ..sqlserver.branch_repository import REVIEW, TERMINAL
 
 TABLE = "DBD_BRANCH"
 

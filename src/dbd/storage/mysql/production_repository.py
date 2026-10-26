@@ -13,7 +13,6 @@ import pymysql
 
 from ...core.settings import settings
 from ...deep.catalog import CORE_ENDPOINT_MASK, core_discovery_plan
-
 from ..production import ProductionLeaseLost
 from ..sqlserver.repository import (
     _COMPANY_STATE_COLUMNS,

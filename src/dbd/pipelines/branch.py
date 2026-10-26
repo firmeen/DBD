@@ -14,6 +14,7 @@ from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 
+from ..core.exceptions import ContractError
 from ..core.settings import settings
 
 SITE = "https://www.dataforthai.com"
@@ -383,8 +384,8 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
     belongs only to the current pass, never to durable completion. All HTTP
     workers are read-only and one caller thread owns database writes.
     """
-    from ..storage.production import production_repository
     from ..presentation.setup import local_node_id
+    from ..storage.production import production_repository
 
     repo = repository or production_repository(backend)
     selected = getattr(repo, "backend", None)
@@ -419,8 +420,8 @@ def collect(*, event=None, limit: int | None = None, backend: str | None = None,
                 # Files used by the old standalone collector prove there may be
                 # terminal results outside the new Production HQ table. Refuse
                 # initial HTTP instead of silently repeating requests.
-                from pathlib import Path
                 import os
+                from pathlib import Path
                 journal = Path(os.environ.get(
                     "DBD_BRANCH_JOURNAL_PATH",".dbd_branch_results.jsonl"
                 ))
@@ -784,20 +785,21 @@ def import_mysql(*, check: bool = False, limit: int | None = None,
     index prevents unbounded RAM use for millions of JSONL result records.
     The Production target alone receives transactional per-identity writes.
     """
-    import os
     import json
+    import os
     import sqlite3
     import tempfile
     from pathlib import Path
-    from ..storage.production import production_repository
+
     from ..storage.mysql.engine import connect as legacy_connection
+    from ..storage.production import production_repository
 
     repo=production_repository(backend)
     selected=getattr(repo,"backend",None)
     if selected=="sqlserver":
+        from ..presentation.setup import local_node_id
         from ..storage.sqlserver import branch_repository as store
         from ..storage.sqlserver.control_repository import ControlRepository
-        from ..presentation.setup import local_node_id
         node=local_node_id()
         if node is None:
             raise BranchError("Admin setup required for SQL Server Legacy Import")
@@ -1060,10 +1062,11 @@ def import_sqlserver_extension(*, check: bool = False, limit: int | None = None)
     """
     import os
     from pathlib import Path
+
+    from ..presentation.setup import local_node_id
     from ..storage.production import production_repository
     from ..storage.sqlserver import branch_repository as store
     from ..storage.sqlserver.control_repository import ControlRepository
-    from ..presentation.setup import local_node_id
 
     node=local_node_id()
     if node is None:

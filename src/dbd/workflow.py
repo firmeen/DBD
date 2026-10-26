@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import sys
 from contextlib import contextmanager
-from time import monotonic
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
+from time import monotonic
 from typing import Any, Awaitable, Callable
 
 from .contracts.identity import CompanyIdentity

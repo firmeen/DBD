@@ -9,8 +9,7 @@ from __future__ import annotations
 from hashlib import sha256
 
 from ...core.exceptions import ContractError
-from ..sqlserver.discovery_repository import _filters_json, filters_for
-
+from ..sqlserver.discovery_repository import _filters_json
 
 TABLE = "DBD_DISCOVERY_WORK"
 

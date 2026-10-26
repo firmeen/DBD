@@ -1054,7 +1054,8 @@ async def run(
         if node_id is None:
             raise RuntimeError("Run dbd-data setup on the Admin machine before Discovery")
         await asyncio.to_thread(control.require_admin, node_id)
-        admission = lambda: control.admit(node_id, int(generation))
+        def admission():
+            return control.admit(node_id, int(generation))
 
     buckets_processed = 0
     pages_fetched = 0

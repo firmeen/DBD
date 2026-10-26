@@ -16,12 +16,12 @@ from ...contracts.master_deep import (
 from ...core.settings import settings
 from ...deep.catalog import CORE_ENDPOINT_MASK, core_discovery_plan
 from ..production import ProductionLeaseLost
+from .control_repository import ControlRepository
 from .engine import _pymssql, check_connection, connection
 from .engine import transaction as sqlserver_transaction
 from .schema import MANAGED_TABLES, TABLE_COLUMNS
 from .schema import ensure_schema as ensure_production_schema
 from .schema import validate_schema as validate_production_schema
-from .control_repository import ControlRepository
 
 TARGET_TABLE = "dbo.DBD_MASTER_DEEP"
 
@@ -768,7 +768,7 @@ class ProductionSqlServerRepository:
         with self.transaction() as conn:
             result = ensure_production_schema(conn)
             ControlRepository().ensure_schema(conn)
-            from . import discovery_repository, branch_repository
+            from . import branch_repository, discovery_repository
             discovery_repository.ensure_schema(conn)
             branch_repository.ensure_schema(conn)
             return result

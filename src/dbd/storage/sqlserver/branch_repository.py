@@ -6,13 +6,12 @@ an additional table or a destructive control schema migration.
 """
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import re
+from datetime import datetime, timezone
 
 from ...core.exceptions import ContractError
 from .control_repository import ControlRepository
 from .schema import validate_schema as validate_production_schema
-
 
 TABLE = "dbo.DBD_BRANCH"
 TERMINAL = frozenset({

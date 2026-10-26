@@ -11,7 +11,6 @@ from hashlib import sha256
 from ...client.endpoints.search import SearchFilters
 from ...core.exceptions import ContractError
 
-
 TABLE = "dbo.DBD_DISCOVERY_WORK"
 DDL = """
 IF OBJECT_ID(N'dbo.DBD_DISCOVERY_WORK', N'U') IS NULL

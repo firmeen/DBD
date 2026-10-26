@@ -68,9 +68,9 @@ def _sql_procedure_signature(body: object) -> str:
 
 
 def _sql_plan(conn: Any) -> dict[str, Any]:
+    from ..presentation.setup import local_node_id
     from .sqlserver import schema as s
     from .sqlserver.control_repository import ControlRepository
-    from ..presentation.setup import local_node_id
 
     db, login = _many(conn, "SELECT DB_NAME(), ORIGINAL_LOGIN()")[0]
     p = _plan_base("sqlserver", str(db), str(login))
@@ -494,9 +494,9 @@ def apply_migration(backend: str | None = None, *, expected: dict[str, Any]) -> 
         if current["state"] == "READY":
             return {**current, "state": "READY", "created": [], "altered": []}
         if selected == "sqlserver":
-            from .sqlserver.schema import ensure_schema
+            from .sqlserver import branch_repository, discovery_repository
             from .sqlserver.control_repository import ControlRepository
-            from .sqlserver import discovery_repository, branch_repository
+            from .sqlserver.schema import ensure_schema
             with repo.transaction() as conn:
                 if "RECONCILE nullable dbo.DBD_COMPANY.branch_count" in current["actions"]:
                     cur = conn.cursor()
@@ -527,9 +527,9 @@ def apply_migration(backend: str | None = None, *, expected: dict[str, Any]) -> 
                 repo.assert_manager_lock(lock)
             final = inspect_migration(selected)
         else:
-            from .mysql.production_schema import ensure_schema
             from .mysql.discovery_repository import ensure_schema as ensure_work
             from .mysql.production_engine import connection
+            from .mysql.production_schema import ensure_schema
             with connection() as conn:
                 if "RECONCILE nullable DBD_COMPANY.branch_count" in current["actions"]:
                     # MySQL DDL auto-commits: preserve the complete historical

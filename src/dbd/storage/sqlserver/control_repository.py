@@ -8,10 +8,17 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime, timezone
-from uuid import uuid4
 from typing import Any
+from uuid import uuid4
 
-from ...control import ControlError, choose_monthly_generation, ensure_transition, iso, month_key, scheduled_utc
+from ...control import (
+    ControlError,
+    choose_monthly_generation,
+    ensure_transition,
+    iso,
+    month_key,
+    scheduled_utc,
+)
 from .engine import connection, transaction
 
 _TABLE = "dbo.DBD_CONTROL"

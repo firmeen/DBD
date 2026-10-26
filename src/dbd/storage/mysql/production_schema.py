@@ -8,7 +8,11 @@ from __future__ import annotations
 import re
 
 from ..sqlserver.schema import (
-    TABLE_COLUMNS, INDEXES, FOREIGN_KEYS, JSON_CHECKS, EXTRA_CHECKS,
+    EXTRA_CHECKS,
+    FOREIGN_KEYS,
+    INDEXES,
+    JSON_CHECKS,
+    TABLE_COLUMNS,
 )
 
 TABLES = tuple(name.split(".", 1)[1] for name in TABLE_COLUMNS)

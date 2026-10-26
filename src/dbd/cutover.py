@@ -19,12 +19,16 @@ from .contracts.financial import (
 from .contracts.strict import normalize_collection
 from .core.exceptions import ContractError
 from .deep.catalog import (
-    ACTIVE_ENDPOINT_MASK, ACTIVE_ENDPOINTS, BASE_REQUIRED_MASK,
-    DESTINATION_COLUMNS, ENDPOINT_BITS, latest_fiscal_year,
+    ACTIVE_ENDPOINT_MASK,
+    ACTIVE_ENDPOINTS,
+    BASE_REQUIRED_MASK,
+    DESTINATION_COLUMNS,
+    ENDPOINT_BITS,
+    latest_fiscal_year,
 )
 from .storage.mysql.engine import connect as mysql_connection
-from .storage.sqlserver.engine import connection as sqlserver_connection
 from .storage.production import production_repository
+from .storage.sqlserver.engine import connection as sqlserver_connection
 
 SOURCE_TABLE = "dbd_company_deep"
 SOURCE_MASTER_TABLE = "dbd_company_master"
@@ -1447,8 +1451,8 @@ _LEGACY_SYNC_AUDIT = frozenset((
 
 
 def _legacy_sync_metadata():
+    from .storage.sqlserver.repository import _STATEMENT_COLUMNS, _SUBMISSION_COLUMNS
     from .storage.sqlserver.schema import JSON_CHECKS, TABLE_COLUMNS
-    from .storage.sqlserver.repository import _SUBMISSION_COLUMNS, _STATEMENT_COLUMNS
 
     labels = {
         "DBD_COMPANY": "companies", "DBD_COMPANY_RELATION": "relations",
