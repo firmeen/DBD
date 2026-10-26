@@ -1569,7 +1569,8 @@ def _legacy_sync_changes(
                 target_time = _legacy_sync_time(actual.get(field))
                 if source_time is not None and (target_time is None or source_time > target_time):
                     changed[field] = expected[field]
-        changed["published_at"] = expected["published_at"]
+        if "published_at" in expected:
+            changed["published_at"] = expected["published_at"]
     return changed
 
 
@@ -1677,8 +1678,10 @@ def _legacy_sync_compare_domains(repository, conn, expected, observed,
                 key for key in wanted if key in found and
                 int(found[key][_LEGACY_SYNC_PK[table]]) in updated_pks
             )
-            repository.insert_legacy_sync_rows(conn, table, missing)
-            repository.update_legacy_sync_rows(conn, table, changes)
+            if missing:
+                repository.insert_legacy_sync_rows(conn, table, missing)
+            if changes:
+                repository.update_legacy_sync_rows(conn, table, changes)
         inserted += len(missing)
         updated += len(changes)
         target_only += len(found.keys() - wanted.keys())
