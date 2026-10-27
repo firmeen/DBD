@@ -4,6 +4,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from ...contracts.financial_wide import AMOUNT_COLUMNS, YOY_COLUMNS
+
 MANAGED_TABLES = (
     "dbo.DBD_COMPANY",
     "dbo.DBD_COMPANY_RELATION",
@@ -187,6 +189,10 @@ EVENT_COLUMNS = (
 FINANCIAL_COLUMNS = (
     ColumnSpec("financial_id", "BIGINT", False, identity=True),
     ColumnSpec("company_id", "BIGINT", False),
+    ColumnSpec("juristic_type_code", "NVARCHAR(4)"),
+    ColumnSpec("registration_no", "NVARCHAR(20)"),
+    ColumnSpec("company_name_th", "NVARCHAR(500)"),
+    ColumnSpec("company_name_en", "NVARCHAR(500)"),
     ColumnSpec("fiscal_year", "NVARCHAR(8)", False),
     ColumnSpec("fiscal_year_end_date", "DATE"),
     ColumnSpec("submit_objective_code", "NVARCHAR(20)"),
@@ -197,6 +203,8 @@ FINANCIAL_COLUMNS = (
     ColumnSpec("accounting_code", "NVARCHAR(50)"),
     ColumnSpec("auditor_code", "NVARCHAR(50)"),
     ColumnSpec("submission_status_code", "NVARCHAR(20)"),
+    *(ColumnSpec(column, "DECIMAL(28,2)") for column in AMOUNT_COLUMNS),
+    ColumnSpec("return_on_cost", "DECIMAL(20,6)"),
     ColumnSpec("current_ratio", "DECIMAL(20,4)"),
     ColumnSpec("debt_to_asset", "DECIMAL(20,4)"),
     ColumnSpec("debt_to_equity", "DECIMAL(20,4)"),
@@ -213,6 +221,7 @@ FINANCIAL_COLUMNS = (
     ColumnSpec("return_on_equity", "DECIMAL(20,4)"),
     ColumnSpec("earning_per_share", "DECIMAL(20,4)"),
     ColumnSpec("cost_to_income", "DECIMAL(20,4)"),
+    *(ColumnSpec(column, "DECIMAL(20,6)") for column in YOY_COLUMNS),
     ColumnSpec("statement_items", "NVARCHAR(MAX)"),
     ColumnSpec("submission_updated_at", "DATETIME2(6)"),
     ColumnSpec("statement_updated_at", "DATETIME2(6)"),
