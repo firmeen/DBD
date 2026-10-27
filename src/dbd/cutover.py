@@ -584,12 +584,16 @@ def transform_financials(
     submission_payloads = _submission_payloads(submission_source)
     statement_payloads = _statement_payloads(statement_source)
 
-    submission_by_year = {normalize_financial_year(item["submit_year"]): item for item in submissions}
+    submission_by_year = {
+        normalize_financial_year(item["submit_year"]): item for item in submissions
+    }
+    if len(submission_by_year) != len(submissions):
+        raise ContractError("Conflicting financial submission fiscal-year identity")
     statement_by_year = {}
     for item in statements:
         year = normalize_financial_year(item.fiscal_year)
         if year in statement_by_year:
-            continue
+            raise ContractError("Conflicting financial statement fiscal-year identity")
         statement_by_year[year] = item
 
     submission_payloads = {normalize_financial_year(key): value for key, value in submission_payloads.items()}
