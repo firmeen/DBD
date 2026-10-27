@@ -27,6 +27,11 @@ from ..contracts.financial import (
     normalize_statements,
     normalize_submissions,
 )
+from ..contracts.financial_wide import (
+    add_yoy as add_financial_yoy,
+    fiscal_year as normalize_financial_year,
+    statement_values as financial_statement_values,
+)
 from ..contracts.identity import identity
 from ..contracts.strict import normalize_industry_benchmark
 from ..core.exceptions import ContractError, IdentityConflict
@@ -503,7 +508,7 @@ def _submission_rows(
     raw = _raw_by_key(raw_payload, "submitYear")
     return [
         {
-            "fiscal_year": str(item["submit_year"]),
+            "fiscal_year": normalize_financial_year(item["submit_year"]),
             "accounting_date": item.get("ac_date"),
             "submission_date": item.get("submit_date"),
             "accounting_code": item.get("ac_code"),
@@ -534,7 +539,7 @@ def _statement_rows(
         value = source.get("fiscalYear")
         if value is None:
             continue
-        key = str(value)
+        key = normalize_financial_year(value)
         encoded = _json_payload(source)
         previous = raw.get(key)
         if previous is not None and previous[0] != encoded:
@@ -546,9 +551,10 @@ def _statement_rows(
     rows_by_year: dict[str, dict[str, Any]] = {}
     fingerprints: dict[str, str] = {}
     for item in normalized:
-        key = str(item.fiscal_year)
+        key = normalize_financial_year(item.fiscal_year)
         values = {
             "fiscal_year": key,
+            **financial_statement_values(item, raw.get(key, ("{}", {}))[1]),
             "fiscal_year_end_date": item.fiscal_year_end_date,
             "submit_objective_code": item.submit_obj_code,
             "business_size_code": item.business_size_code,
@@ -569,7 +575,9 @@ def _statement_rows(
             )
         fingerprints[key] = fingerprint
         rows_by_year[key] = values
-    return list(rows_by_year.values())
+    result = list(rows_by_year.values())
+    add_financial_yoy(result)
+    return result
 
 
 def _industry_rows(
