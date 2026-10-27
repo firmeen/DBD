@@ -1005,3 +1005,40 @@ def test_industry_conflict_without_source_timestamp_cannot_regress_dated_row() -
                 }
             ],
         )
+
+
+def test_financial_statement_refreshes_yoy_of_following_year() -> None:
+    from decimal import Decimal
+
+    from dbd.contracts.financial_wide import AMOUNT_COLUMNS, YOY_COLUMNS
+
+    class FinancialCursor(_SequenceCursor):
+        def fetchall(self):
+            def financial(fid, year, assets):
+                amounts = [
+                    assets if field == "total_assets" else None
+                    for field in AMOUNT_COLUMNS
+                ]
+                return (fid, year, *amounts)
+
+            # The revised prior-year amount is 80; following year remains 120.
+            return [
+                financial(101, "2567", Decimal("80")),
+                financial(102, "2568", Decimal("120")),
+            ]
+
+    cursor = FinancialCursor([(101,)])
+    ProductionSqlServerRepository().merge_financial_statements(
+        _CaptureConnection(cursor),
+        company_id=42,
+        generation=5,
+        rows=[{"fiscal_year": "2567", "total_assets": Decimal("80"),
+               "published_at": "now"}],
+    )
+    assert cursor.executemany_calls
+    statement, batches = cursor.executemany_calls[-1]
+    yoy_index = YOY_COLUMNS.index("total_assets_yoy_pct")
+    assert "UPDATE dbo.DBD_FINANCIAL SET" in statement
+    assert batches[0][yoy_index] is None
+    assert batches[1][yoy_index] == Decimal("50")
+    assert batches[1][-1] == 102
