@@ -1193,6 +1193,9 @@ def run_generation1_cutover(
                 relations = transform_relations(source, published_at=published_at)
                 events = transform_events(source, published_at=published_at)
                 financial = transform_financials(source, published_at=published_at)
+                for financial_row in financial:
+                    financial_row["company_name_th"] = company["company_name_th"]
+                    financial_row["company_name_en"] = company["company_name_en"]
                 industries = transform_industries(source, published_at=published_at)
                 prepared.append(
                     (identity, company, relations, events, financial, industries)
