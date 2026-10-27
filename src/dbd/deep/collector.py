@@ -554,12 +554,12 @@ def _statement_rows(
         key = normalize_financial_year(item.fiscal_year)
         values = {
             "fiscal_year": key,
+            **item.ratios,
             **financial_statement_values(item, raw.get(key, ("{}", {}))[1]),
             "fiscal_year_end_date": item.fiscal_year_end_date,
             "submit_objective_code": item.submit_obj_code,
             "business_size_code": item.business_size_code,
             "business_size_description": item.business_size_desc,
-            **item.ratios,
             "statement_items": _json_payload(item.items) if item.items else None,
             "statement_updated_at": item.update_date,
             "statement_payload": _json_payload(raw.get(key, ("{}", {}))[1]),
