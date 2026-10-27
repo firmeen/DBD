@@ -609,7 +609,10 @@ def test_financial_submission_merge_never_updates_statement_columns() -> None:
             }
         ],
     )
-    update_sql = cursor.executions[-1][0]
+    update_sql = next(
+        statement for statement, _ in cursor.executions
+        if "WHERE financial_id=%s" in statement
+    )
     assert "accounting_date" in update_sql
     assert "submission_payload" in update_sql
     assert "statement_payload" not in update_sql
@@ -632,7 +635,10 @@ def test_financial_statement_merge_never_updates_submission_columns() -> None:
             }
         ],
     )
-    update_sql = cursor.executions[-1][0]
+    update_sql = next(
+        statement for statement, _ in cursor.executions
+        if "WHERE financial_id=%s" in statement
+    )
     assert "current_ratio" in update_sql
     assert "statement_payload" in update_sql
     assert "submission_payload" not in update_sql
