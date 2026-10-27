@@ -15,6 +15,12 @@ from .contracts.financial import (
     normalize_statements,
     normalize_submissions,
 )
+from .contracts.financial_wide import (
+    VALUE_COLUMNS as FINANCIAL_WIDE_VALUES,
+    add_yoy as add_financial_yoy,
+    fiscal_year as normalize_financial_year,
+    statement_values as financial_statement_values,
+)
 from .contracts.strict import normalize_collection
 from .core.exceptions import ContractError
 from .deep.catalog import latest_fiscal_year
@@ -578,23 +584,39 @@ def transform_financials(
     submission_payloads = _submission_payloads(submission_source)
     statement_payloads = _statement_payloads(statement_source)
 
-    submission_by_year = {str(item["submit_year"]): item for item in submissions}
+    submission_by_year = {
+        normalize_financial_year(item["submit_year"]): item for item in submissions
+    }
+    if len(submission_by_year) != len(submissions):
+        raise ContractError("Conflicting financial submission fiscal-year identity")
     statement_by_year = {}
     for item in statements:
-        year = str(item.fiscal_year)
+        year = normalize_financial_year(item.fiscal_year)
         if year in statement_by_year:
-            continue
+            raise ContractError("Conflicting financial statement fiscal-year identity")
         statement_by_year[year] = item
 
+    submission_payloads = {normalize_financial_year(key): value for key, value in submission_payloads.items()}
+    statement_payloads = {normalize_financial_year(key): value for key, value in statement_payloads.items()}
     rows: list[dict[str, Any]] = []
     for fiscal_year in sorted(set(submission_by_year) | set(statement_by_year)):
         submission = submission_by_year.get(fiscal_year)
         statement = statement_by_year.get(fiscal_year)
         ratios = {} if statement is None else statement.ratios
         items = [] if statement is None else statement.items
+        wide = (
+            {column: None for column in FINANCIAL_WIDE_VALUES}
+            if statement is None
+            else financial_statement_values(statement, statement_payloads.get(fiscal_year))
+        )
         rows.append(
             {
+                "juristic_type_code": _required_text(row.get("jp_type_code"), "jp_type_code"),
+                "registration_no": _required_text(row.get("jp_no"), "jp_no"),
+                "company_name_th": _clean_text(row.get("jp_name")),
+                "company_name_en": _clean_text(row.get("jp_name_e")),
                 "fiscal_year": fiscal_year,
+                **wide,
                 "fiscal_year_end_date": (
                     None if statement is None else statement.fiscal_year_end_date
                 ),
@@ -658,6 +680,7 @@ def transform_financials(
                 "published_at": published_at,
             }
         )
+    add_financial_yoy(rows)
     return rows
 
 
@@ -1170,6 +1193,9 @@ def run_generation1_cutover(
                 relations = transform_relations(source, published_at=published_at)
                 events = transform_events(source, published_at=published_at)
                 financial = transform_financials(source, published_at=published_at)
+                for financial_row in financial:
+                    financial_row["company_name_th"] = company["company_name_th"]
+                    financial_row["company_name_en"] = company["company_name_en"]
                 industries = transform_industries(source, published_at=published_at)
                 prepared.append(
                     (identity, company, relations, events, financial, industries)
