@@ -10,6 +10,12 @@ from typing import Any, Callable, Iterator
 from .contracts.common import money
 from .contracts.company import normalize as normalize_profile
 from .contracts.company import normalize_committee_signs, normalize_committees
+from .contracts.financial_wide import (
+    VALUE_COLUMNS as FINANCIAL_WIDE_VALUES,
+    add_yoy as add_financial_yoy,
+    fiscal_year as normalize_financial_year,
+    statement_values as financial_statement_values,
+)
 from .contracts.financial import (
     normalize_benchmark,
     normalize_statements,
@@ -578,23 +584,35 @@ def transform_financials(
     submission_payloads = _submission_payloads(submission_source)
     statement_payloads = _statement_payloads(statement_source)
 
-    submission_by_year = {str(item["submit_year"]): item for item in submissions}
+    submission_by_year = {normalize_financial_year(item["submit_year"]): item for item in submissions}
     statement_by_year = {}
     for item in statements:
-        year = str(item.fiscal_year)
+        year = normalize_financial_year(item.fiscal_year)
         if year in statement_by_year:
             continue
         statement_by_year[year] = item
 
+    submission_payloads = {normalize_financial_year(key): value for key, value in submission_payloads.items()}
+    statement_payloads = {normalize_financial_year(key): value for key, value in statement_payloads.items()}
     rows: list[dict[str, Any]] = []
     for fiscal_year in sorted(set(submission_by_year) | set(statement_by_year)):
         submission = submission_by_year.get(fiscal_year)
         statement = statement_by_year.get(fiscal_year)
         ratios = {} if statement is None else statement.ratios
         items = [] if statement is None else statement.items
+        wide = (
+            {column: None for column in FINANCIAL_WIDE_VALUES}
+            if statement is None
+            else financial_statement_values(statement, statement_payloads.get(fiscal_year))
+        )
         rows.append(
             {
+                "juristic_type_code": _required_text(row.get("jp_type_code"), "jp_type_code"),
+                "registration_no": _required_text(row.get("jp_no"), "jp_no"),
+                "company_name_th": _clean_text(row.get("jp_name")),
+                "company_name_en": _clean_text(row.get("jp_name_e")),
                 "fiscal_year": fiscal_year,
+                **wide,
                 "fiscal_year_end_date": (
                     None if statement is None else statement.fiscal_year_end_date
                 ),
@@ -658,6 +676,7 @@ def transform_financials(
                 "published_at": published_at,
             }
         )
+    add_financial_yoy(rows)
     return rows
 
 
