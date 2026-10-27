@@ -10,6 +10,7 @@ from .common import money, require_rows, to_date
 # Ratio metrics carry a single value per fiscal year (no Ly/Pc pair), so they
 # are promoted to typed columns on financial_statements.
 _RATIO_COLUMNS = {
+    "returnOnCost": "return_on_cost",
     "currentRatio": "current_ratio",
     "debtToAsset": "debt_to_asset",
     "debtToEquity": "debt_to_equity",
