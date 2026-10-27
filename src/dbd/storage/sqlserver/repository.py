@@ -7,7 +7,11 @@ from datetime import time as datetime_time
 from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
-from ...contracts.financial_wide import AMOUNT_COLUMNS, YOY_COLUMNS
+from ...contracts.financial_wide import (
+    AMOUNT_COLUMNS,
+    YOY_COLUMNS,
+    add_yoy as add_financial_yoy,
+)
 from ...contracts.master_deep import (
     SERVING_COLUMNS,
     SERVING_FIELDS,
@@ -1854,6 +1858,52 @@ class ProductionSqlServerRepository:
                     + " WHERE financial_id=%s",
                     tuple(params + [int(existing[0])]),
                 )
+            if rows:
+                # Refresh denormalized identity from authoritative DBD_COMPANY.
+                # This also covers companies whose names changed on refresh.
+                cur.execute(
+                    """
+                    UPDATE f
+                    SET juristic_type_code=c.juristic_type_code,
+                        registration_no=c.registration_no,
+                        company_name_th=c.company_name_th,
+                        company_name_en=c.company_name_en
+                    FROM dbo.DBD_FINANCIAL f
+                    JOIN dbo.DBD_COMPANY c ON c.company_id=f.company_id
+                    WHERE f.company_id=%s
+                    """,
+                    (int(company_id),),
+                )
+                if "statement_items" in owned_columns:
+                    # Recalculate all affected years, not just those returned
+                    # by the latest endpoint response. A changed earlier year
+                    # must also refresh the following year's YoY.
+                    cur.execute(
+                        "SELECT financial_id, fiscal_year, "
+                        + ", ".join(f"[{column}]" for column in AMOUNT_COLUMNS)
+                        + " FROM dbo.DBD_FINANCIAL WHERE company_id=%s "
+                        "ORDER BY fiscal_year",
+                        (int(company_id),),
+                    )
+                    financial_fields = ("financial_id", "fiscal_year", *AMOUNT_COLUMNS)
+                    existing_rows = [
+                        dict(zip(financial_fields, record, strict=True))
+                        for record in cur.fetchall()
+                    ]
+                    add_financial_yoy(existing_rows)
+                    if existing_rows:
+                        assignments = ", ".join(
+                            f"[{column}]=%s" for column in YOY_COLUMNS
+                        )
+                        cur.executemany(
+                            "UPDATE dbo.DBD_FINANCIAL SET "
+                            + assignments + " WHERE financial_id=%s",
+                            [
+                                tuple(row[column] for column in YOY_COLUMNS)
+                                + (row["financial_id"],)
+                                for row in existing_rows
+                            ],
+                        )
         finally:
             cur.close()
         return len(rows)
