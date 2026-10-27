@@ -22,3 +22,8 @@ dist/
 pytest-cache-files-*/
 
 canary*
+
+.dbd_*
+branch_upgrade_backup/
+export*
+parquet_source_audit.py
