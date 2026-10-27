@@ -10,16 +10,16 @@ from typing import Any, Callable, Iterator
 from .contracts.common import money
 from .contracts.company import normalize as normalize_profile
 from .contracts.company import normalize_committee_signs, normalize_committees
+from .contracts.financial import (
+    normalize_benchmark,
+    normalize_statements,
+    normalize_submissions,
+)
 from .contracts.financial_wide import (
     VALUE_COLUMNS as FINANCIAL_WIDE_VALUES,
     add_yoy as add_financial_yoy,
     fiscal_year as normalize_financial_year,
     statement_values as financial_statement_values,
-)
-from .contracts.financial import (
-    normalize_benchmark,
-    normalize_statements,
-    normalize_submissions,
 )
 from .contracts.strict import normalize_collection
 from .core.exceptions import ContractError
