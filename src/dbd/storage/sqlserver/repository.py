@@ -7,6 +7,7 @@ from datetime import time as datetime_time
 from typing import Any, Iterable, Iterator
 from uuid import uuid4
 
+from ...contracts.financial_wide import AMOUNT_COLUMNS, YOY_COLUMNS
 from ...contracts.master_deep import (
     SERVING_COLUMNS,
     SERVING_FIELDS,
@@ -610,6 +611,9 @@ _STATEMENT_COLUMNS = (
     "submit_objective_code",
     "business_size_code",
     "business_size_description",
+    *AMOUNT_COLUMNS,
+    "return_on_cost",
+    *YOY_COLUMNS,
     "current_ratio",
     "debt_to_asset",
     "debt_to_equity",
