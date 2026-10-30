@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import os
 import signal
+import sys
 from contextlib import contextmanager
 
 from .._version import __version__
@@ -564,6 +565,14 @@ def _campaign_command(args, presenter: TerminalPresenter) -> None:
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "auto":
+        from pathlib import Path
+        from runpy import run_path
+
+        script = Path(__file__).resolve().parents[3] / "scripts" / "run_discover_auto.py"
+
+        runner = run_path(str(script), run_name="dbd_discover_auto")
+        raise SystemExit(runner["main"](sys.argv[2:]))
     parser = argparse.ArgumentParser(prog="dbd-data", description="Durable MySQL-backed DBD ingestion")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)

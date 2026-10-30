@@ -240,6 +240,26 @@ def parse_args(argv: list[str] | None = None):
 
 
 def main(argv: list[str] | None = None) -> None:
+    import sys
+    from pathlib import Path
+    from runpy import run_path
+
+    arguments = sys.argv[1:] if argv is None else argv
+
+    if arguments and arguments[0] == "bootstrap":
+        from .bootstrap import main as bootstrap_main
+
+        bootstrap_main(arguments[1:])
+        return
+
+    if arguments and arguments[0] == "auto":
+        if len(arguments) > 1:
+            raise SystemExit("dbd-deep auto does not accept arguments")
+
+        script = Path(__file__).resolve().parents[3] / "scripts" / "run_deep_auto.py"
+
+        runner = run_path(str(script), run_name="dbd_deep_auto")
+        raise SystemExit(runner["main"]())
     args = parse_args(argv)
     try:
         if args.command == "prepare":

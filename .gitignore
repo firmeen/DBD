@@ -25,4 +25,8 @@ canary*
 
 .dbd*
 
-export*
+export*/dbd_canary_*.py
+/dbd_export_parquet*.py
+/dbd_financial_rebuild.py
+/parquet_source_audit.py
+/output/
